@@ -38,12 +38,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/login":
             return self._html(self._login_page())
         if parsed.path == "/health":
-            return self._json({"version": __version__, **self.server.store.health()})
+            return self._json(
+                {"version": __version__, "build": self._build_manifest(), **self.server.store.health()}
+            )
         if parsed.path == "/api/snapshot":
             quota = self.server.store.latest_quota()
             return self._json(
                 {
                     "version": __version__,
+                    "build": self._build_manifest(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "quota": quota.__dict__ if quota else None,
@@ -128,6 +131,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _static(self, name: str) -> str:
         return (Path(__file__).parent / "static" / name).read_text()
+
+    def _build_manifest(self) -> dict | None:
+        path = self.server.config.install_manifest
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"error": "install manifest unreadable"}
 
     def _login_page(self, error: str = "") -> str:
         notice = f"<p class='error'>{error}</p>" if error else ""

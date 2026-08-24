@@ -26,6 +26,10 @@ class WorkbenchConfig:
     def config_file(self) -> Path:
         return self.state_root / "config.json"
 
+    @property
+    def install_manifest(self) -> Path:
+        return self.state_root / "app" / "install-manifest.json"
+
     def initialize(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.state_root.chmod(0o700)
@@ -63,4 +67,3 @@ class WorkbenchConfig:
                 max_workers=int(raw.get("max_workers", 4)),
             )
         return cls(state_root=root)
-

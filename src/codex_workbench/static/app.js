@@ -24,7 +24,8 @@ async function refreshSnapshot() {
   const response = await fetch("/api/snapshot", {cache: "no-store"});
   const data = await response.json();
   document.querySelector("#health").className = "pill ok";
-  document.querySelector("#health").textContent = `v${data.version} · online`;
+  const build = data.build?.commit ? ` · ${data.build.commit.slice(0, 10)}` : "";
+  document.querySelector("#health").textContent = `v${data.version}${build} · online`;
   const counts = data.health.task_counts || {};
   const active = (counts.running || 0) + (counts.queued || 0) + (counts.verifying || 0);
   const quota = data.quota;

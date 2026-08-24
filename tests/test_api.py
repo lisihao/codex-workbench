@@ -30,6 +30,7 @@ class APITests(unittest.TestCase):
                     snapshot = json.load(response)
                 self.assertTrue(snapshot["health"]["ok"])
                 self.assertFalse(snapshot["authenticated"])
+                self.assertIsNone(snapshot["build"])
                 request = Request(
                     f"http://127.0.0.1:{port}/api/tasks/missing/control",
                     data=b'{"action":"pause"}',
