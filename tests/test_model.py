@@ -2,16 +2,86 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from codex_workbench.executors import codex_subscription_environment
+from codex_workbench.artifacts import ArtifactStore
+from codex_workbench.executors import (
+    CodexExecutor,
+    ExecutionRequest,
+    codex_subscription_environment,
+)
 from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.planner import PLAN_SCHEMA
 
 
 class ModelTests(unittest.TestCase):
+    def test_codex_qualification_requires_companion_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "codex"
+            binary.write_text("#!/bin/sh\necho 'Logged in using ChatGPT'\n")
+            binary.chmod(0o755)
+            executor = CodexExecutor(ArtifactStore(root / "artifacts"), str(binary))
+
+            qualified, reason = executor.qualification()
+
+            self.assertFalse(qualified)
+            self.assertIn("codex-code-mode-host", reason)
+
+    def test_codex_worker_enables_code_mode_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            executor = CodexExecutor(ArtifactStore(root / "artifacts"), "/tmp/codex")
+            request = ExecutionRequest(
+                task_id="task-1",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "write a bounded file",
+                    "allowed_scope": ["result.txt"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                    "timeout_seconds": 30,
+                },
+                spec={
+                    "title": "write result",
+                    "prompt": "write result.txt",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                },
+                worktree=worktree,
+            )
+
+            def fake_run(command: list[str], **_: object):
+                enabled = [
+                    command[index + 1]
+                    for index, argument in enumerate(command[:-1])
+                    if argument == "--enable"
+                ]
+                disabled = [
+                    command[index + 1]
+                    for index, argument in enumerate(command[:-1])
+                    if argument == "--disable"
+                ]
+                self.assertIn("code_mode_host", enabled)
+                self.assertNotIn("code_mode_host", disabled)
+                output_path = Path(command[command.index("--output-last-message") + 1])
+                output_path.write_text(
+                    '{"status":"succeeded","summary":"ok","changed_paths":[],"checks":[]}'
+                )
+                return subprocess.CompletedProcess(command, 0, "", ""), {}
+
+            with (
+                patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+                patch.object(executor, "_run", side_effect=fake_run),
+            ):
+                executor.execute(request)
+
     def test_planner_schema_requires_every_declared_property(self) -> None:
         item = PLAN_SCHEMA["properties"]["nodes"]["items"]
         self.assertEqual(set(item["required"]), set(item["properties"]))

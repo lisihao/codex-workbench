@@ -100,6 +100,9 @@ class CodexExecutor(ProcessExecutor):
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary or not Path(binary).exists():
             return False, "Codex CLI is not installed"
+        companion = Path(binary).resolve().with_name("codex-code-mode-host")
+        if not companion.is_file() or not os.access(companion, os.X_OK):
+            return False, f"Codex workspace tool host is missing or not executable: {companion}"
         try:
             result = subprocess.run(
                 [binary, "login", "status"],
@@ -139,7 +142,7 @@ class CodexExecutor(ProcessExecutor):
                 "plugins",
                 "--disable",
                 "plugin_sharing",
-                "--disable",
+                "--enable",
                 "code_mode_host",
                 "--json",
                 "--model",

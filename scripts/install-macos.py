@@ -41,9 +41,17 @@ def main() -> int:
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     codex_source = Path(args.codex_binary).expanduser().resolve(strict=True)
+    codex_host_source = codex_source.with_name("codex-code-mode-host")
+    if not codex_host_source.is_file():
+        raise SystemExit(
+            f"Codex workspace tool host is missing beside the selected CLI: {codex_host_source}"
+        )
     codex_binary = runtime_root / "codex"
+    codex_host = runtime_root / "codex-code-mode-host"
     shutil.copy2(codex_source, codex_binary)
+    shutil.copy2(codex_host_source, codex_host)
     codex_binary.chmod(0o755)
+    codex_host.chmod(0o755)
     codex_version = run(str(codex_binary), "--version").stdout.strip()
     auth_source = Path.home() / ".codex" / "auth.json"
     if not auth_source.exists():
