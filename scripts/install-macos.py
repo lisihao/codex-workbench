@@ -22,7 +22,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--state-root", default="~/Library/Application Support/Codex Workbench")
-    parser.add_argument("--codex-binary", default="~/.local/codex-workbench/bin/codex")
+    parser.add_argument("--codex-binary", default="~/.codex/packages/standalone/current/codex")
     args = parser.parse_args()
 
     source = Path(args.source).expanduser().resolve()
@@ -31,9 +31,27 @@ def main() -> int:
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / f"{LABEL}.plist"
     logs = state_root / "logs"
+    runtime_root = state_root / "runtime"
+    codex_home = state_root / "codex-home"
 
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    codex_source = Path(args.codex_binary).expanduser().resolve(strict=True)
+    codex_binary = runtime_root / "codex"
+    shutil.copy2(codex_source, codex_binary)
+    codex_binary.chmod(0o755)
+    codex_version = run(str(codex_binary), "--version").stdout.strip()
+    auth_source = Path.home() / ".codex" / "auth.json"
+    if not auth_source.exists():
+        raise SystemExit("Codex subscription auth is missing at ~/.codex/auth.json")
+    auth_link = codex_home / "auth.json"
+    if auth_link.is_symlink():
+        auth_link.unlink()
+    elif auth_link.exists():
+        raise SystemExit(f"refusing to replace non-symlink auth file: {auth_link}")
+    auth_link.symlink_to(auth_source)
     commit = run("git", "-C", str(source), "rev-parse", "HEAD").stdout.strip()
     tag_result = run("git", "-C", str(source), "describe", "--tags", "--exact-match", check=False)
     tag = tag_result.stdout.strip() if tag_result.returncode == 0 else None
@@ -56,6 +74,7 @@ def main() -> int:
                 "commit": commit,
                 "tag": tag,
                 "installed_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "codex_version": codex_version,
             },
             indent=2,
         )
@@ -68,6 +87,9 @@ def main() -> int:
     wrapper.write_text(
         "#!/bin/zsh\n"
         f"export PYTHONPATH={str(app_root / 'src')!r}\n"
+        f"export CODEX_HOME={str(codex_home)!r}\n"
+        f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
+        "export CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude\n"
         f"exec /opt/homebrew/bin/python3 -m codex_workbench \"$@\"\n"
     )
     wrapper.chmod(0o755)
@@ -76,7 +98,8 @@ def main() -> int:
     rendered = (
         template.replace("__APP_ROOT__", str(app_root))
         .replace("__STATE_ROOT__", str(state_root))
-        .replace("__CODEX_BINARY__", str(Path(args.codex_binary).expanduser().resolve()))
+        .replace("__CODEX_BINARY__", str(codex_binary))
+        .replace("__CODEX_HOME__", str(codex_home))
     )
     plistlib.loads(rendered.encode())
     launch_agents.mkdir(parents=True, exist_ok=True)

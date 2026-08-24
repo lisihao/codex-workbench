@@ -10,6 +10,7 @@
 - Worker 完成不等于任务完成，必须经过独立 verifier。
 - Claude 配额未知、认证未知或剩余不高于 25% 时禁止启动新任务，至少保留 20%。
 - 不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，只允许产品订阅登录态。
+- 安装器为无人值守进程建立独立 `CODEX_HOME`；它只软链接用户现有 `auth.json`，不会加载个人 skills、会话、模型缓存或全局配置。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
