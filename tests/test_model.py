@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from codex_workbench.executors import codex_subscription_environment
 from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract
 
 
 class ModelTests(unittest.TestCase):
+    def test_codex_environment_isolates_home_and_removes_api_keys(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/Users/example",
+                "CODEX_WORKBENCH_PROCESS_HOME": "/private/workbench-home",
+                "OPENAI_API_KEY": "must-not-forward",
+                "ANTHROPIC_API_KEY": "must-not-forward",
+            },
+            clear=False,
+        ):
+            environment = codex_subscription_environment()
+        self.assertEqual(environment["HOME"], "/private/workbench-home")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+
     def test_contract_hash_is_deterministic(self) -> None:
         contract = TaskContract(
             task_id="task-1",
@@ -68,4 +87,3 @@ class ModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

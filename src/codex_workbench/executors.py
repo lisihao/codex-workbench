@@ -35,6 +35,14 @@ def subscription_environment() -> dict[str, str]:
     return environment
 
 
+def codex_subscription_environment() -> dict[str, str]:
+    environment = subscription_environment()
+    process_home = environment.get("CODEX_WORKBENCH_PROCESS_HOME")
+    if process_home:
+        environment["HOME"] = process_home
+    return environment
+
+
 class ProcessExecutor:
     def __init__(self, artifacts: ArtifactStore):
         self.artifacts = artifacts
@@ -46,6 +54,7 @@ class ProcessExecutor:
         cwd: Path,
         timeout: int,
         input_text: str | None = None,
+        environment: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
         result = subprocess.run(
             command,
@@ -54,7 +63,7 @@ class ProcessExecutor:
             text=True,
             capture_output=True,
             timeout=timeout,
-            env=subscription_environment(),
+            env=environment or subscription_environment(),
             check=False,
         )
         artifacts = {
@@ -97,7 +106,7 @@ class CodexExecutor(ProcessExecutor):
                 text=True,
                 capture_output=True,
                 timeout=15,
-                env=subscription_environment(),
+                env=codex_subscription_environment(),
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -124,6 +133,12 @@ class CodexExecutor(ProcessExecutor):
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
+                "--disable",
+                "skill_search",
+                "--disable",
+                "plugins",
+                "--disable",
+                "plugin_sharing",
                 "--json",
                 "--model",
                 request.spec["model"],
@@ -143,6 +158,7 @@ class CodexExecutor(ProcessExecutor):
                     cwd=request.worktree,
                     timeout=int(request.contract["timeout_seconds"]),
                     input_text=prompt,
+                    environment=codex_subscription_environment(),
                 )
             except subprocess.TimeoutExpired:
                 return NodeResult(status="indeterminate", summary="Codex turn timed out; terminal state is unknown")

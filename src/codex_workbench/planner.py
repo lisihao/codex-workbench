@@ -75,6 +75,9 @@ class CodexPlanner:
         environment = os.environ.copy()
         environment.pop("OPENAI_API_KEY", None)
         environment.pop("ANTHROPIC_API_KEY", None)
+        process_home = environment.get("CODEX_WORKBENCH_PROCESS_HOME")
+        if process_home:
+            environment["HOME"] = process_home
         prompt = self._prompt(
             contract,
             claude_available=claude_available,
@@ -91,6 +94,12 @@ class CodexPlanner:
                     "exec",
                     "--ephemeral",
                     "--ignore-user-config",
+                    "--disable",
+                    "skill_search",
+                    "--disable",
+                    "plugins",
+                    "--disable",
+                    "plugin_sharing",
                     "--json",
                     "--model",
                     self.model,

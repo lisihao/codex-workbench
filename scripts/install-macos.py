@@ -33,11 +33,13 @@ def main() -> int:
     logs = state_root / "logs"
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
+    process_home = state_root / "codex-process-home"
 
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     codex_source = Path(args.codex_binary).expanduser().resolve(strict=True)
     codex_binary = runtime_root / "codex"
     shutil.copy2(codex_source, codex_binary)
@@ -88,6 +90,7 @@ def main() -> int:
         "#!/bin/zsh\n"
         f"export PYTHONPATH={str(app_root / 'src')!r}\n"
         f"export CODEX_HOME={str(codex_home)!r}\n"
+        f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
         f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
         "export CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude\n"
         f"exec /opt/homebrew/bin/python3 -m codex_workbench \"$@\"\n"
@@ -100,6 +103,7 @@ def main() -> int:
         .replace("__STATE_ROOT__", str(state_root))
         .replace("__CODEX_BINARY__", str(codex_binary))
         .replace("__CODEX_HOME__", str(codex_home))
+        .replace("__PROCESS_HOME__", str(process_home))
     )
     plistlib.loads(rendered.encode())
     launch_agents.mkdir(parents=True, exist_ok=True)
