@@ -58,6 +58,15 @@ tailscale serve --bg --https=10443 http://127.0.0.1:8766
 
 MacBook 和手机读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断线只产生 stale 投影，不会启动第二个协调器。控制操作需要 `codex-workbench token` 返回的本地令牌。
 
+如果 MacBook 的 Shadowrocket Fake-IP 覆盖了 Tailscale MagicDNS，安装自恢复驾驶舱隧道，不修改全局代理规则：
+
+```bash
+python3 scripts/install-macbook-client.py
+open http://127.0.0.1:18766
+```
+
+隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。
+
 ## 状态语义
 
 任务状态为：
