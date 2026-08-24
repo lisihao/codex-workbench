@@ -44,6 +44,14 @@ class WorkbenchStore:
         return connection
 
     @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
@@ -58,7 +66,7 @@ class WorkbenchStore:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with self._init_lock, self._connect() as connection:
+        with self._init_lock, self.connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -350,7 +358,7 @@ class WorkbenchStore:
             return revision
 
     def list_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT task_id, contract_hash, state, state_revision, created_at, updated_at,
@@ -362,7 +370,7 @@ class WorkbenchStore:
             return [self._task_row(connection, row) for row in rows]
 
     def get_task(self, task_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(task_id)
@@ -403,7 +411,7 @@ class WorkbenchStore:
     def read_events(
         self, after: int = 0, limit: int = 500, task_id: str | None = None
     ) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             if task_id:
                 rows = connection.execute(
                     """
@@ -671,7 +679,7 @@ class WorkbenchStore:
             )
 
     def latest_quota(self) -> QuotaSnapshot | None:
-        with self._connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 """
                 SELECT snapshot_json FROM quota_snapshots
@@ -681,7 +689,7 @@ class WorkbenchStore:
             return QuotaSnapshot(**json.loads(row["snapshot_json"])) if row else None
 
     def health(self) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             schema = int(
                 connection.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"

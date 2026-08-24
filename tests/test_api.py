@@ -39,6 +39,7 @@ class APITests(unittest.TestCase):
                 with self.assertRaises(HTTPError) as caught:
                     urlopen(request, timeout=2)
                 self.assertEqual(caught.exception.code, 401)
+                caught.exception.close()
             finally:
                 server.shutdown()
                 server.server_close()
@@ -47,4 +48,3 @@ class APITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -37,7 +37,7 @@
     {
       "id": "tests",
       "label": "Persistent coordinator tests",
-      "command": ["scripts/python-runtime", "-m", "unittest", "discover", "-s", "tests", "-v"],
+      "command": ["scripts/python-runtime", "-W", "error::ResourceWarning", "-m", "unittest", "discover", "-s", "tests", "-v"],
       "env": {"PYTHONPATH": "src"},
       "cwd": ".",
       "scopes": ["source", "governance"],
