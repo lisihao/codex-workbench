@@ -1,0 +1,48 @@
+{
+  "profile_version": 1,
+  "name": "codex-workbench",
+  "project_markers": ["pyproject.toml", "AGENTS.md"],
+  "instruction_sources": [
+    {"path": "AGENTS.md", "required": true, "kind": "agent-instructions"}
+  ],
+  "scope_rules": [
+    {"scope": "source", "patterns": ["src/**", "tests/**", "scripts/**", "launchd/**"]},
+    {"scope": "governance", "patterns": [".agent-governance/**", "AGENTS.md"], "expands": ["source"]},
+    {"scope": "docs", "patterns": ["README.md"]}
+  ],
+  "hooks": [],
+  "ci_contracts": [
+    {"path": ".github/workflows/ci.yml", "required": true, "kind": "github-actions"}
+  ],
+  "gates": [
+    {
+      "id": "diff-check",
+      "label": "Git whitespace and conflict check",
+      "command": ["git", "diff", "--check"],
+      "cwd": ".",
+      "scopes": ["always"],
+      "levels": ["quick", "full"],
+      "timeout_seconds": 60
+    },
+    {
+      "id": "compile",
+      "label": "Python compilation",
+      "command": ["scripts/python-runtime", "-m", "compileall", "-q", "src", "scripts"],
+      "env": {"PYTHONPATH": "src"},
+      "cwd": ".",
+      "scopes": ["source", "governance"],
+      "levels": ["quick", "full"],
+      "timeout_seconds": 60
+    },
+    {
+      "id": "tests",
+      "label": "Persistent coordinator tests",
+      "command": ["scripts/python-runtime", "-m", "unittest", "discover", "-s", "tests", "-v"],
+      "env": {"PYTHONPATH": "src"},
+      "cwd": ".",
+      "scopes": ["source", "governance"],
+      "levels": ["quick", "full"],
+      "timeout_seconds": 180
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-workbench"
+version = "0.1.0"
+description = "Persistent Codex-first development coordinator for a private Mac mini."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+codex-workbench = "codex_workbench.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+codex_workbench = ["static/*.html", "static/*.css", "static/*.js"]
+

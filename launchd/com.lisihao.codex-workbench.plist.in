@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lisihao.codex-workbench</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP_ROOT__/bin/codex-workbench</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_WORKBENCH_HOME</key>
+    <string>__STATE_ROOT__</string>
+    <key>CODEX_WORKBENCH_CODEX</key>
+    <string>__CODEX_BINARY__</string>
+    <key>CODEX_WORKBENCH_CLAUDE</key>
+    <string>/opt/homebrew/bin/claude</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__STATE_ROOT__/logs/service.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE_ROOT__/logs/service.error.log</string>
+</dict>
+</plist>
+

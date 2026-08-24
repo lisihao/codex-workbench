@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import subprocess
+
+
+class WorktreeError(RuntimeError):
+    pass
+
+
+def _safe_segment(value: str) -> str:
+    result = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    if not result:
+        raise ValueError("identifier cannot be normalized to an empty path segment")
+    return result[:80]
+
+
+class WorktreeManager:
+    def __init__(self, root: Path):
+        self.root = root
+
+    @staticmethod
+    def _git(repository: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *args],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode:
+            raise WorktreeError(result.stderr.strip() or result.stdout.strip())
+        return result.stdout.strip()
+
+    def prepare(
+        self,
+        repository: str,
+        base_sha: str,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+    ) -> Path:
+        repo = Path(repository).expanduser().resolve(strict=True)
+        if not (repo / ".git").exists() and not self._git(repo, "rev-parse", "--git-dir"):
+            raise WorktreeError(f"repository is not a Git checkout: {repo}")
+        resolved_base = self._git(repo, "rev-parse", f"{base_sha}^{{commit}}")
+        task_segment = _safe_segment(task_id)
+        node_segment = _safe_segment(node_id)
+        worktree = self.root / task_segment / f"{node_segment}-a{attempt}"
+        branch = f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
+        if worktree.exists():
+            actual = self._git(worktree, "rev-parse", "HEAD")
+            if actual != resolved_base:
+                raise WorktreeError(f"existing worktree {worktree} is not at contract base {resolved_base}")
+            return worktree
+        worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        result = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), resolved_base],
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode:
+            raise WorktreeError(result.stderr.strip() or result.stdout.strip())
+        os.chmod(worktree.parent, 0o700)
+        return worktree
+
+    def changed_paths(self, worktree: Path, base_sha: str) -> set[str]:
+        committed = self._git(worktree, "diff", "--name-only", f"{base_sha}...HEAD").splitlines()
+        unstaged = self._git(worktree, "diff", "--name-only").splitlines()
+        staged = self._git(worktree, "diff", "--name-only", "--cached").splitlines()
+        untracked = self._git(worktree, "ls-files", "--others", "--exclude-standard").splitlines()
+        return {path for path in (*committed, *unstaged, *staged, *untracked) if path}
+
+    def diff_patch(self, worktree: Path, base_sha: str) -> bytes:
+        untracked_result = subprocess.run(
+            ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if untracked_result.returncode:
+            raise WorktreeError(untracked_result.stderr.decode(errors="replace").strip())
+        untracked = [
+            item.decode(errors="surrogateescape")
+            for item in untracked_result.stdout.split(b"\0")
+            if item
+        ]
+        if untracked:
+            intent = subprocess.run(
+                ["git", "-C", str(worktree), "add", "--intent-to-add", "--", *untracked],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            if intent.returncode:
+                raise WorktreeError(intent.stderr.strip() or intent.stdout.strip())
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--binary", base_sha],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode:
+            raise WorktreeError(result.stderr.decode(errors="replace").strip())
+        return result.stdout
+
+    def apply_patch(self, worktree: Path, patch: Path) -> None:
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "apply", "--3way", str(patch)],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode:
+            raise WorktreeError(
+                f"cannot compose worker patch {patch.name}: {result.stderr.strip() or result.stdout.strip()}"
+            )
+
+
+def scope_allows(path: str, allowed: list[str], forbidden: list[str]) -> bool:
+    normalized = Path(path).as_posix().lstrip("./")
+
+    def matches(scope: str) -> bool:
+        clean = Path(scope).as_posix().lstrip("./").rstrip("/")
+        return clean in {"", ".", "*"} or normalized == clean or normalized.startswith(clean + "/")
+
+    return any(matches(scope) for scope in allowed) and not any(matches(scope) for scope in forbidden)

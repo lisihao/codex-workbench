@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -euo pipefail
+
+candidates=(
+  /opt/homebrew/bin/python3
+  "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+  /usr/local/bin/python3
+  /usr/bin/python3
+)
+
+for candidate in "${candidates[@]}"; do
+  if [[ -x "$candidate" ]] && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+    exec "$candidate" "$@"
+  fi
+done
+
+print -u2 "Codex Workbench requires Python 3.11 or newer"
+exit 1
+

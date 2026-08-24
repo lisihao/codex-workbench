@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Codex Workbench</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header>
+      <div><p class="eyebrow">MAC MINI · SINGLE AUTHORITY</p><h1>Codex Workbench</h1></div>
+      <div id="health" class="pill pending">连接中</div>
+    </header>
+    <main>
+      <section class="metrics" id="metrics"></section>
+      <section>
+        <div class="section-title"><h2>任务总账</h2><span id="updated">N/A</span></div>
+        <div id="tasks" class="tasks"><p class="muted">正在读取 Mac mini 状态…</p></div>
+      </section>
+      <section>
+        <div class="section-title"><h2>最新事件</h2><span id="cursor">cursor 0</span></div>
+        <div id="events" class="events"></div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
+
