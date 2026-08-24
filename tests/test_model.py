@@ -8,9 +8,14 @@ from unittest.mock import patch
 
 from codex_workbench.executors import codex_subscription_environment
 from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract
+from codex_workbench.planner import PLAN_SCHEMA
 
 
 class ModelTests(unittest.TestCase):
+    def test_planner_schema_requires_every_declared_property(self) -> None:
+        item = PLAN_SCHEMA["properties"]["nodes"]["items"]
+        self.assertEqual(set(item["required"]), set(item["properties"]))
+
     def test_codex_environment_isolates_home_and_removes_api_keys(self) -> None:
         with patch.dict(
             os.environ,

@@ -139,6 +139,8 @@ class CodexExecutor(ProcessExecutor):
                 "plugins",
                 "--disable",
                 "plugin_sharing",
+                "--disable",
+                "code_mode_host",
                 "--json",
                 "--model",
                 request.spec["model"],
