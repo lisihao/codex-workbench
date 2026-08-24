@@ -123,6 +123,7 @@ class CodexExecutor(ProcessExecutor):
                 self.binary,
                 "exec",
                 "--ephemeral",
+                "--ignore-user-config",
                 "--json",
                 "--model",
                 request.spec["model"],

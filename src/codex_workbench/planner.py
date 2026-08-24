@@ -90,6 +90,7 @@ class CodexPlanner:
                     binary,
                     "exec",
                     "--ephemeral",
+                    "--ignore-user-config",
                     "--json",
                     "--model",
                     self.model,
@@ -172,4 +173,3 @@ Rules:
 - That verifier must depend on every non-verifier node and independently inspect the composed diff and run acceptance commands.
 - No node may widen the supplied scope or permission contract.
 - Return only the required JSON object."""
-
