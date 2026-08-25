@@ -5,6 +5,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 import re
 import subprocess
+import threading
 
 
 class WorktreeError(RuntimeError):
@@ -21,6 +22,12 @@ def _safe_segment(value: str) -> str:
 class WorktreeManager:
     def __init__(self, root: Path):
         self.root = root
+        self._repository_locks: dict[Path, threading.Lock] = {}
+        self._repository_locks_guard = threading.Lock()
+
+    def _repository_lock(self, repository: Path) -> threading.Lock:
+        with self._repository_locks_guard:
+            return self._repository_locks.setdefault(repository, threading.Lock())
 
     @staticmethod
     def _git(repository: Path, *args: str) -> str:
@@ -44,30 +51,31 @@ class WorktreeManager:
         attempt: int,
     ) -> Path:
         repo = Path(repository).expanduser().resolve(strict=True)
-        if not (repo / ".git").exists() and not self._git(repo, "rev-parse", "--git-dir"):
-            raise WorktreeError(f"repository is not a Git checkout: {repo}")
-        resolved_base = self._git(repo, "rev-parse", f"{base_sha}^{{commit}}")
-        task_segment = _safe_segment(task_id)
-        node_segment = _safe_segment(node_id)
-        worktree = self.root / task_segment / f"{node_segment}-a{attempt}"
-        branch = f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
-        if worktree.exists():
-            actual = self._git(worktree, "rev-parse", "HEAD")
-            if actual != resolved_base:
-                raise WorktreeError(f"existing worktree {worktree} is not at contract base {resolved_base}")
+        with self._repository_lock(repo):
+            if not (repo / ".git").exists() and not self._git(repo, "rev-parse", "--git-dir"):
+                raise WorktreeError(f"repository is not a Git checkout: {repo}")
+            resolved_base = self._git(repo, "rev-parse", f"{base_sha}^{{commit}}")
+            task_segment = _safe_segment(task_id)
+            node_segment = _safe_segment(node_id)
+            worktree = self.root / task_segment / f"{node_segment}-a{attempt}"
+            branch = f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
+            if worktree.exists():
+                actual = self._git(worktree, "rev-parse", "HEAD")
+                if actual != resolved_base:
+                    raise WorktreeError(f"existing worktree {worktree} is not at contract base {resolved_base}")
+                return worktree
+            worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            result = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), resolved_base],
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode:
+                raise WorktreeError(result.stderr.strip() or result.stdout.strip())
+            os.chmod(worktree.parent, 0o700)
             return worktree
-        worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        result = subprocess.run(
-            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), resolved_base],
-            text=True,
-            capture_output=True,
-            timeout=120,
-            check=False,
-        )
-        if result.returncode:
-            raise WorktreeError(result.stderr.strip() or result.stdout.strip())
-        os.chmod(worktree.parent, 0o700)
-        return worktree
 
     def changed_paths(self, worktree: Path, base_sha: str) -> set[str]:
         committed = self._git(worktree, "diff", "--name-only", f"{base_sha}...HEAD").splitlines()
