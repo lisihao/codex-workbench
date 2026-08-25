@@ -17,6 +17,7 @@ from .executors import (
     FixtureExecutor,
     validate_worker_scope,
 )
+from .evidence import reusable_evidence_key
 from .model import NodeResult
 from .store import WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
@@ -93,6 +94,20 @@ class Coordinator:
                 spec=spec,
                 worktree=worktree,
             )
+            cache_key = reusable_evidence_key(contract, spec, worktree)
+            cached = self.store.cached_evidence(cache_key) if cache_key else None
+            if cached is not None:
+                self.store.record_evidence_reuse(
+                    cache_key,
+                    claimed["task_id"],
+                    claimed["node_id"],
+                )
+                self.store.settle_node(
+                    claimed["task_id"],
+                    claimed["node_id"],
+                    NodeResult.from_dict(cached["result"]),
+                )
+                return
             executor = self._executor(spec["executor"])
             result = executor.execute(request)
             result = validate_worker_scope(self.worktrees, request, result)
@@ -107,6 +122,13 @@ class Coordinator:
                         exit_code=result.exit_code,
                         retryable=result.retryable,
                     )
+            if cache_key and result.status == "succeeded":
+                self.store.save_evidence(
+                    cache_key,
+                    result,
+                    claimed["task_id"],
+                    claimed["node_id"],
+                )
         except WorktreeError as error:
             result = NodeResult(status="blocked", summary=f"worktree unavailable: {error}")
         except Exception as error:

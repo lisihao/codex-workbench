@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import subprocess
 
@@ -123,11 +124,52 @@ class WorktreeManager:
             )
 
 
+def normalize_scope(value: str) -> str:
+    """Return a canonical repository-relative scope."""
+    raw = value.strip().replace("\\", "/")
+    if raw in {"", ".", "*"}:
+        return "."
+    path = PurePosixPath(raw)
+    if path.is_absolute() or re.match(r"^[A-Za-z]:/", raw):
+        raise ValueError(f"scope must be repository-relative: {value!r}")
+    parts = tuple(part for part in path.parts if part not in {"", "."})
+    if ".." in parts:
+        raise ValueError(f"scope must not escape the repository: {value!r}")
+    return "/".join(parts) or "."
+
+
+def scopes_overlap(left: str, right: str) -> bool:
+    """Return whether either repository-relative scope contains the other."""
+    normalized_left = normalize_scope(left)
+    normalized_right = normalize_scope(right)
+    return (
+        normalized_left == "."
+        or normalized_right == "."
+        or normalized_left == normalized_right
+        or normalized_left.startswith(normalized_right + "/")
+        or normalized_right.startswith(normalized_left + "/")
+    )
+
+
+def scope_access_conflicts(
+    candidate_reads: list[str] | tuple[str, ...],
+    candidate_writes: list[str] | tuple[str, ...],
+    running_reads: list[str] | tuple[str, ...],
+    running_writes: list[str] | tuple[str, ...],
+) -> bool:
+    """Apply the read/write conflict matrix for two concurrently running nodes."""
+    return (
+        any(scopes_overlap(left, right) for left in candidate_writes for right in running_writes)
+        or any(scopes_overlap(left, right) for left in candidate_writes for right in running_reads)
+        or any(scopes_overlap(left, right) for left in candidate_reads for right in running_writes)
+    )
+
+
 def scope_allows(path: str, allowed: list[str], forbidden: list[str]) -> bool:
-    normalized = Path(path).as_posix().lstrip("./")
+    normalized = normalize_scope(path)
 
-    def matches(scope: str) -> bool:
-        clean = Path(scope).as_posix().lstrip("./").rstrip("/")
-        return clean in {"", ".", "*"} or normalized == clean or normalized.startswith(clean + "/")
+    def contains(scope: str) -> bool:
+        clean = normalize_scope(scope)
+        return clean == "." or normalized == clean or normalized.startswith(clean + "/")
 
-    return any(matches(scope) for scope in allowed) and not any(matches(scope) for scope in forbidden)
+    return any(contains(scope) for scope in allowed) and not any(contains(scope) for scope in forbidden)

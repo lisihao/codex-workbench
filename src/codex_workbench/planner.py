@@ -183,5 +183,6 @@ Rules:
 - Deterministic nodes must provide an argv command and must not use a shell string.
 - The final node must be exactly one Codex verifier using {verifier_model}.
 - That verifier must depend on every non-verifier node and independently inspect the composed diff and run acceptance commands.
+- The verifier must declare read_scopes that cover every source and test path its evidence depends on, and no write_scopes.
 - No node may widen the supplied scope or permission contract.
 - Return only the required JSON object."""

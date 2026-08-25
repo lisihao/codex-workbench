@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -18,11 +19,14 @@ from . import __version__
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
+from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
 from .model import NodeSpec, QuotaSnapshot, TaskContract
-from .planner import CodexPlanner, PlannerError
+from .planner import PlannerError
 from .service import Coordinator
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
+from .submission import submit_natural_language_request
+from .sync import RepositorySynchronizer
 
 
 def _config(args: argparse.Namespace) -> WorkbenchConfig:
@@ -106,67 +110,80 @@ def command_submit(args: argparse.Namespace) -> int:
 def command_request(args: argparse.Namespace) -> int:
     config = _config(args)
     store = _store(config)
-    repository = Path(args.repository).expanduser().resolve(strict=True)
-    base_sha = subprocess.check_output(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
-    ).strip()
-    task_id = args.task_id or f"task-{uuid.uuid4().hex[:12]}"
-    contract = TaskContract(
-        task_id=task_id,
-        repository=str(repository),
-        base_sha=base_sha,
-        objective=args.objective,
-        allowed_scope=tuple(args.allowed_scope),
-        forbidden_scope=tuple(args.forbidden_scope or ()),
-        acceptance_commands=tuple(args.acceptance_command or ()),
-        planner_model=args.planner_model,
-        executor_model=args.executor_model,
-        verifier_model=args.verifier_model,
-        timeout_seconds=args.timeout,
-        retry_limit=args.retry_limit,
-        external_write_permission=args.allow_external_write,
-        destructive_action_permission=False,
-    )
-    contract.validate()
-    artifacts = ArtifactStore(config.state_root / "artifacts")
-    quota = store.latest_quota()
-    claude_ok, _ = ClaudeExecutor(
-        artifacts,
-        quota,
-        os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
-    ).qualification("sonnet")
-    planner = CodexPlanner(
-        os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
-        model=args.planner_model,
-    )
     try:
-        nodes = planner.compile(
-            contract,
-            claude_available=claude_ok,
-            default_executor_model=args.executor_model,
+        result = submit_natural_language_request(
+            config,
+            store,
+            objective=args.objective,
+            repository=args.repository,
+            allowed_scope=args.allowed_scope,
+            forbidden_scope=args.forbidden_scope or (),
+            acceptance_commands=args.acceptance_command or (),
+            task_id=args.task_id,
+            command_id=args.command_id,
+            planner_model=args.planner_model,
+            executor_model=args.executor_model,
             verifier_model=args.verifier_model,
+            timeout_seconds=args.timeout,
+            retry_limit=args.retry_limit,
+            external_write_permission=args.allow_external_write,
+            queue=args.queue,
+            base_sha=args.base_sha,
         )
     except PlannerError as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
         return 2
-    command_id = args.command_id or f"request-{uuid.uuid4()}"
-    store.create_task(contract, nodes, command_id)
-    if args.queue:
-        store.queue_task(task_id)
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "task_id": task_id,
-                "command_id": command_id,
-                "base_sha": base_sha,
-                "claude_dispatch_available": claude_ok,
-                "nodes": [node.to_dict() for node in nodes],
-            },
-            ensure_ascii=False,
-            indent=2,
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_mcp(args: argparse.Namespace) -> int:
+    from .mcp import serve_stdio
+
+    config = _config(args)
+    serve_stdio(config, _store(config))
+    return 0
+
+
+def command_sync(args: argparse.Namespace) -> int:
+    synchronizer = RepositorySynchronizer()
+    if args.sync_action == "github":
+        result = synchronizer.sync_github(args.repository, args.remote, args.branch)
+    elif args.sync_action == "export":
+        result = synchronizer.export_increment(
+            args.repository,
+            args.base_ref,
+            args.head_ref,
+            Path(args.output),
         )
-    )
+    elif args.sync_action == "import":
+        if args.bundle == "-":
+            with tempfile.NamedTemporaryFile(prefix="codex-workbench-increment-", suffix=".bundle") as temporary:
+                temporary.write(sys.stdin.buffer.read())
+                temporary.flush()
+                result = synchronizer.import_increment(
+                    args.repository,
+                    Path(temporary.name),
+                    args.ref_name,
+                )
+        else:
+            result = synchronizer.import_increment(
+                args.repository,
+                Path(args.bundle),
+                args.ref_name,
+            )
+    elif args.sync_action == "send":
+        result = synchronizer.send_increment(
+            args.repository,
+            args.base_ref,
+            args.head_ref,
+            host=args.host,
+            remote_repository=args.remote_repository,
+            ref_name=args.ref_name,
+        )
+    else:
+        raise AssertionError(args.sync_action)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -214,6 +231,24 @@ def command_events(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def command_deliver(args: argparse.Namespace) -> int:
+    config = _config(args)
+    receipt = GitHubDelivery(
+        _store(config), ArtifactStore(config.state_root / "artifacts")
+    ).deliver(
+        GitHubDeliveryRequest(
+            task_id=args.task_id,
+            command_id=args.command_id or f"deliver-{uuid.uuid4()}",
+            base_branch=args.base_branch,
+            remote=args.remote,
+            merge=args.merge,
+            release_tag=args.release_tag,
+        )
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2))
+    return 0 if receipt["state"] not in {"failed", "indeterminate"} else 2
 
 
 def command_quota(args: argparse.Namespace) -> int:
@@ -357,6 +392,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-workers", type=int)
     serve.set_defaults(func=command_serve)
 
+    mcp = sub.add_parser("mcp", help="serve the Codex-native Workbench tools over stdio")
+    mcp.set_defaults(func=command_mcp)
+
     submit = sub.add_parser("submit")
     submit.add_argument("file")
     submit.add_argument("--command-id")
@@ -371,6 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--acceptance-command", action="append")
     request.add_argument("--task-id")
     request.add_argument("--command-id")
+    request.add_argument("--base-sha", help="fixed commit or imported increment ref; defaults to HEAD")
     request.add_argument("--planner-model", default="gpt-5.6-sol")
     request.add_argument("--executor-model", default="gpt-5.6-luna")
     request.add_argument("--verifier-model", default="gpt-5.6-sol")
@@ -397,6 +436,39 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--task-id")
     events.set_defaults(func=command_events)
+
+    sync = sub.add_parser("sync", help="synchronize repositories without copying active worktrees")
+    sync_sub = sync.add_subparsers(dest="sync_action", required=True)
+    sync_github = sync_sub.add_parser("github")
+    sync_github.add_argument("--repository", required=True)
+    sync_github.add_argument("--remote", default="origin")
+    sync_github.add_argument("--branch", required=True)
+    sync_export = sync_sub.add_parser("export")
+    sync_export.add_argument("--repository", required=True)
+    sync_export.add_argument("--base-ref", required=True)
+    sync_export.add_argument("--head-ref", default="HEAD")
+    sync_export.add_argument("--output", required=True)
+    sync_import = sync_sub.add_parser("import")
+    sync_import.add_argument("--repository", required=True)
+    sync_import.add_argument("--bundle", required=True, help="bundle path or '-' for stdin")
+    sync_import.add_argument("--ref-name", required=True)
+    sync_send = sync_sub.add_parser("send")
+    sync_send.add_argument("--repository", required=True)
+    sync_send.add_argument("--base-ref", required=True)
+    sync_send.add_argument("--head-ref", default="HEAD")
+    sync_send.add_argument("--host", default="macmini")
+    sync_send.add_argument("--remote-repository", required=True)
+    sync_send.add_argument("--ref-name", required=True)
+    sync.set_defaults(func=command_sync)
+
+    deliver = sub.add_parser("deliver", help="deliver an accepted task through GitHub")
+    deliver.add_argument("task_id")
+    deliver.add_argument("--command-id")
+    deliver.add_argument("--base-branch", required=True)
+    deliver.add_argument("--remote", default="origin")
+    deliver.add_argument("--merge", action="store_true")
+    deliver.add_argument("--release-tag")
+    deliver.set_defaults(func=command_deliver)
 
     quota = sub.add_parser("quota")
     quota_sub = quota.add_subparsers(dest="quota_action", required=True)
@@ -429,7 +501,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         code = args.func(args)
-    except (KeyError, ValueError, StateConflictError) as error:
+    except (CommandConflictError, KeyError, ValueError, StateConflictError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         code = 2
     raise SystemExit(code)

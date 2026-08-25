@@ -14,6 +14,23 @@ from codex_workbench.store import WorkbenchStore
 
 
 class ServiceTests(unittest.TestCase):
+    @staticmethod
+    def run_until_terminal(store: WorkbenchStore, state: Path, task_id: str) -> dict:
+        coordinator = Coordinator(store, state, max_workers=1, poll_seconds=0.01)
+        thread = threading.Thread(target=coordinator.run_forever)
+        thread.start()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and store.get_task(task_id)["state"] not in {
+            "accepted",
+            "blocked",
+            "needs_fix",
+            "needs_approval",
+        }:
+            time.sleep(0.02)
+        coordinator.stop()
+        thread.join(timeout=3)
+        return store.get_task(task_id)
+
     def test_fixture_dag_reaches_independent_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -123,6 +140,66 @@ class ServiceTests(unittest.TestCase):
             verifier_worktree = Path(verifier["worktree"])
             self.assertEqual((verifier_worktree / "tests/a.txt").read_text(), "A")
             self.assertEqual((verifier_worktree / "tests/b.txt").read_text(), "B")
+
+    def test_verified_evidence_is_reused_until_its_declared_input_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "checked.txt").write_text("stable\n")
+            (repository / "unrelated.txt").write_text("one\n")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+            state = root / "state"
+            counter = root / "counter.txt"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+
+            def create_and_run(task_id: str) -> dict:
+                base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+                contract = TaskContract(
+                    task_id=task_id,
+                    repository=str(repository),
+                    base_sha=base_sha,
+                    objective="verify the declared input",
+                    allowed_scope=("checked.txt",),
+                )
+                script = (
+                    "from pathlib import Path; "
+                    f"p=Path({str(counter)!r}); p.write_text((p.read_text() if p.exists() else '')+'run\\n'); "
+                    "assert Path('checked.txt').read_text()"
+                )
+                node = NodeSpec(
+                    "verify",
+                    task_id,
+                    "verify",
+                    "deterministic",
+                    "local",
+                    command=(sys.executable, "-c", script),
+                    read_scopes=("checked.txt",),
+                    verifier=True,
+                )
+                store.create_task(contract, [node], f"create-{task_id}")
+                store.queue_task(task_id)
+                return self.run_until_terminal(store, state, task_id)
+
+            self.assertEqual(create_and_run("cache-1")["state"], "accepted")
+            (repository / "unrelated.txt").write_text("two\n")
+            subprocess.run(["git", "add", "unrelated.txt"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "unrelated"], cwd=repository, check=True, capture_output=True)
+            self.assertEqual(create_and_run("cache-2")["state"], "accepted")
+            self.assertEqual(counter.read_text().splitlines(), ["run"])
+            reused = store.read_events(task_id="cache-2")
+            self.assertIn("node.evidence_reused", {event["event_type"] for event in reused})
+
+            (repository / "checked.txt").write_text("changed\n")
+            subprocess.run(["git", "add", "checked.txt"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "checked"], cwd=repository, check=True, capture_output=True)
+            self.assertEqual(create_and_run("cache-3")["state"], "accepted")
+            self.assertEqual(counter.read_text().splitlines(), ["run", "run"])
 
 
 if __name__ == "__main__":

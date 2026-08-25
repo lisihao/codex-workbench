@@ -6,11 +6,12 @@
 
 - Codex 是唯一用户入口，Claude Code 只是可选后台 Worker。
 - 任务、节点、事件、配额快照和审批持久化到 SQLite。
-- DAG 节点只有依赖完成且写作用域不冲突时才能并行执行。
+- DAG 节点只有依赖完成且读写作用域不冲突时才能并行执行；父子路径按包含关系互斥，read/read 可并行。
 - Worker 完成不等于任务完成，必须经过独立 verifier。
 - Claude 配额未知、认证未知或剩余不高于 25% 时禁止启动新任务，至少保留 20%。
 - 不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，只允许产品订阅登录态。
 - 安装器为无人值守进程建立独立 `CODEX_HOME`；它只软链接用户现有 `auth.json`，不会加载个人 skills、会话、模型缓存或全局配置。
+- 已通过的验证 Evidence 在声明输入闭包、命令和运行时身份不变时复用；实现型 Worker 不复用。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -35,6 +36,48 @@ codex-workbench request \
 ```
 
 默认路由是 `gpt-5.6-sol` 规划、`gpt-5.6-luna` 执行、`gpt-5.6-sol` 独立验收。可以用 `--executor-model gpt-5.6-terra` 或其他当前 Codex 订阅模型覆盖执行层。每个执行节点获得独立分支和 worktree，最终 verifier 只读取组合后的 patch，不与 Worker 共用上下文。
+
+## Codex 原生入口
+
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用八个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制或显式处理不确定状态、读取事件、读取 Evidence Artifact，以及在契约授权后执行 GitHub 交付。
+
+```bash
+python3 scripts/install-macbook-client.py
+codex mcp get codex-workbench
+```
+
+## GitHub 与 Tailscale 同步
+
+GitHub 是代码主同步通道。Mac mini 只对干净工作树执行 fast-forward：
+
+```bash
+codex-workbench sync github \
+  --repository /Users/example/Projects/example \
+  --branch main
+```
+
+尚未推送的 MacBook 增量使用 Git bundle 经 SSH/Tailscale 流式送达，导入到 `refs/workbench/increment/*`，不会移动 Mac mini 当前分支，也不会复制活跃 `.git`、`node_modules` 或构建目录：
+
+```bash
+codex-workbench sync send \
+  --repository /Users/example/Projects/example \
+  --base-ref origin/main \
+  --remote-repository /Users/example/Projects/example \
+  --ref-name macbook/task-123
+```
+
+随后用 `request --base-sha refs/workbench/increment/macbook/task-123` 固定该增量作为 TaskGraph 基线。
+
+## 授权 GitHub 交付
+
+只有 `external_write_permission=true` 且已由 verifier 接受的任务才能进入交付。显式 `deliver` 命令使用持久 Receipt，依次完成 integration branch、PR、CI，并按参数决定是否 merge/release；网络超时进入 `indeterminate`，不会自动猜测重放。
+
+```bash
+codex-workbench deliver TASK_ID \
+  --command-id delivery-TASK_ID-v1 \
+  --base-branch main \
+  --merge --release-tag v1.2.3
+```
 
 ## Claude 配额保护
 

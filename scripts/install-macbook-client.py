@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 
 
@@ -37,10 +38,34 @@ def main() -> int:
     run("launchctl", "bootstrap", domain, str(plist_path))
     run("launchctl", "enable", f"{domain}/{LABEL}")
     run("launchctl", "kickstart", "-k", f"{domain}/{LABEL}")
+    codex = shutil.which("codex")
+    if not codex:
+        raise SystemExit("Codex CLI is required to register the Workbench MCP entry")
+    remote_command = 'exec "$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench" mcp'
+    run(codex, "mcp", "remove", "codex-workbench", check=False)
+    run(
+        codex,
+        "mcp",
+        "add",
+        "codex-workbench",
+        "--",
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        "macmini",
+        remote_command,
+    )
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
+    print("Codex native entry: MCP server 'codex-workbench'")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -18,9 +18,10 @@ from .model import (
     canonical_json,
     now_iso,
 )
+from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 class CommandConflictError(RuntimeError):
@@ -128,6 +129,24 @@ class WorkbenchStore:
                     decided_at TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS delivery_receipts (
+                    command_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                    state TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS evidence_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    result_json TEXT NOT NULL,
+                    source_task_id TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    use_count INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
@@ -141,11 +160,183 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+            elif int(current["value"]) in {1, 2}:
+                connection.execute(
+                    "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
             elif int(current["value"]) != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
                 )
         self.path.chmod(0o600)
+
+    def cached_evidence(self, cache_key: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "cache_key": row["cache_key"],
+                "result": json.loads(row["result_json"]),
+                "source_task_id": row["source_task_id"],
+                "source_node_id": row["source_node_id"],
+                "created_at": row["created_at"],
+                "last_used_at": row["last_used_at"],
+                "use_count": row["use_count"],
+            }
+
+    def save_evidence(
+        self,
+        cache_key: str,
+        result: NodeResult,
+        task_id: str,
+        node_id: str,
+    ) -> None:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_cache(
+                    cache_key, result_json, source_task_id, source_node_id,
+                    created_at, last_used_at, use_count
+                ) VALUES(?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(cache_key) DO NOTHING
+                """,
+                (cache_key, canonical_json(result.to_dict()), task_id, node_id, timestamp, timestamp),
+            )
+
+    def record_evidence_reuse(
+        self,
+        cache_key: str,
+        task_id: str,
+        node_id: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(cache_key)
+            connection.execute(
+                """
+                UPDATE evidence_cache SET last_used_at = ?, use_count = use_count + 1
+                WHERE cache_key = ?
+                """,
+                (timestamp, cache_key),
+            )
+            source = {
+                "cache_key": cache_key,
+                "source_task_id": row["source_task_id"],
+                "source_node_id": row["source_node_id"],
+            }
+            self._event(connection, "node.evidence_reused", task_id, node_id, source)
+            return source
+
+    def begin_delivery(self, task_id: str, command_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        request_hash = canonical_hash(request)
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise CommandConflictError(
+                        f"delivery command {command_id!r} was already used with a different request"
+                    )
+                return self._delivery_row(existing)
+            task = connection.execute(
+                "SELECT state, contract_json FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if task["state"] != "accepted":
+                raise StateConflictError(f"task {task_id} is {task['state']}, expected accepted")
+            contract = json.loads(task["contract_json"])
+            if not contract.get("external_write_permission", False):
+                raise StateConflictError(
+                    f"task {task_id} contract does not authorize external GitHub writes"
+                )
+            details = {"request": request}
+            connection.execute(
+                """
+                INSERT INTO delivery_receipts(
+                    command_id, request_hash, task_id, state, details_json, created_at, updated_at
+                ) VALUES(?, ?, ?, 'accepted', ?, ?, ?)
+                """,
+                (command_id, request_hash, task_id, canonical_json(details), timestamp, timestamp),
+            )
+            self._event(
+                connection,
+                "delivery.accepted",
+                task_id,
+                None,
+                {"command_id": command_id, "request_hash": request_hash},
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            assert row is not None
+            return self._delivery_row(row)
+
+    def update_delivery(
+        self,
+        command_id: str,
+        state: str,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(command_id)
+            merged = {**json.loads(row["details_json"]), **details}
+            connection.execute(
+                """
+                UPDATE delivery_receipts SET state = ?, details_json = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (state, canonical_json(merged), timestamp, command_id),
+            )
+            self._event(
+                connection,
+                f"delivery.{state}",
+                row["task_id"],
+                None,
+                {"command_id": command_id, **details},
+            )
+            updated = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            assert updated is not None
+            return self._delivery_row(updated)
+
+    def get_delivery(self, command_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(command_id)
+            return self._delivery_row(row)
+
+    @staticmethod
+    def _delivery_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "command_id": row["command_id"],
+            "request_hash": row["request_hash"],
+            "task_id": row["task_id"],
+            "state": row["state"],
+            "details": json.loads(row["details_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     @staticmethod
     def _event(
@@ -181,6 +372,14 @@ class WorkbenchStore:
             raise ValueError("node_id must be unique within a task")
         for node in nodes:
             node.validate()
+            for scope in (*node.read_scopes, *node.write_scopes):
+                normalize_scope(scope)
+                if not scope_allows(scope, list(contract.allowed_scope), []):
+                    raise ValueError(f"node {node.node_id} scope {scope!r} exceeds the task contract")
+                if any(scopes_overlap(scope, forbidden) for forbidden in contract.forbidden_scope):
+                    raise ValueError(
+                        f"node {node.node_id} scope {scope!r} overlaps forbidden scope"
+                    )
             missing = set(node.depends_on) - node_ids
             if missing:
                 raise ValueError(f"node {node.node_id} has missing dependencies: {sorted(missing)}")
@@ -448,11 +647,17 @@ class WorkbenchStore:
                 ORDER BY t.created_at, json_extract(n.spec_json, '$.ordinal'), n.node_id
                 """
             ).fetchall()
-            running_scopes: set[str] = set()
+            running_accesses: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
             for running in connection.execute(
                 "SELECT spec_json FROM nodes WHERE state = 'running'"
             ).fetchall():
-                running_scopes.update(json.loads(running["spec_json"]).get("write_scopes", []))
+                running_spec = json.loads(running["spec_json"])
+                running_accesses.append(
+                    (
+                        tuple(running_spec.get("read_scopes", [])),
+                        tuple(running_spec.get("write_scopes", [])),
+                    )
+                )
 
             selected: sqlite3.Row | None = None
             selected_spec: dict[str, Any] | None = None
@@ -467,8 +672,12 @@ class WorkbenchStore:
                     ).fetchall()
                     if len(states) != len(dependencies) or any(row["state"] != "accepted" for row in states):
                         continue
-                write_scopes = set(spec.get("write_scopes", []))
-                if write_scopes & running_scopes:
+                read_scopes = tuple(spec.get("read_scopes", []))
+                write_scopes = tuple(spec.get("write_scopes", []))
+                if any(
+                    scope_access_conflicts(read_scopes, write_scopes, running_reads, running_writes)
+                    for running_reads, running_writes in running_accesses
+                ):
                     continue
                 selected = candidate
                 selected_spec = spec

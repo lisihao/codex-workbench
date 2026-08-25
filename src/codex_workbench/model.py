@@ -165,6 +165,10 @@ class NodeResult:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "NodeResult":
+        return cls(**raw)
+
 
 @dataclass(frozen=True)
 class QuotaSnapshot:
@@ -196,4 +200,3 @@ class QuotaSnapshot:
         if minimum <= stop_line:
             return False, f"Claude quota protection active at {minimum:.1f}% remaining"
         return True, "Claude quota permits dispatch"
-
