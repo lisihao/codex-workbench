@@ -18,6 +18,32 @@ from codex_workbench.planner import PLAN_SCHEMA, CodexPlanner
 
 
 class ModelTests(unittest.TestCase):
+    def test_artifact_refs_reject_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ArtifactStore(Path(directory))
+            with self.assertRaises(ValueError):
+                store.path_for("sha256:" + "a" * 64 + ":../secret")
+
+    def test_runtime_steering_is_injected_without_changing_scope(self) -> None:
+        request = ExecutionRequest(
+            task_id="steered",
+            node_id="work",
+            attempt=1,
+            contract={
+                "objective": "update parser",
+                "allowed_scope": ["src/parser"],
+                "forbidden_scope": ["src/private"],
+                "acceptance_commands": ["python -m unittest"],
+                "timeout_seconds": 30,
+            },
+            spec={"title": "parser", "prompt": "implement", "verifier": False},
+            worktree=None,
+            steering=("保留公开接口",),
+        )
+        prompt = CodexExecutor._prompt(request)
+        self.assertIn("Runtime steering: [\"保留公开接口\"]", prompt)
+        self.assertIn('Allowed scope: ["src/parser"]', prompt)
+
     def test_codex_qualification_requires_companion_host(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

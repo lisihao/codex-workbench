@@ -22,6 +22,7 @@ class ExecutionRequest:
     contract: dict
     spec: dict
     worktree: Path | None
+    steering: tuple[str, ...] = ()
 
 
 class Executor(Protocol):
@@ -204,6 +205,11 @@ class CodexExecutor(ProcessExecutor):
     @staticmethod
     def _prompt(request: ExecutionRequest) -> str:
         contract = request.contract
+        steering = (
+            f"Runtime steering: {json.dumps(request.steering, ensure_ascii=False)}\n"
+            if request.steering
+            else ""
+        )
         base = (
             "You are a bounded Codex Workbench worker. Complete only this node.\n"
             f"Task: {contract['objective']}\n"
@@ -212,6 +218,7 @@ class CodexExecutor(ProcessExecutor):
             f"Allowed scope: {json.dumps(contract['allowed_scope'])}\n"
             f"Forbidden scope: {json.dumps(contract['forbidden_scope'])}\n"
             f"Acceptance commands: {json.dumps(contract['acceptance_commands'])}\n"
+            f"{steering}"
             "Do not push, merge, release, deploy, delete unrelated files, or broaden scope. "
         )
         if request.spec.get("verifier"):

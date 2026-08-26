@@ -225,6 +225,20 @@ def command_task(args: argparse.Namespace) -> int:
             expected_revision=args.expected_revision,
         )
         result = {"ok": True, "task_id": args.task_id, "revision": revision}
+    elif args.action == "priority":
+        revision = store.set_task_priority(
+            args.task_id,
+            args.priority,
+            expected_revision=args.expected_revision,
+        )
+        result = {"ok": True, "task_id": args.task_id, "revision": revision}
+    elif args.action == "steer":
+        revision = store.append_task_steering(
+            args.task_id,
+            args.instruction,
+            expected_revision=args.expected_revision,
+        )
+        result = {"ok": True, "task_id": args.task_id, "revision": revision}
     else:
         task = store.get_task(args.task_id)
         if args.action in {"queue", "resume"}:
@@ -551,6 +565,14 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("node_id")
     resolve.add_argument("--resolution", choices=("retry", "fail", "cancel"), required=True)
     resolve.add_argument("--expected-revision", type=int, required=True)
+    priority = task_sub.add_parser("priority")
+    priority.add_argument("task_id")
+    priority.add_argument("priority", type=int)
+    priority.add_argument("--expected-revision", type=int, required=True)
+    steer = task_sub.add_parser("steer")
+    steer.add_argument("task_id")
+    steer.add_argument("instruction")
+    steer.add_argument("--expected-revision", type=int, required=True)
     task.set_defaults(func=command_task)
 
     approval = sub.add_parser("approval", help="list or decide durable approval receipts")

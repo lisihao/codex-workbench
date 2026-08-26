@@ -142,8 +142,9 @@ class Coordinator:
                 contract=contract,
                 spec=spec,
                 worktree=worktree,
+                steering=claimed["steering"],
             )
-            cache_key = reusable_evidence_key(contract, spec, worktree)
+            cache_key = reusable_evidence_key(contract, spec, worktree, request.steering)
             cached = self.store.cached_evidence(cache_key) if cache_key else None
             if cached is not None:
                 self.store.record_evidence_reuse(
@@ -230,6 +231,7 @@ class Coordinator:
             contract=request.contract,
             spec={**request.spec, "executor": "codex", "model": fallback_model},
             worktree=request.worktree,
+            steering=request.steering,
         )
         return routed_request, self._executor("codex").execute(routed_request)
 

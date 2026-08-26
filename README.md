@@ -16,10 +16,12 @@
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
-- SQLite v4 分开保存原始节点契约和 `effective_executor/effective_model`，因此面板展示的是实时路由与真实并发，不会把 Codex 接管误标成 Claude。
+- SQLite v5 分开保存原始节点契约、`effective_executor/effective_model` 与运行时任务优先级；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
 - A1、A2、A12 不再永久写死为 pending：MacBook 心跳间隔、已登录手机的真实渲染回执和本地管理员导入的 PPT/PDF 工件都进入 Mac mini 同一条 Evidence 账本。
 - 不确定执行会原子生成持久 `approval` 回执；手机控制面以任务阶段、阻塞原因和下一步为主视图，可带 task revision 明确选择重试、失败或取消。重复提交同一决策保持幂等，冲突决策 fail loud。
+- MacBook/手机可以 revision-fenced 地调整 `-10..10` 任务优先级，或补充最多 500 字的后续 attempt 短指令；调度器按优先级选择 ready 节点，Evidence 复用 key 包含短指令。
+- 面板从事件账本投影完成、阻塞、审批、路由和协调器提醒；用户可启用页面打开期间的浏览器前台通知。真正的页面关闭后台 Push 尚未启用，不把它冒充已交付能力。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -132,6 +134,8 @@ MacBook 和手机读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断�
 ```bash
 codex-workbench approval list
 codex-workbench approval decide <approval-id> --decision retry --expected-revision <revision>
+codex-workbench task priority <task-id> 5 --expected-revision <revision>
+codex-workbench task steer <task-id> "后续 attempt 保留公开接口" --expected-revision <revision>
 ```
 
 如果 MacBook 的 Shadowrocket Fake-IP 覆盖了 Tailscale MagicDNS，安装自恢复驾驶舱隧道，不修改全局代理规则：

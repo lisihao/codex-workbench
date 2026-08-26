@@ -21,7 +21,7 @@ from .model import (
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class CommandConflictError(RuntimeError):
@@ -81,6 +81,7 @@ class WorkbenchStore:
                     contract_hash TEXT NOT NULL,
                     state TEXT NOT NULL,
                     state_revision INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     blocker TEXT,
@@ -131,6 +132,12 @@ class WorkbenchStore:
                     decided_at TEXT,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_steering (
+                    steering_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    instruction TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS delivery_receipts (
                     command_id TEXT PRIMARY KEY,
                     request_hash TEXT NOT NULL,
@@ -152,6 +159,8 @@ class WorkbenchStore:
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
+                CREATE INDEX IF NOT EXISTS task_steering_task_created_idx
+                    ON task_steering(task_id, created_at);
                 """
             )
             current = connection.execute(
@@ -162,7 +171,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3}:
+            elif int(current["value"]) in {1, 2, 3, 4}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -171,6 +180,14 @@ class WorkbenchStore:
                     connection.execute("ALTER TABLE nodes ADD COLUMN effective_executor TEXT")
                 if "effective_model" not in node_columns:
                     connection.execute("ALTER TABLE nodes ADD COLUMN effective_model TEXT")
+                task_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                if "priority" not in task_columns:
+                    connection.execute(
+                        "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                    )
                 connection.execute(
                     "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -514,6 +531,106 @@ class WorkbenchStore:
                 )
         return self.transition_task(task_id, "queued", expected_revision=task["state_revision"])
 
+    def set_task_priority(
+        self,
+        task_id: str,
+        priority: int,
+        *,
+        expected_revision: int,
+    ) -> int:
+        if not -10 <= priority <= 10:
+            raise ValueError("priority must be between -10 and 10")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT state, state_revision, priority FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if int(task["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {task['state_revision']}"
+                )
+            if task["state"] in {"accepted", "cancelled"}:
+                raise StateConflictError(f"cannot reprioritize task in {task['state']}")
+            if int(task["priority"]) == priority:
+                return int(task["state_revision"])
+            revision = int(task["state_revision"]) + 1
+            connection.execute(
+                """
+                UPDATE tasks SET priority = ?, state_revision = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (priority, revision, timestamp, task_id),
+            )
+            self._event(
+                connection,
+                "task.priority_changed",
+                task_id,
+                None,
+                {
+                    "from": int(task["priority"]),
+                    "to": priority,
+                    "revision": revision,
+                },
+            )
+            return revision
+
+    def append_task_steering(
+        self,
+        task_id: str,
+        instruction: str,
+        *,
+        expected_revision: int,
+    ) -> int:
+        instruction = instruction.strip()
+        if not instruction or len(instruction) > 500:
+            raise ValueError("instruction must contain 1 to 500 characters")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if int(task["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {task['state_revision']}"
+                )
+            if task["state"] in {"accepted", "cancelled"}:
+                raise StateConflictError(f"cannot steer task in {task['state']}")
+            revision = int(task["state_revision"]) + 1
+            steering_id = "steering-" + canonical_hash(
+                {
+                    "task_id": task_id,
+                    "revision": revision,
+                    "instruction": instruction,
+                }
+            )[:24]
+            connection.execute(
+                """
+                INSERT INTO task_steering(steering_id, task_id, instruction, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (steering_id, task_id, instruction, timestamp),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET state_revision = ?, updated_at = ? WHERE task_id = ?
+                """,
+                (revision, timestamp, task_id),
+            )
+            self._event(
+                connection,
+                "task.steering_added",
+                task_id,
+                None,
+                {"steering_id": steering_id, "revision": revision},
+            )
+            return revision
+
     def resolve_indeterminate(
         self,
         task_id: str,
@@ -785,7 +902,7 @@ class WorkbenchStore:
         with self.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT task_id, contract_hash, state, state_revision, created_at, updated_at,
+                SELECT task_id, contract_hash, state, state_revision, priority, created_at, updated_at,
                        blocker, verdict, contract_json
                 FROM tasks ORDER BY updated_at DESC LIMIT ?
                 """,
@@ -806,16 +923,25 @@ class WorkbenchStore:
             "SELECT * FROM nodes WHERE task_id = ? ORDER BY json_extract(spec_json, '$.ordinal'), node_id",
             (row["task_id"],),
         ).fetchall()
+        steering_rows = connection.execute(
+            """
+            SELECT steering_id, instruction, created_at FROM task_steering
+            WHERE task_id = ? ORDER BY created_at, steering_id
+            """,
+            (row["task_id"],),
+        ).fetchall()
         return {
             "task_id": row["task_id"],
             "state": row["state"],
             "state_revision": row["state_revision"],
+            "priority": row["priority"],
             "contract_hash": row["contract_hash"],
             "contract": json.loads(row["contract_json"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "blocker": row["blocker"],
             "verdict": row["verdict"],
+            "steering": [dict(item) for item in steering_rows],
             "nodes": [
                 {
                     **json.loads(node["spec_json"]),
@@ -862,6 +988,43 @@ class WorkbenchStore:
                 }
                 for row in rows
             ]
+
+    def list_alerts(self, limit: int = 30) -> list[dict[str, Any]]:
+        important = {
+            "approval.requested",
+            "node.blocked",
+            "node.indeterminate",
+            "node.routed",
+            "coordinator.started",
+            "coordinator.stopped",
+        }
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM events ORDER BY cursor DESC LIMIT 1000"
+            ).fetchall()
+        alerts: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            is_task_alert = (
+                row["event_type"] == "task.state_changed"
+                and payload.get("to")
+                in {"accepted", "blocked", "needs_fix", "needs_approval", "cancelled"}
+            )
+            if row["event_type"] not in important and not is_task_alert:
+                continue
+            alerts.append(
+                {
+                    "cursor": row["cursor"],
+                    "event_type": row["event_type"],
+                    "task_id": row["task_id"],
+                    "node_id": row["node_id"],
+                    "payload": payload,
+                    "created_at": row["created_at"],
+                }
+            )
+            if len(alerts) == limit:
+                break
+        return list(reversed(alerts))
 
     def record_system_event(self, event_type: str, payload: dict[str, Any]) -> int:
         with self.transaction() as connection:
@@ -987,10 +1150,11 @@ class WorkbenchStore:
         with self.transaction() as connection:
             candidates = connection.execute(
                 """
-                SELECT n.*, t.contract_json, t.state AS task_state
+                SELECT n.*, t.contract_json, t.state AS task_state, t.priority AS task_priority
                 FROM nodes n JOIN tasks t USING(task_id)
                 WHERE n.state = 'pending' AND t.state IN ('queued', 'running', 'verifying', 'needs_fix')
-                ORDER BY t.created_at, json_extract(n.spec_json, '$.ordinal'), n.node_id
+                ORDER BY t.priority DESC, t.created_at,
+                         json_extract(n.spec_json, '$.ordinal'), n.node_id
                 """
             ).fetchall()
             running_accesses: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
@@ -1076,12 +1240,23 @@ class WorkbenchStore:
                 selected["node_id"],
                 {"attempt": attempt, "worker_id": worker_id, "executor": selected_spec["executor"]},
             )
+            steering = tuple(
+                row["instruction"]
+                for row in connection.execute(
+                    """
+                    SELECT instruction FROM task_steering
+                    WHERE task_id = ? ORDER BY created_at, steering_id
+                    """,
+                    (selected["task_id"],),
+                ).fetchall()
+            )
             return {
                 "task_id": selected["task_id"],
                 "node_id": selected["node_id"],
                 "attempt": attempt,
                 "spec": selected_spec,
                 "contract": json.loads(selected["contract_json"]),
+                "steering": steering,
             }
 
     def assign_worktree(self, task_id: str, node_id: str, worktree: str) -> None:

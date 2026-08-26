@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
 from .acceptance import build_acceptance_report
+from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .store import StateConflictError, WorkbenchStore
 
@@ -20,6 +21,7 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         super().__init__((config.host, config.port), WorkbenchHandler)
         self.config = config
         self.store = store
+        self.artifacts = ArtifactStore(config.state_root / "artifacts")
 
 
 class WorkbenchHandler(BaseHTTPRequestHandler):
@@ -51,6 +53,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "approvals": self.server.store.list_approvals(),
+                    "alerts": self.server.store.list_alerts(),
                     "quota": quota.__dict__ if quota else None,
                     "quota_policy": quota.policy_summary() if quota else None,
                     "acceptance": build_acceptance_report(self.server.store),
@@ -69,6 +72,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/tasks":
             return self._json({"tasks": self.server.store.list_tasks()})
+        if parsed.path.startswith("/api/artifacts/"):
+            if not self._authenticated():
+                return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
+            artifact_ref = unquote(parsed.path.removeprefix("/api/artifacts/"))
+            try:
+                artifact = self.server.artifacts.path_for(artifact_ref)
+                if not artifact.is_file():
+                    raise FileNotFoundError(artifact)
+                content_type = (
+                    "text/plain; charset=utf-8"
+                    if artifact.suffix in {".txt", ".log", ".json", ".patch"}
+                    else "application/octet-stream"
+                )
+                return self._bytes(artifact.read_bytes(), content_type)
+            except (FileNotFoundError, ValueError):
+                return self._json({"error": "artifact not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path.startswith("/api/tasks/"):
             task_id = unquote(parsed.path.removeprefix("/api/tasks/"))
             try:
@@ -130,6 +149,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "approval not found"}, HTTPStatus.NOT_FOUND)
             except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+        if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/steer"):
+            task_id = unquote(parsed.path.removeprefix("/api/tasks/").removesuffix("/steer"))
+            try:
+                body = json.loads(self._read_body() or b"{}")
+                revision = self.server.store.append_task_steering(
+                    task_id,
+                    str(body["instruction"]),
+                    expected_revision=int(body["expected_revision"]),
+                )
+                return self._json({"ok": True, "revision": revision})
+            except KeyError:
+                return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
+            except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
         if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/control"):
             task_id = unquote(parsed.path.removeprefix("/api/tasks/").removesuffix("/control"))
             try:
@@ -145,6 +178,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 elif action == "cancel":
                     revision = self.server.store.transition_task(
                         task_id, "cancelled", expected_revision=task["state_revision"]
+                    )
+                elif action == "set_priority":
+                    revision = self.server.store.set_task_priority(
+                        task_id,
+                        int(body["priority"]),
+                        expected_revision=int(body["expected_revision"]),
                     )
                 elif action == "resolve_indeterminate":
                     revision = self.server.store.resolve_indeterminate(
@@ -207,6 +246,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _html(self, value: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         self._text(value, "text/html; charset=utf-8", status)
+
+    def _bytes(
+        self,
+        data: bytes,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _text(
         self, value: str, content_type: str, status: HTTPStatus = HTTPStatus.OK

@@ -12,7 +12,12 @@ from .model import canonical_hash
 from .worktrees import normalize_scope
 
 
-def reusable_evidence_key(contract: dict, spec: dict, worktree: Path | None) -> str | None:
+def reusable_evidence_key(
+    contract: dict,
+    spec: dict,
+    worktree: Path | None,
+    steering: tuple[str, ...] = (),
+) -> str | None:
     if worktree is None or spec.get("executor") == "fixture":
         return None
     if not spec.get("verifier") and (spec.get("executor") != "deterministic" or spec.get("write_scopes")):
@@ -31,6 +36,7 @@ def reusable_evidence_key(contract: dict, spec: dict, worktree: Path | None) -> 
                 for key, value in spec.items()
                 if key not in {"task_id", "node_id", "ordinal", "depends_on"}
             },
+            "steering": steering,
             "scope_fingerprint": _scope_fingerprint(worktree, scopes),
             "runtime": _runtime_identity(executor),
         }

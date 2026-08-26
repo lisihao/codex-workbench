@@ -38,13 +38,18 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 4)
+        self.assertEqual(self.store.health()["schema_version"], 5)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
             }
         self.assertIn("effective_executor", columns)
         self.assertIn("effective_model", columns)
+        with self.store.connection() as connection:
+            task_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+        self.assertIn("priority", task_columns)
 
     def test_schema_three_adds_effective_route_columns(self) -> None:
         path = Path(self.temp.name) / "schema-three.sqlite"
@@ -71,7 +76,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 4)
+        self.assertEqual(migrated.health()["schema_version"], 5)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -126,6 +131,47 @@ class StoreTests(unittest.TestCase):
         self.store.settle_node("task-1", "a", NodeResult("succeeded", "ok"))
         third = self.store.claim_ready_node("worker-3")
         self.assertEqual(third["node_id"], "b")
+
+    def test_priority_orders_ready_tasks_and_steering_reaches_future_attempts(self) -> None:
+        second_contract = TaskContract(
+            task_id="task-2",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="high priority task",
+            allowed_scope=("src",),
+        )
+        self.store.create_task(
+            self.contract,
+            [NodeSpec("work", "task-1", "low", "fixture", "fixture", "ok")],
+            "cmd-low-priority",
+        )
+        self.store.create_task(
+            second_contract,
+            [NodeSpec("work", "task-2", "high", "fixture", "fixture", "ok")],
+            "cmd-high-priority",
+        )
+        self.store.queue_task("task-1")
+        self.store.queue_task("task-2")
+        task = self.store.get_task("task-2")
+        revision = self.store.set_task_priority(
+            "task-2", 7, expected_revision=task["state_revision"]
+        )
+        revision = self.store.append_task_steering(
+            "task-2",
+            "先保留现有公开接口，再修改内部实现。",
+            expected_revision=revision,
+        )
+
+        claimed = self.store.claim_ready_node("priority-worker")
+        self.assertEqual(claimed["task_id"], "task-2")
+        self.assertEqual(claimed["steering"], ("先保留现有公开接口，再修改内部实现。",))
+        task = self.store.get_task("task-2")
+        self.assertEqual(task["priority"], 7)
+        self.assertEqual(task["state_revision"], revision + 1)
+        self.assertEqual(task["steering"][0]["instruction"], "先保留现有公开接口，再修改内部实现。")
+        event_types = {event["event_type"] for event in self.store.read_events(task_id="task-2")}
+        self.assertIn("task.priority_changed", event_types)
+        self.assertIn("task.steering_added", event_types)
 
     def test_parent_and_child_write_scopes_conflict(self) -> None:
         nodes = [

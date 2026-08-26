@@ -27,6 +27,11 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .tasks { display: grid; gap: 12px; }
 .approvals { display: grid; gap: 10px; }
+.alerts { display: grid; gap: 8px; }
+.alert { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; border-bottom: 1px solid var(--line); padding: 8px 0; }
+.alert:last-child { border-bottom: 0; }
+.alert strong { font-size: 13px; }
+.alert p { color: var(--muted); font-size: 11px; margin-top: 4px; }
 .approval { display: flex; justify-content: space-between; align-items: center; gap: 16px; border: 1px solid color-mix(in srgb, var(--red) 55%, var(--line)); border-radius: 12px; padding: 14px; background: var(--panel-2); }
 .approval h3 { margin: 10px 0 5px; font-size: 14px; }
 .approval p { color: var(--muted); font-size: 12px; margin-bottom: 7px; }
@@ -42,7 +47,12 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .task p { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .task-brief { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 11px; }
 .task-brief strong { color: var(--text); display: block; margin-top: 3px; }
+.steering { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 12px; }
+.steering input { min-width: 0; }
 .nodes { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.artifacts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.artifact { color: var(--blue); border-bottom: 1px solid currentColor; font: 11px ui-monospace, monospace; text-decoration: none; }
+.artifact.disabled { color: var(--muted); }
 .node { border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font: 11px ui-monospace, monospace; }
 .pill { border: 1px solid currentColor; border-radius: 999px; padding: 7px 12px; font: 700 11px ui-monospace, monospace; }
 .ok, .accepted { color: var(--green); }
@@ -61,6 +71,7 @@ button { background: var(--green); color: #0b1811; font-weight: 700; cursor: poi
 button.small { width: auto; padding: 7px 10px; font-size: 11px; }
 button.warning { background: var(--amber); }
 button.danger { background: var(--red); }
+button.quiet { background: transparent; color: var(--text); }
 .login-link { color: var(--blue); font-size: 11px; text-decoration: none; }
 .error { color: var(--red) !important; }
 @media (max-width: 640px) {
@@ -76,6 +87,7 @@ button.danger { background: var(--red); }
   .approval-actions, .task-actions { justify-content: flex-start; }
   .approval-actions button { flex: 1; }
   .task-brief { grid-template-columns: 1fr; }
+  .steering { grid-template-columns: 1fr; }
   .nodes { display: grid; }
   .node { border-radius: 8px; }
   .event { grid-template-columns: 64px 1fr; }

@@ -85,9 +85,19 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "task_id": {"type": "string"},
                 "action": {
-                    "enum": ["queue", "resume", "pause", "cancel", "resolve_indeterminate"]
+                    "enum": [
+                        "queue",
+                        "resume",
+                        "pause",
+                        "cancel",
+                        "set_priority",
+                        "steer",
+                        "resolve_indeterminate",
+                    ]
                 },
                 "expected_revision": {"type": "integer"},
+                "priority": {"type": "integer", "minimum": -10, "maximum": 10},
+                "instruction": {"type": "string", "minLength": 1, "maxLength": 500},
                 "node_id": {"type": "string"},
                 "resolution": {"enum": ["retry", "fail", "cancel"]},
             },
@@ -345,6 +355,18 @@ class WorkbenchMCPServer:
                     task_id,
                     "cancelled",
                     expected_revision=int(arguments.get("expected_revision", task["state_revision"])),
+                )
+            elif action == "set_priority":
+                revision = self.store.set_task_priority(
+                    task_id,
+                    int(arguments["priority"]),
+                    expected_revision=int(arguments["expected_revision"]),
+                )
+            elif action == "steer":
+                revision = self.store.append_task_steering(
+                    task_id,
+                    arguments["instruction"],
+                    expected_revision=int(arguments["expected_revision"]),
                 )
             elif action == "resolve_indeterminate":
                 revision = self.store.resolve_indeterminate(

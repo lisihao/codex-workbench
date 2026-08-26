@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from codex_workbench.api import WorkbenchHTTPServer
+from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.store import WorkbenchStore
@@ -97,6 +98,42 @@ class APITests(unittest.TestCase):
                     [NodeSpec("work", contract.task_id, "work", "fixture", "fixture", "ok")],
                     "phone-approval-create",
                 )
+                task = store.get_task(contract.task_id)
+                priority = Request(
+                    f"http://127.0.0.1:{port}/api/tasks/{contract.task_id}/control",
+                    data=json.dumps(
+                        {
+                            "action": "set_priority",
+                            "priority": 5,
+                            "expected_revision": task["state_revision"],
+                        }
+                    ).encode(),
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {config.token()}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urlopen(priority, timeout=2) as response:
+                    priority_receipt = json.load(response)
+                steering = Request(
+                    f"http://127.0.0.1:{port}/api/tasks/{contract.task_id}/steer",
+                    data=json.dumps(
+                        {
+                            "instruction": "保留公开接口",
+                            "expected_revision": priority_receipt["revision"],
+                        }
+                    ).encode(),
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {config.token()}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urlopen(steering, timeout=2) as response:
+                    steering_receipt = json.load(response)
+                self.assertTrue(steering_receipt["ok"])
+                self.assertEqual(store.get_task(contract.task_id)["priority"], 5)
                 store.queue_task(contract.task_id)
                 store.claim_ready_node("worker")
                 store.settle_node(
@@ -107,6 +144,10 @@ class APITests(unittest.TestCase):
                 with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
                     snapshot = json.load(response)
                 approval = snapshot["approvals"][0]
+                self.assertIn(
+                    "approval.requested",
+                    {alert["event_type"] for alert in snapshot["alerts"]},
+                )
                 decision = Request(
                     f"http://127.0.0.1:{port}/api/approvals/{approval['approval_id']}/decide",
                     data=json.dumps(
@@ -125,6 +166,18 @@ class APITests(unittest.TestCase):
                     receipt = json.load(response)
                 self.assertTrue(receipt["ok"])
                 self.assertEqual(store.get_task(contract.task_id)["state"], "queued")
+
+                artifact_ref = ArtifactStore(root / "artifacts").put_text(
+                    "phone-visible evidence",
+                    "txt",
+                )
+                artifact_request = Request(
+                    f"http://127.0.0.1:{port}/api/artifacts/{artifact_ref}",
+                    headers={"Authorization": f"Bearer {config.token()}"},
+                )
+                with urlopen(artifact_request, timeout=2) as response:
+                    artifact_body = response.read().decode()
+                self.assertEqual(artifact_body, "phone-visible evidence")
             finally:
                 server.shutdown()
                 server.server_close()
