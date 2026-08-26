@@ -17,6 +17,7 @@
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
 - SQLite v4 分开保存原始节点契约和 `effective_executor/effective_model`，因此面板展示的是实时路由与真实并发，不会把 Codex 接管误标成 Claude。
+- GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
