@@ -25,6 +25,7 @@ from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
 from .model import NodeSpec, QuotaSnapshot, TaskContract
 from .planner import PlannerError
+from .restart_readiness import assess_restart_readiness
 from .service import Coordinator
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
@@ -442,8 +443,12 @@ def command_doctor(args: argparse.Namespace) -> int:
     quota = store.latest_quota()
     claude_ok, claude_reason = ClaudeExecutor(artifacts, quota, claude_binary).qualification("sonnet")
     git_code, git_output = _run(["git", "--version"])
+    restart_recovery = assess_restart_readiness()
+    overall_ok = codex_ok and git_code == 0 and (
+        restart_recovery["ready"] if args.require_restart_ready else True
+    )
     report = {
-        "ok": codex_ok and git_code == 0,
+        "ok": overall_ok,
         "version": __version__,
         "home": str(config.state_root),
         "database": store.health(),
@@ -456,9 +461,10 @@ def command_doctor(args: argparse.Namespace) -> int:
         },
         "git": {"ok": git_code == 0, "version": git_output},
         "api_key_environment_forwarded": False,
+        "restart_recovery": restart_recovery,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report["ok"] else 1
+    return 0 if overall_ok else 1
 
 
 def command_fixture_demo(args: argparse.Namespace) -> int:
@@ -643,6 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     token.set_defaults(func=command_token)
 
     doctor = sub.add_parser("doctor")
+    doctor.add_argument("--require-restart-ready", action="store_true")
     doctor.set_defaults(func=command_doctor)
 
     acceptance = sub.add_parser("acceptance", help="evaluate or attest A1-A12 durable Evidence")

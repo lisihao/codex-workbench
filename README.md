@@ -27,9 +27,12 @@
 PYTHONPATH=src python3 -m codex_workbench init
 PYTHONPATH=src python3 -m codex_workbench serve
 PYTHONPATH=src python3 -m codex_workbench doctor
+PYTHONPATH=src python3 -m codex_workbench doctor --require-restart-ready
 ```
 
 默认数据目录为 `~/Library/Application Support/Codex Workbench`，默认只监听 `127.0.0.1:8766`。远程访问由 Tailscale Serve 代理，服务自身不开放公网端口。
+
+在任何计划内整机重启前必须运行 `doctor --require-restart-ready`。它会同时验证 FileVault、自动登录、用户 LaunchAgent、Tailscale、断电自启和系统睡眠策略；任一项不满足就拒绝把该机器视为无人值守可恢复。FileVault 开启时，必须由本地用户单独授权一次 `fdesetup authrestart` 或接受重启后的本地解锁，Workbench 不保存系统密码。
 
 ## 自然语言任务入口
 

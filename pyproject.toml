@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-workbench"
-version = "0.8.0"
+version = "0.8.1"
 description = "Persistent Codex-first development coordinator for a private Mac mini."
 requires-python = ">=3.11"
 dependencies = []
