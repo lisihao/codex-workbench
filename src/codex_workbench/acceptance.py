@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 import re
 from typing import Any
 
+from .artifacts import ArtifactStore
 from .store import WorkbenchStore
 
 
@@ -40,8 +42,8 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     quota = _runtime_quota_evidence(store.list_quota_snapshots(limit=5_000))
     authority = store.authority_status()
     checks = [
-        _pending("A1", "需要一次带开始/结束时间的 MacBook 离线 8 小时运行证据"),
-        _pending("A2", "tailnet 只读端点已提供；仍需手机真机读取回执"),
+        _macbook_offline_check(tasks, events),
+        _phone_observation_check(events),
         _restart_check(tasks, events),
         _model_worker_check(tasks),
         _sol_verifier_check(tasks),
@@ -51,7 +53,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         _auth_storm_check(tasks, events),
         _accepted_evidence_check(tasks),
         _authority_check(authority),
-        _pending("A12", "需要用户在保留池内完成一次 Claude 网页端 PPT 任务"),
+        _ppt_reserve_check(events, ArtifactStore(store.path.parent / "artifacts")),
     ]
     counts = {status: sum(check.status == status for check in checks) for status in ("ok", "warn", "error", "pending")}
     return {
@@ -74,6 +76,96 @@ def _runtime_quota_evidence(quota: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def _pending(check_id: str, evidence: str) -> AcceptanceCheck:
     return AcceptanceCheck(check_id, "pending", REQUIREMENTS[check_id], evidence)
+
+
+def _timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _macbook_offline_check(
+    tasks: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> AcceptanceCheck:
+    by_client: dict[str, list[datetime]] = {}
+    for event in events:
+        if event["event_type"] != "client.heartbeat":
+            continue
+        payload = event["payload"]
+        if payload.get("client_kind") != "macbook":
+            continue
+        by_client.setdefault(str(payload.get("client_id", "unknown")), []).append(
+            _timestamp(event["created_at"])
+        )
+    accepted = [
+        (task["task_id"], _timestamp(task["updated_at"]))
+        for task in tasks
+        if task["state"] == "accepted"
+    ]
+    for client_id, heartbeats in by_client.items():
+        heartbeats.sort()
+        for before, after in zip(heartbeats, heartbeats[1:]):
+            gap = after - before
+            if gap < timedelta(hours=8):
+                continue
+            completed = [task_id for task_id, timestamp in accepted if before < timestamp < after]
+            if completed:
+                return AcceptanceCheck(
+                    "A1",
+                    "ok",
+                    REQUIREMENTS["A1"],
+                    f"{client_id} 心跳中断 {gap.total_seconds() / 3600:.1f} 小时；期间完成 {len(completed)} 个 accepted 任务",
+                )
+    return _pending("A1", "等待同一 MacBook 两次心跳间隔至少 8 小时，且间隔内有任务进入 accepted")
+
+
+def _phone_observation_check(events: list[dict[str, Any]]) -> AcceptanceCheck:
+    observations = [
+        event
+        for event in events
+        if event["event_type"] == "client.observed"
+        and event["payload"].get("device_class") == "phone"
+        and event["payload"].get("authenticated") is True
+        and event["payload"].get("rendered") is True
+    ]
+    if observations:
+        latest = observations[-1]
+        return AcceptanceCheck(
+            "A2",
+            "ok",
+            REQUIREMENTS["A2"],
+            f"手机客户端 {latest['payload'].get('client_id')} 已渲染游标 {latest['payload'].get('snapshot_cursor')}，服务端回执时间 {latest['created_at']}",
+        )
+    return _pending("A2", "等待已登录手机浏览器成功渲染一次真实快照并写入服务端回执")
+
+
+def _ppt_reserve_check(
+    events: list[dict[str, Any]], artifacts: ArtifactStore
+) -> AcceptanceCheck:
+    attestations: list[dict[str, Any]] = []
+    for event in events:
+        payload = event["payload"]
+        if (
+            event["event_type"] != "acceptance.attested"
+            or payload.get("check_id") != "A12"
+            or not str(payload.get("artifact_ref", "")).startswith("sha256:")
+            or int(payload.get("artifact_size", 0)) <= 0
+            or not payload.get("quota_window_id")
+        ):
+            continue
+        try:
+            path = artifacts.path_for(str(payload["artifact_ref"]))
+        except ValueError:
+            continue
+        if path.is_file() and path.stat().st_size == int(payload["artifact_size"]):
+            attestations.append(event)
+    if attestations:
+        latest = attestations[-1]
+        return AcceptanceCheck(
+            "A12",
+            "ok",
+            REQUIREMENTS["A12"],
+            f"已保存 {latest['payload'].get('artifact_name')}（{latest['payload'].get('artifact_ref')}），配额窗口 {latest['payload'].get('quota_window_id')}",
+        )
+    return _pending("A12", "等待本地管理员导入一次保留池内完成的 Claude 网页 PPT/PDF 工件")
 
 
 def _restart_check(tasks: list[dict[str, Any]], events: list[dict[str, Any]]) -> AcceptanceCheck:

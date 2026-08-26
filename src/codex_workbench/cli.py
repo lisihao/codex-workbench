@@ -318,9 +318,55 @@ def command_quota(args: argparse.Namespace) -> int:
 
 
 def command_acceptance(args: argparse.Namespace) -> int:
-    report = build_acceptance_report(_store(_config(args)))
+    config = _config(args)
+    store = _store(config)
+    if args.acceptance_action == "attest-a12":
+        if not args.artifact or not args.quota_window or not args.note:
+            raise ValueError("attest-a12 requires --artifact, --quota-window, and --note")
+        artifact = Path(args.artifact).expanduser()
+        if not artifact.is_file():
+            raise ValueError("A12 artifact file does not exist")
+        artifact = artifact.resolve()
+        suffix = artifact.suffix.lower().removeprefix(".")
+        if suffix not in {"ppt", "pptx", "pdf"}:
+            raise ValueError("A12 artifact must be a PPT, PPTX, or PDF file")
+        data = artifact.read_bytes()
+        if not data:
+            raise ValueError("A12 artifact must not be empty")
+        artifact_ref = ArtifactStore(config.state_root / "artifacts").put_bytes(data, suffix)
+        cursor = store.record_acceptance_attestation(
+            "A12",
+            artifact_ref,
+            artifact.name,
+            len(data),
+            args.quota_window,
+            args.note,
+        )
+        print(
+            json.dumps(
+                {"ok": True, "check_id": "A12", "event_cursor": cursor, "artifact_ref": artifact_ref},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    report = build_acceptance_report(store)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["complete"] else 1
+
+
+def command_client(args: argparse.Namespace) -> int:
+    store = _store(_config(args))
+    if args.client_action == "heartbeat":
+        cursor = store.record_client_heartbeat(args.client_id, args.kind)
+        print(
+            json.dumps(
+                {"ok": True, "event_cursor": cursor, "client_id": args.client_id, "kind": args.kind},
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    raise ValueError(f"unsupported client action: {args.client_action}")
 
 
 def command_token(args: argparse.Namespace) -> int:
@@ -542,8 +588,24 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=command_doctor)
 
-    acceptance = sub.add_parser("acceptance", help="evaluate A1-A12 from durable runtime Evidence")
+    acceptance = sub.add_parser("acceptance", help="evaluate or attest A1-A12 durable Evidence")
+    acceptance.add_argument(
+        "acceptance_action",
+        nargs="?",
+        choices=("report", "attest-a12"),
+        default="report",
+    )
+    acceptance.add_argument("--artifact")
+    acceptance.add_argument("--quota-window")
+    acceptance.add_argument("--note")
     acceptance.set_defaults(func=command_acceptance)
+
+    client = sub.add_parser("client", help="record a trusted cockpit heartbeat")
+    client_sub = client.add_subparsers(dest="client_action", required=True)
+    client_heartbeat = client_sub.add_parser("heartbeat")
+    client_heartbeat.add_argument("--client-id", required=True)
+    client_heartbeat.add_argument("--kind", choices=("macbook", "phone"), required=True)
+    client.set_defaults(func=command_client)
 
     demo = sub.add_parser("fixture-demo")
     demo.add_argument("--repository", default=".")

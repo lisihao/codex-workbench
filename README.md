@@ -18,6 +18,7 @@
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
 - SQLite v4 分开保存原始节点契约和 `effective_executor/effective_model`，因此面板展示的是实时路由与真实并发，不会把 Codex 接管误标成 Claude。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
+- A1、A2、A12 不再永久写死为 pending：MacBook 心跳间隔、已登录手机的真实渲染回执和本地管理员导入的 PPT/PDF 工件都进入 Mac mini 同一条 Evidence 账本。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -134,7 +135,20 @@ python3 scripts/install-macbook-client.py
 open http://127.0.0.1:18766
 ```
 
-隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。
+隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。安装器同时每五分钟从 MacBook 向 Mac mini 写入一次服务端时间心跳；同一客户端出现至少八小时心跳空窗，且期间有任务 accepted 后，A1 才会通过。
+
+手机登录控制面并成功渲染真实快照后，页面只在该浏览器会话写入一次 `client.observed` 回执。服务端根据移动 User-Agent、认证 Cookie 和当前事件游标判定 A2；普通匿名 GET 不能生成验收证据。
+
+完成一次 Claude 网页 PPT 旅程后，由 Mac mini 本地管理员导入真实工件：
+
+```bash
+codex-workbench acceptance attest-a12 \
+  --artifact /path/to/slides.pptx \
+  --quota-window 2026-W35 \
+  --note "Claude web completed with the reserved quota pool"
+```
+
+只有实际存在且大小匹配的内容寻址 PPT、PPTX 或 PDF 工件才能让 A12 通过。
 
 ## 状态语义
 

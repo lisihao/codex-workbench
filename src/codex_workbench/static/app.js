@@ -63,6 +63,22 @@ async function refreshSnapshot() {
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
   document.querySelector("#updated").textContent = `刷新 ${new Date().toLocaleTimeString()}`;
   cursor = Math.max(cursor, data.health.cursor || 0);
+  await recordPhoneObservation(data);
+}
+
+async function recordPhoneObservation(data) {
+  if (!data.authenticated || !/(iphone|android|mobile)/i.test(navigator.userAgent) || sessionStorage.getItem("workbench-phone-observed")) return;
+  let clientId = localStorage.getItem("workbench-phone-client-id");
+  if (!clientId) {
+    clientId = `phone-${crypto.randomUUID()}`;
+    localStorage.setItem("workbench-phone-client-id", clientId);
+  }
+  const response = await fetch("/api/clients/observe", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({client_id: clientId, snapshot_cursor: data.health.cursor || 0}),
+  });
+  if (response.ok) sessionStorage.setItem("workbench-phone-observed", "true");
 }
 
 async function controlTask(event) {

@@ -5,10 +5,12 @@ import argparse
 from pathlib import Path
 import plistlib
 import shutil
+import socket
 import subprocess
 
 
-LABEL = "com.lisihao.codex-workbench-tunnel"
+TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
+HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
 
 
 def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -26,18 +28,25 @@ def main() -> int:
     log_root.mkdir(parents=True, exist_ok=True)
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     launch_agents.mkdir(parents=True, exist_ok=True)
-    plist_path = launch_agents / f"{LABEL}.plist"
-    template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
-    rendered = template.replace("__LOG_ROOT__", str(log_root))
-    plistlib.loads(rendered.encode())
-    plist_path.write_text(rendered)
-    plist_path.chmod(0o600)
-
     domain = f"gui/{run('id', '-u').stdout.strip()}"
-    run("launchctl", "bootout", domain, str(plist_path), check=False)
-    run("launchctl", "bootstrap", domain, str(plist_path))
-    run("launchctl", "enable", f"{domain}/{LABEL}")
-    run("launchctl", "kickstart", "-k", f"{domain}/{LABEL}")
+    client_id = "macbook-" + "".join(
+        character if character.isalnum() or character in ".-_" else "-"
+        for character in socket.gethostname()
+    )
+    for label in (TUNNEL_LABEL, HEARTBEAT_LABEL):
+        plist_path = launch_agents / f"{label}.plist"
+        template = (source / "launchd" / f"{label}.plist.in").read_text()
+        rendered = (
+            template.replace("__LOG_ROOT__", str(log_root))
+            .replace("__CLIENT_ID__", client_id)
+        )
+        plistlib.loads(rendered.encode())
+        plist_path.write_text(rendered)
+        plist_path.chmod(0o600)
+        run("launchctl", "bootout", domain, str(plist_path), check=False)
+        run("launchctl", "bootstrap", domain, str(plist_path))
+        run("launchctl", "enable", f"{domain}/{label}")
+        run("launchctl", "kickstart", "-k", f"{domain}/{label}")
     codex = shutil.which("codex")
     if not codex:
         raise SystemExit("Codex CLI is required to register the Workbench MCP entry")
@@ -64,6 +73,7 @@ def main() -> int:
     )
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
     print("Codex native entry: MCP server 'codex-workbench'")
+    print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes")
     return 0
 
 

@@ -654,6 +654,73 @@ class WorkbenchStore:
         with self.transaction() as connection:
             return self._event(connection, event_type, None, None, payload)
 
+    def record_client_heartbeat(self, client_id: str, client_kind: str) -> int:
+        if not client_id or len(client_id) > 128 or any(character.isspace() for character in client_id):
+            raise ValueError("client_id must be non-empty, contain no whitespace, and be at most 128 characters")
+        if client_kind not in {"macbook", "phone"}:
+            raise ValueError("client_kind must be macbook or phone")
+        return self.record_system_event(
+            "client.heartbeat",
+            {"client_id": client_id, "client_kind": client_kind},
+        )
+
+    def record_client_observation(
+        self,
+        client_id: str,
+        device_class: str,
+        snapshot_cursor: int,
+        current_cursor: int,
+        user_agent: str,
+    ) -> int:
+        if not client_id or len(client_id) > 128 or any(character.isspace() for character in client_id):
+            raise ValueError("client_id must be non-empty, contain no whitespace, and be at most 128 characters")
+        if device_class not in {"phone", "desktop"}:
+            raise ValueError("device_class must be phone or desktop")
+        if snapshot_cursor < 0 or snapshot_cursor > current_cursor:
+            raise ValueError("snapshot_cursor is outside the current event ledger")
+        if current_cursor - snapshot_cursor > 100:
+            raise ValueError("rendered snapshot is too stale to attest")
+        return self.record_system_event(
+            "client.observed",
+            {
+                "client_id": client_id,
+                "device_class": device_class,
+                "snapshot_cursor": snapshot_cursor,
+                "current_cursor": current_cursor,
+                "authenticated": True,
+                "rendered": True,
+                "user_agent": user_agent[:512],
+            },
+        )
+
+    def record_acceptance_attestation(
+        self,
+        check_id: str,
+        artifact_ref: str,
+        artifact_name: str,
+        artifact_size: int,
+        quota_window_id: str,
+        note: str,
+    ) -> int:
+        if check_id != "A12":
+            raise ValueError("only A12 accepts a local administrator attestation")
+        if not artifact_ref.startswith("sha256:") or artifact_size <= 0:
+            raise ValueError("a non-empty content-addressed artifact is required")
+        if not quota_window_id.strip() or not note.strip():
+            raise ValueError("quota_window_id and note are required")
+        return self.record_system_event(
+            "acceptance.attested",
+            {
+                "check_id": check_id,
+                "artifact_ref": artifact_ref,
+                "artifact_name": artifact_name,
+                "artifact_size": artifact_size,
+                "quota_window_id": quota_window_id,
+                "note": note,
+                "source": "local-admin-cli",
+            },
+        )
+
     def record_node_event(
         self,
         event_type: str,

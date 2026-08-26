@@ -64,6 +64,26 @@ class APITests(unittest.TestCase):
                 self.assertEqual(snapshot["quota_policy"]["zone"], "mixed")
                 self.assertEqual(snapshot["quota_policy"]["zones"]["sonnet"], "yellow")
                 self.assertEqual(snapshot["quota_policy"]["models"]["sonnet"]["max_concurrency"], 1)
+
+                observation = Request(
+                    f"http://127.0.0.1:{port}/api/clients/observe",
+                    data=json.dumps(
+                        {"client_id": "phone-fixture", "snapshot_cursor": snapshot["health"]["cursor"]}
+                    ).encode(),
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {config.token()}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (iPhone; Mobile)",
+                    },
+                )
+                with urlopen(observation, timeout=2) as response:
+                    observation_receipt = json.load(response)
+                self.assertEqual(observation_receipt["device_class"], "phone")
+                with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
+                    acceptance = json.load(response)
+                checks = {check["id"]: check for check in acceptance["checks"]}
+                self.assertEqual(checks["A2"]["status"], "ok")
             finally:
                 server.shutdown()
                 server.server_close()

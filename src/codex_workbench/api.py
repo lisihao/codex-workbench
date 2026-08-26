@@ -90,6 +90,29 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if not self._authenticated():
             return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
+        if parsed.path == "/api/clients/observe":
+            try:
+                body = json.loads(self._read_body() or b"{}")
+                user_agent = self.headers.get("User-Agent", "")
+                lowered = user_agent.lower()
+                device_class = (
+                    "phone"
+                    if any(marker in lowered for marker in ("iphone", "android", "mobile"))
+                    else "desktop"
+                )
+                current_cursor = int(self.server.store.health()["cursor"])
+                cursor = self.server.store.record_client_observation(
+                    str(body.get("client_id", "")),
+                    device_class,
+                    int(body.get("snapshot_cursor", -1)),
+                    current_cursor,
+                    user_agent,
+                )
+                return self._json(
+                    {"ok": True, "event_cursor": cursor, "device_class": device_class}
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
         if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/control"):
             task_id = unquote(parsed.path.removeprefix("/api/tasks/").removesuffix("/control"))
             try:
