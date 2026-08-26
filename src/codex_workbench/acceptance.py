@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any
 
 from .store import WorkbenchStore
@@ -36,7 +37,7 @@ REQUIREMENTS = {
 def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     tasks = store.list_tasks(limit=500)
     events = store.read_events(after=0, limit=10_000)
-    quota = store.list_quota_snapshots(limit=5_000)
+    quota = _runtime_quota_evidence(store.list_quota_snapshots(limit=5_000))
     authority = store.authority_status()
     checks = [
         _pending("A1", "需要一次带开始/结束时间的 MacBook 离线 8 小时运行证据"),
@@ -58,6 +59,17 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         "counts": counts,
         "checks": [check.to_dict() for check in checks],
     }
+
+
+def _runtime_quota_evidence(quota: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    excluded_markers = {"fixture", "test", "tests", "controlled", "simulation"}
+    return [
+        snapshot
+        for snapshot in quota
+        if not excluded_markers.intersection(
+            re.split(r"[^a-z0-9]+", str(snapshot.get("source", "")).lower())
+        )
+    ]
 
 
 def _pending(check_id: str, evidence: str) -> AcceptanceCheck:

@@ -16,7 +16,11 @@ function controls(task) {
 }
 
 function renderTask(task) {
-  const nodes = task.nodes.map((node) => `<span class="node ${escapeHtml(node.state)}">${escapeHtml(node.node_id)} · ${escapeHtml(node.executor)} · ${escapeHtml(node.state)}</span>`).join("");
+  const nodes = task.nodes.map((node) => {
+    const executor = node.effective_executor || node.executor;
+    const model = node.result?.actual_model || node.effective_model || node.model;
+    return `<span class="node ${escapeHtml(node.state)}">${escapeHtml(node.node_id)} · ${escapeHtml(executor)} / ${escapeHtml(model)} · ${escapeHtml(node.state)}</span>`;
+  }).join("");
   return `<article class="task"><div class="task-head"><div><h3>${escapeHtml(task.task_id)}</h3><p>${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="nodes">${nodes}</div></article>`;
 }
 
@@ -33,6 +37,13 @@ async function refreshSnapshot() {
   const counts = data.health.task_counts || {};
   const active = (counts.running || 0) + (counts.queued || 0) + (counts.verifying || 0);
   const quota = data.quota;
+  const quotaPolicy = data.quota_policy;
+  const activeModels = data.health.active_models || {};
+  const activeSonnet = Object.entries(activeModels).filter(([model]) => model.toLowerCase().includes("sonnet")).reduce((total, [, count]) => total + count, 0);
+  const activeHigh = Object.entries(activeModels).filter(([model]) => !model.toLowerCase().includes("sonnet") && (model.toLowerCase().includes("opus") || model.toLowerCase().includes("fable"))).reduce((total, [, count]) => total + count, 0);
+  const sonnetCap = quotaPolicy?.models?.sonnet?.max_concurrency ?? 0;
+  const highCap = Math.max(quotaPolicy?.models?.opus?.max_concurrency ?? 0, quotaPolicy?.models?.fable?.max_concurrency ?? 0);
+  const quotaZones = quotaPolicy?.zones ? `O ${quotaPolicy.zones.opus} · S ${quotaPolicy.zones.sonnet} · F ${quotaPolicy.zones.fable}` : "unknown";
   const acceptance = data.acceptance;
   authenticated = data.authenticated;
   document.querySelector("#metrics").innerHTML = [
@@ -41,6 +52,8 @@ async function refreshSnapshot() {
     metric("已验收", counts.accepted || 0, "ok"),
     metric("状态陈旧", data.diagnostics.stale_tasks.length, data.diagnostics.stale_tasks.length ? "error" : "ok"),
     metric("Claude 五小时剩余", quota?.five_hour_remaining == null ? "未知/禁用" : `${quota.five_hour_remaining}%`, quota?.five_hour_remaining > 25 ? "ok" : "error"),
+    metric("Claude 调度区", quotaZones, quotaPolicy?.zone === "green" ? "ok" : quotaPolicy?.zone === "yellow" || quotaPolicy?.zone === "mixed" ? "pending" : "error"),
+    metric("Claude 当前并发", `高阶 ${activeHigh}/${highCap} · S ${activeSonnet}/${sonnetCap}`, activeHigh || activeSonnet ? "running" : ""),
     metric("验收通过", `${acceptance.counts.ok}/12`, acceptance.complete ? "ok" : "pending"),
     metric("事件游标", data.health.cursor),
   ].join("");

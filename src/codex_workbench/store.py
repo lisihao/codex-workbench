@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .model import (
     NodeResult,
@@ -21,7 +21,7 @@ from .model import (
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class CommandConflictError(RuntimeError):
@@ -94,6 +94,8 @@ class WorkbenchStore:
                     attempt INTEGER NOT NULL DEFAULT 0,
                     worker_id TEXT,
                     worktree TEXT,
+                    effective_executor TEXT,
+                    effective_model TEXT,
                     started_at TEXT,
                     settled_at TEXT,
                     result_json TEXT,
@@ -160,7 +162,15 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2}:
+            elif int(current["value"]) in {1, 2, 3}:
+                node_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
+                }
+                if "effective_executor" not in node_columns:
+                    connection.execute("ALTER TABLE nodes ADD COLUMN effective_executor TEXT")
+                if "effective_model" not in node_columns:
+                    connection.execute("ALTER TABLE nodes ADD COLUMN effective_model TEXT")
                 connection.execute(
                     "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -495,8 +505,9 @@ class WorkbenchStore:
             with self.transaction() as connection:
                 connection.execute(
                     """
-                    UPDATE nodes SET state = 'pending', worker_id = NULL, started_at = NULL,
-                                     settled_at = NULL, updated_at = ?
+                    UPDATE nodes SET state = 'pending', worker_id = NULL,
+                                     effective_executor = NULL, effective_model = NULL,
+                                     started_at = NULL, settled_at = NULL, updated_at = ?
                     WHERE task_id = ? AND state = 'failed'
                     """,
                     (now_iso(), task_id),
@@ -533,8 +544,9 @@ class WorkbenchStore:
             task_state = "queued" if resolution == "retry" else "needs_fix" if resolution == "fail" else "cancelled"
             connection.execute(
                 """
-                UPDATE nodes SET state = ?, worker_id = NULL, started_at = NULL,
-                                 settled_at = NULL, updated_at = ?
+                UPDATE nodes SET state = ?, worker_id = NULL,
+                                 effective_executor = NULL, effective_model = NULL,
+                                 started_at = NULL, settled_at = NULL, updated_at = ?
                 WHERE task_id = ? AND node_id = ?
                 """,
                 (node_state, timestamp, task_id, node_id),
@@ -598,6 +610,8 @@ class WorkbenchStore:
                     "attempt": node["attempt"],
                     "worker_id": node["worker_id"],
                     "worktree": node["worktree"],
+                    "effective_executor": node["effective_executor"],
+                    "effective_model": node["effective_model"],
                     "started_at": node["started_at"],
                     "settled_at": node["settled_at"],
                     "updated_at": node["updated_at"],
@@ -650,6 +664,27 @@ class WorkbenchStore:
         with self.transaction() as connection:
             return self._event(connection, event_type, task_id, node_id, payload)
 
+    def record_node_route(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        executor: str,
+        model: str,
+        payload: dict[str, Any],
+    ) -> int:
+        with self.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE nodes SET effective_executor = ?, effective_model = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'running'
+                """,
+                (executor, model, now_iso(), task_id, node_id),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError(f"node {node_id} is not running")
+            return self._event(connection, "node.routed", task_id, node_id, payload)
+
     def authority_status(self) -> dict[str, Any] | None:
         with self.connection() as connection:
             row = connection.execute(
@@ -663,7 +698,11 @@ class WorkbenchStore:
                 return None
             return {**json.loads(row["payload_json"]), "active": True, "observed_at": row["created_at"]}
 
-    def claim_ready_node(self, worker_id: str) -> dict[str, Any] | None:
+    def claim_ready_node(
+        self,
+        worker_id: str,
+        admissible: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any] | None:
         timestamp = now_iso()
         with self.transaction() as connection:
             candidates = connection.execute(
@@ -706,6 +745,8 @@ class WorkbenchStore:
                     for running_reads, running_writes in running_accesses
                 ):
                     continue
+                if admissible is not None and not admissible(spec):
+                    continue
                 selected = candidate
                 selected_spec = spec
                 break
@@ -717,10 +758,20 @@ class WorkbenchStore:
             connection.execute(
                 """
                 UPDATE nodes SET state = 'running', attempt = ?, worker_id = ?,
+                                 effective_executor = ?, effective_model = ?,
                                  started_at = ?, updated_at = ?
                 WHERE task_id = ? AND node_id = ? AND state = 'pending'
                 """,
-                (attempt, worker_id, timestamp, timestamp, selected["task_id"], selected["node_id"]),
+                (
+                    attempt,
+                    worker_id,
+                    selected_spec["executor"],
+                    selected_spec["model"],
+                    timestamp,
+                    timestamp,
+                    selected["task_id"],
+                    selected["node_id"],
+                ),
             )
             if selected["task_state"] in {"queued", "needs_fix"}:
                 connection.execute(
@@ -831,8 +882,9 @@ class WorkbenchStore:
                 if result.retryable and int(row["attempt"]) <= int(contract.get("retry_limit", 0)):
                     connection.execute(
                         """
-                        UPDATE nodes SET state = 'pending', worker_id = NULL, started_at = NULL,
-                                         settled_at = NULL, updated_at = ?
+                        UPDATE nodes SET state = 'pending', worker_id = NULL,
+                                         effective_executor = NULL, effective_model = NULL,
+                                         started_at = NULL, settled_at = NULL, updated_at = ?
                         WHERE task_id = ? AND node_id = ?
                         """,
                         (timestamp, task_id, node_id),
@@ -945,6 +997,7 @@ class WorkbenchStore:
             return len(rows)
 
     def write_quota(self, snapshot: QuotaSnapshot) -> None:
+        snapshot.validate()
         with self.transaction() as connection:
             connection.execute(
                 """
@@ -1000,11 +1053,35 @@ class WorkbenchStore:
                     "SELECT state, COUNT(*) AS count FROM tasks GROUP BY state"
                 ).fetchall()
             }
+            active_executors = {
+                row["executor"]: row["count"]
+                for row in connection.execute(
+                    """
+                    SELECT effective_executor AS executor, COUNT(*) AS count
+                    FROM nodes WHERE state = 'running'
+                    GROUP BY effective_executor
+                    """
+                ).fetchall()
+                if row["executor"]
+            }
+            active_models = {
+                row["model"]: row["count"]
+                for row in connection.execute(
+                    """
+                    SELECT effective_model AS model, COUNT(*) AS count
+                    FROM nodes WHERE state = 'running'
+                    GROUP BY effective_model
+                    """
+                ).fetchall()
+                if row["model"]
+            }
         return {
             "ok": True,
             "schema_version": schema,
             "cursor": cursor,
             "task_counts": counts,
+            "active_executors": active_executors,
+            "active_models": active_models,
             "authority": self.authority_status(),
         }
 

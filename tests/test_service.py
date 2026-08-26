@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench.acceptance import build_acceptance_report
-from codex_workbench.model import NodeResult, NodeSpec, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
 
@@ -83,6 +83,17 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at="2026-08-26T00:00:00+00:00",
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=60,
+                    weekly_all_remaining=60,
+                    weekly_sonnet_remaining=60,
+                    source="settings-usage",
+                )
+            )
             contract = TaskContract(
                 task_id="fallback",
                 repository=str(repository),
@@ -123,6 +134,8 @@ class ServiceTests(unittest.TestCase):
             task = store.get_task("fallback")
             self.assertEqual(task["nodes"][0]["state"], "accepted")
             self.assertEqual(task["nodes"][0]["result"]["actual_model"], "gpt-5.6-luna")
+            self.assertEqual(task["nodes"][0]["effective_executor"], "codex")
+            self.assertEqual(task["nodes"][0]["effective_model"], "gpt-5.6-luna")
             self.assertEqual(claude.calls, 1)
             self.assertEqual(codex.calls, 1)
             routed = [event for event in store.read_events(task_id="fallback") if event["event_type"] == "node.routed"]
@@ -130,6 +143,166 @@ class ServiceTests(unittest.TestCase):
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
             self.assertEqual(checks["A8"]["status"], "pending")
             self.assertEqual(checks["A9"]["status"], "ok")
+
+    def test_red_quota_zone_routes_to_codex_without_starting_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at="2026-08-26T00:00:00+00:00",
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=27,
+                    weekly_all_remaining=60,
+                    weekly_sonnet_remaining=60,
+                    source="settings-usage",
+                )
+            )
+            contract = TaskContract(
+                task_id="red-fallback",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="route before starting Claude",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+                executor_model="gpt-5.6-luna",
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "inspect the fixture",
+                read_scopes=("README.md",),
+            )
+            store.create_task(contract, [node], "red-fallback-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("worker-1")
+            coordinator = Coordinator(store, state, max_workers=1)
+
+            class StubExecutor:
+                def __init__(self, result: NodeResult):
+                    self.result = result
+                    self.calls = 0
+
+                def execute(self, _request):
+                    self.calls += 1
+                    return self.result
+
+            claude = StubExecutor(NodeResult("succeeded", "must not run", actual_model="sonnet"))
+            codex = StubExecutor(NodeResult("succeeded", "Codex completed", actual_model="gpt-5.6-luna"))
+            with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
+                coordinator._execute_claimed(claimed)
+            coordinator._pool.shutdown(wait=True)
+
+            self.assertEqual(claude.calls, 0)
+            self.assertEqual(codex.calls, 1)
+            routed_node = store.get_task(contract.task_id)["nodes"][0]
+            self.assertEqual(routed_node["effective_executor"], "codex")
+            self.assertEqual(routed_node["effective_model"], "gpt-5.6-luna")
+            routed = [event for event in store.read_events(task_id=contract.task_id) if event["event_type"] == "node.routed"]
+            self.assertEqual(routed[0]["payload"]["zone"], "red")
+
+    def test_yellow_quota_zone_limits_sonnet_but_keeps_codex_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at="2026-08-26T00:00:00+00:00",
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=35,
+                    weekly_all_remaining=60,
+                    weekly_sonnet_remaining=60,
+                    source="settings-usage",
+                )
+            )
+            contract = TaskContract(
+                task_id="yellow-concurrency",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="enforce yellow-zone concurrency",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+            )
+            nodes = [
+                NodeSpec("a", contract.task_id, "A", "claude", "sonnet", "A", read_scopes=("README.md",)),
+                NodeSpec("b", contract.task_id, "B", "claude", "sonnet", "B", read_scopes=("README.md",)),
+                NodeSpec("c", contract.task_id, "C", "codex", "gpt-5.6-luna", "C", read_scopes=("README.md",)),
+            ]
+            store.create_task(contract, nodes, "yellow-concurrency-create")
+            store.queue_task(contract.task_id)
+            codex_started = threading.Event()
+
+            class ClaudeStub:
+                def __init__(self):
+                    self.calls = 0
+                    self.active = 0
+                    self.max_active = 0
+                    self.lock = threading.Lock()
+
+                def execute(self, _request):
+                    with self.lock:
+                        self.calls += 1
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                    codex_started.wait(timeout=2)
+                    time.sleep(0.03)
+                    with self.lock:
+                        self.active -= 1
+                    return NodeResult("succeeded", "Sonnet completed", actual_model="sonnet")
+
+            class CodexStub:
+                def __init__(self):
+                    self.calls = 0
+
+                def execute(self, _request):
+                    self.calls += 1
+                    codex_started.set()
+                    return NodeResult("succeeded", "Codex completed", actual_model="gpt-5.6-luna")
+
+            claude = ClaudeStub()
+            codex = CodexStub()
+            coordinator = Coordinator(store, state, max_workers=3, poll_seconds=0.01)
+            with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
+                thread = threading.Thread(target=coordinator.run_forever)
+                thread.start()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if all(node["state"] == "accepted" for node in store.get_task(contract.task_id)["nodes"]):
+                        break
+                    time.sleep(0.02)
+                coordinator.stop()
+                thread.join(timeout=3)
+
+            self.assertEqual(claude.calls, 2)
+            self.assertEqual(claude.max_active, 1)
+            self.assertEqual(codex.calls, 1)
 
     def test_parallel_worktree_patches_are_composed_for_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

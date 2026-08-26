@@ -66,7 +66,7 @@ class CodexPlanner:
         self,
         contract: TaskContract,
         *,
-        claude_available: bool,
+        claude_models_available: tuple[str, ...],
         default_executor_model: str,
         verifier_model: str,
     ) -> list[NodeSpec]:
@@ -81,7 +81,7 @@ class CodexPlanner:
             environment["HOME"] = process_home
         prompt = self._prompt(
             contract,
-            claude_available=claude_available,
+            claude_models_available=claude_models_available,
             default_executor_model=default_executor_model,
             verifier_model=verifier_model,
         )
@@ -160,7 +160,7 @@ class CodexPlanner:
     def _prompt(
         contract: TaskContract,
         *,
-        claude_available: bool,
+        claude_models_available: tuple[str, ...],
         default_executor_model: str,
         verifier_model: str,
     ) -> str:
@@ -174,12 +174,12 @@ Forbidden scopes: {json.dumps(contract.forbidden_scope)}
 Acceptance commands: {json.dumps(contract.acceptance_commands)}
 External writes allowed: {contract.external_write_permission}
 Destructive actions allowed: {contract.destructive_action_permission}
-Claude dispatch available: {claude_available}
+Claude models currently admitted by authentication, quota zone, and reserve policy: {json.dumps(claude_models_available)}
 
 Rules:
 - Prefer independent parallel nodes when their write scopes do not overlap.
 - Use Codex model {default_executor_model} for bounded implementation work.
-- Use Claude only when available is true and the node clearly benefits from it.
+- Use Claude only when its exact model family appears in the admitted list; otherwise use Codex.
 - Deterministic nodes must provide an argv command and must not use a shell string.
 - The final node must be exactly one Codex verifier using {verifier_model}.
 - That verifier must depend on every non-verifier node and independently inspect the composed diff and run acceptance commands.

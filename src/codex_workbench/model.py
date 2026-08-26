@@ -35,6 +35,16 @@ NodeState = Literal[
     "cancelled",
 ]
 
+ClaudeQuotaZone = Literal[
+    "green",
+    "yellow",
+    "red",
+    "protected",
+    "unknown",
+    "auth-unavailable",
+]
+ClaudeDispatchAction = Literal["claude", "codex", "defer"]
+
 TERMINAL_TASK_STATES = {"accepted", "blocked", "cancelled"}
 TERMINAL_NODE_STATES = {"accepted", "failed", "blocked", "indeterminate", "cancelled"}
 
@@ -171,6 +181,17 @@ class NodeResult:
 
 
 @dataclass(frozen=True)
+class ClaudeDispatchDecision:
+    action: ClaudeDispatchAction
+    zone: ClaudeQuotaZone
+    reason: str
+    max_concurrency: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class QuotaSnapshot:
     observed_at: str
     auth_ok: bool
@@ -183,6 +204,19 @@ class QuotaSnapshot:
     five_hour_window_id: str | None = None
     weekly_window_id: str | None = None
 
+    def validate(self) -> None:
+        if not self.source.strip():
+            raise ValueError("quota source is required")
+        percentages = {
+            "five_hour_remaining": self.five_hour_remaining,
+            "weekly_all_remaining": self.weekly_all_remaining,
+            "weekly_sonnet_remaining": self.weekly_sonnet_remaining,
+            "weekly_fable_remaining": self.weekly_fable_remaining,
+        }
+        for name, value in percentages.items():
+            if value is not None and not 0 <= value <= 100:
+                raise ValueError(f"{name} must be between 0 and 100")
+
     def remaining_for(self, model: str) -> tuple[float | None, ...]:
         values: list[float | None] = [self.five_hour_remaining, self.weekly_all_remaining]
         lower = model.lower()
@@ -192,13 +226,102 @@ class QuotaSnapshot:
             values.append(self.weekly_fable_remaining)
         return tuple(values)
 
-    def permits(self, model: str, stop_line: float = 25.0) -> tuple[bool, str]:
+    def quota_zone(self, model: str) -> tuple[ClaudeQuotaZone, float | None]:
         if not self.auth_ok or self.auth_method != "native-subscription":
-            return False, "Claude native-subscription authentication is unavailable"
+            return "auth-unavailable", None
         values = self.remaining_for(model)
         if any(value is None for value in values):
-            return False, "Claude quota is unknown"
+            return "unknown", None
         minimum = min(value for value in values if value is not None)
-        if minimum <= stop_line:
-            return False, f"Claude quota protection active at {minimum:.1f}% remaining"
-        return True, "Claude quota permits dispatch"
+        if minimum <= 25:
+            return "protected", minimum
+        if minimum < 30:
+            return "red", minimum
+        if minimum <= 40:
+            return "yellow", minimum
+        return "green", minimum
+
+    def dispatch_decision(
+        self,
+        model: str,
+        active_models: tuple[str, ...] = (),
+    ) -> ClaudeDispatchDecision:
+        zone, minimum = self.quota_zone(model)
+        if zone == "auth-unavailable":
+            return ClaudeDispatchDecision(
+                "codex",
+                zone,
+                "Claude native-subscription authentication is unavailable",
+                0,
+            )
+        if zone == "unknown":
+            return ClaudeDispatchDecision("codex", zone, "Claude quota is unknown", 0)
+        assert minimum is not None
+        if zone == "protected":
+            return ClaudeDispatchDecision(
+                "codex",
+                zone,
+                f"Claude quota protection active at {minimum:.1f}% remaining",
+                0,
+            )
+        if zone == "red":
+            return ClaudeDispatchDecision(
+                "codex",
+                zone,
+                f"Claude quota red zone at {minimum:.1f}% remaining; new Claude turns are disabled",
+                0,
+            )
+
+        lower = model.lower()
+        if zone == "yellow" and "sonnet" not in lower:
+            return ClaudeDispatchDecision(
+                "codex",
+                zone,
+                f"Claude quota yellow zone at {minimum:.1f}% remaining; only Sonnet may start",
+                0,
+            )
+        family = "sonnet" if "sonnet" in lower else "high"
+        cap = 1 if zone == "yellow" else 2 if family == "sonnet" else 1
+        active = sum(
+            "sonnet" in active_model.lower()
+            if family == "sonnet"
+            else "sonnet" not in active_model.lower()
+            for active_model in active_models
+        )
+        if active >= cap:
+            return ClaudeDispatchDecision(
+                "defer",
+                zone,
+                f"Claude {zone} zone concurrency cap reached for {family}: {active}/{cap}",
+                cap,
+            )
+        return ClaudeDispatchDecision(
+            "claude",
+            zone,
+            f"Claude {zone} zone permits {family}: {active}/{cap} active",
+            cap,
+        )
+
+    def permits(self, model: str, stop_line: float = 25.0) -> tuple[bool, str]:
+        if stop_line != 25.0:
+            raise ValueError("Claude quota stop line is fixed at 25%")
+        decision = self.dispatch_decision(model)
+        return decision.action == "claude", decision.reason
+
+    def policy_summary(self) -> dict[str, Any]:
+        models = {
+            model: self.dispatch_decision(model).to_dict()
+            for model in ("opus", "sonnet", "fable")
+        }
+        zones = {model: decision["zone"] for model, decision in models.items()}
+        return {
+            "zone": next(iter(set(zones.values()))) if len(set(zones.values())) == 1 else "mixed",
+            "zones": zones,
+            "thresholds": {
+                "hard_reserve": 20,
+                "stop_line": 25,
+                "red_upper_exclusive": 30,
+                "yellow_upper_inclusive": 40,
+            },
+            "models": models,
+        }

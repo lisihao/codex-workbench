@@ -51,6 +51,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "quota": quota.__dict__ if quota else None,
+                    "quota_policy": quota.policy_summary() if quota else None,
                     "acceptance": build_acceptance_report(self.server.store),
                     "diagnostics": {"stale_tasks": self.server.store.stale_tasks()},
                     "authenticated": self._authenticated(),

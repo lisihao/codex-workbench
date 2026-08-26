@@ -15,6 +15,8 @@
 - `coordinator.lock` 是进程生命周期的排他权威租约；MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
+- Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
+- SQLite v4 分开保存原始节点契约和 `effective_executor/effective_model`，因此面板展示的是实时路由与真实并发，不会把 Codex 接管误标成 Claude。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -94,7 +96,17 @@ codex-workbench quota set \
   --source settings-usage
 ```
 
-任何池未知或剩余不高于 25% 时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。
+任何池未知时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。fixture、test、controlled 或 simulation 来源的快照不会计入 A6/A7 配额验收。
+
+调度器按所有适用配额池的最低剩余值执行：
+
+| 区域 | 余额 | 新 Claude 调度 |
+|---|---:|---|
+| green | `>40%` | Opus/Fable 高阶槽合计最多 1；Sonnet 最多 2 |
+| yellow | `30%–40%` | 禁止 Opus/Fable；Sonnet 最多 1 |
+| red | `>25%–<30%` | 不启动 Claude，转 Codex |
+| protected | `≤25%` | 不启动 Claude，转 Codex 并保护至少 20% |
+| unknown/auth unavailable | N/A | 不启动 Claude，转 Codex |
 
 ## A1–A12 验收面
 

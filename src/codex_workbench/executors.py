@@ -280,15 +280,10 @@ class ClaudeExecutor(ProcessExecutor):
         self.quota = quota
         self.binary = binary
 
-    def qualification(self, model: str) -> tuple[bool, str]:
+    def authentication(self) -> tuple[bool, str]:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary or not Path(binary).exists():
             return False, "Claude Code CLI is not installed"
-        if self.quota is None:
-            return False, "Claude quota is unknown"
-        permitted, reason = self.quota.permits(model)
-        if not permitted:
-            return False, reason
         try:
             result = subprocess.run(
                 [binary, "auth", "status", "--json"],
@@ -304,6 +299,14 @@ class ClaudeExecutor(ProcessExecutor):
         if result.returncode or not status.get("loggedIn") or status.get("authMethod") in {None, "none", "api_key"}:
             return False, "Claude must attest native-subscription authentication"
         return True, "native-subscription"
+
+    def qualification(self, model: str) -> tuple[bool, str]:
+        if self.quota is None:
+            return False, "Claude quota is unknown"
+        permitted, reason = self.quota.permits(model)
+        if not permitted:
+            return False, reason
+        return self.authentication()
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None

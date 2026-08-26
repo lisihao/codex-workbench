@@ -63,17 +63,28 @@ def submit_natural_language_request(
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
-    claude_ok, _ = ClaudeExecutor(
-        artifacts,
-        store.latest_quota(),
-        os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
-    ).qualification("sonnet")
+    quota = store.latest_quota()
+    quota_admitted_models = tuple(
+        model
+        for model in ("opus", "sonnet", "fable")
+        if quota is not None and quota.permits(model)[0]
+    )
+    claude_authenticated = False
+    if quota_admitted_models:
+        claude_authenticated, _ = ClaudeExecutor(
+            artifacts,
+            quota,
+            os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+        ).authentication()
+    claude_models_available = tuple(
+        model for model in quota_admitted_models if claude_authenticated
+    )
     nodes = CodexPlanner(
         os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
         model=planner_model,
     ).compile(
         contract,
-        claude_available=claude_ok,
+        claude_models_available=claude_models_available,
         default_executor_model=executor_model,
         verifier_model=verifier_model,
     )
@@ -86,6 +97,7 @@ def submit_natural_language_request(
         "task_id": resolved_task_id,
         "command_id": resolved_command_id,
         "base_sha": resolved_base_sha,
-        "claude_dispatch_available": claude_ok,
+        "claude_dispatch_available": bool(claude_models_available),
+        "claude_models_available": claude_models_available,
         "nodes": [node.to_dict() for node in nodes],
     }

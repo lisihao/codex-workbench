@@ -278,7 +278,18 @@ def command_quota(args: argparse.Namespace) -> int:
     store = _store(_config(args))
     if args.quota_action == "show":
         snapshot = store.latest_quota()
-        print(json.dumps(asdict(snapshot) if snapshot else None, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "snapshot": asdict(snapshot),
+                    "policy": snapshot.policy_summary(),
+                }
+                if snapshot
+                else None,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     snapshot = QuotaSnapshot(
         observed_at=datetime.now(UTC).isoformat(timespec="seconds"),
@@ -293,7 +304,16 @@ def command_quota(args: argparse.Namespace) -> int:
         weekly_window_id=args.weekly_window,
     )
     store.write_quota(snapshot)
-    print(json.dumps({"ok": True, "snapshot": asdict(snapshot)}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "snapshot": asdict(snapshot),
+                "policy": snapshot.policy_summary(),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

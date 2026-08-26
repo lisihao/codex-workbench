@@ -34,11 +34,37 @@ class AcceptanceTests(unittest.TestCase):
                         five_hour_remaining=remaining,
                         weekly_all_remaining=65,
                         weekly_sonnet_remaining=60,
-                        source="fixture",
+                        source="settings-usage",
                         five_hour_window_id=window,
                         weekly_window_id="week-1",
                     )
                 )
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=1,
+                    weekly_all_remaining=1,
+                    weekly_sonnet_remaining=1,
+                    source="acceptance-fixture",
+                    five_hour_window_id="fixture-window",
+                    weekly_window_id="fixture-week",
+                )
+            )
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=70,
+                    weekly_all_remaining=70,
+                    weekly_sonnet_remaining=70,
+                    source="latest-settings-usage",
+                    five_hour_window_id="five-2",
+                    weekly_window_id="week-1",
+                )
+            )
 
             report = build_acceptance_report(store)
             checks = {check["id"]: check for check in report["checks"]}

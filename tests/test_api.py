@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.model import QuotaSnapshot
 from codex_workbench.store import WorkbenchStore
 
 
@@ -31,6 +32,7 @@ class APITests(unittest.TestCase):
                 self.assertTrue(snapshot["health"]["ok"])
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
+                self.assertIsNone(snapshot["quota_policy"])
                 self.assertEqual(len(snapshot["acceptance"]["checks"]), 12)
                 with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
                     acceptance = json.load(response)
@@ -45,6 +47,23 @@ class APITests(unittest.TestCase):
                     urlopen(request, timeout=2)
                 self.assertEqual(caught.exception.code, 401)
                 caught.exception.close()
+
+                store.write_quota(
+                    QuotaSnapshot(
+                        observed_at="2026-08-26T00:00:00+00:00",
+                        auth_ok=True,
+                        auth_method="native-subscription",
+                        five_hour_remaining=35,
+                        weekly_all_remaining=60,
+                        weekly_sonnet_remaining=60,
+                        source="settings-usage",
+                    )
+                )
+                with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
+                    snapshot = json.load(response)
+                self.assertEqual(snapshot["quota_policy"]["zone"], "mixed")
+                self.assertEqual(snapshot["quota_policy"]["zones"]["sonnet"], "yellow")
+                self.assertEqual(snapshot["quota_policy"]["models"]["sonnet"]["max_concurrency"], 1)
             finally:
                 server.shutdown()
                 server.server_close()

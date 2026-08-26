@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -32,12 +33,51 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(CommandConflictError):
             self.store.create_task(self.contract, changed, "cmd-1")
 
-    def test_schema_one_migrates_to_delivery_schema(self) -> None:
+    def test_schema_one_migrates_to_current_schema(self) -> None:
         with self.store.connection() as connection:
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 3)
+        self.assertEqual(self.store.health()["schema_version"], 4)
+        with self.store.connection() as connection:
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+        self.assertIn("effective_executor", columns)
+        self.assertIn("effective_model", columns)
+
+    def test_schema_three_adds_effective_route_columns(self) -> None:
+        path = Path(self.temp.name) / "schema-three.sqlite"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '3');
+                CREATE TABLE nodes (
+                    task_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT,
+                    worktree TEXT,
+                    started_at TEXT,
+                    settled_at TEXT,
+                    result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, node_id)
+                );
+                """
+            )
+        migrated = WorkbenchStore(path)
+        migrated.initialize()
+        self.assertEqual(migrated.health()["schema_version"], 4)
+        with migrated.connection() as connection:
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+        self.assertIn("effective_executor", columns)
+        self.assertIn("effective_model", columns)
 
     def test_cycle_is_rejected(self) -> None:
         nodes = [
@@ -80,6 +120,9 @@ class StoreTests(unittest.TestCase):
         second = self.store.claim_ready_node("worker-2")
         self.assertEqual(first["node_id"], "a")
         self.assertEqual(second["node_id"], "c")
+        health = self.store.health()
+        self.assertEqual(health["active_executors"], {"fixture": 2})
+        self.assertEqual(health["active_models"], {"fixture": 2})
         self.store.settle_node("task-1", "a", NodeResult("succeeded", "ok"))
         third = self.store.claim_ready_node("worker-3")
         self.assertEqual(third["node_id"], "b")
