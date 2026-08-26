@@ -142,6 +142,94 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(task["state"], "accepted")
         self.assertEqual(task["verdict"], "independent verdict")
 
+    def test_real_task_missing_required_evidence_is_rejected(self) -> None:
+        contract = TaskContract(
+            task_id="missing-evidence",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="enforce acceptance evidence",
+            allowed_scope=("src",),
+        )
+        nodes = [
+            NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "deterministic",
+                "local",
+                command=("true",),
+            ),
+            NodeSpec(
+                "verify",
+                contract.task_id,
+                "verify",
+                "deterministic",
+                "local",
+                command=("true",),
+                depends_on=("work",),
+                verifier=True,
+            ),
+        ]
+        self.store.create_task(contract, nodes, "cmd-missing-evidence")
+        self.store.queue_task(contract.task_id)
+        self.store.settle_node(
+            contract.task_id,
+            self.store.claim_ready_node("worker")["node_id"],
+            NodeResult("succeeded", "worker done"),
+        )
+        self.store.settle_node(
+            contract.task_id,
+            self.store.claim_ready_node("verifier")["node_id"],
+            NodeResult("succeeded", "verifier accepted"),
+        )
+        task = self.store.get_task(contract.task_id)
+        self.assertEqual(task["state"], "needs_fix")
+        self.assertIn("diff, test-log", task["blocker"])
+
+    def test_real_task_with_required_evidence_is_accepted(self) -> None:
+        contract = TaskContract(
+            task_id="complete-evidence",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="accept complete evidence",
+            allowed_scope=("src",),
+        )
+        nodes = [
+            NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "deterministic",
+                "local",
+                command=("true",),
+            ),
+            NodeSpec(
+                "verify",
+                contract.task_id,
+                "verify",
+                "deterministic",
+                "local",
+                command=("true",),
+                depends_on=("work",),
+                verifier=True,
+            ),
+        ]
+        self.store.create_task(contract, nodes, "cmd-complete-evidence")
+        self.store.queue_task(contract.task_id)
+        self.store.settle_node(
+            contract.task_id,
+            self.store.claim_ready_node("worker")["node_id"],
+            NodeResult("succeeded", "worker done", artifacts={"patch": "sha256:patch"}),
+        )
+        self.store.settle_node(
+            contract.task_id,
+            self.store.claim_ready_node("verifier")["node_id"],
+            NodeResult("succeeded", "verifier accepted", artifacts={"test-log": "sha256:test"}),
+        )
+        task = self.store.get_task(contract.task_id)
+        self.assertEqual(task["state"], "accepted")
+        self.assertEqual(task["verdict"], "verifier accepted")
+
     def test_restart_marks_running_node_indeterminate(self) -> None:
         nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
         self.store.create_task(self.contract, nodes, "cmd-recover")

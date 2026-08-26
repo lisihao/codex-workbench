@@ -26,6 +26,10 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .muted, .metric span, #updated, #cursor { color: var(--muted); font-size: 12px; }
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .tasks { display: grid; gap: 12px; }
+.acceptance { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+.acceptance-check { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--panel-2); }
+.acceptance-check strong { display: block; font-size: 13px; margin-bottom: 5px; }
+.acceptance-check p { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .task { border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: var(--panel-2); }
 .task-head { display: flex; gap: 12px; justify-content: space-between; align-items: start; }
 .task-actions { display: flex; align-items: center; gap: 8px; }

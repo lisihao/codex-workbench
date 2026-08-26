@@ -12,6 +12,9 @@
 - 不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，只允许产品订阅登录态。
 - 安装器为无人值守进程建立独立 `CODEX_HOME`；它只软链接用户现有 `auth.json`，不会加载个人 skills、会话、模型缓存或全局配置。
 - 已通过的验证 Evidence 在声明输入闭包、命令和运行时身份不变时复用；实现型 Worker 不复用。
+- `coordinator.lock` 是进程生命周期的排他权威租约；MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
+- 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
+- Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -39,7 +42,7 @@ codex-workbench request \
 
 ## Codex 原生入口
 
-MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用八个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制或显式处理不确定状态、读取事件、读取 Evidence Artifact，以及在契约授权后执行 GitHub 交付。
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用九个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制或显式处理不确定状态、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
 
 ```bash
 python3 scripts/install-macbook-client.py
@@ -87,10 +90,19 @@ Claude 没有稳定的官方 CLI 用量接口，因此系统不会猜测余额�
 codex-workbench quota set \
   --auth-ok --auth-method native-subscription \
   --five-hour 80 --weekly-all 70 --weekly-sonnet 65 \
+  --five-hour-window 2026-08-26T00 --weekly-window 2026-W35 \
   --source settings-usage
 ```
 
-任何池未知或剩余不高于 25% 时禁止新 Claude 任务；系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。
+任何池未知或剩余不高于 25% 时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。
+
+## A1–A12 验收面
+
+`codex-workbench acceptance`、MCP `workbench_acceptance_report`、`/api/acceptance` 与远程面板都从同一份 SQLite 账本计算验收状态。命令仅在十二项全部有真实 Evidence 时返回成功；MacBook 离线八小时、手机真机读取、Mac mini 整机重启和 Claude 网页 PPT 等外部旅程在没有回执时保持 `pending`，不会被 fixture 冒充完成。
+
+```bash
+codex-workbench acceptance
+```
 
 ## 远程面板
 

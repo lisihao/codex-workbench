@@ -16,8 +16,10 @@ import time
 import uuid
 
 from . import __version__
+from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore
+from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
@@ -59,33 +61,54 @@ def command_serve(args: argparse.Namespace) -> int:
             max_workers=args.max_workers or config.max_workers,
         )
     store = _store(config)
-    coordinator = Coordinator(store, config.state_root, max_workers=config.max_workers)
-    recovered = coordinator.recover()
-    coordinator_thread = threading.Thread(target=coordinator.run_forever, name="coordinator", daemon=True)
-    coordinator_thread.start()
-    server = WorkbenchHTTPServer(config, store)
-
-    def stop(*_args) -> None:
-        coordinator.stop()
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    print(
-        json.dumps(
+    lease = CoordinatorAuthorityLease(config.state_root / "coordinator.lock")
+    with lease as identity:
+        coordinator = Coordinator(store, config.state_root, max_workers=config.max_workers)
+        recovered = coordinator.recover()
+        ledger = store.health()
+        store.record_system_event(
+            "coordinator.started",
             {
-                "ok": True,
-                "version": __version__,
-                "listen": f"http://{config.host}:{config.port}",
+                **identity.to_dict(),
+                "ledger_cursor_before_start": ledger["cursor"],
+                "ledger_task_count": sum(ledger["task_counts"].values()),
                 "recovered_indeterminate": recovered,
-            }
-        ),
-        flush=True,
-    )
-    server.serve_forever(poll_interval=0.5)
-    coordinator.stop()
-    coordinator_thread.join(timeout=30)
-    server.server_close()
+            },
+        )
+        coordinator_thread = threading.Thread(target=coordinator.run_forever, name="coordinator", daemon=True)
+        coordinator_thread.start()
+        server: WorkbenchHTTPServer | None = None
+        try:
+            server = WorkbenchHTTPServer(config, store)
+
+            def stop(*_args) -> None:
+                coordinator.stop()
+                threading.Thread(target=server.shutdown, daemon=True).start()
+
+            signal.signal(signal.SIGTERM, stop)
+            signal.signal(signal.SIGINT, stop)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "version": __version__,
+                        "listen": f"http://{config.host}:{config.port}",
+                        "authority": identity.to_dict(),
+                        "recovered_indeterminate": recovered,
+                    }
+                ),
+                flush=True,
+            )
+            server.serve_forever(poll_interval=0.5)
+        finally:
+            coordinator.stop()
+            coordinator_thread.join(timeout=30)
+            if server is not None:
+                server.server_close()
+            store.record_system_event(
+                "coordinator.stopped",
+                {"instance_id": identity.instance_id, "boot_id": identity.boot_id},
+            )
     return 0
 
 
@@ -266,10 +289,18 @@ def command_quota(args: argparse.Namespace) -> int:
         weekly_sonnet_remaining=args.weekly_sonnet,
         weekly_fable_remaining=args.weekly_fable,
         source=args.source,
+        five_hour_window_id=args.five_hour_window,
+        weekly_window_id=args.weekly_window,
     )
     store.write_quota(snapshot)
     print(json.dumps({"ok": True, "snapshot": asdict(snapshot)}, ensure_ascii=False))
     return 0
+
+
+def command_acceptance(args: argparse.Namespace) -> int:
+    report = build_acceptance_report(_store(_config(args)))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["complete"] else 1
 
 
 def command_token(args: argparse.Namespace) -> int:
@@ -480,6 +511,8 @@ def build_parser() -> argparse.ArgumentParser:
     quota_set.add_argument("--weekly-all", type=float)
     quota_set.add_argument("--weekly-sonnet", type=float)
     quota_set.add_argument("--weekly-fable", type=float)
+    quota_set.add_argument("--five-hour-window")
+    quota_set.add_argument("--weekly-window")
     quota_set.add_argument("--source", default="manual")
     quota.set_defaults(func=command_quota)
 
@@ -488,6 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=command_doctor)
+
+    acceptance = sub.add_parser("acceptance", help="evaluate A1-A12 from durable runtime Evidence")
+    acceptance.set_defaults(func=command_acceptance)
 
     demo = sub.add_parser("fixture-demo")
     demo.add_argument("--repository", default=".")
@@ -501,7 +537,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         code = args.func(args)
-    except (CommandConflictError, KeyError, ValueError, StateConflictError) as error:
+    except (
+        CommandConflictError,
+        CoordinatorAuthorityError,
+        KeyError,
+        ValueError,
+        StateConflictError,
+    ) as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         code = 2
     raise SystemExit(code)

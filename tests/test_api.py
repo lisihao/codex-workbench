@@ -31,6 +31,10 @@ class APITests(unittest.TestCase):
                 self.assertTrue(snapshot["health"]["ok"])
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
+                self.assertEqual(len(snapshot["acceptance"]["checks"]), 12)
+                with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
+                    acceptance = json.load(response)
+                self.assertFalse(acceptance["complete"])
                 request = Request(
                     f"http://127.0.0.1:{port}/api/tasks/missing/control",
                     data=b'{"action":"pause"}',

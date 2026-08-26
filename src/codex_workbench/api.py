@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
+from .acceptance import build_acceptance_report
 from .config import WorkbenchConfig
 from .store import StateConflictError, WorkbenchStore
 
@@ -50,10 +51,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "quota": quota.__dict__ if quota else None,
+                    "acceptance": build_acceptance_report(self.server.store),
                     "diagnostics": {"stale_tasks": self.server.store.stale_tasks()},
                     "authenticated": self._authenticated(),
                 }
             )
+        if parsed.path == "/api/acceptance":
+            return self._json(build_acceptance_report(self.server.store))
         if parsed.path == "/api/events":
             query = parse_qs(parsed.query)
             after = int(query.get("after", ["0"])[0])

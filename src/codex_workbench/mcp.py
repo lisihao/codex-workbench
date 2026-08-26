@@ -7,6 +7,7 @@ import sys
 from typing import Any, TextIO
 
 from . import __version__
+from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
@@ -133,6 +134,15 @@ TOOLS: list[dict[str, Any]] = [
                 "artifact_ref": {"type": "string"},
                 "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000},
             },
+        },
+    },
+    {
+        "name": "workbench_acceptance_report",
+        "description": "Evaluate Workbench A1-A12 from the Mac mini durable Evidence ledger.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
         },
     },
 ]
@@ -270,6 +280,8 @@ class WorkbenchMCPServer:
                     "text": text[:limit],
                 }
             )
+        if name == "workbench_acceptance_report":
+            return self._text(build_acceptance_report(self.store))
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]

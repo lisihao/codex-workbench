@@ -7,8 +7,10 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from codex_workbench.model import NodeSpec, TaskContract
+from codex_workbench.acceptance import build_acceptance_report
+from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
 
@@ -65,6 +67,69 @@ class ServiceTests(unittest.TestCase):
             cursors = [event["cursor"] for event in events]
             self.assertEqual(cursors, sorted(cursors))
             self.assertIn("task.state_changed", {event["event_type"] for event in events})
+
+    def test_unavailable_claude_node_falls_back_once_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            contract = TaskContract(
+                task_id="fallback",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="fallback without replaying Claude",
+                allowed_scope=("README.md",),
+                executor_model="gpt-5.6-luna",
+            )
+            node = NodeSpec(
+                "work",
+                "fallback",
+                "work",
+                "claude",
+                "sonnet",
+                "inspect the fixture",
+                read_scopes=("README.md",),
+            )
+            store.create_task(contract, [node], "fallback-create")
+            store.queue_task("fallback")
+            claimed = store.claim_ready_node("worker-1")
+            coordinator = Coordinator(store, state, max_workers=1)
+
+            class StubExecutor:
+                def __init__(self, result: NodeResult):
+                    self.result = result
+                    self.calls = 0
+
+                def execute(self, _request):
+                    self.calls += 1
+                    return self.result
+
+            claude = StubExecutor(NodeResult("blocked", "Claude native-subscription authentication is unavailable"))
+            codex = StubExecutor(NodeResult("succeeded", "Codex fallback completed", actual_model="gpt-5.6-luna"))
+            with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
+                coordinator._execute_claimed(claimed)
+            coordinator._pool.shutdown(wait=True)
+
+            task = store.get_task("fallback")
+            self.assertEqual(task["nodes"][0]["state"], "accepted")
+            self.assertEqual(task["nodes"][0]["result"]["actual_model"], "gpt-5.6-luna")
+            self.assertEqual(claude.calls, 1)
+            self.assertEqual(codex.calls, 1)
+            routed = [event for event in store.read_events(task_id="fallback") if event["event_type"] == "node.routed"]
+            self.assertEqual(routed[0]["payload"]["reason"], "Claude native-subscription authentication is unavailable")
+            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            self.assertEqual(checks["A8"]["status"], "pending")
+            self.assertEqual(checks["A9"]["status"], "ok")
 
     def test_parallel_worktree_patches_are_composed_for_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -166,6 +231,7 @@ class ServiceTests(unittest.TestCase):
                     base_sha=base_sha,
                     objective="verify the declared input",
                     allowed_scope=("checked.txt",),
+                    required_artifacts=("test-log", "verdict"),
                 )
                 script = (
                     "from pathlib import Path; "

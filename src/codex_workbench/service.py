@@ -110,6 +110,29 @@ class Coordinator:
                 return
             executor = self._executor(spec["executor"])
             result = executor.execute(request)
+            if spec["executor"] == "claude" and result.status == "blocked":
+                fallback_model = contract["executor_model"]
+                self.store.record_node_event(
+                    "node.routed",
+                    claimed["task_id"],
+                    claimed["node_id"],
+                    {
+                        "attempt": claimed["attempt"],
+                        "from": "claude",
+                        "to": "codex",
+                        "model": fallback_model,
+                        "reason": result.summary,
+                    },
+                )
+                request = ExecutionRequest(
+                    task_id=request.task_id,
+                    node_id=request.node_id,
+                    attempt=request.attempt,
+                    contract=request.contract,
+                    spec={**request.spec, "executor": "codex", "model": fallback_model},
+                    worktree=request.worktree,
+                )
+                result = self._executor("codex").execute(request)
             result = validate_worker_scope(self.worktrees, request, result)
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(worktree, contract["base_sha"])

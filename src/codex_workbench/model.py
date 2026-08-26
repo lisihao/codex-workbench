@@ -180,6 +180,8 @@ class QuotaSnapshot:
     weekly_sonnet_remaining: float | None
     source: str
     weekly_fable_remaining: float | None = None
+    five_hour_window_id: str | None = None
+    weekly_window_id: str | None = None
 
     def remaining_for(self, model: str) -> tuple[float | None, ...]:
         values: list[float | None] = [self.five_hour_remaining, self.weekly_all_remaining]

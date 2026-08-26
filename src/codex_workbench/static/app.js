@@ -20,6 +20,10 @@ function renderTask(task) {
   return `<article class="task"><div class="task-head"><div><h3>${escapeHtml(task.task_id)}</h3><p>${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="nodes">${nodes}</div></article>`;
 }
 
+function renderAcceptance(check) {
+  return `<article class="acceptance-check"><span class="pill ${escapeHtml(check.status)}">${escapeHtml(check.id)} · ${escapeHtml(check.status)}</span><div><strong>${escapeHtml(check.requirement)}</strong><p>${escapeHtml(check.evidence)}</p></div></article>`;
+}
+
 async function refreshSnapshot() {
   const response = await fetch("/api/snapshot", {cache: "no-store"});
   const data = await response.json();
@@ -29,6 +33,7 @@ async function refreshSnapshot() {
   const counts = data.health.task_counts || {};
   const active = (counts.running || 0) + (counts.queued || 0) + (counts.verifying || 0);
   const quota = data.quota;
+  const acceptance = data.acceptance;
   authenticated = data.authenticated;
   document.querySelector("#metrics").innerHTML = [
     metric("任务总数", data.tasks.length),
@@ -36,8 +41,11 @@ async function refreshSnapshot() {
     metric("已验收", counts.accepted || 0, "ok"),
     metric("状态陈旧", data.diagnostics.stale_tasks.length, data.diagnostics.stale_tasks.length ? "error" : "ok"),
     metric("Claude 五小时剩余", quota?.five_hour_remaining == null ? "未知/禁用" : `${quota.five_hour_remaining}%`, quota?.five_hour_remaining > 25 ? "ok" : "error"),
+    metric("验收通过", `${acceptance.counts.ok}/12`, acceptance.complete ? "ok" : "pending"),
     metric("事件游标", data.health.cursor),
   ].join("");
+  document.querySelector("#acceptance-summary").textContent = `${acceptance.counts.ok} ok · ${acceptance.counts.pending} pending · ${acceptance.counts.error} error`;
+  document.querySelector("#acceptance").innerHTML = acceptance.checks.map(renderAcceptance).join("");
   document.querySelector("#tasks").innerHTML = data.tasks.length ? data.tasks.map(renderTask).join("") : '<p class="muted">暂无任务</p>';
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
   document.querySelector("#updated").textContent = `刷新 ${new Date().toLocaleTimeString()}`;

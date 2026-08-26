@@ -170,7 +170,12 @@ class CodexExecutor(ProcessExecutor):
             structured = None
             if output_path.exists():
                 try:
-                    structured = json.loads(output_path.read_text())
+                    structured_text = output_path.read_text()
+                    structured = json.loads(structured_text)
+                    structured_ref = self.artifacts.put_text(structured_text, "result.json")
+                    artifacts = {**artifacts, "structured-result": structured_ref}
+                    if verifier:
+                        artifacts = {**artifacts, "test-log": structured_ref, "verdict": structured_ref}
                 except json.JSONDecodeError:
                     structured = None
         summary = (

@@ -46,8 +46,13 @@ class MCPTests(unittest.TestCase):
                 "workbench_deliver_github",
                 "workbench_read_events",
                 "workbench_read_artifact",
+                "workbench_acceptance_report",
             },
         )
+
+        report = json.loads(self.call("workbench_acceptance_report", {})["content"][0]["text"])
+        self.assertFalse(report["complete"])
+        self.assertEqual(len(report["checks"]), 12)
 
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(

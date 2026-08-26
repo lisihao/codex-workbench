@@ -636,6 +636,33 @@ class WorkbenchStore:
                 for row in rows
             ]
 
+    def record_system_event(self, event_type: str, payload: dict[str, Any]) -> int:
+        with self.transaction() as connection:
+            return self._event(connection, event_type, None, None, payload)
+
+    def record_node_event(
+        self,
+        event_type: str,
+        task_id: str,
+        node_id: str,
+        payload: dict[str, Any],
+    ) -> int:
+        with self.transaction() as connection:
+            return self._event(connection, event_type, task_id, node_id, payload)
+
+    def authority_status(self) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT event_type, payload_json, created_at FROM events
+                WHERE event_type IN ('coordinator.started', 'coordinator.stopped')
+                ORDER BY cursor DESC LIMIT 1
+                """
+            ).fetchone()
+            if row is None or row["event_type"] != "coordinator.started":
+                return None
+            return {**json.loads(row["payload_json"]), "active": True, "observed_at": row["created_at"]}
+
     def claim_ready_node(self, worker_id: str) -> dict[str, Any] | None:
         timestamp = now_iso()
         with self.transaction() as connection:
@@ -737,7 +764,11 @@ class WorkbenchStore:
         timestamp = now_iso()
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT state, attempt, spec_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                """
+                SELECT n.state, n.attempt, n.spec_json, t.contract_json
+                FROM nodes n JOIN tasks t USING(task_id)
+                WHERE n.task_id = ? AND n.node_id = ?
+                """,
                 (task_id, node_id),
             ).fetchone()
             if row is None:
@@ -745,6 +776,18 @@ class WorkbenchStore:
             if row["state"] != "running":
                 raise StateConflictError(f"node {node_id} is {row['state']}, expected running")
             spec = json.loads(row["spec_json"])
+            contract = json.loads(row["contract_json"])
+            if result.status == "succeeded" and spec.get("verifier"):
+                missing = self._missing_required_artifacts(connection, task_id, contract, result)
+                if missing:
+                    result = NodeResult(
+                        status="failed",
+                        summary=f"required acceptance Evidence is missing: {', '.join(missing)}",
+                        artifacts=result.artifacts,
+                        actual_model=result.actual_model,
+                        exit_code=result.exit_code,
+                        retryable=False,
+                    )
             if result.status == "succeeded":
                 node_state = "accepted"
             elif result.status == "indeterminate":
@@ -769,10 +812,9 @@ class WorkbenchStore:
             )
 
             task = connection.execute(
-                "SELECT state, state_revision, contract_json FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             assert task is not None
-            contract = json.loads(task["contract_json"])
             next_state = task["state"]
             blocker: str | None = None
             verdict: str | None = None
@@ -834,6 +876,38 @@ class WorkbenchStore:
                     None,
                     {"from": task["state"], "to": next_state, "revision": revision, "blocker": blocker},
                 )
+
+    @staticmethod
+    def _missing_required_artifacts(
+        connection: sqlite3.Connection,
+        task_id: str,
+        contract: dict[str, Any],
+        verifier_result: NodeResult,
+    ) -> list[str]:
+        rows = connection.execute(
+            "SELECT spec_json, result_json FROM nodes WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        specs = [json.loads(row["spec_json"]) for row in rows]
+        if specs and all(spec["executor"] == "fixture" for spec in specs):
+            return []
+        artifact_keys = set(verifier_result.artifacts)
+        for row in rows:
+            if row["result_json"]:
+                artifact_keys.update(json.loads(row["result_json"]).get("artifacts", {}))
+        missing: list[str] = []
+        for required in contract.get("required_artifacts", []):
+            if required == "diff":
+                present = "patch" in artifact_keys
+            elif required == "test-log":
+                present = bool({"test-log", "stdout", "stderr"} & artifact_keys)
+            elif required == "verdict":
+                present = bool(verifier_result.summary.strip())
+            else:
+                present = required in artifact_keys
+            if not present:
+                missing.append(required)
+        return missing
 
     def recover_interrupted(self) -> int:
         timestamp = now_iso()
@@ -897,6 +971,17 @@ class WorkbenchStore:
             ).fetchone()
             return QuotaSnapshot(**json.loads(row["snapshot_json"])) if row else None
 
+    def list_quota_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [json.loads(row["snapshot_json"]) for row in rows]
+
     def health(self) -> dict[str, Any]:
         with self.connection() as connection:
             schema = int(
@@ -915,7 +1000,13 @@ class WorkbenchStore:
                     "SELECT state, COUNT(*) AS count FROM tasks GROUP BY state"
                 ).fetchall()
             }
-        return {"ok": True, "schema_version": schema, "cursor": cursor, "task_counts": counts}
+        return {
+            "ok": True,
+            "schema_version": schema,
+            "cursor": cursor,
+            "task_counts": counts,
+            "authority": self.authority_status(),
+        }
 
     def stale_tasks(self, max_age_seconds: int = 300) -> list[dict[str, str]]:
         cutoff = datetime.now(UTC).timestamp() - max_age_seconds
