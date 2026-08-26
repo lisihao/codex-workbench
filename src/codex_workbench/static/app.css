@@ -26,6 +26,11 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .muted, .metric span, #updated, #cursor { color: var(--muted); font-size: 12px; }
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .tasks { display: grid; gap: 12px; }
+.approvals { display: grid; gap: 10px; }
+.approval { display: flex; justify-content: space-between; align-items: center; gap: 16px; border: 1px solid color-mix(in srgb, var(--red) 55%, var(--line)); border-radius: 12px; padding: 14px; background: var(--panel-2); }
+.approval h3 { margin: 10px 0 5px; font-size: 14px; }
+.approval p { color: var(--muted); font-size: 12px; margin-bottom: 7px; }
+.approval-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .acceptance { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
 .acceptance-check { display: grid; grid-template-columns: auto 1fr; align-items: start; gap: 12px; border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--panel-2); }
 .acceptance-check strong { display: block; font-size: 13px; margin-bottom: 5px; }
@@ -35,6 +40,8 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .task-actions { display: flex; align-items: center; gap: 8px; }
 .task h3 { margin: 0 0 6px; font-size: 15px; }
 .task p { color: var(--muted); font-size: 13px; line-height: 1.45; }
+.task-brief { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 11px; }
+.task-brief strong { color: var(--text); display: block; margin-top: 3px; }
 .nodes { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
 .node { border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font: 11px ui-monospace, monospace; }
 .pill { border: 1px solid currentColor; border-radius: 999px; padding: 7px 12px; font: 700 11px ui-monospace, monospace; }
@@ -52,6 +59,25 @@ input, button { font: inherit; padding: 11px; border-radius: 9px; border: 1px so
 input { color: var(--text); background: var(--bg); }
 button { background: var(--green); color: #0b1811; font-weight: 700; cursor: pointer; }
 button.small { width: auto; padding: 7px 10px; font-size: 11px; }
+button.warning { background: var(--amber); }
+button.danger { background: var(--red); }
 .login-link { color: var(--blue); font-size: 11px; text-decoration: none; }
 .error { color: var(--red) !important; }
-@media (max-width: 640px) { header { align-items: start; } .event { grid-template-columns: 64px 1fr; } .event span:last-child { grid-column: 1 / -1; } }
+@media (max-width: 640px) {
+  header { align-items: start; padding: 20px 16px 14px; }
+  h1 { font-size: 30px; }
+  main { width: min(100% - 20px, 1180px); margin-top: 16px; gap: 14px; }
+  section { padding: 14px; border-radius: 12px; }
+  .desktop-detail { display: none; }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric { padding: 12px; }
+  .metric strong { font-size: 18px; }
+  .approval, .task-head { align-items: stretch; flex-direction: column; }
+  .approval-actions, .task-actions { justify-content: flex-start; }
+  .approval-actions button { flex: 1; }
+  .task-brief { grid-template-columns: 1fr; }
+  .nodes { display: grid; }
+  .node { border-radius: 8px; }
+  .event { grid-template-columns: 64px 1fr; }
+  .event span:last-child { grid-column: 1 / -1; }
+}

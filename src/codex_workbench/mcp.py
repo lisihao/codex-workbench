@@ -145,6 +145,32 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {},
         },
     },
+    {
+        "name": "workbench_list_approvals",
+        "description": "List durable pending approval receipts from the Mac mini authority.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "pending_only": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "workbench_decide_approval",
+        "description": "Apply an explicit retry, fail, or cancel decision to a pending receipt.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["approval_id", "decision", "expected_revision"],
+            "properties": {
+                "approval_id": {"type": "string"},
+                "decision": {"enum": ["retry", "fail", "cancel"]},
+                "expected_revision": {"type": "integer", "minimum": 1},
+            },
+        },
+    },
 ]
 
 
@@ -282,6 +308,26 @@ class WorkbenchMCPServer:
             )
         if name == "workbench_acceptance_report":
             return self._text(build_acceptance_report(self.store))
+        if name == "workbench_list_approvals":
+            return self._text(
+                self.store.list_approvals(
+                    pending_only=bool(arguments.get("pending_only", True)),
+                    limit=int(arguments.get("limit", 100)),
+                )
+            )
+        if name == "workbench_decide_approval":
+            revision = self.store.decide_approval(
+                arguments["approval_id"],
+                arguments["decision"],
+                expected_revision=int(arguments["expected_revision"]),
+            )
+            return self._text(
+                {
+                    "ok": True,
+                    "approval_id": arguments["approval_id"],
+                    "revision": revision,
+                }
+            )
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]

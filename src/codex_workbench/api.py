@@ -50,6 +50,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "build": self._build_manifest(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
+                    "approvals": self.server.store.list_approvals(),
                     "quota": quota.__dict__ if quota else None,
                     "quota_policy": quota.policy_summary() if quota else None,
                     "acceptance": build_acceptance_report(self.server.store),
@@ -113,6 +114,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 )
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path.startswith("/api/approvals/") and parsed.path.endswith("/decide"):
+            approval_id = unquote(
+                parsed.path.removeprefix("/api/approvals/").removesuffix("/decide")
+            )
+            try:
+                body = json.loads(self._read_body() or b"{}")
+                revision = self.server.store.decide_approval(
+                    approval_id,
+                    str(body["decision"]),
+                    expected_revision=int(body["expected_revision"]),
+                )
+                return self._json({"ok": True, "revision": revision})
+            except KeyError:
+                return self._json({"error": "approval not found"}, HTTPStatus.NOT_FOUND)
+            except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
         if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/control"):
             task_id = unquote(parsed.path.removeprefix("/api/tasks/").removesuffix("/control"))
             try:

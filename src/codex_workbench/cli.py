@@ -244,6 +244,30 @@ def command_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_approval(args: argparse.Namespace) -> int:
+    store = _store(_config(args))
+    if args.approval_action == "list":
+        result: object = store.list_approvals(
+            pending_only=not args.all,
+            limit=args.limit,
+        )
+    elif args.approval_action == "decide":
+        revision = store.decide_approval(
+            args.approval_id,
+            args.decision,
+            expected_revision=args.expected_revision,
+        )
+        result = {
+            "ok": True,
+            "approval_id": args.approval_id,
+            "revision": revision,
+        }
+    else:
+        raise AssertionError(args.approval_action)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_events(args: argparse.Namespace) -> int:
     store = _store(_config(args))
     print(
@@ -528,6 +552,17 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--resolution", choices=("retry", "fail", "cancel"), required=True)
     resolve.add_argument("--expected-revision", type=int, required=True)
     task.set_defaults(func=command_task)
+
+    approval = sub.add_parser("approval", help="list or decide durable approval receipts")
+    approval_sub = approval.add_subparsers(dest="approval_action", required=True)
+    approval_list = approval_sub.add_parser("list")
+    approval_list.add_argument("--all", action="store_true")
+    approval_list.add_argument("--limit", type=int, default=100)
+    approval_decide = approval_sub.add_parser("decide")
+    approval_decide.add_argument("approval_id")
+    approval_decide.add_argument("--decision", choices=("retry", "fail", "cancel"), required=True)
+    approval_decide.add_argument("--expected-revision", type=int, required=True)
+    approval.set_defaults(func=command_approval)
 
     events = sub.add_parser("events")
     events.add_argument("--after", type=int, default=0)

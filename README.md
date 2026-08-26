@@ -19,6 +19,7 @@
 - SQLite v4 分开保存原始节点契约和 `effective_executor/effective_model`，因此面板展示的是实时路由与真实并发，不会把 Codex 接管误标成 Claude。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
 - A1、A2、A12 不再永久写死为 pending：MacBook 心跳间隔、已登录手机的真实渲染回执和本地管理员导入的 PPT/PDF 工件都进入 Mac mini 同一条 Evidence 账本。
+- 不确定执行会原子生成持久 `approval` 回执；手机控制面以任务阶段、阻塞原因和下一步为主视图，可带 task revision 明确选择重试、失败或取消。重复提交同一决策保持幂等，冲突决策 fail loud。
 
 ```bash
 PYTHONPATH=src python3 -m codex_workbench init
@@ -46,7 +47,7 @@ codex-workbench request \
 
 ## Codex 原生入口
 
-MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用九个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制或显式处理不确定状态、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
 
 ```bash
 python3 scripts/install-macbook-client.py
@@ -126,7 +127,12 @@ Mac mini 正式服务只绑定 loopback。通过 Tailscale Serve 将其映射成
 tailscale serve --bg --https=10443 http://127.0.0.1:8766
 ```
 
-MacBook 和手机读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断线只产生 stale 投影，不会启动第二个协调器。控制操作需要 `codex-workbench token` 返回的本地令牌。
+MacBook 和手机读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断线只产生 stale 投影，不会启动第二个协调器。手机窄屏隐藏工程验收明细，优先显示任务阶段、阻塞/下一步和待处理审批。控制操作需要 `codex-workbench token` 返回的本地令牌。
+
+```bash
+codex-workbench approval list
+codex-workbench approval decide <approval-id> --decision retry --expected-revision <revision>
+```
 
 如果 MacBook 的 Shadowrocket Fake-IP 覆盖了 Tailscale MagicDNS，安装自恢复驾驶舱隧道，不修改全局代理规则：
 

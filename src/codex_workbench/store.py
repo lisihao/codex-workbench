@@ -522,6 +522,23 @@ class WorkbenchStore:
         *,
         expected_revision: int,
     ) -> int:
+        with self.connection() as connection:
+            approval = connection.execute(
+                """
+                SELECT approval_id FROM approvals
+                WHERE task_id = ? AND kind = 'indeterminate_resolution'
+                  AND decision IS NULL
+                  AND json_extract(request_json, '$.node_id') = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (task_id, node_id),
+            ).fetchone()
+        if approval is not None:
+            return self.decide_approval(
+                str(approval["approval_id"]),
+                resolution,
+                expected_revision=expected_revision,
+            )
         if resolution not in {"retry", "fail", "cancel"}:
             raise ValueError("resolution must be retry, fail, or cancel")
         timestamp = now_iso()
@@ -567,6 +584,202 @@ class WorkbenchStore:
                 {"resolution": resolution, "task_revision": revision},
             )
             return revision
+
+    def list_approvals(
+        self,
+        *,
+        pending_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE a.decision IS NULL" if pending_only else ""
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT a.*, t.state_revision AS task_revision
+                FROM approvals a JOIN tasks t USING(task_id)
+                {where}
+                ORDER BY CASE WHEN a.decision IS NULL THEN 0 ELSE 1 END,
+                         a.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [self._approval_row(row) for row in rows]
+
+    def decide_approval(
+        self,
+        approval_id: str,
+        decision: str,
+        *,
+        expected_revision: int,
+    ) -> int:
+        if decision not in {"retry", "fail", "cancel"}:
+            raise ValueError("decision must be retry, fail, or cancel")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            approval = connection.execute(
+                """
+                SELECT a.*, t.state_revision AS task_revision
+                FROM approvals a JOIN tasks t USING(task_id)
+                WHERE a.approval_id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            if approval is None:
+                raise KeyError(approval_id)
+            if approval["kind"] != "indeterminate_resolution":
+                raise StateConflictError(f"unsupported approval kind {approval['kind']}")
+            request = json.loads(approval["request_json"])
+            if approval["decision"] is not None:
+                if approval["decision"] == decision:
+                    return int(request["decision_revision"])
+                raise StateConflictError(
+                    f"approval {approval_id} was already decided as {approval['decision']}"
+                )
+            if int(approval["task_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {approval['task_revision']}"
+                )
+            task_id = str(approval["task_id"])
+            node_id = str(request["node_id"])
+            node = connection.execute(
+                "SELECT state FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            if node is None:
+                raise KeyError((task_id, node_id))
+            if node["state"] != "indeterminate":
+                raise StateConflictError(
+                    f"node {node_id} is {node['state']}, expected indeterminate"
+                )
+            node_state = (
+                "pending" if decision == "retry" else "failed" if decision == "fail" else "cancelled"
+            )
+            connection.execute(
+                """
+                UPDATE nodes SET state = ?, worker_id = NULL,
+                                 effective_executor = NULL, effective_model = NULL,
+                                 started_at = NULL, settled_at = NULL, updated_at = ?
+                WHERE task_id = ? AND node_id = ?
+                """,
+                (node_state, timestamp, task_id, node_id),
+            )
+            remaining_indeterminate = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM nodes WHERE task_id = ? AND state = 'indeterminate'",
+                    (task_id,),
+                ).fetchone()["count"]
+            )
+            if decision == "cancel":
+                task_state = "cancelled"
+                blocker = None
+            elif remaining_indeterminate:
+                task_state = "needs_approval"
+                blocker = f"{remaining_indeterminate} indeterminate node(s) still require approval"
+            else:
+                task_state = "queued" if decision == "retry" else "needs_fix"
+                blocker = None
+            revision = int(approval["task_revision"]) + 1
+            connection.execute(
+                """
+                UPDATE tasks SET state = ?, state_revision = ?, updated_at = ?, blocker = ?
+                WHERE task_id = ?
+                """,
+                (task_state, revision, timestamp, blocker, task_id),
+            )
+            request["decision_revision"] = revision
+            connection.execute(
+                """
+                UPDATE approvals SET decision = ?, decided_at = ?, request_json = ?
+                WHERE approval_id = ?
+                """,
+                (decision, timestamp, canonical_json(request), approval_id),
+            )
+            self._event(
+                connection,
+                "approval.decided",
+                task_id,
+                node_id,
+                {
+                    "approval_id": approval_id,
+                    "decision": decision,
+                    "task_revision": revision,
+                },
+            )
+            self._event(
+                connection,
+                "node.indeterminate_resolved",
+                task_id,
+                node_id,
+                {
+                    "approval_id": approval_id,
+                    "resolution": decision,
+                    "task_revision": revision,
+                },
+            )
+            return revision
+
+    @staticmethod
+    def _approval_row(row: sqlite3.Row) -> dict[str, Any]:
+        request = json.loads(row["request_json"])
+        return {
+            "approval_id": row["approval_id"],
+            "task_id": row["task_id"],
+            "kind": row["kind"],
+            "request": request,
+            "decision": row["decision"],
+            "decided_at": row["decided_at"],
+            "created_at": row["created_at"],
+            "task_revision": int(row["task_revision"]),
+            "decision_revision": request.get("decision_revision"),
+        }
+
+    @staticmethod
+    def _create_indeterminate_approval(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+        task_revision: int,
+        reason: str,
+    ) -> str:
+        approval_id = "approval-" + canonical_hash(
+            {
+                "kind": "indeterminate_resolution",
+                "task_id": task_id,
+                "node_id": node_id,
+                "attempt": attempt,
+            }
+        )[:24]
+        request = {
+            "node_id": node_id,
+            "attempt": attempt,
+            "task_revision_at_request": task_revision,
+            "reason": reason,
+            "allowed_decisions": ["retry", "fail", "cancel"],
+        }
+        inserted = connection.execute(
+            """
+            INSERT OR IGNORE INTO approvals(
+                approval_id, task_id, kind, request_json, created_at
+            ) VALUES(?, ?, 'indeterminate_resolution', ?, ?)
+            """,
+            (approval_id, task_id, canonical_json(request), now_iso()),
+        ).rowcount
+        if inserted:
+            WorkbenchStore._event(
+                connection,
+                "approval.requested",
+                task_id,
+                node_id,
+                {
+                    "approval_id": approval_id,
+                    "kind": "indeterminate_resolution",
+                    "attempt": attempt,
+                    "task_revision": task_revision,
+                },
+            )
+        return approval_id
 
     def list_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -933,6 +1146,7 @@ class WorkbenchStore:
                 "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             assert task is not None
+            task_revision = int(task["state_revision"])
             next_state = task["state"]
             blocker: str | None = None
             verdict: str | None = None
@@ -980,7 +1194,7 @@ class WorkbenchStore:
                     next_state = "verifying"
 
             if next_state != task["state"] or blocker or verdict:
-                revision = int(task["state_revision"]) + 1
+                revision = task_revision + 1
                 connection.execute(
                     """
                     UPDATE tasks SET state = ?, state_revision = ?, updated_at = ?,
@@ -994,6 +1208,16 @@ class WorkbenchStore:
                     task_id,
                     None,
                     {"from": task["state"], "to": next_state, "revision": revision, "blocker": blocker},
+                )
+                task_revision = revision
+            if node_state == "indeterminate":
+                self._create_indeterminate_approval(
+                    connection,
+                    task_id,
+                    node_id,
+                    int(row["attempt"]),
+                    task_revision,
+                    result.summary,
                 )
 
     @staticmethod
@@ -1054,12 +1278,26 @@ class WorkbenchStore:
                     """,
                     (timestamp, f"node {row['node_id']} is indeterminate after restart", row["task_id"]),
                 )
+                task_revision = int(
+                    connection.execute(
+                        "SELECT state_revision FROM tasks WHERE task_id = ?",
+                        (row["task_id"],),
+                    ).fetchone()["state_revision"]
+                )
                 self._event(
                     connection,
                     "node.indeterminate",
                     row["task_id"],
                     row["node_id"],
                     {"attempt": row["attempt"], "reason": "coordinator_restart"},
+                )
+                self._create_indeterminate_approval(
+                    connection,
+                    row["task_id"],
+                    row["node_id"],
+                    int(row["attempt"]),
+                    task_revision,
+                    result.summary,
                 )
             return len(rows)
 

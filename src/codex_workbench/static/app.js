@@ -16,16 +16,28 @@ function controls(task) {
 }
 
 function renderTask(task) {
+  const activeNode = task.nodes.find((node) => ["running", "blocked", "indeterminate"].includes(node.state));
+  const nextNode = task.nodes.find((node) => node.state === "pending");
+  const phase = activeNode ? `${activeNode.node_id} · ${activeNode.state}` : task.state;
+  const nextAction = task.blocker || (nextNode ? `下一节点：${nextNode.node_id}` : task.verdict || "等待状态推进");
   const nodes = task.nodes.map((node) => {
     const executor = node.effective_executor || node.executor;
     const model = node.result?.actual_model || node.effective_model || node.model;
     return `<span class="node ${escapeHtml(node.state)}">${escapeHtml(node.node_id)} · ${escapeHtml(executor)} / ${escapeHtml(model)} · ${escapeHtml(node.state)}</span>`;
   }).join("");
-  return `<article class="task"><div class="task-head"><div><h3>${escapeHtml(task.task_id)}</h3><p>${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="nodes">${nodes}</div></article>`;
+  return `<article class="task"><div class="task-head"><div><h3>${escapeHtml(task.task_id)}</h3><p>${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="task-brief"><span>阶段 <strong>${escapeHtml(phase)}</strong></span><span>下一步 <strong>${escapeHtml(nextAction)}</strong></span></div><div class="nodes">${nodes}</div></article>`;
 }
 
 function renderAcceptance(check) {
   return `<article class="acceptance-check"><span class="pill ${escapeHtml(check.status)}">${escapeHtml(check.id)} · ${escapeHtml(check.status)}</span><div><strong>${escapeHtml(check.requirement)}</strong><p>${escapeHtml(check.evidence)}</p></div></article>`;
+}
+
+function renderApproval(approval) {
+  const request = approval.request || {};
+  const buttons = authenticated
+    ? `<div class="approval-actions"><button class="small" data-approval="${escapeHtml(approval.approval_id)}" data-decision="retry" data-revision="${escapeHtml(approval.task_revision)}">重试</button><button class="small warning" data-approval="${escapeHtml(approval.approval_id)}" data-decision="fail" data-revision="${escapeHtml(approval.task_revision)}">标记失败</button><button class="small danger" data-approval="${escapeHtml(approval.approval_id)}" data-decision="cancel" data-revision="${escapeHtml(approval.task_revision)}">取消任务</button></div>`
+    : '<a class="login-link" href="/login">登录后审批</a>';
+  return `<article class="approval"><div><span class="pill needs_approval">${escapeHtml(approval.kind)}</span><h3>${escapeHtml(approval.task_id)} · ${escapeHtml(request.node_id)}</h3><p>${escapeHtml(request.reason)}</p><span class="muted">attempt ${escapeHtml(request.attempt)} · revision ${escapeHtml(approval.task_revision)}</span></div>${buttons}</article>`;
 }
 
 async function refreshSnapshot() {
@@ -45,6 +57,7 @@ async function refreshSnapshot() {
   const highCap = Math.max(quotaPolicy?.models?.opus?.max_concurrency ?? 0, quotaPolicy?.models?.fable?.max_concurrency ?? 0);
   const quotaZones = quotaPolicy?.zones ? `O ${quotaPolicy.zones.opus} · S ${quotaPolicy.zones.sonnet} · F ${quotaPolicy.zones.fable}` : "unknown";
   const acceptance = data.acceptance;
+  const approvals = data.approvals || [];
   authenticated = data.authenticated;
   document.querySelector("#metrics").innerHTML = [
     metric("任务总数", data.tasks.length),
@@ -55,15 +68,31 @@ async function refreshSnapshot() {
     metric("Claude 调度区", quotaZones, quotaPolicy?.zone === "green" ? "ok" : quotaPolicy?.zone === "yellow" || quotaPolicy?.zone === "mixed" ? "pending" : "error"),
     metric("Claude 当前并发", `高阶 ${activeHigh}/${highCap} · S ${activeSonnet}/${sonnetCap}`, activeHigh || activeSonnet ? "running" : ""),
     metric("验收通过", `${acceptance.counts.ok}/12`, acceptance.complete ? "ok" : "pending"),
+    metric("待处理审批", approvals.length, approvals.length ? "error" : "ok"),
     metric("事件游标", data.health.cursor),
   ].join("");
+  document.querySelector("#approval-summary").textContent = approvals.length ? `${approvals.length} pending` : "0 pending";
+  document.querySelector("#approvals").innerHTML = approvals.length ? approvals.map(renderApproval).join("") : '<p class="muted">当前没有待处理审批</p>';
   document.querySelector("#acceptance-summary").textContent = `${acceptance.counts.ok} ok · ${acceptance.counts.pending} pending · ${acceptance.counts.error} error`;
   document.querySelector("#acceptance").innerHTML = acceptance.checks.map(renderAcceptance).join("");
   document.querySelector("#tasks").innerHTML = data.tasks.length ? data.tasks.map(renderTask).join("") : '<p class="muted">暂无任务</p>';
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
+  document.querySelectorAll("button[data-approval]").forEach((button) => button.addEventListener("click", decideApproval));
   document.querySelector("#updated").textContent = `刷新 ${new Date().toLocaleTimeString()}`;
   cursor = Math.max(cursor, data.health.cursor || 0);
   await recordPhoneObservation(data);
+}
+
+async function decideApproval(event) {
+  const button = event.currentTarget;
+  document.querySelectorAll(`button[data-approval="${CSS.escape(button.dataset.approval)}"]`).forEach((item) => { item.disabled = true; });
+  const response = await fetch(`/api/approvals/${encodeURIComponent(button.dataset.approval)}/decide`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({decision: button.dataset.decision, expected_revision: Number(button.dataset.revision)}),
+  });
+  if (!response.ok) alert((await response.json()).error || "审批失败");
+  await refreshSnapshot();
 }
 
 async function recordPhoneObservation(data) {

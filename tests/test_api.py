@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.config import WorkbenchConfig
-from codex_workbench.model import QuotaSnapshot
+from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.store import WorkbenchStore
 
 
@@ -84,6 +84,47 @@ class APITests(unittest.TestCase):
                     acceptance = json.load(response)
                 checks = {check["id"]: check for check in acceptance["checks"]}
                 self.assertEqual(checks["A2"]["status"], "ok")
+
+                contract = TaskContract(
+                    task_id="phone-approval",
+                    repository=str(root),
+                    base_sha="fixture",
+                    objective="approve an indeterminate node from the phone cockpit",
+                    allowed_scope=("tests",),
+                )
+                store.create_task(
+                    contract,
+                    [NodeSpec("work", contract.task_id, "work", "fixture", "fixture", "ok")],
+                    "phone-approval-create",
+                )
+                store.queue_task(contract.task_id)
+                store.claim_ready_node("worker")
+                store.settle_node(
+                    contract.task_id,
+                    "work",
+                    NodeResult("indeterminate", "fixture outcome unknown"),
+                )
+                with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
+                    snapshot = json.load(response)
+                approval = snapshot["approvals"][0]
+                decision = Request(
+                    f"http://127.0.0.1:{port}/api/approvals/{approval['approval_id']}/decide",
+                    data=json.dumps(
+                        {
+                            "decision": "retry",
+                            "expected_revision": approval["task_revision"],
+                        }
+                    ).encode(),
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {config.token()}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urlopen(decision, timeout=2) as response:
+                    receipt = json.load(response)
+                self.assertTrue(receipt["ok"])
+                self.assertEqual(store.get_task(contract.task_id)["state"], "queued")
             finally:
                 server.shutdown()
                 server.server_close()

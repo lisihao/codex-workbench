@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
-from codex_workbench.store import CommandConflictError, WorkbenchStore
+from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
 class StoreTests(unittest.TestCase):
@@ -282,13 +282,50 @@ class StoreTests(unittest.TestCase):
         task = self.store.get_task("task-1")
         self.assertEqual(task["state"], "needs_approval")
         self.assertEqual(task["nodes"][0]["state"], "indeterminate")
-        revision = self.store.resolve_indeterminate(
-            "task-1", "work", "retry", expected_revision=task["state_revision"]
+        approvals = self.store.list_approvals()
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["task_id"], "task-1")
+        self.assertEqual(approvals[0]["request"]["node_id"], "work")
+        revision = self.store.decide_approval(
+            approvals[0]["approval_id"],
+            "retry",
+            expected_revision=task["state_revision"],
         )
         retried = self.store.get_task("task-1")
         self.assertEqual(retried["state_revision"], revision)
         self.assertEqual(retried["state"], "queued")
         self.assertEqual(retried["nodes"][0]["state"], "pending")
+        decided = self.store.list_approvals(pending_only=False)[0]
+        self.assertEqual(decided["decision"], "retry")
+        self.assertEqual(
+            self.store.decide_approval(
+                decided["approval_id"], "retry", expected_revision=task["state_revision"]
+            ),
+            revision,
+        )
+        with self.assertRaises(StateConflictError):
+            self.store.decide_approval(
+                decided["approval_id"], "fail", expected_revision=revision
+            )
+
+    def test_indeterminate_settlement_creates_one_durable_approval(self) -> None:
+        nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
+        self.store.create_task(self.contract, nodes, "cmd-indeterminate")
+        self.store.queue_task("task-1")
+        self.store.claim_ready_node("worker-1")
+        self.store.settle_node(
+            "task-1",
+            "work",
+            NodeResult("indeterminate", "worker outcome unknown"),
+        )
+
+        approvals = self.store.list_approvals()
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["kind"], "indeterminate_resolution")
+        self.assertEqual(approvals[0]["request"]["attempt"], 1)
+        self.assertEqual(approvals[0]["request"]["allowed_decisions"], ["retry", "fail", "cancel"])
+        event_types = {event["event_type"] for event in self.store.read_events(task_id="task-1")}
+        self.assertIn("approval.requested", event_types)
 
 
 if __name__ == "__main__":

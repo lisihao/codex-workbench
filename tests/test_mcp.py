@@ -8,7 +8,7 @@ import unittest
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.mcp import WorkbenchMCPServer
-from codex_workbench.model import NodeSpec, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.store import WorkbenchStore
 
 
@@ -47,6 +47,8 @@ class MCPTests(unittest.TestCase):
                 "workbench_read_events",
                 "workbench_read_artifact",
                 "workbench_acceptance_report",
+                "workbench_list_approvals",
+                "workbench_decide_approval",
             },
         )
 
@@ -72,6 +74,29 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(controlled["revision"], 2)
         events = json.loads(self.call("workbench_read_events", {"task_id": "mcp-task"})["content"][0]["text"])
         self.assertIn("task.state_changed", {event["event_type"] for event in events})
+
+        self.store.claim_ready_node("fixture-worker")
+        self.store.settle_node(
+            "mcp-task",
+            "work",
+            NodeResult("indeterminate", "fixture outcome unknown"),
+        )
+        approvals = json.loads(
+            self.call("workbench_list_approvals", {})["content"][0]["text"]
+        )
+        self.assertEqual(len(approvals), 1)
+        decided = json.loads(
+            self.call(
+                "workbench_decide_approval",
+                {
+                    "approval_id": approvals[0]["approval_id"],
+                    "decision": "retry",
+                    "expected_revision": approvals[0]["task_revision"],
+                },
+            )["content"][0]["text"]
+        )
+        self.assertTrue(decided["ok"])
+        self.assertEqual(self.store.get_task("mcp-task")["state"], "queued")
 
         ref = ArtifactStore(self.root / "artifacts").put_text("verified evidence", "txt")
         artifact = json.loads(self.call("workbench_read_artifact", {"artifact_ref": ref})["content"][0]["text"])
