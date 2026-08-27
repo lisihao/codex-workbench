@@ -9,6 +9,8 @@ from typing import Callable
 
 
 CommandRunner = Callable[[list[str]], tuple[int, str]]
+TAILSCALE_BINARY = "/opt/homebrew/bin/tailscale"
+TAILSCALE_FALLBACK_SOCKET = "/var/run/tailscale/tailscaled.sock"
 
 
 def _run(command: list[str]) -> tuple[int, str]:
@@ -23,6 +25,19 @@ def _run(command: list[str]) -> tuple[int, str]:
         return result.returncode, (result.stdout + result.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as error:
         return 1, str(error)
+
+
+def _tailscale_status(runner: CommandRunner) -> tuple[int, str]:
+    code, output = runner([TAILSCALE_BINARY, "status"])
+    if code == 0:
+        return code, output
+    return runner(
+        [
+            TAILSCALE_BINARY,
+            f"--socket={TAILSCALE_FALLBACK_SOCKET}",
+            "status",
+        ]
+    )
 
 
 def assess_restart_readiness(
@@ -85,7 +100,7 @@ def assess_restart_readiness(
     if not sleep_disabled:
         blockers.append("system sleep is not disabled for every active power profile")
 
-    tailscale_code, tailscale_output = runner(["/opt/homebrew/bin/tailscale", "status"])
+    tailscale_code, tailscale_output = _tailscale_status(runner)
     tailscale_ready = tailscale_code == 0 and "logged out" not in tailscale_output.lower()
     if not tailscale_ready:
         blockers.append("Tailscale is not ready on the authority host")
