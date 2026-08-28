@@ -24,11 +24,13 @@
 - 面板从事件账本投影完成、阻塞、审批、路由和协调器提醒；用户可启用页面打开期间的浏览器前台通知。真正的页面关闭后台 Push 尚未启用，不把它冒充已交付能力。
 
 ```bash
-PYTHONPATH=src python3 -m codex_workbench init
-PYTHONPATH=src python3 -m codex_workbench serve
-PYTHONPATH=src python3 -m codex_workbench doctor
-PYTHONPATH=src python3 -m codex_workbench doctor --require-restart-ready
+scripts/python-runtime -m codex_workbench init
+scripts/python-runtime -m codex_workbench serve
+scripts/python-runtime -m codex_workbench doctor
+scripts/python-runtime -m codex_workbench doctor --require-restart-ready
 ```
+
+`scripts/python-runtime` 会先使用 `CODEX_WORKBENCH_PYTHON` 或项目 runtime，再按固定顺序检查 Homebrew Python 3.11+；不会使用系统 Python 3.9。需要固定解释器时设置绝对路径，例如 `CODEX_WORKBENCH_PYTHON=/opt/homebrew/bin/python3.13 scripts/python-runtime -m codex_workbench doctor`。
 
 默认数据目录为 `~/Library/Application Support/Codex Workbench`，默认只监听 `127.0.0.1:8766`。远程访问由 Tailscale Serve 代理，服务自身不开放公网端口。
 
@@ -55,7 +57,7 @@ codex-workbench request \
 MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
 
 ```bash
-python3 scripts/install-macbook-client.py
+scripts/python-runtime scripts/install-macbook-client.py
 codex mcp get codex-workbench
 ```
 
@@ -144,7 +146,7 @@ codex-workbench task steer <task-id> "后续 attempt 保留公开接口" --expec
 如果 MacBook 的 Shadowrocket Fake-IP 覆盖了 Tailscale MagicDNS，安装自恢复驾驶舱隧道，不修改全局代理规则：
 
 ```bash
-python3 scripts/install-macbook-client.py
+scripts/python-runtime scripts/install-macbook-client.py
 open http://127.0.0.1:18766
 ```
 

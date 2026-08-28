@@ -2,15 +2,36 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import plistlib
 import shutil
 import socket
 import subprocess
+import sys
 
 
 TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
 HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
+
+
+def relaunch_with_supported_runtime() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    selector = Path(__file__).resolve().with_name("python-runtime")
+    if not selector.is_file():
+        raise SystemExit(
+            "Codex Workbench requires Python 3.11 or newer; "
+            f"runtime selector is missing: {selector}"
+        )
+    print(
+        "Current Python is incompatible; relaunching with the Workbench Python runtime selector.",
+        file=sys.stderr,
+    )
+    os.execv(str(selector), [str(selector), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+relaunch_with_supported_runtime()
 
 
 def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:

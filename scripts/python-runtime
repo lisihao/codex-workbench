@@ -1,19 +1,51 @@
 #!/bin/zsh
 set -euo pipefail
 
-candidates=(
-  /opt/homebrew/bin/python3
-  "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
-  /usr/local/bin/python3
-  /usr/bin/python3
-)
+script_directory="${0:A:h}"
+project_root="${script_directory:h}"
+
+# An explicitly configured interpreter is authoritative.  Falling through to
+# another interpreter after it fails would hide a broken deployment and could
+# silently change the runtime used by the coordinator.
+if [[ -n "${CODEX_WORKBENCH_PYTHON:-}" ]]; then
+  candidates=("$CODEX_WORKBENCH_PYTHON")
+else
+  candidates=(
+    "$project_root/.venv/bin/python3"
+    "$project_root/.runtime/bin/python3"
+    "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+    /opt/homebrew/bin/python3
+    /opt/homebrew/bin/python3.14
+    /opt/homebrew/bin/python3.13
+    /opt/homebrew/bin/python3.12
+    /opt/homebrew/bin/python3.11
+    /usr/local/bin/python3
+    /usr/local/bin/python3.14
+    /usr/local/bin/python3.13
+    /usr/local/bin/python3.12
+    /usr/local/bin/python3.11
+  )
+fi
+
+rejected=()
 
 for candidate in "${candidates[@]}"; do
-  if [[ -x "$candidate" ]] && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+  if [[ ! -x "$candidate" ]]; then
+    rejected+=("$candidate (missing or not executable)")
+    continue
+  fi
+  if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
     exec "$candidate" "$@"
   fi
+  rejected+=("$candidate (Python < 3.11 or unavailable)")
 done
 
-print -u2 "Codex Workbench requires Python 3.11 or newer"
+print -u2 "Codex Workbench requires Python 3.11 or newer; no compatible runtime was found."
+if [[ -n "${CODEX_WORKBENCH_PYTHON:-}" ]]; then
+  print -u2 "Configured CODEX_WORKBENCH_PYTHON is not usable: $CODEX_WORKBENCH_PYTHON"
+fi
+print -u2 "Set CODEX_WORKBENCH_PYTHON to an absolute Python 3.11+ path, or install Homebrew Python 3.11+."
+if (( ${#rejected[@]} > 0 )); then
+  print -u2 "Checked: ${rejected[*]}"
+fi
 exit 1
-

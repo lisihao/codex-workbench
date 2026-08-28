@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import plistlib
 import shutil
@@ -12,6 +13,25 @@ import sys
 
 
 LABEL = "com.lisihao.codex-workbench"
+
+
+def relaunch_with_supported_runtime() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    selector = Path(__file__).resolve().with_name("python-runtime")
+    if not selector.is_file():
+        raise SystemExit(
+            "Codex Workbench requires Python 3.11 or newer; "
+            f"runtime selector is missing: {selector}"
+        )
+    print(
+        "Current Python is incompatible; relaunching with the Workbench Python runtime selector.",
+        file=sys.stderr,
+    )
+    os.execv(str(selector), [str(selector), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+relaunch_with_supported_runtime()
 
 
 def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -83,7 +103,7 @@ def main() -> int:
                 "version": version,
                 "commit": commit,
                 "tag": tag,
-                "installed_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "codex_version": codex_version,
             },
             indent=2,
@@ -94,6 +114,9 @@ def main() -> int:
     bin_dir = app_root / "bin"
     bin_dir.mkdir(exist_ok=True)
     wrapper = bin_dir / "codex-workbench"
+    runtime_selector = app_root / "scripts" / "python-runtime"
+    if not runtime_selector.is_file():
+        raise SystemExit(f"Workbench Python runtime selector is missing: {runtime_selector}")
     wrapper.write_text(
         "#!/bin/zsh\n"
         f"export PYTHONPATH={str(app_root / 'src')!r}\n"
@@ -101,7 +124,7 @@ def main() -> int:
         f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
         f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
         "export CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude\n"
-        f"exec /opt/homebrew/bin/python3 -m codex_workbench \"$@\"\n"
+        f"exec {str(runtime_selector)!r} -m codex_workbench \"$@\"\n"
     )
     wrapper.chmod(0o755)
 
