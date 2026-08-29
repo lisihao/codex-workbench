@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench.config import WorkbenchConfig
-from codex_workbench.model import NodeSpec, QuotaSnapshot
+from codex_workbench.model import NodeSpec, QuotaSnapshot, now_iso
 from codex_workbench.store import WorkbenchStore
 from codex_workbench.submission import submit_natural_language_request
 
@@ -31,7 +31,7 @@ class SubmissionTests(unittest.TestCase):
             store.initialize()
             store.write_quota(
                 QuotaSnapshot(
-                    observed_at="2026-08-26T00:00:00+00:00",
+                    observed_at=now_iso(),
                     auth_ok=True,
                     auth_method="native-subscription",
                     five_hour_remaining=35,

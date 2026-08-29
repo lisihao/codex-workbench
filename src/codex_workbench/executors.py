@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -10,7 +10,7 @@ import tempfile
 from typing import Protocol
 
 from .artifacts import ArtifactStore
-from .model import NodeResult, QuotaSnapshot
+from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeResult, QuotaSnapshot
 from .worktrees import WorktreeManager, scope_allows
 
 
@@ -83,12 +83,17 @@ class DeterministicExecutor(ProcessExecutor):
             cwd=request.worktree,
             timeout=int(request.contract["timeout_seconds"]),
         )
+        verifier = bool(request.spec.get("verifier"))
         return NodeResult(
             status="succeeded" if result.returncode == 0 else "failed",
             summary=(result.stdout or result.stderr).strip()[-1000:] or f"exit {result.returncode}",
             artifacts=artifacts,
             exit_code=result.returncode,
             retryable=False,
+            result_kind="verifier" if verifier else "worker",
+            checks=("process-exit:0",) if result.returncode == 0 else (f"process-exit:{result.returncode}",),
+            evidence=tuple(artifacts.values()) if verifier else (),
+            verdict=("accepted" if result.returncode == 0 else "needs_fix") if verifier else None,
         )
 
 
@@ -123,10 +128,14 @@ class CodexExecutor(ProcessExecutor):
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
         qualified, reason = self.qualification()
-        if not qualified:
-            return NodeResult(status="blocked", summary=reason)
-        prompt = self._prompt(request)
         verifier = bool(request.spec.get("verifier"))
+        if not qualified:
+            return NodeResult(
+                status="blocked", summary=reason,
+                result_kind="verifier" if verifier else "worker",
+                verdict="blocked" if verifier else None,
+            )
+        prompt = self._prompt(request)
         schema = self._verifier_schema() if verifier else self._worker_schema()
         with tempfile.TemporaryDirectory(prefix="codex-workbench-turn-") as directory:
             schema_path = Path(directory) / "schema.json"
@@ -167,7 +176,12 @@ class CodexExecutor(ProcessExecutor):
                     environment=codex_subscription_environment(),
                 )
             except subprocess.TimeoutExpired:
-                return NodeResult(status="indeterminate", summary="Codex turn timed out; terminal state is unknown")
+                return NodeResult(
+                    status="indeterminate",
+                    summary="Codex turn timed out; terminal state is unknown",
+                    actual_model=request.spec["model"],
+                    result_kind="verifier" if verifier else "worker",
+                )
             structured = None
             if output_path.exists():
                 try:
@@ -200,6 +214,11 @@ class CodexExecutor(ProcessExecutor):
             actual_model=request.spec["model"],
             exit_code=result.returncode,
             retryable=False,
+            result_kind="verifier" if verifier else "worker",
+            changed_paths=tuple(structured.get("changed_paths", ())) if isinstance(structured, dict) else (),
+            checks=tuple(structured.get("checks", ())) if isinstance(structured, dict) else (),
+            evidence=tuple(artifacts.values()) if verifier else (),
+            verdict=structured.get("verdict") if verifier and isinstance(structured, dict) else None,
         )
 
     @staticmethod
@@ -238,7 +257,7 @@ class CodexExecutor(ProcessExecutor):
                 "status": {"enum": ["succeeded", "failed", "blocked"]},
                 "summary": {"type": "string"},
                 "changed_paths": {"type": "array", "items": {"type": "string"}},
-                "checks": {"type": "array", "items": {"type": "string"}},
+                "checks": {"type": "array", "minItems": 1, "items": {"type": "string"}},
             },
         }
 
@@ -251,8 +270,8 @@ class CodexExecutor(ProcessExecutor):
             "properties": {
                 "verdict": {"enum": ["accepted", "needs_fix", "blocked"]},
                 "summary": {"type": "string"},
-                "checks": {"type": "array", "items": {"type": "string"}},
-                "evidence": {"type": "array", "items": {"type": "string"}},
+                "checks": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                "evidence": {"type": "array", "minItems": 1, "items": {"type": "string"}},
             },
         }
 
@@ -282,10 +301,12 @@ class ClaudeExecutor(ProcessExecutor):
         artifacts: ArtifactStore,
         quota: QuotaSnapshot | None,
         binary: str = "claude",
+        quota_ttl_seconds: int = DEFAULT_QUOTA_TTL_SECONDS,
     ):
         super().__init__(artifacts)
         self.quota = quota
         self.binary = binary
+        self.quota_ttl_seconds = quota_ttl_seconds
 
     def authentication(self) -> tuple[bool, str]:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
@@ -310,16 +331,19 @@ class ClaudeExecutor(ProcessExecutor):
     def qualification(self, model: str) -> tuple[bool, str]:
         if self.quota is None:
             return False, "Claude quota is unknown"
-        permitted, reason = self.quota.permits(model)
-        if not permitted:
-            return False, reason
+        decision = self.quota.dispatch_decision(
+            model,
+            max_age_seconds=self.quota_ttl_seconds,
+        )
+        if decision.action != "claude":
+            return False, decision.reason
         return self.authentication()
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
         qualified, reason = self.qualification(request.spec["model"])
         if not qualified:
-            return NodeResult(status="blocked", summary=reason)
+            return NodeResult(status="blocked", summary=reason, result_kind="worker")
         prompt = CodexExecutor._prompt(request)
         command = [
             self.binary,
@@ -337,7 +361,12 @@ class ClaudeExecutor(ProcessExecutor):
                 timeout=int(request.contract["timeout_seconds"]),
             )
         except subprocess.TimeoutExpired:
-            return NodeResult(status="indeterminate", summary="Claude turn timed out; terminal state is unknown")
+            return NodeResult(
+                status="indeterminate",
+                summary="Claude turn timed out; terminal state is unknown",
+                actual_model=request.spec["model"],
+                result_kind="worker",
+            )
         summary = result.stdout.strip()[-2000:] or result.stderr.strip()[-1000:]
         return NodeResult(
             status="succeeded" if result.returncode == 0 else "failed",
@@ -346,6 +375,8 @@ class ClaudeExecutor(ProcessExecutor):
             actual_model=request.spec["model"],
             exit_code=result.returncode,
             retryable=False,
+            result_kind="worker",
+            checks=(f"claude-exit:{result.returncode}",),
         )
 
 
@@ -375,11 +406,9 @@ def validate_worker_scope(
         if not scope_allows(path, request.contract["allowed_scope"], request.contract["forbidden_scope"])
     )
     if disallowed:
-        return NodeResult(
+        return replace(
+            result,
             status="failed",
             summary=f"worker changed paths outside the task contract: {', '.join(disallowed)}",
-            artifacts=result.artifacts,
-            actual_model=result.actual_model,
-            exit_code=result.exit_code,
         )
-    return result
+    return replace(result, changed_paths=tuple(changed))

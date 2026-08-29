@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import uuid
+import re
 
 
 class CoordinatorAuthorityError(RuntimeError):
@@ -81,5 +82,18 @@ def machine_boot_id() -> str:
         check=False,
     )
     if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
+        return normalize_boot_id(result.stdout)
     return "unknown"
+
+
+def normalize_boot_id(raw: str) -> str:
+    """Return a stable boot identity from platform output.
+
+    macOS may format ``kern.boottime`` with a recalculated microsecond field;
+    the boot epoch second is the stable machine-restart boundary.
+    """
+    value = raw.strip()
+    match = re.search(r"\bsec\s*=\s*(\d+)", value)
+    if match:
+        return f"darwin:{match.group(1)}"
+    return value

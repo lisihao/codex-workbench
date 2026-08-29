@@ -9,11 +9,21 @@ from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
+def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
+    if any(node.verifier for node in nodes):
+        return nodes
+    return [*nodes, NodeSpec(
+        "verify", task_id, "verify", "fixture", "fixture", "accepted",
+        depends_on=tuple(node.node_id for node in nodes), verifier=True,
+    )]
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = WorkbenchStore(Path(self.temp.name) / "state.sqlite")
         self.store.initialize()
+        self.epoch = self.store.activate_coordinator("test-store")
         self.contract = TaskContract(
             task_id="task-1",
             repository=str(Path(self.temp.name).resolve()),
@@ -26,10 +36,10 @@ class StoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_idempotent_submit_and_command_conflict(self) -> None:
-        nodes = [NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")]
+        nodes = verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1")
         self.assertEqual(self.store.create_task(self.contract, nodes, "cmd-1"), "task-1")
         self.assertEqual(self.store.create_task(self.contract, nodes, "cmd-1"), "task-1")
-        changed = [NodeSpec("a", "task-1", "changed", "fixture", "fixture", "ok")]
+        changed = verified([NodeSpec("a", "task-1", "changed", "fixture", "fixture", "ok")], "task-1")
         with self.assertRaises(CommandConflictError):
             self.store.create_task(self.contract, changed, "cmd-1")
 
@@ -38,7 +48,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 5)
+        self.assertEqual(self.store.health()["schema_version"], 7)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -76,7 +86,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 5)
+        self.assertEqual(migrated.health()["schema_version"], 7)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -90,7 +100,7 @@ class StoreTests(unittest.TestCase):
             NodeSpec("b", "task-1", "B", "fixture", "fixture", "ok", depends_on=("a",)),
         ]
         with self.assertRaisesRegex(ValueError, "cycle"):
-            self.store.create_task(self.contract, nodes, "cmd-cycle")
+            self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-cycle")
 
     def test_node_scope_cannot_cover_a_forbidden_child(self) -> None:
         contract = TaskContract(
@@ -119,17 +129,17 @@ class StoreTests(unittest.TestCase):
             NodeSpec("b", "task-1", "B", "fixture", "fixture", "ok", write_scopes=("src/shared",), ordinal=1),
             NodeSpec("c", "task-1", "C", "fixture", "fixture", "ok", write_scopes=("src/independent",), ordinal=1),
         ]
-        self.store.create_task(self.contract, nodes, "cmd-parallel")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-parallel")
         self.store.queue_task("task-1")
-        first = self.store.claim_ready_node("worker-1")
-        second = self.store.claim_ready_node("worker-2")
+        first = self.store.claim_ready_node("worker-1", self.epoch)
+        second = self.store.claim_ready_node("worker-2", self.epoch)
         self.assertEqual(first["node_id"], "a")
         self.assertEqual(second["node_id"], "c")
         health = self.store.health()
         self.assertEqual(health["active_executors"], {"fixture": 2})
         self.assertEqual(health["active_models"], {"fixture": 2})
-        self.store.settle_node("task-1", "a", NodeResult("succeeded", "ok"))
-        third = self.store.claim_ready_node("worker-3")
+        self.store.settle_claimed(first, NodeResult("succeeded", "ok"))
+        third = self.store.claim_ready_node("worker-3", self.epoch)
         self.assertEqual(third["node_id"], "b")
 
     def test_priority_orders_ready_tasks_and_steering_reaches_future_attempts(self) -> None:
@@ -142,12 +152,12 @@ class StoreTests(unittest.TestCase):
         )
         self.store.create_task(
             self.contract,
-            [NodeSpec("work", "task-1", "low", "fixture", "fixture", "ok")],
+            verified([NodeSpec("work", "task-1", "low", "fixture", "fixture", "ok")], "task-1"),
             "cmd-low-priority",
         )
         self.store.create_task(
             second_contract,
-            [NodeSpec("work", "task-2", "high", "fixture", "fixture", "ok")],
+            verified([NodeSpec("work", "task-2", "high", "fixture", "fixture", "ok")], "task-2"),
             "cmd-high-priority",
         )
         self.store.queue_task("task-1")
@@ -162,7 +172,7 @@ class StoreTests(unittest.TestCase):
             expected_revision=revision,
         )
 
-        claimed = self.store.claim_ready_node("priority-worker")
+        claimed = self.store.claim_ready_node("priority-worker", self.epoch)
         self.assertEqual(claimed["task_id"], "task-2")
         self.assertEqual(claimed["steering"], ("先保留现有公开接口，再修改内部实现。",))
         task = self.store.get_task("task-2")
@@ -178,31 +188,31 @@ class StoreTests(unittest.TestCase):
             NodeSpec("parent", "task-1", "parent", "fixture", "fixture", "ok", write_scopes=("src/parser",), ordinal=1),
             NodeSpec("child", "task-1", "child", "fixture", "fixture", "ok", write_scopes=("src/parser/tokenizer",), ordinal=1),
         ]
-        self.store.create_task(self.contract, nodes, "cmd-parent-child")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-parent-child")
         self.store.queue_task("task-1")
-        self.assertEqual(self.store.claim_ready_node("worker-1")["node_id"], "child")
-        self.assertIsNone(self.store.claim_ready_node("worker-2"))
+        self.assertEqual(self.store.claim_ready_node("worker-1", self.epoch)["node_id"], "child")
+        self.assertIsNone(self.store.claim_ready_node("worker-2", self.epoch))
 
     def test_read_write_parent_child_scopes_conflict(self) -> None:
         nodes = [
             NodeSpec("reader", "task-1", "reader", "fixture", "fixture", "ok", read_scopes=("src/parser",), ordinal=1),
             NodeSpec("writer", "task-1", "writer", "fixture", "fixture", "ok", write_scopes=("src/parser/tokenizer",), ordinal=2),
         ]
-        self.store.create_task(self.contract, nodes, "cmd-read-write")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-read-write")
         self.store.queue_task("task-1")
-        self.assertEqual(self.store.claim_ready_node("worker-1")["node_id"], "reader")
-        self.assertIsNone(self.store.claim_ready_node("worker-2"))
+        self.assertEqual(self.store.claim_ready_node("worker-1", self.epoch)["node_id"], "reader")
+        self.assertIsNone(self.store.claim_ready_node("worker-2", self.epoch))
 
     def test_read_only_nodes_on_same_scope_can_run_in_parallel(self) -> None:
         nodes = [
             NodeSpec("reader-a", "task-1", "reader A", "fixture", "fixture", "ok", read_scopes=("src/parser",), ordinal=1),
             NodeSpec("reader-b", "task-1", "reader B", "fixture", "fixture", "ok", read_scopes=("src/parser/tokenizer",), ordinal=1),
         ]
-        self.store.create_task(self.contract, nodes, "cmd-read-read")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-read-read")
         self.store.queue_task("task-1")
         claimed = {
-            self.store.claim_ready_node("worker-1")["node_id"],
-            self.store.claim_ready_node("worker-2")["node_id"],
+            self.store.claim_ready_node("worker-1", self.epoch)["node_id"],
+            self.store.claim_ready_node("worker-2", self.epoch)["node_id"],
         }
         self.assertEqual(claimed, {"reader-a", "reader-b"})
 
@@ -222,11 +232,11 @@ class StoreTests(unittest.TestCase):
         ]
         self.store.create_task(self.contract, nodes, "cmd-verify")
         self.store.queue_task("task-1")
-        work = self.store.claim_ready_node("worker-1")
-        self.store.settle_node("task-1", work["node_id"], NodeResult("succeeded", "worker done"))
+        work = self.store.claim_ready_node("worker-1", self.epoch)
+        self.store.settle_claimed(work, NodeResult("succeeded", "worker done"))
         self.assertEqual(self.store.get_task("task-1")["state"], "verifying")
-        verify = self.store.claim_ready_node("verifier")
-        self.store.settle_node("task-1", verify["node_id"], NodeResult("succeeded", "independent verdict"))
+        verify = self.store.claim_ready_node("verifier", self.epoch)
+        self.store.settle_claimed(verify, NodeResult("succeeded", "independent verdict"))
         task = self.store.get_task("task-1")
         self.assertEqual(task["state"], "accepted")
         self.assertEqual(task["verdict"], "independent verdict")
@@ -238,38 +248,47 @@ class StoreTests(unittest.TestCase):
             base_sha="abc123",
             objective="enforce acceptance evidence",
             allowed_scope=("src",),
+            retry_limit=0,
         )
         nodes = [
             NodeSpec(
                 "work",
                 contract.task_id,
                 "work",
-                "deterministic",
-                "local",
-                command=("true",),
+                "codex",
+                "gpt-5.6-luna",
+                "work",
             ),
             NodeSpec(
                 "verify",
                 contract.task_id,
                 "verify",
-                "deterministic",
-                "local",
-                command=("true",),
+                "codex",
+                "gpt-5.6-sol",
+                "verify",
                 depends_on=("work",),
                 verifier=True,
             ),
         ]
         self.store.create_task(contract, nodes, "cmd-missing-evidence")
         self.store.queue_task(contract.task_id)
-        self.store.settle_node(
-            contract.task_id,
-            self.store.claim_ready_node("worker")["node_id"],
-            NodeResult("succeeded", "worker done"),
+        worker = self.store.claim_ready_node("worker", self.epoch)
+        self.store.settle_claimed(
+            worker,
+            NodeResult(
+                "succeeded", "worker done", actual_model="gpt-5.6-luna",
+                result_kind="worker", checks=("check",),
+            ),
         )
-        self.store.settle_node(
-            contract.task_id,
-            self.store.claim_ready_node("verifier")["node_id"],
-            NodeResult("succeeded", "verifier accepted"),
+        verifier = self.store.claim_ready_node("verifier", self.epoch)
+        evidence_ref = self.store.artifacts.put_text("verifier evidence", "result.json")
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "succeeded", "verifier accepted", actual_model="gpt-5.6-sol",
+                result_kind="verifier", checks=("check",), evidence=(evidence_ref,),
+                verdict="accepted",
+            ),
         )
         task = self.store.get_task(contract.task_id)
         self.assertEqual(task["state"], "needs_fix")
@@ -288,32 +307,41 @@ class StoreTests(unittest.TestCase):
                 "work",
                 contract.task_id,
                 "work",
-                "deterministic",
-                "local",
-                command=("true",),
+                "codex",
+                "gpt-5.6-luna",
+                "work",
             ),
             NodeSpec(
                 "verify",
                 contract.task_id,
                 "verify",
-                "deterministic",
-                "local",
-                command=("true",),
+                "codex",
+                "gpt-5.6-sol",
+                "verify",
                 depends_on=("work",),
                 verifier=True,
             ),
         ]
         self.store.create_task(contract, nodes, "cmd-complete-evidence")
         self.store.queue_task(contract.task_id)
-        self.store.settle_node(
-            contract.task_id,
-            self.store.claim_ready_node("worker")["node_id"],
-            NodeResult("succeeded", "worker done", artifacts={"patch": "sha256:patch"}),
+        patch_ref = self.store.artifacts.put_text("patch", "patch")
+        test_ref = self.store.artifacts.put_text("test", "stdout.log")
+        worker = self.store.claim_ready_node("worker", self.epoch)
+        self.store.settle_claimed(
+            worker,
+            NodeResult(
+                "succeeded", "worker done", artifacts={"patch": patch_ref},
+                actual_model="gpt-5.6-luna", result_kind="worker", checks=("check",),
+            ),
         )
-        self.store.settle_node(
-            contract.task_id,
-            self.store.claim_ready_node("verifier")["node_id"],
-            NodeResult("succeeded", "verifier accepted", artifacts={"test-log": "sha256:test"}),
+        verifier = self.store.claim_ready_node("verifier", self.epoch)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "succeeded", "verifier accepted", artifacts={"test-log": test_ref},
+                actual_model="gpt-5.6-sol", result_kind="verifier",
+                checks=("check",), evidence=(test_ref,), verdict="accepted",
+            ),
         )
         task = self.store.get_task(contract.task_id)
         self.assertEqual(task["state"], "accepted")
@@ -321,13 +349,14 @@ class StoreTests(unittest.TestCase):
 
     def test_restart_marks_running_node_indeterminate(self) -> None:
         nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
-        self.store.create_task(self.contract, nodes, "cmd-recover")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-recover")
         self.store.queue_task("task-1")
-        self.store.claim_ready_node("worker-1")
+        self.store.claim_ready_node("worker-1", self.epoch)
         self.assertEqual(self.store.recover_interrupted(), 1)
         task = self.store.get_task("task-1")
         self.assertEqual(task["state"], "needs_approval")
-        self.assertEqual(task["nodes"][0]["state"], "indeterminate")
+        work = next(node for node in task["nodes"] if node["node_id"] == "work")
+        self.assertEqual(work["state"], "indeterminate")
         approvals = self.store.list_approvals()
         self.assertEqual(len(approvals), 1)
         self.assertEqual(approvals[0]["task_id"], "task-1")
@@ -356,12 +385,11 @@ class StoreTests(unittest.TestCase):
 
     def test_indeterminate_settlement_creates_one_durable_approval(self) -> None:
         nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
-        self.store.create_task(self.contract, nodes, "cmd-indeterminate")
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-indeterminate")
         self.store.queue_task("task-1")
-        self.store.claim_ready_node("worker-1")
-        self.store.settle_node(
-            "task-1",
-            "work",
+        claim = self.store.claim_ready_node("worker-1", self.epoch)
+        self.store.settle_claimed(
+            claim,
             NodeResult("indeterminate", "worker outcome unknown"),
         )
 

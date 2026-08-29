@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.config import WorkbenchConfig
-from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.store import WorkbenchStore
 
 
@@ -23,6 +23,7 @@ class APITests(unittest.TestCase):
             config.initialize()
             store = WorkbenchStore(config.database)
             store.initialize()
+            epoch = store.activate_coordinator("api-test")
             server = WorkbenchHTTPServer(config, store)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -51,7 +52,7 @@ class APITests(unittest.TestCase):
 
                 store.write_quota(
                     QuotaSnapshot(
-                        observed_at="2026-08-26T00:00:00+00:00",
+                        observed_at=now_iso(),
                         auth_ok=True,
                         auth_method="native-subscription",
                         five_hour_remaining=35,
@@ -95,7 +96,10 @@ class APITests(unittest.TestCase):
                 )
                 store.create_task(
                     contract,
-                    [NodeSpec("work", contract.task_id, "work", "fixture", "fixture", "ok")],
+                    [
+                        NodeSpec("work", contract.task_id, "work", "fixture", "fixture", "ok"),
+                        NodeSpec("verify", contract.task_id, "verify", "fixture", "fixture", "accepted", depends_on=("work",), verifier=True),
+                    ],
                     "phone-approval-create",
                 )
                 task = store.get_task(contract.task_id)
@@ -135,10 +139,9 @@ class APITests(unittest.TestCase):
                 self.assertTrue(steering_receipt["ok"])
                 self.assertEqual(store.get_task(contract.task_id)["priority"], 5)
                 store.queue_task(contract.task_id)
-                store.claim_ready_node("worker")
-                store.settle_node(
-                    contract.task_id,
-                    "work",
+                claimed = store.claim_ready_node("worker", epoch)
+                store.settle_claimed(
+                    claimed,
                     NodeResult("indeterminate", "fixture outcome unknown"),
                 )
                 with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:

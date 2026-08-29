@@ -63,6 +63,24 @@ class InstallerTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "scripts" / "install-macos.py").read_text()
         self.assertIn('app_root / "scripts" / "python-runtime"', source)
         self.assertNotIn("exec /opt/homebrew/bin/python3 -m codex_workbench", source)
+        self.assertIn("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE", source)
+
+    def test_authority_launch_agent_persists_quota_source(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / "com.lisihao.codex-workbench.plist.in").read_text()
+        rendered = (
+            template.replace("__APP_ROOT__", "/tmp/app")
+            .replace("__STATE_ROOT__", "/tmp/state")
+            .replace("__CODEX_BINARY__", "/tmp/codex")
+            .replace("__CODEX_HOME__", "/tmp/codex-home")
+            .replace("__PROCESS_HOME__", "/tmp/process-home")
+            .replace("__QUOTA_SNAPSHOT_FILE__", "/tmp/state/claude-quota.json")
+        )
+        payload = plistlib.loads(rendered.encode())
+        self.assertEqual(
+            payload["EnvironmentVariables"]["CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE"],
+            "/tmp/state/claude-quota.json",
+        )
 
     def test_macbook_heartbeat_launch_agent_is_valid_and_bounded(self) -> None:
         root = Path(__file__).resolve().parents[1]

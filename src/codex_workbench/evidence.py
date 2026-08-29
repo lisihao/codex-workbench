@@ -28,7 +28,7 @@ def reusable_evidence_key(
     executor = spec["executor"]
     return canonical_hash(
         {
-            "kind": "verified-evidence-v1",
+            "kind": "verified-evidence-v2",
             "objective": contract["objective"],
             "acceptance_commands": contract.get("acceptance_commands", ()),
             "spec": {

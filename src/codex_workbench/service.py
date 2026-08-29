@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 import os
 from pathlib import Path
 import socket
@@ -17,8 +18,9 @@ from .executors import (
     validate_worker_scope,
 )
 from .evidence import reusable_evidence_key
-from .model import ClaudeDispatchDecision, NodeResult, QuotaSnapshot
-from .store import WorkbenchStore
+from .model import ClaudeDispatchDecision, NodeResult, QuotaSnapshot, retry_model
+from .quota import JsonFileQuotaAdapter, QuotaRefresher
+from .store import StateConflictError, WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
 
 
@@ -28,13 +30,19 @@ class Coordinator:
         store: WorkbenchStore,
         state_root: Path,
         *,
+        coordinator_epoch: int,
         max_workers: int = 4,
         poll_seconds: float = 1.0,
+        quota_ttl_seconds: int = 900,
+        quota_refresh_seconds: float = 300,
+        quota_snapshot_file: Path | None = None,
     ):
         self.store = store
         self.state_root = state_root
         self.max_workers = max_workers
         self.poll_seconds = poll_seconds
+        self.coordinator_epoch = coordinator_epoch
+        self.quota_ttl_seconds = quota_ttl_seconds
         self.artifacts = ArtifactStore(state_root / "artifacts")
         self.worktrees = WorktreeManager(state_root / "worktrees")
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workbench-worker")
@@ -42,6 +50,19 @@ class Coordinator:
         self._routed_to_codex: set[str] = set()
         self._routing_lock = threading.Lock()
         self._stop = threading.Event()
+        quota_path = os.environ.get("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE")
+        quota_source = Path(quota_path).expanduser() if quota_path else quota_snapshot_file
+        self._quota_refresher = (
+            QuotaRefresher(
+                store,
+                JsonFileQuotaAdapter(quota_source),
+                interval_seconds=quota_refresh_seconds,
+            )
+            if quota_source is not None
+            else None
+        )
+        self._next_quota_refresh = 0.0
+        self._quota_unavailable_reported = False
 
     def recover(self) -> int:
         return self.store.recover_interrupted()
@@ -49,6 +70,25 @@ class Coordinator:
     def run_forever(self) -> None:
         worker_counter = 0
         while not self._stop.is_set():
+            if self._quota_refresher is not None and time.monotonic() >= self._next_quota_refresh:
+                try:
+                    refreshed = self._quota_refresher.refresh_once()
+                    source = self._quota_refresher.adapter
+                    if isinstance(source, JsonFileQuotaAdapter) and not source.path.is_file():
+                        if not self._quota_unavailable_reported:
+                            self.store.record_system_event(
+                                "quota.refresh_unavailable",
+                                {"path": str(source.path), "policy": "fail-closed"},
+                            )
+                            self._quota_unavailable_reported = True
+                    elif refreshed:
+                        self._quota_unavailable_reported = False
+                except (OSError, ValueError) as error:
+                    self.store.record_system_event(
+                        "quota.refresh_failed",
+                        {"error": f"{type(error).__name__}: {error}"},
+                    )
+                self._next_quota_refresh = time.monotonic() + self._quota_refresher.interval_seconds
             self._collect()
             while len(self._futures) < self.max_workers:
                 worker_counter += 1
@@ -57,16 +97,26 @@ class Coordinator:
                 active_claude_models = self._active_claude_models()
 
                 def admissible(spec: dict) -> bool:
-                    decision = self._claude_decision(spec, quota, active_claude_models)
+                    decision = self._claude_decision(
+                        spec,
+                        quota,
+                        active_claude_models,
+                        quota_ttl_seconds=self.quota_ttl_seconds,
+                    )
                     return decision is None or decision.action != "defer"
 
-                claimed = self.store.claim_ready_node(worker_id, admissible=admissible)
+                claimed = self.store.claim_ready_node(
+                    worker_id,
+                    self.coordinator_epoch,
+                    admissible=admissible,
+                )
                 if claimed is None:
                     break
                 decision = self._claude_decision(
                     claimed["spec"],
                     quota,
                     active_claude_models,
+                    quota_ttl_seconds=self.quota_ttl_seconds,
                 )
                 active_claude_model = (
                     claimed["spec"]["model"]
@@ -90,7 +140,14 @@ class Coordinator:
                 label, _ = self._futures.pop(future)
                 with self._routing_lock:
                     self._routed_to_codex.discard(label)
-                future.result()
+                try:
+                    future.result()
+                except Exception as error:
+                    self.store.record_system_event(
+                        "coordinator.failed",
+                        {"worker": label, "error": f"{type(error).__name__}: {error}"},
+                    )
+                    self._stop.set()
 
     def _active_claude_models(self) -> tuple[str, ...]:
         with self._routing_lock:
@@ -106,6 +163,8 @@ class Coordinator:
         spec: dict,
         quota: QuotaSnapshot | None,
         active_models: tuple[str, ...] = (),
+        *,
+        quota_ttl_seconds: int = 900,
     ) -> ClaudeDispatchDecision | None:
         if spec["executor"] != "claude":
             return None
@@ -116,7 +175,11 @@ class Coordinator:
                 "Claude quota is unknown",
                 0,
             )
-        return quota.dispatch_decision(spec["model"], active_models)
+        return quota.dispatch_decision(
+            spec["model"],
+            active_models,
+            max_age_seconds=quota_ttl_seconds,
+        )
 
     def _execute_claimed(self, claimed: dict) -> None:
         request: ExecutionRequest
@@ -132,7 +195,14 @@ class Coordinator:
                     claimed["node_id"],
                     claimed["attempt"],
                 )
-                self.store.assign_worktree(claimed["task_id"], claimed["node_id"], str(worktree))
+                self.store.assign_worktree(
+                    claimed["task_id"],
+                    claimed["node_id"],
+                    str(worktree),
+                    attempt=claimed["attempt"],
+                    coordinator_epoch=claimed["coordinator_epoch"],
+                    lease_epoch=claimed["lease_epoch"],
+                )
                 if spec.get("verifier"):
                     self._compose_worker_patches(claimed["task_id"], worktree)
             request = ExecutionRequest(
@@ -156,9 +226,16 @@ class Coordinator:
                     claimed["task_id"],
                     claimed["node_id"],
                     NodeResult.from_dict(cached["result"]),
+                    attempt=claimed["attempt"],
+                    coordinator_epoch=claimed["coordinator_epoch"],
+                    lease_epoch=claimed["lease_epoch"],
                 )
                 return
-            decision = self._claude_decision(spec, self.store.latest_quota())
+            decision = self._claude_decision(
+                spec,
+                self.store.latest_quota(),
+                quota_ttl_seconds=self.quota_ttl_seconds,
+            )
             if decision is not None and decision.action == "codex":
                 request, result = self._execute_codex_fallback(
                     claimed,
@@ -179,13 +256,12 @@ class Coordinator:
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(worktree, contract["base_sha"])
                 if patch:
-                    result = NodeResult(
-                        status=result.status,
-                        summary=result.summary,
-                        artifacts={**result.artifacts, "patch": self.artifacts.put_bytes(patch, "patch")},
-                        actual_model=result.actual_model,
-                        exit_code=result.exit_code,
-                        retryable=result.retryable,
+                    result = replace(
+                        result,
+                        artifacts={
+                            **result.artifacts,
+                            "patch": self.artifacts.put_bytes(patch, "patch"),
+                        },
                     )
             if cache_key and result.status == "succeeded":
                 self.store.save_evidence(
@@ -195,10 +271,30 @@ class Coordinator:
                     claimed["node_id"],
                 )
         except WorktreeError as error:
-            result = NodeResult(status="blocked", summary=f"worktree unavailable: {error}")
+            result = NodeResult(
+                status="blocked",
+                summary=f"worktree unavailable: {error}",
+                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                verdict="blocked" if claimed["spec"].get("verifier") else None,
+            )
         except Exception as error:
-            result = NodeResult(status="indeterminate", summary=f"worker crashed: {type(error).__name__}: {error}")
-        self.store.settle_node(claimed["task_id"], claimed["node_id"], result)
+            result = NodeResult(
+                status="indeterminate",
+                summary=f"worker crashed: {type(error).__name__}: {error}",
+                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+            )
+        try:
+            self.store.settle_node(
+                claimed["task_id"],
+                claimed["node_id"],
+                result,
+                attempt=claimed["attempt"],
+                coordinator_epoch=claimed["coordinator_epoch"],
+                lease_epoch=claimed["lease_epoch"],
+            )
+        except StateConflictError:
+            # A newer coordinator/node lease owns the durable state; this late result is fenced.
+            return
 
     def _execute_codex_fallback(
         self,
@@ -207,7 +303,10 @@ class Coordinator:
         reason: str,
         zone: str,
     ) -> tuple[ExecutionRequest, NodeResult]:
-        fallback_model = request.contract["executor_model"]
+        fallback_model = retry_model(
+            request.contract["executor_model"],
+            int(claimed["attempt"]),
+        )
         with self._routing_lock:
             self._routed_to_codex.add(f"{claimed['task_id']}/{claimed['node_id']}")
         self.store.record_node_route(
@@ -223,6 +322,9 @@ class Coordinator:
                 "zone": zone,
                 "reason": reason,
             },
+            attempt=claimed["attempt"],
+            coordinator_epoch=claimed["coordinator_epoch"],
+            lease_epoch=claimed["lease_epoch"],
         )
         routed_request = ExecutionRequest(
             task_id=request.task_id,
@@ -256,5 +358,6 @@ class Coordinator:
                 self.artifacts,
                 self.store.latest_quota(),
                 os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+                self.quota_ttl_seconds,
             )
         raise ValueError(f"unsupported executor {kind!r}")

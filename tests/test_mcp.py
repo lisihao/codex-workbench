@@ -20,6 +20,7 @@ class MCPTests(unittest.TestCase):
         self.config.initialize()
         self.store = WorkbenchStore(self.config.database)
         self.store.initialize()
+        self.epoch = self.store.activate_coordinator("mcp-test")
         self.server = WorkbenchMCPServer(self.config, self.store)
 
     def tearDown(self) -> None:
@@ -64,7 +65,10 @@ class MCPTests(unittest.TestCase):
             objective="MCP fixture",
             allowed_scope=("tests",),
         )
-        nodes = [NodeSpec("work", "mcp-task", "work", "fixture", "fixture", "ok")]
+        nodes = [
+            NodeSpec("work", "mcp-task", "work", "fixture", "fixture", "ok"),
+            NodeSpec("verify", "mcp-task", "verify", "fixture", "fixture", "accepted", depends_on=("work",), verifier=True),
+        ]
         self.store.create_task(contract, nodes, "mcp-create")
         inspected = json.loads(self.call("workbench_inspect_task", {"task_id": "mcp-task"})["content"][0]["text"])
         self.assertEqual(inspected["state"], "inbox")
@@ -75,10 +79,9 @@ class MCPTests(unittest.TestCase):
         events = json.loads(self.call("workbench_read_events", {"task_id": "mcp-task"})["content"][0]["text"])
         self.assertIn("task.state_changed", {event["event_type"] for event in events})
 
-        self.store.claim_ready_node("fixture-worker")
-        self.store.settle_node(
-            "mcp-task",
-            "work",
+        claimed = self.store.claim_ready_node("fixture-worker", self.epoch)
+        self.store.settle_claimed(
+            claimed,
             NodeResult("indeterminate", "fixture outcome unknown"),
         )
         approvals = json.loads(

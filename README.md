@@ -7,16 +7,18 @@
 - Codex 是唯一用户入口，Claude Code 只是可选后台 Worker。
 - 任务、节点、事件、配额快照和审批持久化到 SQLite。
 - DAG 节点只有依赖完成且读写作用域不冲突时才能并行执行；父子路径按包含关系互斥，read/read 可并行。
-- Worker 完成不等于任务完成，必须经过独立 verifier。
+- Worker 完成不等于任务完成，必须经过依赖全部 Worker 的独立 Codex Sol verifier；退回会自动携带反馈进入 Worker 修复与新一轮 Sol 验证。
 - Claude 配额未知、认证未知或剩余不高于 25% 时禁止启动新任务，至少保留 20%。
 - 不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，只允许产品订阅登录态。
 - 安装器为无人值守进程建立独立 `CODEX_HOME`；它只软链接用户现有 `auth.json`，不会加载个人 skills、会话、模型缓存或全局配置。
 - 已通过的验证 Evidence 在声明输入闭包、命令和运行时身份不变时复用；实现型 Worker 不复用。
-- `coordinator.lock` 是进程生命周期的排他权威租约；MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
+- `coordinator.lock` 是进程生命周期的排他权威租约；SQLite coordinator epoch 与逐节点 lease epoch 会拒绝旧进程的迟到提交。MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
-- SQLite v5 分开保存原始节点契约、`effective_executor/effective_model` 与运行时任务优先级；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
+- SQLite v6 分开保存原始节点契约、`effective_executor/effective_model`、coordinator/node lease epoch 与运行时任务优先级；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
+- Evidence 引用在结算和复用时都验证文件存在性与 SHA-256；损坏缓存不会继续复用。
+- 同一路径 scope 仅在同一规范化 repository identity 内互斥，不同仓库不会发生伪冲突；Codex 修复重试按 Luna → Terra → Sol 有界升级。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
 - A1、A2、A12 不再永久写死为 pending：MacBook 心跳间隔、已登录手机的真实渲染回执和本地管理员导入的 PPT/PDF 工件都进入 Mac mini 同一条 Evidence 账本。
 - 不确定执行会原子生成持久 `approval` 回执；手机控制面以任务阶段、阻塞原因和下一步为主视图，可带 task revision 明确选择重试、失败或取消。重复提交同一决策保持幂等，冲突决策 fail loud。
@@ -24,7 +26,7 @@
 - 面板从事件账本投影完成、阻塞、审批、路由和协调器提醒；用户可启用页面打开期间的浏览器前台通知。真正的页面关闭后台 Push 尚未启用，不把它冒充已交付能力。
 
 ```bash
-scripts/python-runtime -m codex_workbench init
+scripts/python-runtime -m codex_workbench init --authority
 scripts/python-runtime -m codex_workbench serve
 scripts/python-runtime -m codex_workbench doctor
 scripts/python-runtime -m codex_workbench doctor --require-restart-ready
@@ -106,7 +108,15 @@ codex-workbench quota set \
   --source settings-usage
 ```
 
-任何池未知时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。fixture、test、controlled 或 simulation 来源的快照不会计入 A6/A7 配额验收。
+任何池未知或快照超过 15 分钟时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。fixture、test、controlled 或 simulation 来源的快照不会计入 A6/A7 配额验收。
+
+长期运行时可将 Claude 设置页导出的本地 JSON 文件交给无模型调用的刷新 adapter；服务按周期读取，内容未变化时不重复写账本：
+
+```bash
+export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE="$HOME/Library/Application Support/Codex Workbench/claude-quota.json"
+```
+
+文件字段与 `quota set` 一致：`observed_at`、`auth_ok`、`auth_method`、三个或四个 remaining 百分比及可选具名窗口。Adapter 不使用 API key，也不启动 Claude 回合。
 
 调度器按所有适用配额池的最低剩余值执行：
 
@@ -160,10 +170,11 @@ open http://127.0.0.1:18766
 codex-workbench acceptance attest-a12 \
   --artifact /path/to/slides.pptx \
   --quota-window 2026-W35 \
+  --source-session-id claude-web-session-id \
   --note "Claude web completed with the reserved quota pool"
 ```
 
-只有实际存在且大小匹配的内容寻址 PPT、PPTX 或 PDF 工件才能让 A12 通过。
+只有实际存在、SHA-256 与大小匹配、且文件签名/内部结构确认为 PPT、PPTX 或 PDF 的工件，连同明确的 Claude Web session provenance，才能让 A12 通过；改扩展名的 fixture 不会通过。
 
 ## 状态语义
 

@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 import re
 from typing import Any
 
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, presentation_format
+from .authority import normalize_boot_id
 from .store import WorkbenchStore
 
 
@@ -46,7 +47,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         _phone_observation_check(events),
         _restart_check(tasks, events),
         _model_worker_check(tasks),
-        _sol_verifier_check(tasks),
+        _sol_verifier_check(events),
         _five_hour_quota_check(quota),
         _weekly_quota_check(quota),
         _fallback_check(tasks, events),
@@ -149,34 +150,63 @@ def _ppt_reserve_check(
             or not str(payload.get("artifact_ref", "")).startswith("sha256:")
             or int(payload.get("artifact_size", 0)) <= 0
             or not payload.get("quota_window_id")
+            or payload.get("provider") != "claude-web"
+            or payload.get("provenance_kind") != "real-user-journey"
+            or not payload.get("source_session_id")
         ):
             continue
         try:
-            path = artifacts.path_for(str(payload["artifact_ref"]))
+            path = artifacts.verify(str(payload["artifact_ref"]))
         except ValueError:
             continue
-        if path.is_file() and path.stat().st_size == int(payload["artifact_size"]):
+        if (
+            path.stat().st_size == int(payload["artifact_size"])
+            and presentation_format(path) == payload.get("detected_format")
+        ):
             attestations.append(event)
     if attestations:
         latest = attestations[-1]
         return AcceptanceCheck(
             "A12",
-            "ok",
+            "pending",
             REQUIREMENTS["A12"],
-            f"已保存 {latest['payload'].get('artifact_name')}（{latest['payload'].get('artifact_ref')}），配额窗口 {latest['payload'].get('quota_window_id')}",
+            f"管理员已导入 {latest['payload'].get('artifact_name')}，但缺少可核验 Claude export/receipt 与配额快照关联；等待人工验收",
         )
     return _pending("A12", "等待本地管理员导入一次保留池内完成的 Claude 网页 PPT/PDF 工件")
 
 
 def _restart_check(tasks: list[dict[str, Any]], events: list[dict[str, Any]]) -> AcceptanceCheck:
     starts = [event for event in events if event["event_type"] == "coordinator.started"]
-    boot_ids = {event["payload"].get("boot_id") for event in starts if event["payload"].get("boot_id")}
+    boot_ids = {
+        normalize_boot_id(str(event["payload"]["boot_id"]))
+        for event in starts
+        if event["payload"].get("boot_id")
+        and normalize_boot_id(str(event["payload"]["boot_id"])) not in {"unknown", "darwin:unknown"}
+    }
     accepted = [task for task in tasks if task["state"] == "accepted"]
     latest = starts[-1]["payload"] if starts else {}
     recovered_ledger = int(latest.get("ledger_task_count", 0)) > 0 and int(
         latest.get("ledger_cursor_before_start", 0)
     ) > 0
-    if len(boot_ids) >= 2 and accepted and recovered_ledger:
+    latest_start_cursor = int(starts[-1]["cursor"]) if starts else 0
+    accepted_ids = {str(task["task_id"]) for task in accepted}
+    created_before = {
+        str(event["task_id"])
+        for event in events
+        if event["event_type"] == "task.created"
+        and event.get("task_id") in accepted_ids
+        and int(event["cursor"]) < latest_start_cursor
+    }
+    accepted_after = {
+        str(event["task_id"])
+        for event in events
+        if event["event_type"] == "task.state_changed"
+        and event.get("task_id") in accepted_ids
+        and event["payload"].get("to") == "accepted"
+        and int(event["cursor"]) > latest_start_cursor
+    }
+    crossed_boot = bool(len(starts) >= 2 and created_before & accepted_after)
+    if len(boot_ids) >= 2 and crossed_boot and recovered_ledger:
         return AcceptanceCheck(
             "A3",
             "ok",
@@ -205,18 +235,33 @@ def _model_worker_check(tasks: list[dict[str, Any]]) -> AcceptanceCheck:
     return _pending("A4", f"缺少 {'、'.join(missing)} 的 accepted 真实模型 Evidence")
 
 
-def _sol_verifier_check(tasks: list[dict[str, Any]]) -> AcceptanceCheck:
-    accepted = False
-    rejected = False
-    for task in tasks:
-        for node in task["nodes"]:
-            model = str(node.get("result", {}).get("actual_model", "")).lower() if node.get("result") else ""
-            if node.get("verifier") and "sol" in model:
-                accepted |= node["state"] == "accepted"
-                rejected |= node["state"] in {"failed", "blocked"}
-    if accepted and rejected:
-        return AcceptanceCheck("A5", "ok", REQUIREMENTS["A5"], "Sol verifier 同时存在 accepted 与退回失败任务的持久 Evidence")
-    return _pending("A5", "需要 Sol verifier 各一份 accepted 与退回失败任务 Evidence")
+def _sol_verifier_check(events: list[dict[str, Any]]) -> AcceptanceCheck:
+    # Final-state projections erase rejected attempts. A5 is therefore proven
+    # by the append-only reject -> repair -> accepted event chain instead.
+    by_task: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        if event.get("task_id"):
+            by_task.setdefault(str(event["task_id"]), []).append(event)
+    for task_id, chain in by_task.items():
+        rejected = [
+            event for event in chain
+            if event["event_type"] == "node.failed"
+            and event["payload"].get("result", {}).get("result_kind") == "verifier"
+            and "sol" in str(event["payload"].get("result", {}).get("actual_model", "")).lower()
+        ]
+        repairs = [event for event in chain if event["event_type"] == "task.repair_scheduled"]
+        accepted = [
+            event for event in chain
+            if event["event_type"] == "node.accepted"
+            and event["payload"].get("result", {}).get("result_kind") == "verifier"
+            and "sol" in str(event["payload"].get("result", {}).get("actual_model", "")).lower()
+        ]
+        if rejected and repairs and accepted and rejected[0]["cursor"] < repairs[0]["cursor"] < accepted[-1]["cursor"]:
+            return AcceptanceCheck(
+                "A5", "ok", REQUIREMENTS["A5"],
+                f"任务 {task_id} 已保存 Sol reject → repair → accepted 事件链",
+            )
+    return _pending("A5", "需要同一任务的 Sol reject、repair_scheduled 与后续 accepted 持久事件链")
 
 
 def _five_hour_quota_check(quota: list[dict[str, Any]]) -> AcceptanceCheck:

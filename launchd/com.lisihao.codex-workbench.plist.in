@@ -21,6 +21,8 @@
     <string>__PROCESS_HOME__</string>
     <key>CODEX_WORKBENCH_CLAUDE</key>
     <string>/opt/homebrew/bin/claude</string>
+    <key>CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE</key>
+    <string>__QUOTA_SNAPSHOT_FILE__</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONUNBUFFERED</key>

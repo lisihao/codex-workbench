@@ -7,18 +7,53 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from unittest.mock import patch
 
 from codex_workbench.acceptance import build_acceptance_report
-from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.service import Coordinator
+from codex_workbench.executors import FixtureExecutor
 from codex_workbench.store import WorkbenchStore
 
 
+def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
+    if any(node.verifier for node in nodes):
+        return nodes
+    return [*nodes, NodeSpec(
+        "verify", task_id, "verify", "fixture", "fixture", "accepted",
+        depends_on=tuple(node.node_id for node in nodes), verifier=True,
+    )]
+
+
 class ServiceTests(unittest.TestCase):
+    def test_worker_future_exception_is_persisted_and_fails_health(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("future-failure")
+            store.record_system_event("coordinator.started", {"instance_id": "future-failure"})
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            future: Future[None] = Future()
+            future.set_exception(RuntimeError("fixture worker exploded"))
+            coordinator._futures[future] = ("task/node", None)
+            coordinator._collect()
+            coordinator._pool.shutdown(wait=True)
+
+            health = store.health()
+            self.assertFalse(health["ok"])
+            self.assertIn("fixture worker exploded", health["coordinator_failure"]["error"])
+            self.assertIn(
+                "coordinator.failed",
+                {event["event_type"] for event in store.read_events()},
+            )
     @staticmethod
     def run_until_terminal(store: WorkbenchStore, state: Path, task_id: str) -> dict:
-        coordinator = Coordinator(store, state, max_workers=1, poll_seconds=0.01)
+        epoch = store.activate_coordinator(f"run-{task_id}")
+        coordinator = Coordinator(
+            store, state, coordinator_epoch=epoch, max_workers=1, poll_seconds=0.01
+        )
         thread = threading.Thread(target=coordinator.run_forever)
         thread.start()
         deadline = time.monotonic() + 8
@@ -38,6 +73,7 @@ class ServiceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("fixture-dag")
             contract = TaskContract(
                 task_id="e2e",
                 repository=str(root),
@@ -52,7 +88,9 @@ class ServiceTests(unittest.TestCase):
             ]
             store.create_task(contract, nodes, "e2e-create")
             store.queue_task("e2e")
-            coordinator = Coordinator(store, root, max_workers=2, poll_seconds=0.01)
+            coordinator = Coordinator(
+                store, root, coordinator_epoch=epoch, max_workers=2, poll_seconds=0.01
+            )
             thread = threading.Thread(target=coordinator.run_forever)
             thread.start()
             deadline = time.monotonic() + 3
@@ -83,9 +121,10 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("fallback")
             store.write_quota(
                 QuotaSnapshot(
-                    observed_at="2026-08-26T00:00:00+00:00",
+                    observed_at=now_iso(),
                     auth_ok=True,
                     auth_method="native-subscription",
                     five_hour_remaining=60,
@@ -111,10 +150,10 @@ class ServiceTests(unittest.TestCase):
                 "inspect the fixture",
                 read_scopes=("README.md",),
             )
-            store.create_task(contract, [node], "fallback-create")
+            store.create_task(contract, verified([node], contract.task_id), "fallback-create")
             store.queue_task("fallback")
-            claimed = store.claim_ready_node("worker-1")
-            coordinator = Coordinator(store, state, max_workers=1)
+            claimed = store.claim_ready_node("worker-1", epoch)
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch, max_workers=1)
 
             class StubExecutor:
                 def __init__(self, result: NodeResult):
@@ -126,16 +165,20 @@ class ServiceTests(unittest.TestCase):
                     return self.result
 
             claude = StubExecutor(NodeResult("blocked", "Claude native-subscription authentication is unavailable"))
-            codex = StubExecutor(NodeResult("succeeded", "Codex fallback completed", actual_model="gpt-5.6-luna"))
+            codex = StubExecutor(NodeResult(
+                "succeeded", "Codex fallback completed", actual_model="gpt-5.6-luna",
+                result_kind="worker", checks=("fixture-check",),
+            ))
             with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
                 coordinator._execute_claimed(claimed)
             coordinator._pool.shutdown(wait=True)
 
             task = store.get_task("fallback")
-            self.assertEqual(task["nodes"][0]["state"], "accepted")
-            self.assertEqual(task["nodes"][0]["result"]["actual_model"], "gpt-5.6-luna")
-            self.assertEqual(task["nodes"][0]["effective_executor"], "codex")
-            self.assertEqual(task["nodes"][0]["effective_model"], "gpt-5.6-luna")
+            work = next(node for node in task["nodes"] if node["node_id"] == "work")
+            self.assertEqual(work["state"], "accepted")
+            self.assertEqual(work["result"]["actual_model"], "gpt-5.6-luna")
+            self.assertEqual(work["effective_executor"], "codex")
+            self.assertEqual(work["effective_model"], "gpt-5.6-luna")
             self.assertEqual(claude.calls, 1)
             self.assertEqual(codex.calls, 1)
             routed = [event for event in store.read_events(task_id="fallback") if event["event_type"] == "node.routed"]
@@ -159,9 +202,10 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("red-fallback")
             store.write_quota(
                 QuotaSnapshot(
-                    observed_at="2026-08-26T00:00:00+00:00",
+                    observed_at=now_iso(),
                     auth_ok=True,
                     auth_method="native-subscription",
                     five_hour_remaining=27,
@@ -188,10 +232,10 @@ class ServiceTests(unittest.TestCase):
                 "inspect the fixture",
                 read_scopes=("README.md",),
             )
-            store.create_task(contract, [node], "red-fallback-create")
+            store.create_task(contract, verified([node], contract.task_id), "red-fallback-create")
             store.queue_task(contract.task_id)
-            claimed = store.claim_ready_node("worker-1")
-            coordinator = Coordinator(store, state, max_workers=1)
+            claimed = store.claim_ready_node("worker-1", epoch)
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch, max_workers=1)
 
             class StubExecutor:
                 def __init__(self, result: NodeResult):
@@ -203,14 +247,20 @@ class ServiceTests(unittest.TestCase):
                     return self.result
 
             claude = StubExecutor(NodeResult("succeeded", "must not run", actual_model="sonnet"))
-            codex = StubExecutor(NodeResult("succeeded", "Codex completed", actual_model="gpt-5.6-luna"))
+            codex = StubExecutor(NodeResult(
+                "succeeded", "Codex completed", actual_model="gpt-5.6-luna",
+                result_kind="worker", checks=("fixture-check",),
+            ))
             with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
                 coordinator._execute_claimed(claimed)
             coordinator._pool.shutdown(wait=True)
 
             self.assertEqual(claude.calls, 0)
             self.assertEqual(codex.calls, 1)
-            routed_node = store.get_task(contract.task_id)["nodes"][0]
+            routed_node = next(
+                node for node in store.get_task(contract.task_id)["nodes"]
+                if node["node_id"] == "work"
+            )
             self.assertEqual(routed_node["effective_executor"], "codex")
             self.assertEqual(routed_node["effective_model"], "gpt-5.6-luna")
             routed = [event for event in store.read_events(task_id=contract.task_id) if event["event_type"] == "node.routed"]
@@ -231,9 +281,10 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("yellow-concurrency")
             store.write_quota(
                 QuotaSnapshot(
-                    observed_at="2026-08-26T00:00:00+00:00",
+                    observed_at=now_iso(),
                     auth_ok=True,
                     auth_method="native-subscription",
                     five_hour_remaining=35,
@@ -255,7 +306,7 @@ class ServiceTests(unittest.TestCase):
                 NodeSpec("b", contract.task_id, "B", "claude", "sonnet", "B", read_scopes=("README.md",)),
                 NodeSpec("c", contract.task_id, "C", "codex", "gpt-5.6-luna", "C", read_scopes=("README.md",)),
             ]
-            store.create_task(contract, nodes, "yellow-concurrency-create")
+            store.create_task(contract, verified(nodes, contract.task_id), "yellow-concurrency-create")
             store.queue_task(contract.task_id)
             codex_started = threading.Event()
 
@@ -275,7 +326,10 @@ class ServiceTests(unittest.TestCase):
                     time.sleep(0.03)
                     with self.lock:
                         self.active -= 1
-                    return NodeResult("succeeded", "Sonnet completed", actual_model="sonnet")
+                    return NodeResult(
+                        "succeeded", "Sonnet completed", actual_model="sonnet",
+                        result_kind="worker", checks=("fixture-check",),
+                    )
 
             class CodexStub:
                 def __init__(self):
@@ -284,12 +338,22 @@ class ServiceTests(unittest.TestCase):
                 def execute(self, _request):
                     self.calls += 1
                     codex_started.set()
-                    return NodeResult("succeeded", "Codex completed", actual_model="gpt-5.6-luna")
+                    return NodeResult(
+                        "succeeded", "Codex completed", actual_model="gpt-5.6-luna",
+                        result_kind="worker", checks=("fixture-check",),
+                    )
 
             claude = ClaudeStub()
             codex = CodexStub()
-            coordinator = Coordinator(store, state, max_workers=3, poll_seconds=0.01)
-            with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
+            coordinator = Coordinator(
+                store, state, coordinator_epoch=epoch, max_workers=3, poll_seconds=0.01
+            )
+            fixture = FixtureExecutor(coordinator.artifacts)
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=lambda kind: claude if kind == "claude" else fixture if kind == "fixture" else codex,
+            ):
                 thread = threading.Thread(target=coordinator.run_forever)
                 thread.start()
                 deadline = time.monotonic() + 5
@@ -320,12 +384,14 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("compose")
             contract = TaskContract(
                 task_id="compose",
                 repository=str(repository),
                 base_sha=base_sha,
                 objective="compose parallel changes",
                 allowed_scope=("tests",),
+                verifier_model="fixture",
             )
             make_a = (
                 sys.executable,
@@ -350,7 +416,7 @@ class ServiceTests(unittest.TestCase):
                     "compose",
                     "verify",
                     "deterministic",
-                    "local",
+                    "fixture",
                     command=verify,
                     depends_on=("a", "b"),
                     verifier=True,
@@ -359,7 +425,9 @@ class ServiceTests(unittest.TestCase):
             ]
             store.create_task(contract, nodes, "compose-create")
             store.queue_task("compose")
-            coordinator = Coordinator(store, state, max_workers=2, poll_seconds=0.01)
+            coordinator = Coordinator(
+                store, state, coordinator_epoch=epoch, max_workers=2, poll_seconds=0.01
+            )
             thread = threading.Thread(target=coordinator.run_forever)
             thread.start()
             deadline = time.monotonic() + 8
@@ -405,6 +473,7 @@ class ServiceTests(unittest.TestCase):
                     objective="verify the declared input",
                     allowed_scope=("checked.txt",),
                     required_artifacts=("test-log", "verdict"),
+                    verifier_model="fixture",
                 )
                 script = (
                     "from pathlib import Path; "
@@ -416,7 +485,7 @@ class ServiceTests(unittest.TestCase):
                     task_id,
                     "verify",
                     "deterministic",
-                    "local",
+                    "fixture",
                     command=(sys.executable, "-c", script),
                     read_scopes=("checked.txt",),
                     verifier=True,

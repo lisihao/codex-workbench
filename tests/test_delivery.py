@@ -7,7 +7,7 @@ import unittest
 
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.delivery import GitHubDelivery, GitHubDeliveryRequest
-from codex_workbench.model import NodeSpec, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.store import StateConflictError, WorkbenchStore
 
 
@@ -38,6 +38,7 @@ class DeliveryTests(unittest.TestCase):
         (self.worktree / "result.txt").write_text("accepted\n")
         self.store = WorkbenchStore(self.root / "state.sqlite")
         self.store.initialize()
+        self.epoch = self.store.activate_coordinator("delivery-test")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -53,8 +54,17 @@ class DeliveryTests(unittest.TestCase):
         )
         node = NodeSpec("verify", "delivery-task", "verify", "fixture", "fixture", "accepted", verifier=True)
         self.store.create_task(contract, [node], "create-delivery")
-        self.store.assign_worktree("delivery-task", "verify", str(self.worktree))
-        self.store.transition_task("delivery-task", "accepted", expected_revision=1)
+        self.store.queue_task("delivery-task")
+        claimed = self.store.claim_ready_node("delivery-verifier", self.epoch)
+        self.store.assign_worktree(
+            "delivery-task",
+            "verify",
+            str(self.worktree),
+            attempt=claimed["attempt"],
+            coordinator_epoch=claimed["coordinator_epoch"],
+            lease_epoch=claimed["lease_epoch"],
+        )
+        self.store.settle_claimed(claimed, NodeResult("succeeded", "accepted"))
 
     def test_external_delivery_requires_contract_authorization(self) -> None:
         self.create_accepted_task(external_write=False)

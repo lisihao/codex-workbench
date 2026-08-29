@@ -8,7 +8,7 @@ import uuid
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .executors import ClaudeExecutor
-from .model import TaskContract
+from .model import DEFAULT_QUOTA_TTL_SECONDS, TaskContract
 from .planner import CodexPlanner
 from .store import WorkbenchStore
 
@@ -67,7 +67,11 @@ def submit_natural_language_request(
     quota_admitted_models = tuple(
         model
         for model in ("opus", "sonnet", "fable")
-        if quota is not None and quota.permits(model)[0]
+        if quota is not None
+        and quota.dispatch_decision(
+            model,
+            max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS,
+        ).action == "claude"
     )
     claude_authenticated = False
     if quota_admitted_models:

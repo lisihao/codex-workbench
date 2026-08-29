@@ -43,6 +43,7 @@ def main() -> int:
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--state-root", default="~/Library/Application Support/Codex Workbench")
     parser.add_argument("--codex-binary", default="~/.codex/packages/standalone/current/codex")
+    parser.add_argument("--quota-snapshot-file")
     args = parser.parse_args()
 
     source = Path(args.source).expanduser().resolve()
@@ -54,12 +55,29 @@ def main() -> int:
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
     process_home = state_root / "codex-process-home"
+    quota_snapshot_file = (
+        Path(args.quota_snapshot_file).expanduser().resolve()
+        if args.quota_snapshot_file
+        else state_root / "claude-quota.json"
+    )
 
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_file = state_root / "config.json"
+    config_raw = json.loads(config_file.read_text()) if config_file.exists() else {}
+    config_raw.update(
+        {
+            "deployment_role": "authority",
+            "authority_host": __import__("socket").gethostname(),
+            "quota_snapshot_file": str(quota_snapshot_file),
+            "quota_refresh_seconds": int(config_raw.get("quota_refresh_seconds", 300)),
+        }
+    )
+    config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
+    config_file.chmod(0o600)
     codex_source = Path(args.codex_binary).expanduser().resolve(strict=True)
     codex_host_source = codex_source.with_name("codex-code-mode-host")
     if not codex_host_source.is_file():
@@ -123,6 +141,7 @@ def main() -> int:
         f"export CODEX_HOME={str(codex_home)!r}\n"
         f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
         f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
+        f"export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE={str(quota_snapshot_file)!r}\n"
         "export CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude\n"
         f"exec {str(runtime_selector)!r} -m codex_workbench \"$@\"\n"
     )
@@ -135,6 +154,7 @@ def main() -> int:
         .replace("__CODEX_BINARY__", str(codex_binary))
         .replace("__CODEX_HOME__", str(codex_home))
         .replace("__PROCESS_HOME__", str(process_home))
+        .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
     )
     plistlib.loads(rendered.encode())
     launch_agents.mkdir(parents=True, exist_ok=True)

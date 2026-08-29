@@ -8,6 +8,8 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
+from unittest.mock import patch
 
 from codex_workbench.acceptance import build_acceptance_report
 from codex_workbench.artifacts import ArtifactStore
@@ -22,6 +24,7 @@ class AcceptanceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("acceptance-offline")
             contract = TaskContract(
                 task_id="offline-work",
                 repository=str(root),
@@ -29,15 +32,16 @@ class AcceptanceTests(unittest.TestCase):
                 objective="finish while the MacBook is offline",
                 allowed_scope=("result",),
                 required_artifacts=(),
+                verifier_model="fixture",
             )
             nodes = [
-                NodeSpec("work", contract.task_id, "work", "deterministic", "local", command=("true",)),
+                NodeSpec("work", contract.task_id, "work", "deterministic", "fixture", command=("true",)),
                 NodeSpec(
                     "verify",
                     contract.task_id,
                     "verify",
                     "deterministic",
-                    "local",
+                    "fixture",
                     command=("true",),
                     depends_on=("work",),
                     verifier=True,
@@ -45,14 +49,14 @@ class AcceptanceTests(unittest.TestCase):
             ]
             store.create_task(contract, nodes, "offline-create")
             store.queue_task(contract.task_id)
-            store.settle_node(
-                contract.task_id,
-                store.claim_ready_node("worker")["node_id"],
+            worker = store.claim_ready_node("worker", epoch)
+            store.settle_claimed(
+                worker,
                 NodeResult("succeeded", "work complete", actual_model="local"),
             )
-            store.settle_node(
-                contract.task_id,
-                store.claim_ready_node("verifier")["node_id"],
+            verifier = store.claim_ready_node("verifier", epoch)
+            store.settle_claimed(
+                verifier,
                 NodeResult("succeeded", "accepted", actual_model="local"),
             )
             first = store.record_client_heartbeat("macbook-fixture", "macbook")
@@ -77,7 +81,11 @@ class AcceptanceTests(unittest.TestCase):
                 store.health()["cursor"],
                 "iPhone fixture",
             )
-            ppt_data = b"pptx fixture"
+            presentation = root / "slides.pptx"
+            with zipfile.ZipFile(presentation, "w") as archive:
+                archive.writestr("[Content_Types].xml", "<Types/>")
+                archive.writestr("ppt/presentation.xml", "<p:presentation/>")
+            ppt_data = presentation.read_bytes()
             artifact_ref = ArtifactStore(root / "artifacts").put_bytes(ppt_data, "pptx")
             store.record_acceptance_attestation(
                 "A12",
@@ -85,35 +93,42 @@ class AcceptanceTests(unittest.TestCase):
                 "slides.pptx",
                 len(ppt_data),
                 "2026-W35",
+                "claude-web-session",
                 "completed in Claude web using the reserved pool",
             )
 
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
             self.assertEqual(checks["A1"]["status"], "ok")
             self.assertEqual(checks["A2"]["status"], "ok")
-            self.assertEqual(checks["A12"]["status"], "ok")
+            self.assertEqual(checks["A12"]["status"], "pending")
 
     def test_a12_cli_imports_a_content_addressed_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "slides.pptx"
-            artifact.write_bytes(b"pptx fixture")
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("[Content_Types].xml", "<Types/>")
+                archive.writestr("ppt/presentation.xml", "<p:presentation/>")
             args = SimpleNamespace(
                 home=str(root / "state"),
                 acceptance_action="attest-a12",
                 artifact=str(artifact),
                 quota_window="2026-W35",
+                source_session_id="claude-web-session",
                 note="completed in Claude web using the reserved pool",
             )
             output = io.StringIO()
-            with redirect_stdout(output):
+            with patch.dict(
+                "os.environ",
+                {"CODEX_WORKBENCH_PROCESS_HOME": str(root / "process-home")},
+            ), redirect_stdout(output):
                 self.assertEqual(command_acceptance(args), 0)
             receipt = json.loads(output.getvalue())
             self.assertTrue(receipt["artifact_ref"].startswith("sha256:"))
             store = WorkbenchStore(root / "state" / "state.sqlite")
             self.assertEqual(
                 {check["id"]: check for check in build_acceptance_report(store)["checks"]}["A12"]["status"],
-                "ok",
+                "pending",
             )
 
     def test_report_is_evidence_based_and_keeps_external_checks_pending(self) -> None:
@@ -185,6 +200,7 @@ class AcceptanceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
+            epoch = store.activate_coordinator("acceptance-fallback")
             store.record_system_event(
                 "coordinator.started",
                 {
@@ -221,26 +237,32 @@ class AcceptanceTests(unittest.TestCase):
             ]
             store.create_task(contract, nodes, "fallback-create")
             store.queue_task(contract.task_id)
-            store.claim_ready_node("worker")
-            store.record_node_event(
-                "node.routed",
+            worker = store.claim_ready_node("worker", epoch)
+            store.record_node_route(
                 contract.task_id,
                 "work",
-                {
+                executor="codex",
+                model="gpt-5.6-luna",
+                payload={
                     "attempt": 1,
                     "from": "claude",
                     "to": "codex",
                     "model": "gpt-5.6-luna",
                     "reason": "Claude quota protection active at 25.0% remaining",
                 },
+                attempt=worker["attempt"],
+                coordinator_epoch=worker["coordinator_epoch"],
+                lease_epoch=worker["lease_epoch"],
             )
-            store.settle_node(
-                contract.task_id,
-                "work",
-                NodeResult("succeeded", "fallback complete", actual_model="gpt-5.6-luna"),
+            store.settle_claimed(
+                worker,
+                NodeResult(
+                    "succeeded", "fallback complete", actual_model="gpt-5.6-luna",
+                    result_kind="worker", checks=("fixture-check",),
+                ),
             )
-            store.claim_ready_node("verifier")
-            store.settle_node(contract.task_id, "verify", NodeResult("succeeded", "accepted"))
+            verifier = store.claim_ready_node("verifier", epoch)
+            store.settle_claimed(verifier, NodeResult("succeeded", "accepted"))
             cursor_before_restart = store.health()["cursor"]
             store.record_system_event(
                 "coordinator.started",
@@ -256,7 +278,7 @@ class AcceptanceTests(unittest.TestCase):
             )
 
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
-            self.assertEqual(checks["A3"]["status"], "ok")
+            self.assertEqual(checks["A3"]["status"], "pending")
             self.assertEqual(checks["A8"]["status"], "ok")
 
 

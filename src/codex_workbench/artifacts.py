@@ -3,6 +3,7 @@ from __future__ import annotations
 from hashlib import sha256
 from pathlib import Path
 import re
+import zipfile
 
 
 _SUFFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
@@ -38,3 +39,39 @@ class ArtifactStore:
         ):
             raise ValueError("unsupported artifact ref")
         return self.root / "sha256" / digest[:2] / f"{digest}.{suffix}"
+
+    def verify(self, ref: str) -> Path:
+        path = self.path_for(ref)
+        if not path.is_file():
+            raise ValueError(f"artifact does not exist: {ref}")
+        expected = ref.split(":", 2)[1]
+        actual = sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ValueError(f"artifact hash mismatch: {ref}")
+        return path
+
+
+def presentation_format(path: Path) -> str | None:
+    """Identify supported presentation artifacts by content, never by extension."""
+    data = path.read_bytes()
+    if (
+        data.startswith(b"%PDF-")
+        and b"%%EOF" in data[-1024:]
+        and (b"/Type /Catalog" in data or b"xref" in data)
+    ):
+        return "pdf"
+    if (
+        len(data) >= 512
+        and data.startswith(bytes.fromhex("d0cf11e0a1b11ae1"))
+        and "PowerPoint Document".encode("utf-16le") in data
+    ):
+        return "ppt"
+    if data.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile):
+            return None
+        if "[Content_Types].xml" in names and "ppt/presentation.xml" in names:
+            return "pptx"
+    return None

@@ -11,6 +11,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
+from .model import DEFAULT_QUOTA_TTL_SECONDS
 from .store import StateConflictError, WorkbenchStore
 
 
@@ -41,8 +42,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/login":
             return self._html(self._login_page())
         if parsed.path == "/health":
+            health = self.server.store.health()
             return self._json(
-                {"version": __version__, "build": self._build_manifest(), **self.server.store.health()}
+                {"version": __version__, "build": self._build_manifest(), **health},
+                HTTPStatus.OK if health["ok"] else HTTPStatus.SERVICE_UNAVAILABLE,
             )
         if parsed.path == "/api/snapshot":
             quota = self.server.store.latest_quota()
@@ -55,7 +58,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "approvals": self.server.store.list_approvals(),
                     "alerts": self.server.store.list_alerts(),
                     "quota": quota.__dict__ if quota else None,
-                    "quota_policy": quota.policy_summary() if quota else None,
+                    "quota_policy": quota.policy_summary(
+                        max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS
+                    ) if quota else None,
                     "acceptance": build_acceptance_report(self.server.store),
                     "diagnostics": {"stale_tasks": self.server.store.stale_tasks()},
                     "authenticated": self._authenticated(),

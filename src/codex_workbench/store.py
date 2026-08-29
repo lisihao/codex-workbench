@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import threading
 from typing import Any, Callable, Iterator
 
@@ -17,11 +18,25 @@ from .model import (
     canonical_hash,
     canonical_json,
     now_iso,
+    retry_model,
 )
+from .artifacts import ArtifactStore, presentation_format
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
+
+
+def _repository_identity(repository: str) -> str:
+    root = Path(repository).expanduser().resolve()
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            text=True, capture_output=True, timeout=10, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return str(root)
+    return str(Path(common).resolve())
 
 
 class CommandConflictError(RuntimeError):
@@ -100,6 +115,8 @@ class WorkbenchStore:
                     started_at TEXT,
                     settled_at TEXT,
                     result_json TEXT,
+                    coordinator_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_epoch INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (task_id, node_id)
                 );
@@ -171,7 +188,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -180,6 +197,14 @@ class WorkbenchStore:
                     connection.execute("ALTER TABLE nodes ADD COLUMN effective_executor TEXT")
                 if "effective_model" not in node_columns:
                     connection.execute("ALTER TABLE nodes ADD COLUMN effective_model TEXT")
+                if "coordinator_epoch" not in node_columns:
+                    connection.execute(
+                        "ALTER TABLE nodes ADD COLUMN coordinator_epoch INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "lease_epoch" not in node_columns:
+                    connection.execute(
+                        "ALTER TABLE nodes ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
+                    )
                 task_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
@@ -192,28 +217,90 @@ class WorkbenchStore:
                     "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
+                # v7 changes the reusable Evidence ABI; old rows cannot prove
+                # the new structured result and artifact invariants.
+                connection.execute("DELETE FROM evidence_cache")
             elif int(current["value"]) != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
                 )
         self.path.chmod(0o600)
 
+    @property
+    def artifacts(self) -> ArtifactStore:
+        return ArtifactStore(self.path.parent / "artifacts")
+
+    def activate_coordinator(self, instance_id: str) -> int:
+        if not instance_id.strip():
+            raise ValueError("coordinator instance_id is required")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'coordinator_epoch'"
+            ).fetchone()
+            epoch = (int(row["value"]) if row else 0) + 1
+            connection.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('coordinator_epoch', ?)",
+                (str(epoch),),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('coordinator_instance_id', ?)",
+                (instance_id,),
+            )
+            return epoch
+
+    @staticmethod
+    def _next_lease_epoch(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'node_lease_epoch'"
+        ).fetchone()
+        epoch = (int(row["value"]) if row else 0) + 1
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES('node_lease_epoch', ?)",
+            (str(epoch),),
+        )
+        return epoch
+
+    @staticmethod
+    def _assert_active_coordinator(
+        connection: sqlite3.Connection,
+        coordinator_epoch: int,
+    ) -> None:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'coordinator_epoch'"
+        ).fetchone()
+        if row is None or int(row["value"]) != coordinator_epoch:
+            raise StateConflictError("coordinator lease epoch is stale")
+
     def cached_evidence(self, cache_key: str) -> dict[str, Any] | None:
-        with self.connection() as connection:
+        with self.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM evidence_cache WHERE cache_key = ?", (cache_key,)
             ).fetchone()
             if row is None:
                 return None
+            result = json.loads(row["result_json"])
+            try:
+                self._verify_artifact_refs(result.get("artifacts", {}))
+            except ValueError:
+                connection.execute(
+                    "DELETE FROM evidence_cache WHERE cache_key = ?", (cache_key,)
+                )
+                return None
             return {
                 "cache_key": row["cache_key"],
-                "result": json.loads(row["result_json"]),
+                "result": result,
                 "source_task_id": row["source_task_id"],
                 "source_node_id": row["source_node_id"],
                 "created_at": row["created_at"],
                 "last_used_at": row["last_used_at"],
                 "use_count": row["use_count"],
             }
+
+    def _verify_artifact_refs(self, artifacts: dict[str, str]) -> None:
+        for name, ref in artifacts.items():
+            if not isinstance(ref, str):
+                raise ValueError(f"artifact {name!r} must be a content-addressed ref")
+            self.artifacts.verify(ref)
 
     def save_evidence(
         self,
@@ -222,6 +309,7 @@ class WorkbenchStore:
         task_id: str,
         node_id: str,
     ) -> None:
+        self._verify_artifact_refs(result.artifacts)
         timestamp = now_iso()
         with self.transaction() as connection:
             connection.execute(
@@ -410,6 +498,7 @@ class WorkbenchStore:
             missing = set(node.depends_on) - node_ids
             if missing:
                 raise ValueError(f"node {node.node_id} has missing dependencies: {sorted(missing)}")
+        self._assert_verifier_contract(contract, nodes)
         self._assert_acyclic(nodes)
 
         request = {"contract": contract.to_dict(), "nodes": [node.to_dict() for node in nodes]}
@@ -476,6 +565,26 @@ class WorkbenchStore:
                 raise ValueError("task graph contains a cycle")
             remaining -= ready
 
+    @staticmethod
+    def _assert_verifier_contract(contract: TaskContract, nodes: list[NodeSpec]) -> None:
+        verifiers = [node for node in nodes if node.verifier]
+        if not verifiers:
+            raise ValueError("task graph must contain exactly one verifier")
+        if len(verifiers) != 1:
+            raise ValueError("task graph must contain exactly one verifier")
+        verifier = verifiers[0]
+        workers = {node.node_id for node in nodes if not node.verifier}
+        if set(verifier.depends_on) != workers:
+            raise ValueError("verifier must depend on every required worker")
+        if verifier.executor == "fixture":
+            return
+        if contract.verifier_model == "fixture" and verifier.model == "fixture":
+            return
+        if verifier.executor != "codex" or "sol" not in verifier.model.lower():
+            raise ValueError("verifier must be a Codex Sol node")
+        if verifier.model != contract.verifier_model or "sol" not in contract.verifier_model.lower():
+            raise ValueError("verifier must match the contract's Codex Sol verifier_model")
+
     def transition_task(
         self,
         task_id: str,
@@ -486,6 +595,17 @@ class WorkbenchStore:
         verdict: str | None = None,
     ) -> int:
         timestamp = now_iso()
+        allowed = {
+            "inbox": {"queued", "cancelled"},
+            "planning": {"queued", "paused", "cancelled"},
+            "ready": {"queued", "paused", "cancelled"},
+            "queued": {"paused", "cancelled"},
+            "running": {"paused", "cancelled"},
+            "verifying": {"paused", "cancelled"},
+            "needs_fix": {"queued", "cancelled"},
+            "needs_approval": {"queued", "cancelled"},
+            "paused": {"queued", "cancelled"},
+        }
         with self.transaction() as connection:
             task = connection.execute(
                 "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
@@ -496,6 +616,10 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"expected task revision {expected_revision}, found {task['state_revision']}"
                 )
+            if state == "accepted":
+                raise StateConflictError("accepted is verifier-owned and cannot be set by task control")
+            if state not in allowed.get(str(task["state"]), set()):
+                raise StateConflictError(f"cannot transition task from {task['state']} to {state}")
             revision = int(task["state_revision"]) + 1
             connection.execute(
                 """
@@ -951,6 +1075,8 @@ class WorkbenchStore:
                     "worktree": node["worktree"],
                     "effective_executor": node["effective_executor"],
                     "effective_model": node["effective_model"],
+                    "coordinator_epoch": node["coordinator_epoch"],
+                    "lease_epoch": node["lease_epoch"],
                     "started_at": node["started_at"],
                     "settled_at": node["settled_at"],
                     "updated_at": node["updated_at"],
@@ -997,6 +1123,9 @@ class WorkbenchStore:
             "node.routed",
             "coordinator.started",
             "coordinator.stopped",
+            "coordinator.failed",
+            "quota.refresh_failed",
+            "quota.refresh_unavailable",
         }
         with self.connection() as connection:
             rows = connection.execute(
@@ -1076,14 +1205,19 @@ class WorkbenchStore:
         artifact_name: str,
         artifact_size: int,
         quota_window_id: str,
+        source_session_id: str,
         note: str,
     ) -> int:
         if check_id != "A12":
             raise ValueError("only A12 accepts a local administrator attestation")
         if not artifact_ref.startswith("sha256:") or artifact_size <= 0:
             raise ValueError("a non-empty content-addressed artifact is required")
-        if not quota_window_id.strip() or not note.strip():
-            raise ValueError("quota_window_id and note are required")
+        if not quota_window_id.strip() or not source_session_id.strip() or not note.strip():
+            raise ValueError("quota_window_id, source_session_id, and note are required")
+        path = self.artifacts.verify(artifact_ref)
+        detected_format = presentation_format(path)
+        if detected_format is None or path.stat().st_size != artifact_size:
+            raise ValueError("A12 artifact content or size is invalid")
         return self.record_system_event(
             "acceptance.attested",
             {
@@ -1092,6 +1226,10 @@ class WorkbenchStore:
                 "artifact_name": artifact_name,
                 "artifact_size": artifact_size,
                 "quota_window_id": quota_window_id,
+                "source_session_id": source_session_id,
+                "provider": "claude-web",
+                "provenance_kind": "real-user-journey",
+                "detected_format": detected_format,
                 "note": note,
                 "source": "local-admin-cli",
             },
@@ -1115,14 +1253,28 @@ class WorkbenchStore:
         executor: str,
         model: str,
         payload: dict[str, Any],
+        attempt: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
     ) -> int:
         with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
             changed = connection.execute(
                 """
                 UPDATE nodes SET effective_executor = ?, effective_model = ?, updated_at = ?
                 WHERE task_id = ? AND node_id = ? AND state = 'running'
+                  AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
                 """,
-                (executor, model, now_iso(), task_id, node_id),
+                (
+                    executor,
+                    model,
+                    now_iso(),
+                    task_id,
+                    node_id,
+                    attempt,
+                    coordinator_epoch,
+                    lease_epoch,
+                ),
             ).rowcount
             if changed != 1:
                 raise StateConflictError(f"node {node_id} is not running")
@@ -1133,7 +1285,7 @@ class WorkbenchStore:
             row = connection.execute(
                 """
                 SELECT event_type, payload_json, created_at FROM events
-                WHERE event_type IN ('coordinator.started', 'coordinator.stopped')
+                WHERE event_type IN ('coordinator.started', 'coordinator.stopped', 'coordinator.failed')
                 ORDER BY cursor DESC LIMIT 1
                 """
             ).fetchone()
@@ -1144,10 +1296,14 @@ class WorkbenchStore:
     def claim_ready_node(
         self,
         worker_id: str,
+        coordinator_epoch: int,
         admissible: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any] | None:
+        if coordinator_epoch <= 0:
+            raise ValueError("coordinator_epoch must be positive")
         timestamp = now_iso()
         with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
             candidates = connection.execute(
                 """
                 SELECT n.*, t.contract_json, t.state AS task_state, t.priority AS task_priority
@@ -1157,13 +1313,19 @@ class WorkbenchStore:
                          json_extract(n.spec_json, '$.ordinal'), n.node_id
                 """
             ).fetchall()
-            running_accesses: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+            running_accesses: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
             for running in connection.execute(
-                "SELECT spec_json FROM nodes WHERE state = 'running'"
+                """
+                SELECT n.spec_json, t.contract_json
+                FROM nodes n JOIN tasks t USING(task_id)
+                WHERE n.state = 'running'
+                """
             ).fetchall():
                 running_spec = json.loads(running["spec_json"])
+                running_contract = json.loads(running["contract_json"])
                 running_accesses.append(
                     (
+                        _repository_identity(running_contract["repository"]),
                         tuple(running_spec.get("read_scopes", [])),
                         tuple(running_spec.get("write_scopes", [])),
                     )
@@ -1184,9 +1346,12 @@ class WorkbenchStore:
                         continue
                 read_scopes = tuple(spec.get("read_scopes", []))
                 write_scopes = tuple(spec.get("write_scopes", []))
+                candidate_contract = json.loads(candidate["contract_json"])
+                repository = _repository_identity(candidate_contract["repository"])
                 if any(
-                    scope_access_conflicts(read_scopes, write_scopes, running_reads, running_writes)
-                    for running_reads, running_writes in running_accesses
+                    repository == running_repository
+                    and scope_access_conflicts(read_scopes, write_scopes, running_reads, running_writes)
+                    for running_repository, running_reads, running_writes in running_accesses
                 ):
                     continue
                 if admissible is not None and not admissible(spec):
@@ -1199,10 +1364,17 @@ class WorkbenchStore:
                 return None
 
             attempt = int(selected["attempt"]) + 1
+            lease_epoch = self._next_lease_epoch(connection)
+            effective_model = retry_model(
+                selected_spec["model"],
+                attempt,
+                verifier=bool(selected_spec.get("verifier")),
+            )
             connection.execute(
                 """
                 UPDATE nodes SET state = 'running', attempt = ?, worker_id = ?,
                                  effective_executor = ?, effective_model = ?,
+                                 coordinator_epoch = ?, lease_epoch = ?,
                                  started_at = ?, updated_at = ?
                 WHERE task_id = ? AND node_id = ? AND state = 'pending'
                 """,
@@ -1210,7 +1382,9 @@ class WorkbenchStore:
                     attempt,
                     worker_id,
                     selected_spec["executor"],
-                    selected_spec["model"],
+                    effective_model,
+                    coordinator_epoch,
+                    lease_epoch,
                     timestamp,
                     timestamp,
                     selected["task_id"],
@@ -1238,7 +1412,14 @@ class WorkbenchStore:
                 "node.started",
                 selected["task_id"],
                 selected["node_id"],
-                {"attempt": attempt, "worker_id": worker_id, "executor": selected_spec["executor"]},
+                {
+                    "attempt": attempt,
+                    "worker_id": worker_id,
+                    "executor": selected_spec["executor"],
+                    "model": effective_model,
+                    "coordinator_epoch": coordinator_epoch,
+                    "lease_epoch": lease_epoch,
+                },
             )
             steering = tuple(
                 row["instruction"]
@@ -1254,24 +1435,61 @@ class WorkbenchStore:
                 "task_id": selected["task_id"],
                 "node_id": selected["node_id"],
                 "attempt": attempt,
-                "spec": selected_spec,
+                "coordinator_epoch": coordinator_epoch,
+                "lease_epoch": lease_epoch,
+                "spec": {**selected_spec, "model": effective_model},
                 "contract": json.loads(selected["contract_json"]),
                 "steering": steering,
             }
 
-    def assign_worktree(self, task_id: str, node_id: str, worktree: str) -> None:
+    def assign_worktree(
+        self,
+        task_id: str,
+        node_id: str,
+        worktree: str,
+        *,
+        attempt: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+    ) -> None:
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE nodes SET worktree = ?, updated_at = ? WHERE task_id = ? AND node_id = ?",
-                (worktree, now_iso(), task_id, node_id),
-            )
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            changed = connection.execute(
+                """
+                UPDATE nodes SET worktree = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'running'
+                  AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
+                """,
+                (
+                    worktree,
+                    now_iso(),
+                    task_id,
+                    node_id,
+                    attempt,
+                    coordinator_epoch,
+                    lease_epoch,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError(f"node {node_id} lease is stale")
 
-    def settle_node(self, task_id: str, node_id: str, result: NodeResult) -> None:
+    def settle_node(
+        self,
+        task_id: str,
+        node_id: str,
+        result: NodeResult,
+        *,
+        attempt: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+    ) -> None:
         timestamp = now_iso()
         with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
             row = connection.execute(
                 """
-                SELECT n.state, n.attempt, n.spec_json, t.contract_json
+                SELECT n.state, n.attempt, n.coordinator_epoch, n.lease_epoch,
+                       n.effective_executor, n.effective_model, n.spec_json, t.contract_json
                 FROM nodes n JOIN tasks t USING(task_id)
                 WHERE n.task_id = ? AND n.node_id = ?
                 """,
@@ -1281,18 +1499,28 @@ class WorkbenchStore:
                 raise KeyError((task_id, node_id))
             if row["state"] != "running":
                 raise StateConflictError(f"node {node_id} is {row['state']}, expected running")
+            if (
+                int(row["attempt"]) != attempt
+                or int(row["coordinator_epoch"]) != coordinator_epoch
+                or int(row["lease_epoch"]) != lease_epoch
+            ):
+                raise StateConflictError(f"node {node_id} lease is stale")
             spec = json.loads(row["spec_json"])
             contract = json.loads(row["contract_json"])
+            self._validate_result_contract(spec, row, result)
+            self._verify_artifact_refs(result.artifacts)
+            if spec.get("verifier") and spec.get("executor") != "fixture":
+                for ref in result.evidence:
+                    self.artifacts.verify(ref)
             if result.status == "succeeded" and spec.get("verifier"):
                 missing = self._missing_required_artifacts(connection, task_id, contract, result)
                 if missing:
-                    result = NodeResult(
+                    result = replace(
+                        result,
                         status="failed",
                         summary=f"required acceptance Evidence is missing: {', '.join(missing)}",
-                        artifacts=result.artifacts,
-                        actual_model=result.actual_model,
-                        exit_code=result.exit_code,
                         retryable=False,
+                        verdict="needs_fix",
                     )
             if result.status == "succeeded":
                 node_state = "accepted"
@@ -1316,6 +1544,20 @@ class WorkbenchStore:
                 node_id,
                 {"attempt": row["attempt"], "result": result.to_dict()},
             )
+            if spec.get("verifier") and result.evidence:
+                for ref in result.evidence:
+                    self._event(
+                        connection,
+                        "verifier.evidence_claimed",
+                        task_id,
+                        node_id,
+                        {
+                            "attempt": int(row["attempt"]),
+                            "artifact_ref": ref,
+                            "checks": list(result.checks),
+                            "verdict": result.verdict,
+                        },
+                    )
 
             task = connection.execute(
                 "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
@@ -1335,7 +1577,51 @@ class WorkbenchStore:
                 next_state = "blocked"
                 blocker = result.summary
             elif node_state == "failed":
-                if result.retryable and int(row["attempt"]) <= int(contract.get("retry_limit", 0)):
+                if spec.get("verifier") and int(row["attempt"]) <= int(
+                    contract.get("retry_limit", 0)
+                ):
+                    feedback = f"Verifier rejected attempt {row['attempt']}: {result.summary}"[:500]
+                    steering_id = "steering-" + canonical_hash(
+                        {
+                            "task_id": task_id,
+                            "verifier_node": node_id,
+                            "attempt": int(row["attempt"]),
+                            "feedback": feedback,
+                        }
+                    )[:24]
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO task_steering(
+                            steering_id, task_id, instruction, created_at
+                        ) VALUES(?, ?, ?, ?)
+                        """,
+                        (steering_id, task_id, feedback, timestamp),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE nodes
+                        SET state = 'pending', worker_id = NULL, worktree = NULL,
+                            effective_executor = NULL, effective_model = NULL,
+                            started_at = NULL, settled_at = NULL,
+                            result_json = NULL,
+                            coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+                        WHERE task_id = ?
+                          AND (node_id = ? OR json_extract(spec_json, '$.verifier') = 0)
+                        """,
+                        (timestamp, task_id, node_id),
+                    )
+                    next_state = "queued"
+                    self._event(
+                        connection,
+                        "task.repair_scheduled",
+                        task_id,
+                        node_id,
+                        {
+                            "verifier_attempt": int(row["attempt"]),
+                            "feedback_steering_id": steering_id,
+                        },
+                    )
+                elif result.retryable and int(row["attempt"]) <= int(contract.get("retry_limit", 0)):
                     connection.execute(
                         """
                         UPDATE nodes SET state = 'pending', worker_id = NULL,
@@ -1395,6 +1681,64 @@ class WorkbenchStore:
                     result.summary,
                 )
 
+    def settle_claimed(self, claimed: dict[str, Any], result: NodeResult) -> None:
+        self.settle_node(
+            str(claimed["task_id"]),
+            str(claimed["node_id"]),
+            result,
+            attempt=int(claimed["attempt"]),
+            coordinator_epoch=int(claimed["coordinator_epoch"]),
+            lease_epoch=int(claimed["lease_epoch"]),
+        )
+
+    @staticmethod
+    def _validate_result_contract(
+        spec: dict[str, Any],
+        row: sqlite3.Row,
+        result: NodeResult,
+    ) -> None:
+        if spec.get("executor") == "fixture" or spec.get("model") == "fixture":
+            return
+        if spec.get("verifier"):
+            if result.result_kind != "verifier":
+                raise ValueError("verifier result must declare result_kind=verifier")
+            WorkbenchStore._validate_actual_model(row, result)
+            if "sol" not in str(row["effective_model"] or "").lower():
+                raise ValueError("only a Codex Sol verifier may settle the verifier node")
+            expected = {
+                "succeeded": "accepted",
+                "failed": "needs_fix",
+                "blocked": "blocked",
+            }.get(result.status)
+            if expected is not None and result.verdict != expected:
+                raise ValueError(
+                    f"verifier result status {result.status} requires verdict {expected}"
+                )
+            if result.status in {"blocked", "indeterminate"}:
+                return
+            if not result.checks:
+                raise ValueError("verifier result must contain structured checks")
+            if not result.evidence:
+                raise ValueError("verifier result must contain structured evidence")
+            return
+        if result.result_kind != "worker":
+            raise ValueError("worker result must declare result_kind=worker")
+        WorkbenchStore._validate_actual_model(row, result)
+        if result.status == "succeeded" and not result.checks:
+            raise ValueError("successful worker result must contain structured checks")
+
+    @staticmethod
+    def _validate_actual_model(row: sqlite3.Row, result: NodeResult) -> None:
+        if (
+            result.status in {"succeeded", "failed"}
+            and str(row["effective_executor"] or "") in {"codex", "claude"}
+            and result.actual_model != row["effective_model"]
+        ):
+            raise ValueError(
+                f"result actual_model {result.actual_model!r} does not match leased model "
+                f"{row['effective_model']!r}"
+            )
+
     @staticmethod
     def _missing_required_artifacts(
         connection: sqlite3.Connection,
@@ -1431,12 +1775,14 @@ class WorkbenchStore:
         timestamp = now_iso()
         with self.transaction() as connection:
             rows = connection.execute(
-                "SELECT task_id, node_id, attempt FROM nodes WHERE state = 'running'"
+                "SELECT task_id, node_id, attempt, spec_json FROM nodes WHERE state = 'running'"
             ).fetchall()
             for row in rows:
+                spec = json.loads(row["spec_json"])
                 result = NodeResult(
                     status="indeterminate",
                     summary="coordinator restarted while the worker was running; explicit resolution required",
+                    result_kind="verifier" if spec.get("verifier") else "worker",
                 )
                 connection.execute(
                     """
@@ -1555,14 +1901,27 @@ class WorkbenchStore:
                 ).fetchall()
                 if row["model"]
             }
+        authority = self.authority_status()
+        with self.connection() as connection:
+            lifecycle = connection.execute(
+                "SELECT event_type, payload_json, created_at FROM events "
+                "WHERE event_type IN ('coordinator.started','coordinator.stopped','coordinator.failed') "
+                "ORDER BY cursor DESC LIMIT 1"
+            ).fetchone()
+        coordinator_failure = (
+            {**json.loads(lifecycle["payload_json"]), "observed_at": lifecycle["created_at"]}
+            if lifecycle is not None and lifecycle["event_type"] == "coordinator.failed"
+            else None
+        )
         return {
-            "ok": True,
+            "ok": coordinator_failure is None,
             "schema_version": schema,
             "cursor": cursor,
             "task_counts": counts,
             "active_executors": active_executors,
             "active_models": active_models,
-            "authority": self.authority_status(),
+            "authority": authority,
+            "coordinator_failure": coordinator_failure,
         }
 
     def stale_tasks(self, max_age_seconds: int = 300) -> list[dict[str, str]]:

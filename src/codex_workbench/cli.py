@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,12 +19,12 @@ import uuid
 from . import __version__
 from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
-from .model import NodeSpec, QuotaSnapshot, TaskContract
+from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .planner import PlannerError
 from .restart_readiness import assess_restart_readiness
 from .service import Coordinator
@@ -40,6 +41,7 @@ def _config(args: argparse.Namespace) -> WorkbenchConfig:
 
 
 def _store(config: WorkbenchConfig) -> WorkbenchStore:
+    config.assert_authority()
     store = WorkbenchStore(config.database)
     store.initialize()
     return store
@@ -47,6 +49,18 @@ def _store(config: WorkbenchConfig) -> WorkbenchStore:
 
 def command_init(args: argparse.Namespace) -> int:
     config = _config(args)
+    if args.authority:
+        config = WorkbenchConfig(
+            state_root=config.state_root,
+            host=config.host,
+            port=config.port,
+            max_workers=config.max_workers,
+            deployment_role="authority",
+            authority_host=socket.gethostname(),
+            quota_snapshot_file=config.effective_quota_snapshot_file,
+            quota_refresh_seconds=config.quota_refresh_seconds,
+        )
+        config.initialize()
     _store(config)
     print(json.dumps({"ok": True, "home": str(config.state_root), "version": __version__}))
     return 0
@@ -60,17 +74,30 @@ def command_serve(args: argparse.Namespace) -> int:
             host=args.host or config.host,
             port=args.port or config.port,
             max_workers=args.max_workers or config.max_workers,
+            deployment_role=config.deployment_role,
+            authority_host=config.authority_host,
+            quota_snapshot_file=config.effective_quota_snapshot_file,
+            quota_refresh_seconds=config.quota_refresh_seconds,
         )
     store = _store(config)
     lease = CoordinatorAuthorityLease(config.state_root / "coordinator.lock")
     with lease as identity:
-        coordinator = Coordinator(store, config.state_root, max_workers=config.max_workers)
+        coordinator_epoch = store.activate_coordinator(identity.instance_id)
+        coordinator = Coordinator(
+            store,
+            config.state_root,
+            coordinator_epoch=coordinator_epoch,
+            max_workers=config.max_workers,
+            quota_snapshot_file=config.effective_quota_snapshot_file,
+            quota_refresh_seconds=config.quota_refresh_seconds,
+        )
         recovered = coordinator.recover()
         ledger = store.health()
         store.record_system_event(
             "coordinator.started",
             {
                 **identity.to_dict(),
+                "coordinator_epoch": coordinator_epoch,
                 "ledger_cursor_before_start": ledger["cursor"],
                 "ledger_task_count": sum(ledger["task_counts"].values()),
                 "recovered_indeterminate": recovered,
@@ -321,7 +348,9 @@ def command_quota(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "snapshot": asdict(snapshot),
-                    "policy": snapshot.policy_summary(),
+                    "policy": snapshot.policy_summary(
+                        max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS
+                    ),
                 }
                 if snapshot
                 else None,
@@ -348,7 +377,9 @@ def command_quota(args: argparse.Namespace) -> int:
             {
                 "ok": True,
                 "snapshot": asdict(snapshot),
-                "policy": snapshot.policy_summary(),
+                "policy": snapshot.policy_summary(
+                    max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS
+                ),
             },
             ensure_ascii=False,
         )
@@ -360,15 +391,17 @@ def command_acceptance(args: argparse.Namespace) -> int:
     config = _config(args)
     store = _store(config)
     if args.acceptance_action == "attest-a12":
-        if not args.artifact or not args.quota_window or not args.note:
-            raise ValueError("attest-a12 requires --artifact, --quota-window, and --note")
+        if not args.artifact or not args.quota_window or not args.note or not args.source_session_id:
+            raise ValueError(
+                "attest-a12 requires --artifact, --quota-window, --source-session-id, and --note"
+            )
         artifact = Path(args.artifact).expanduser()
         if not artifact.is_file():
             raise ValueError("A12 artifact file does not exist")
         artifact = artifact.resolve()
-        suffix = artifact.suffix.lower().removeprefix(".")
-        if suffix not in {"ppt", "pptx", "pdf"}:
-            raise ValueError("A12 artifact must be a PPT, PPTX, or PDF file")
+        suffix = presentation_format(artifact)
+        if suffix is None:
+            raise ValueError("A12 artifact content must be a valid PPT, PPTX, or PDF file")
         data = artifact.read_bytes()
         if not data:
             raise ValueError("A12 artifact must not be empty")
@@ -379,6 +412,7 @@ def command_acceptance(args: argparse.Namespace) -> int:
             artifact.name,
             len(data),
             args.quota_window,
+            args.source_session_id,
             args.note,
         )
         print(
@@ -468,8 +502,6 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def command_fixture_demo(args: argparse.Namespace) -> int:
-    config = _config(args)
-    store = _store(config)
     repository = Path(args.repository).expanduser().resolve()
     base_sha = subprocess.check_output(
         ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
@@ -500,20 +532,33 @@ def command_fixture_demo(args: argparse.Namespace) -> int:
             ordinal=2,
         ),
     ]
-    store.create_task(contract, nodes, f"fixture-demo-{task_id}")
-    store.queue_task(task_id)
-    coordinator = Coordinator(store, config.state_root, max_workers=2, poll_seconds=0.05)
-    thread = threading.Thread(target=coordinator.run_forever, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        task = store.get_task(task_id)
-        if task["state"] in {"accepted", "blocked", "needs_fix", "needs_approval"}:
-            break
-        time.sleep(0.05)
-    coordinator.stop()
-    thread.join(timeout=5)
-    task = store.get_task(task_id)
+    with tempfile.TemporaryDirectory(prefix="codex-workbench-fixture-") as directory:
+        fixture_root = Path(directory)
+        store = WorkbenchStore(fixture_root / "state.sqlite")
+        store.initialize()
+        store.create_task(contract, nodes, f"fixture-demo-{task_id}")
+        store.queue_task(task_id)
+        lease = CoordinatorAuthorityLease(fixture_root / "coordinator.lock")
+        with lease as identity:
+            coordinator_epoch = store.activate_coordinator(identity.instance_id)
+            coordinator = Coordinator(
+                store,
+                fixture_root,
+                coordinator_epoch=coordinator_epoch,
+                max_workers=2,
+                poll_seconds=0.05,
+            )
+            thread = threading.Thread(target=coordinator.run_forever, daemon=True)
+            thread.start()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                task = store.get_task(task_id)
+                if task["state"] in {"accepted", "blocked", "needs_fix", "needs_approval"}:
+                    break
+                time.sleep(0.05)
+            coordinator.stop()
+            thread.join(timeout=5)
+            task = store.get_task(task_id)
     print(json.dumps(task, ensure_ascii=False, indent=2))
     return 0 if task["state"] == "accepted" else 1
 
@@ -525,6 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init")
+    init.add_argument(
+        "--authority",
+        action="store_true",
+        help="pin this host as the sole Workbench state writer",
+    )
     init.set_defaults(func=command_init)
 
     serve = sub.add_parser("serve")
@@ -661,6 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     acceptance.add_argument("--artifact")
     acceptance.add_argument("--quota-window")
+    acceptance.add_argument("--source-session-id")
     acceptance.add_argument("--note")
     acceptance.set_defaults(func=command_acceptance)
 
@@ -689,6 +740,7 @@ def main(argv: list[str] | None = None) -> None:
         KeyError,
         ValueError,
         StateConflictError,
+        RuntimeError,
     ) as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         code = 2

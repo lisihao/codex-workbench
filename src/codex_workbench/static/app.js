@@ -60,12 +60,15 @@ function alertText(alert) {
   if (alert.event_type === "node.routed") return `执行器已切换：${alert.payload?.reason || "路由策略"}`;
   if (alert.event_type === "coordinator.started") return "Mac mini 协调器已启动";
   if (alert.event_type === "coordinator.stopped") return "Mac mini 协调器已停止";
+  if (alert.event_type === "coordinator.failed") return `协调器执行失败：${alert.payload?.error || "未知错误"}`;
+  if (alert.event_type === "quota.refresh_unavailable") return "Claude 配额快照不可用；Claude 调度已关闭";
+  if (alert.event_type === "quota.refresh_failed") return `Claude 配额刷新失败：${alert.payload?.error || "未知错误"}`;
   if (alert.event_type === "task.state_changed") return `任务进入 ${alert.payload?.to}`;
   return alert.event_type;
 }
 
 function renderAlert(alert) {
-  const tone = ["approval.requested", "node.indeterminate", "node.blocked", "coordinator.stopped"].includes(alert.event_type) ? "error" : alert.payload?.to === "accepted" ? "ok" : "pending";
+  const tone = ["approval.requested", "node.indeterminate", "node.blocked", "coordinator.stopped", "coordinator.failed", "quota.refresh_failed", "quota.refresh_unavailable"].includes(alert.event_type) ? "error" : alert.payload?.to === "accepted" ? "ok" : "pending";
   return `<article class="alert"><span class="pill ${tone}">#${escapeHtml(alert.cursor)}</span><div><strong>${escapeHtml(alertText(alert))}</strong><p>${escapeHtml(alert.task_id || "system")} ${escapeHtml(alert.node_id || "")} · ${escapeHtml(new Date(alert.created_at).toLocaleString())}</p></div></article>`;
 }
 

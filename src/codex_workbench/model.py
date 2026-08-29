@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -47,6 +47,7 @@ ClaudeDispatchAction = Literal["claude", "codex", "defer"]
 
 TERMINAL_TASK_STATES = {"accepted", "blocked", "cancelled"}
 TERMINAL_NODE_STATES = {"accepted", "failed", "blocked", "indeterminate", "cancelled"}
+DEFAULT_QUOTA_TTL_SECONDS = 15 * 60
 
 
 def now_iso() -> str:
@@ -171,13 +172,35 @@ class NodeResult:
     actual_model: str | None = None
     exit_code: int | None = None
     retryable: bool = False
+    result_kind: Literal["worker", "verifier"] | None = None
+    changed_paths: tuple[str, ...] = ()
+    checks: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+    verdict: Literal["accepted", "needs_fix", "blocked"] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "NodeResult":
-        return cls(**raw)
+        tuple_fields = {"changed_paths", "checks", "evidence"}
+        normalized = {
+            key: tuple(value) if key in tuple_fields else value
+            for key, value in raw.items()
+        }
+        return cls(**normalized)
+
+
+def retry_model(model: str, attempt: int, *, verifier: bool = False) -> str:
+    """Escalate bounded Codex repair attempts without changing provider families."""
+    if verifier or attempt <= 1:
+        return model
+    lower = model.lower()
+    if "luna" in lower:
+        return "gpt-5.6-terra" if attempt == 2 else "gpt-5.6-sol"
+    if "terra" in lower:
+        return "gpt-5.6-sol"
+    return model
 
 
 @dataclass(frozen=True)
@@ -226,6 +249,25 @@ class QuotaSnapshot:
             values.append(self.weekly_fable_remaining)
         return tuple(values)
 
+    def age(self, *, current_time: datetime | None = None) -> timedelta | None:
+        try:
+            observed = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=UTC)
+        current = current_time or datetime.now(UTC)
+        return current.astimezone(UTC) - observed.astimezone(UTC)
+
+    def is_fresh(
+        self,
+        *,
+        max_age_seconds: int = DEFAULT_QUOTA_TTL_SECONDS,
+        current_time: datetime | None = None,
+    ) -> bool:
+        age = self.age(current_time=current_time)
+        return age is not None and timedelta(0) <= age <= timedelta(seconds=max_age_seconds)
+
     def quota_zone(self, model: str) -> tuple[ClaudeQuotaZone, float | None]:
         if not self.auth_ok or self.auth_method != "native-subscription":
             return "auth-unavailable", None
@@ -245,7 +287,22 @@ class QuotaSnapshot:
         self,
         model: str,
         active_models: tuple[str, ...] = (),
+        *,
+        max_age_seconds: int | None = None,
+        current_time: datetime | None = None,
     ) -> ClaudeDispatchDecision:
+        if max_age_seconds is not None and not self.is_fresh(
+            max_age_seconds=max_age_seconds,
+            current_time=current_time,
+        ):
+            age = self.age(current_time=current_time)
+            age_text = "invalid" if age is None else f"{max(age.total_seconds(), 0):.0f}s old"
+            return ClaudeDispatchDecision(
+                "codex",
+                "unknown",
+                f"Claude quota snapshot is stale ({age_text}; TTL {max_age_seconds}s)",
+                0,
+            )
         zone, minimum = self.quota_zone(model)
         if zone == "auth-unavailable":
             return ClaudeDispatchDecision(
@@ -308,9 +365,18 @@ class QuotaSnapshot:
         decision = self.dispatch_decision(model)
         return decision.action == "claude", decision.reason
 
-    def policy_summary(self) -> dict[str, Any]:
+    def policy_summary(
+        self,
+        *,
+        max_age_seconds: int | None = None,
+        current_time: datetime | None = None,
+    ) -> dict[str, Any]:
         models = {
-            model: self.dispatch_decision(model).to_dict()
+            model: self.dispatch_decision(
+                model,
+                max_age_seconds=max_age_seconds,
+                current_time=current_time,
+            ).to_dict()
             for model in ("opus", "sonnet", "fable")
         }
         zones = {model: decision["zone"] for model, decision in models.items()}
@@ -324,4 +390,13 @@ class QuotaSnapshot:
                 "yellow_upper_inclusive": 40,
             },
             "models": models,
+            "snapshot_fresh": (
+                self.is_fresh(
+                    max_age_seconds=max_age_seconds,
+                    current_time=current_time,
+                )
+                if max_age_seconds is not None
+                else None
+            ),
+            "snapshot_ttl_seconds": max_age_seconds,
         }
