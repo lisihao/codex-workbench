@@ -24,8 +24,9 @@ class InstallerTests(unittest.TestCase):
     def _run_selector(self, runtime: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CODEX_WORKBENCH_PYTHON"] = str(runtime)
+        selector = Path(__file__).resolve().parents[1] / "scripts" / "python-runtime"
         return subprocess.run(
-            ["/bin/zsh", str(Path(__file__).resolve().parents[1] / "scripts" / "python-runtime"), *arguments],
+            [str(selector), *arguments],
             text=True,
             capture_output=True,
             env=environment,

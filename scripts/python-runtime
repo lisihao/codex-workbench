@@ -1,8 +1,8 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-script_directory="${0:A:h}"
-project_root="${script_directory:h}"
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+project_root="$(dirname -- "$script_directory")"
 
 # An explicitly configured interpreter is authoritative.  Falling through to
 # another interpreter after it fails would hide a broken deployment and could
@@ -40,12 +40,12 @@ for candidate in "${candidates[@]}"; do
   rejected+=("$candidate (Python < 3.11 or unavailable)")
 done
 
-print -u2 "Codex Workbench requires Python 3.11 or newer; no compatible runtime was found."
+printf '%s\n' "Codex Workbench requires Python 3.11 or newer; no compatible runtime was found." >&2
 if [[ -n "${CODEX_WORKBENCH_PYTHON:-}" ]]; then
-  print -u2 "Configured CODEX_WORKBENCH_PYTHON is not usable: $CODEX_WORKBENCH_PYTHON"
+  printf '%s\n' "Configured CODEX_WORKBENCH_PYTHON is not usable: $CODEX_WORKBENCH_PYTHON" >&2
 fi
-print -u2 "Set CODEX_WORKBENCH_PYTHON to an absolute Python 3.11+ path, or install Homebrew Python 3.11+."
+printf '%s\n' "Set CODEX_WORKBENCH_PYTHON to an absolute Python 3.11+ path, or install Homebrew Python 3.11+." >&2
 if (( ${#rejected[@]} > 0 )); then
-  print -u2 "Checked: ${rejected[*]}"
+  printf '%s\n' "Checked: ${rejected[*]}" >&2
 fi
 exit 1
