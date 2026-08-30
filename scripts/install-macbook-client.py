@@ -12,7 +12,7 @@ import sys
 
 
 TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
-HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
+LEGACY_HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -67,7 +67,11 @@ def main() -> int:
         character if character.isalnum() or character in ".-_" else "-"
         for character in socket.gethostname()
     )
-    for label in (TUNNEL_LABEL, HEARTBEAT_LABEL):
+    legacy_heartbeat_path = launch_agents / f"{LEGACY_HEARTBEAT_LABEL}.plist"
+    run("launchctl", "bootout", domain, str(legacy_heartbeat_path), check=False)
+    legacy_heartbeat_path.unlink(missing_ok=True)
+
+    for label in (TUNNEL_LABEL,):
         plist_path = launch_agents / f"{label}.plist"
         template = (source / "launchd" / f"{label}.plist.in").read_text()
         rendered = (
@@ -109,7 +113,7 @@ def main() -> int:
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
     print("Codex native entry: MCP server 'codex-workbench'")
     print(f"Authority SSH destination: {authority_ssh_alias}")
-    print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes")
+    print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes over the cockpit tunnel")
     return 0
 
 

@@ -162,7 +162,7 @@ scripts/python-runtime scripts/install-macbook-client.py
 open http://127.0.0.1:18766
 ```
 
-隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。隧道断开后最多每五分钟尝试一次重连，避免 Tailscale SSH 资格失效时形成认证重启风暴。安装器同时每五分钟从 MacBook 向 Mac mini 写入一次服务端时间心跳；同一客户端出现至少八小时心跳空窗，且期间有任务 accepted 后，A1 才会通过。
+隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。隧道断开后最多每五分钟尝试一次重连，避免 Tailscale SSH 资格失效时形成认证重启风暴。同一条 SSH 连接每五分钟在 Mac mini 写入一次服务端时间心跳，不再启动第二条 Heartbeat SSH；同一客户端出现至少八小时心跳空窗，且期间有任务 accepted 后，A1 才会通过。
 
 手机登录控制面并成功渲染真实快照后，页面只在该浏览器会话写入一次 `client.observed` 回执。服务端根据移动 User-Agent、认证 Cookie 和当前事件游标判定 A2；普通匿名 GET 不能生成验收证据。
 

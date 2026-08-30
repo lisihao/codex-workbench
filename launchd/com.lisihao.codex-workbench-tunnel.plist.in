@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/ssh</string>
-    <string>-N</string>
+    <string>-T</string>
     <string>-o</string>
     <string>BatchMode=yes</string>
     <string>-o</string>
@@ -19,6 +19,7 @@
     <string>-L</string>
     <string>127.0.0.1:18766:127.0.0.1:8766</string>
     <string>__AUTHORITY_SSH_ALIAS__</string>
+    <string>while true; do &quot;$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench&quot; client heartbeat --client-id &quot;__CLIENT_ID__&quot; --kind macbook; sleep 300; done</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
