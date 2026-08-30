@@ -12,7 +12,7 @@
     <string>BatchMode=yes</string>
     <string>-o</string>
     <string>ConnectTimeout=15</string>
-    <string>macmini</string>
+    <string>__AUTHORITY_SSH_ALIAS__</string>
     <string>exec &quot;$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench&quot; client heartbeat --client-id &quot;__CLIENT_ID__&quot; --kind macbook</string>
   </array>
   <key>RunAtLoad</key>

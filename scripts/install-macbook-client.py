@@ -41,9 +41,22 @@ def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument(
+        "--authority-ssh-alias",
+        default="macmini",
+        help="SSH config alias or user@host for the Mac mini authority (default: macmini)",
+    )
     args = parser.parse_args()
     source = Path(args.source).expanduser().resolve()
-    run("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "macmini", "true")
+    authority_ssh_alias = args.authority_ssh_alias.strip()
+    if not authority_ssh_alias or authority_ssh_alias.startswith("-") or any(
+        character.isspace() for character in authority_ssh_alias
+    ):
+        raise SystemExit("--authority-ssh-alias must be one non-option SSH destination")
+    run(
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+        authority_ssh_alias, "true",
+    )
 
     log_root = Path.home() / "Library" / "Logs" / "Codex Workbench"
     log_root.mkdir(parents=True, exist_ok=True)
@@ -60,6 +73,7 @@ def main() -> int:
         rendered = (
             template.replace("__LOG_ROOT__", str(log_root))
             .replace("__CLIENT_ID__", client_id)
+            .replace("__AUTHORITY_SSH_ALIAS__", authority_ssh_alias)
         )
         plistlib.loads(rendered.encode())
         plist_path.write_text(rendered)
@@ -89,11 +103,12 @@ def main() -> int:
         "ServerAliveInterval=10",
         "-o",
         "ServerAliveCountMax=2",
-        "macmini",
+        authority_ssh_alias,
         remote_command,
     )
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
     print("Codex native entry: MCP server 'codex-workbench'")
+    print(f"Authority SSH destination: {authority_ssh_alias}")
     print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes")
     return 0
 

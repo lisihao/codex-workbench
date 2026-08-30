@@ -16,11 +16,11 @@
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
-- SQLite v6 分开保存原始节点契约、`effective_executor/effective_model`、coordinator/node lease epoch 与运行时任务优先级；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
+- SQLite v7 分开保存原始节点契约、`effective_executor/effective_model`、coordinator/node lease epoch 与运行时任务优先级，并在迁移时清除旧 Evidence ABI 缓存；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
 - Evidence 引用在结算和复用时都验证文件存在性与 SHA-256；损坏缓存不会继续复用。
 - 同一路径 scope 仅在同一规范化 repository identity 内互斥，不同仓库不会发生伪冲突；Codex 修复重试按 Luna → Terra → Sol 有界升级。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
-- A1、A2、A12 不再永久写死为 pending：MacBook 心跳间隔、已登录手机的真实渲染回执和本地管理员导入的 PPT/PDF 工件都进入 Mac mini 同一条 Evidence 账本。
+- A1、A2 不再永久写死为 pending：MacBook 心跳间隔和已登录手机的真实渲染回执进入 Mac mini 同一条 Evidence 账本。A12 可以导入并验证 PPT/PDF 工件，但在缺少可核验 Claude export/receipt 与配额快照关联时仍保持 `pending`，等待人工验收。
 - 不确定执行会原子生成持久 `approval` 回执；手机控制面以任务阶段、阻塞原因和下一步为主视图，可带 task revision 明确选择重试、失败或取消。重复提交同一决策保持幂等，冲突决策 fail loud。
 - MacBook/手机可以 revision-fenced 地调整 `-10..10` 任务优先级，或补充最多 500 字的后续 attempt 短指令；调度器按优先级选择 ready 节点，Evidence 复用 key 包含短指令。
 - 面板从事件账本投影完成、阻塞、审批、路由和协调器提醒；用户可启用页面打开期间的浏览器前台通知。真正的页面关闭后台 Push 尚未启用，不把它冒充已交付能力。
@@ -56,7 +56,7 @@ codex-workbench request \
 
 ## Codex 原生入口
 
-MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
 
 ```bash
 scripts/python-runtime scripts/install-macbook-client.py
@@ -174,7 +174,7 @@ codex-workbench acceptance attest-a12 \
   --note "Claude web completed with the reserved quota pool"
 ```
 
-只有实际存在、SHA-256 与大小匹配、且文件签名/内部结构确认为 PPT、PPTX 或 PDF 的工件，连同明确的 Claude Web session provenance，才能让 A12 通过；改扩展名的 fixture 不会通过。
+只有实际存在、SHA-256 与大小匹配、且文件签名/内部结构确认为 PPT、PPTX 或 PDF 的工件才会被账本接收；改扩展名的 fixture 不会通过。当前即使具有 Claude Web session provenance，若没有可核验的 Claude export/receipt 与对应配额快照关联，A12 仍保持 `pending` 并等待人工验收，不会自动标记 `ok`。
 
 ## 状态语义
 

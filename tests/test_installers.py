@@ -89,24 +89,36 @@ class InstallerTests(unittest.TestCase):
         ).read_text()
         rendered = template.replace("__LOG_ROOT__", "/tmp/logs").replace(
             "__CLIENT_ID__", "macbook-fixture"
-        )
+        ).replace("__AUTHORITY_SSH_ALIAS__", "authority-fixture")
         payload = plistlib.loads(rendered.encode())
         self.assertEqual(payload["StartInterval"], 300)
         self.assertNotIn("KeepAlive", payload)
         self.assertIn("client heartbeat", payload["ProgramArguments"][-1])
+        self.assertIn("authority-fixture", payload["ProgramArguments"])
 
     def test_macbook_tunnel_reconnect_is_bounded(self) -> None:
         root = Path(__file__).resolve().parents[1]
         template = (
             root / "launchd" / "com.lisihao.codex-workbench-tunnel.plist.in"
         ).read_text()
-        rendered = template.replace("__LOG_ROOT__", "/tmp/logs")
+        rendered = template.replace("__LOG_ROOT__", "/tmp/logs").replace(
+            "__AUTHORITY_SSH_ALIAS__", "authority-fixture"
+        )
         payload = plistlib.loads(rendered.encode())
         self.assertTrue(payload["RunAtLoad"])
         self.assertEqual(payload["StartInterval"], 300)
         self.assertNotIn("KeepAlive", payload)
         self.assertNotIn("ThrottleInterval", payload)
         self.assertIn("127.0.0.1:18766:127.0.0.1:8766", payload["ProgramArguments"])
+        self.assertEqual(payload["ProgramArguments"][-1], "authority-fixture")
+
+    def test_macbook_installer_supports_configurable_authority_alias(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "scripts" / "install-macbook-client.py"
+        ).read_text()
+        self.assertIn('"--authority-ssh-alias"', source)
+        self.assertIn('default="macmini"', source)
+        self.assertIn('__AUTHORITY_SSH_ALIAS__', source)
 
 
 if __name__ == "__main__":

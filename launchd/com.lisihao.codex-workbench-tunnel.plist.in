@@ -18,7 +18,7 @@
     <string>ServerAliveCountMax=3</string>
     <string>-L</string>
     <string>127.0.0.1:18766:127.0.0.1:8766</string>
-    <string>macmini</string>
+    <string>__AUTHORITY_SSH_ALIAS__</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
