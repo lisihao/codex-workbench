@@ -25,7 +25,7 @@ class WorkbenchHardeningTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.store = WorkbenchStore(self.root / "state.sqlite")
         self.store.initialize()
-        self.epoch = self.store.activate_coordinator("coordinator-test")
+        self.epoch = self.store.activate_coordinator("coordinator-test", "test-machine")
         self.artifacts = ArtifactStore(self.root / "artifacts")
 
     def tearDown(self) -> None:
@@ -300,7 +300,7 @@ class WorkbenchHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not exist"):
             self.store.settle_claimed(claim, invalid)
 
-        newer_epoch = self.store.activate_coordinator("coordinator-new")
+        newer_epoch = self.store.activate_coordinator("coordinator-new", "test-machine")
         self.assertGreater(newer_epoch, self.epoch)
         with self.assertRaisesRegex(StateConflictError, "stale"):
             self.store.settle_claimed(claim, self._worker_result("late result", "gpt-5.6-luna"))
@@ -388,6 +388,34 @@ class WorkbenchHardeningTests(unittest.TestCase):
         client = WorkbenchConfig(self.root / "client", deployment_role="client")
         with self.assertRaisesRegex(RuntimeError, "cannot start a local writer"):
             client.assert_authority()
+
+    def test_legacy_authority_config_requires_explicit_machine_rebind(self) -> None:
+        config = WorkbenchConfig(
+            self.root / "legacy-authority",
+            deployment_role="authority",
+            authority_host=__import__("socket").gethostname(),
+        )
+        config.initialize()
+        loaded = WorkbenchConfig.load(config.state_root)
+        with self.assertRaisesRegex(RuntimeError, "machine ID is missing"):
+            loaded.assert_authority()
+
+    def test_authority_config_checks_stable_machine_id_not_only_hostname(self) -> None:
+        config = WorkbenchConfig(
+            self.root / "bound-authority",
+            deployment_role="authority",
+            authority_host=__import__("socket").gethostname(),
+            authority_machine_id="darwin:ioplatformuuid:expected",
+        )
+        with patch(
+            "codex_workbench.config.authority_machine_id",
+            return_value="darwin:ioplatformuuid:different",
+        ), self.assertRaisesRegex(RuntimeError, "different machine ID"):
+            config.assert_authority()
+
+    def test_store_rejects_a_different_authority_machine(self) -> None:
+        with self.assertRaisesRegex(StateConflictError, "different machine ID"):
+            self.store.activate_coordinator("foreign", "other-machine")
 
     def _worker_result(self, summary: str, model: str) -> NodeResult:
         return NodeResult(

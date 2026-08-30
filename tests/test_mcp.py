@@ -20,7 +20,7 @@ class MCPTests(unittest.TestCase):
         self.config.initialize()
         self.store = WorkbenchStore(self.config.database)
         self.store.initialize()
-        self.epoch = self.store.activate_coordinator("mcp-test")
+        self.epoch = self.store.activate_coordinator("mcp-test", "test-machine")
         self.server = WorkbenchMCPServer(self.config, self.store)
 
     def tearDown(self) -> None:

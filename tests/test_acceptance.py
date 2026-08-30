@@ -14,6 +14,7 @@ from unittest.mock import patch
 from codex_workbench.acceptance import build_acceptance_report
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.cli import command_acceptance
+from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.store import WorkbenchStore
 
@@ -24,7 +25,7 @@ class AcceptanceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("acceptance-offline")
+            epoch = store.activate_coordinator("acceptance-offline", "test-machine")
             contract = TaskContract(
                 task_id="offline-work",
                 repository=str(root),
@@ -117,10 +118,19 @@ class AcceptanceTests(unittest.TestCase):
                 source_session_id="claude-web-session",
                 note="completed in Claude web using the reserved pool",
             )
+            WorkbenchConfig(
+                root / "state",
+                deployment_role="authority",
+                authority_host=__import__("socket").gethostname(),
+                authority_machine_id="test-machine",
+            ).initialize()
             output = io.StringIO()
             with patch.dict(
                 "os.environ",
                 {"CODEX_WORKBENCH_PROCESS_HOME": str(root / "process-home")},
+            ), patch(
+                "codex_workbench.config.authority_machine_id",
+                return_value="test-machine",
             ), redirect_stdout(output):
                 self.assertEqual(command_acceptance(args), 0)
             receipt = json.loads(output.getvalue())
@@ -200,7 +210,7 @@ class AcceptanceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("acceptance-fallback")
+            epoch = store.activate_coordinator("acceptance-fallback", "test-machine")
             store.record_system_event(
                 "coordinator.started",
                 {

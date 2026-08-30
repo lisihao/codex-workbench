@@ -23,7 +23,7 @@ class StoreTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.store = WorkbenchStore(Path(self.temp.name) / "state.sqlite")
         self.store.initialize()
-        self.epoch = self.store.activate_coordinator("test-store")
+        self.epoch = self.store.activate_coordinator("test-store", "test-machine")
         self.contract = TaskContract(
             task_id="task-1",
             repository=str(Path(self.temp.name).resolve()),

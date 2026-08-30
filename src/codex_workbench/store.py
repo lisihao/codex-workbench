@@ -230,10 +230,24 @@ class WorkbenchStore:
     def artifacts(self) -> ArtifactStore:
         return ArtifactStore(self.path.parent / "artifacts")
 
-    def activate_coordinator(self, instance_id: str) -> int:
+    def activate_coordinator(self, instance_id: str, authority_machine_id: str) -> int:
         if not instance_id.strip():
             raise ValueError("coordinator instance_id is required")
+        if not authority_machine_id.strip():
+            raise ValueError("authority_machine_id is required")
         with self.transaction() as connection:
+            owner = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'authority_machine_id'"
+            ).fetchone()
+            if owner is not None and owner["value"] != authority_machine_id:
+                raise StateConflictError(
+                    "authority ledger belongs to a different machine ID"
+                )
+            if owner is None:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('authority_machine_id', ?)",
+                    (authority_machine_id,),
+                )
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'coordinator_epoch'"
             ).fetchone()

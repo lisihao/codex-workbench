@@ -32,7 +32,7 @@ class ServiceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("future-failure")
+            epoch = store.activate_coordinator("future-failure", "test-machine")
             store.record_system_event("coordinator.started", {"instance_id": "future-failure"})
             coordinator = Coordinator(store, root, coordinator_epoch=epoch)
             future: Future[None] = Future()
@@ -50,7 +50,7 @@ class ServiceTests(unittest.TestCase):
             )
     @staticmethod
     def run_until_terminal(store: WorkbenchStore, state: Path, task_id: str) -> dict:
-        epoch = store.activate_coordinator(f"run-{task_id}")
+        epoch = store.activate_coordinator(f"run-{task_id}", "test-machine")
         coordinator = Coordinator(
             store, state, coordinator_epoch=epoch, max_workers=1, poll_seconds=0.01
         )
@@ -73,7 +73,7 @@ class ServiceTests(unittest.TestCase):
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("fixture-dag")
+            epoch = store.activate_coordinator("fixture-dag", "test-machine")
             contract = TaskContract(
                 task_id="e2e",
                 repository=str(root),
@@ -121,7 +121,7 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("fallback")
+            epoch = store.activate_coordinator("fallback", "test-machine")
             store.write_quota(
                 QuotaSnapshot(
                     observed_at=now_iso(),
@@ -202,7 +202,7 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("red-fallback")
+            epoch = store.activate_coordinator("red-fallback", "test-machine")
             store.write_quota(
                 QuotaSnapshot(
                     observed_at=now_iso(),
@@ -281,7 +281,7 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("yellow-concurrency")
+            epoch = store.activate_coordinator("yellow-concurrency", "test-machine")
             store.write_quota(
                 QuotaSnapshot(
                     observed_at=now_iso(),
@@ -384,7 +384,7 @@ class ServiceTests(unittest.TestCase):
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("compose")
+            epoch = store.activate_coordinator("compose", "test-machine")
             contract = TaskContract(
                 task_id="compose",
                 repository=str(repository),

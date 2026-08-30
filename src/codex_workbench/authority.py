@@ -10,6 +10,8 @@ import socket
 import subprocess
 import uuid
 import re
+import sys
+from typing import Callable
 
 
 class CoordinatorAuthorityError(RuntimeError):
@@ -21,6 +23,7 @@ class AuthorityIdentity:
     instance_id: str
     pid: int
     host: str
+    machine_id: str
     boot_id: str
     started_at: str
 
@@ -38,6 +41,7 @@ class CoordinatorAuthorityLease:
             instance_id=str(uuid.uuid4()),
             pid=os.getpid(),
             host=socket.gethostname(),
+            machine_id=authority_machine_id(),
             boot_id=machine_boot_id(),
             started_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
@@ -84,6 +88,42 @@ def machine_boot_id() -> str:
     if result.returncode == 0 and result.stdout.strip():
         return normalize_boot_id(result.stdout)
     return "unknown"
+
+
+MachineIdRunner = Callable[[list[str]], tuple[int, str]]
+
+
+def _run_machine_id(command: list[str]) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            command, text=True, capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return result.returncode, result.stdout
+
+
+def authority_machine_id(
+    *,
+    platform_name: str | None = None,
+    runner: MachineIdRunner = _run_machine_id,
+    linux_machine_id: Path = Path("/etc/machine-id"),
+) -> str:
+    """Return the stable platform identity used to fence the authority ledger."""
+    platform_name = platform_name or sys.platform
+    if platform_name == "darwin":
+        code, output = runner(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]
+        )
+        match = re.search(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]+)"', output)
+        if code == 0 and match:
+            return "darwin:ioplatformuuid:" + match.group(1).lower()
+        raise CoordinatorAuthorityError("macOS IOPlatformUUID is unavailable")
+    if platform_name.startswith("linux") and linux_machine_id.is_file():
+        value = linux_machine_id.read_text().strip().lower()
+        if re.fullmatch(r"[0-9a-f-]{16,64}", value):
+            return "linux:machine-id:" + value
+    raise CoordinatorAuthorityError(f"stable authority machine ID is unavailable on {platform_name}")
 
 
 def normalize_boot_id(raw: str) -> str:

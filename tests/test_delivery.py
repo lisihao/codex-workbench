@@ -38,7 +38,7 @@ class DeliveryTests(unittest.TestCase):
         (self.worktree / "result.txt").write_text("accepted\n")
         self.store = WorkbenchStore(self.root / "state.sqlite")
         self.store.initialize()
-        self.epoch = self.store.activate_coordinator("delivery-test")
+        self.epoch = self.store.activate_coordinator("delivery-test", "test-machine")
 
     def tearDown(self) -> None:
         self.temp.cleanup()

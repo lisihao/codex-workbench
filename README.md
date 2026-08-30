@@ -12,7 +12,7 @@
 - 不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，只允许产品订阅登录态。
 - 安装器为无人值守进程建立独立 `CODEX_HOME`；它只软链接用户现有 `auth.json`，不会加载个人 skills、会话、模型缓存或全局配置。
 - 已通过的验证 Evidence 在声明输入闭包、命令和运行时身份不变时复用；实现型 Worker 不复用。
-- `coordinator.lock` 是进程生命周期的排他权威租约；SQLite coordinator epoch 与逐节点 lease epoch 会拒绝旧进程的迟到提交。MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
+- `coordinator.lock` 是进程生命周期的排他权威租约；authority 账本显式绑定规范化 macOS `IOPlatformUUID`，hostname 只用于显示。SQLite coordinator epoch 与逐节点 lease epoch 会拒绝旧进程或不同机器的迟到提交。MacBook、手机和第二个服务进程只能读取或控制 Mac mini 上的同一个协调器。
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区最多 Opus/Fable 高阶槽 1、Sonnet 2；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。
@@ -31,6 +31,8 @@ scripts/python-runtime -m codex_workbench serve
 scripts/python-runtime -m codex_workbench doctor
 scripts/python-runtime -m codex_workbench doctor --require-restart-ready
 ```
+
+从旧版仅记录 hostname 的 authority 配置升级时，服务会 fail-closed；必须在权威 Mac mini 上显式重新运行 `init --authority`，确认将现有账本绑定到当前 Platform UUID。系统不会把启动时所在机器静默认作旧账本 owner。
 
 `scripts/python-runtime` 会先使用 `CODEX_WORKBENCH_PYTHON` 或项目 runtime，再按固定顺序检查 Homebrew Python 3.11+；不会使用系统 Python 3.9。需要固定解释器时设置绝对路径，例如 `CODEX_WORKBENCH_PYTHON=/opt/homebrew/bin/python3.13 scripts/python-runtime -m codex_workbench doctor`。
 

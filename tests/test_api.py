@@ -23,7 +23,7 @@ class APITests(unittest.TestCase):
             config.initialize()
             store = WorkbenchStore(config.database)
             store.initialize()
-            epoch = store.activate_coordinator("api-test")
+            epoch = store.activate_coordinator("api-test", "test-machine")
             server = WorkbenchHTTPServer(config, store)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()

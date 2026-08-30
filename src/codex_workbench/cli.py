@@ -20,7 +20,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
-from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease
+from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
@@ -57,6 +57,7 @@ def command_init(args: argparse.Namespace) -> int:
             max_workers=config.max_workers,
             deployment_role="authority",
             authority_host=socket.gethostname(),
+            authority_machine_id=authority_machine_id(),
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
         )
@@ -76,13 +77,14 @@ def command_serve(args: argparse.Namespace) -> int:
             max_workers=args.max_workers or config.max_workers,
             deployment_role=config.deployment_role,
             authority_host=config.authority_host,
+            authority_machine_id=config.authority_machine_id,
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
         )
     store = _store(config)
     lease = CoordinatorAuthorityLease(config.state_root / "coordinator.lock")
     with lease as identity:
-        coordinator_epoch = store.activate_coordinator(identity.instance_id)
+        coordinator_epoch = store.activate_coordinator(identity.instance_id, identity.machine_id)
         coordinator = Coordinator(
             store,
             config.state_root,
@@ -540,7 +542,7 @@ def command_fixture_demo(args: argparse.Namespace) -> int:
         store.queue_task(task_id)
         lease = CoordinatorAuthorityLease(fixture_root / "coordinator.lock")
         with lease as identity:
-            coordinator_epoch = store.activate_coordinator(identity.instance_id)
+            coordinator_epoch = store.activate_coordinator(identity.instance_id, identity.machine_id)
             coordinator = Coordinator(
                 store,
                 fixture_root,

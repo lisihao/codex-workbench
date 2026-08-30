@@ -7,6 +7,8 @@ from pathlib import Path
 import secrets
 import socket
 
+from .authority import authority_machine_id
+
 
 @dataclass(frozen=True)
 class WorkbenchConfig:
@@ -16,6 +18,7 @@ class WorkbenchConfig:
     max_workers: int = 4
     deployment_role: str = "client"
     authority_host: str | None = None
+    authority_machine_id: str | None = None
     quota_snapshot_file: Path | None = None
     quota_refresh_seconds: int = 300
 
@@ -55,6 +58,7 @@ class WorkbenchConfig:
             "max_workers": self.max_workers,
             "deployment_role": self.deployment_role,
             "authority_host": self.authority_host,
+            "authority_machine_id": self.authority_machine_id,
             "quota_snapshot_file": str(self.effective_quota_snapshot_file),
             "quota_refresh_seconds": self.quota_refresh_seconds,
         }
@@ -68,6 +72,16 @@ class WorkbenchConfig:
         if self.authority_host != socket.gethostname():
             raise RuntimeError(
                 f"authority is pinned to {self.authority_host!r}, not {socket.gethostname()!r}"
+            )
+        if not self.authority_machine_id:
+            raise RuntimeError(
+                "authority machine ID is missing; explicitly run init --authority to bind this ledger"
+            )
+        current_machine_id = authority_machine_id()
+        if self.authority_machine_id != current_machine_id:
+            raise RuntimeError(
+                "authority ledger is bound to a different machine ID: "
+                f"{self.authority_machine_id!r} != {current_machine_id!r}"
             )
 
     def token(self) -> str:
@@ -98,6 +112,7 @@ class WorkbenchConfig:
                 max_workers=int(raw.get("max_workers", 4)),
                 deployment_role=str(role),
                 authority_host=authority_host,
+                authority_machine_id=raw.get("authority_machine_id"),
                 quota_snapshot_file=Path(raw["quota_snapshot_file"]).expanduser()
                 if raw.get("quota_snapshot_file")
                 else root / "claude-quota.json",
@@ -108,5 +123,6 @@ class WorkbenchConfig:
             state_root=root,
             deployment_role="authority" if inferred_authority else "client",
             authority_host=socket.gethostname() if inferred_authority else None,
+            authority_machine_id=None,
             quota_snapshot_file=root / "claude-quota.json",
         )

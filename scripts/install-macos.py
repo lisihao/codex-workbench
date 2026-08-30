@@ -11,7 +11,6 @@ import shutil
 import subprocess
 import sys
 
-
 LABEL = "com.lisihao.codex-workbench"
 
 
@@ -36,6 +35,18 @@ relaunch_with_supported_runtime()
 
 def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=check)
+
+
+def macos_machine_id() -> str:
+    result = run(
+        "/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice",
+        check=False,
+    )
+    import re
+    match = re.search(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]+)"', result.stdout)
+    if result.returncode != 0 or match is None:
+        raise SystemExit("macOS IOPlatformUUID is unavailable; refusing to bind authority")
+    return "darwin:ioplatformuuid:" + match.group(1).lower()
 
 
 def main() -> int:
@@ -72,6 +83,7 @@ def main() -> int:
         {
             "deployment_role": "authority",
             "authority_host": __import__("socket").gethostname(),
+            "authority_machine_id": macos_machine_id(),
             "quota_snapshot_file": str(quota_snapshot_file),
             "quota_refresh_seconds": int(config_raw.get("quota_refresh_seconds", 300)),
         }

@@ -64,6 +64,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('app_root / "scripts" / "python-runtime"', source)
         self.assertNotIn("exec /opt/homebrew/bin/python3 -m codex_workbench", source)
         self.assertIn("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE", source)
+        self.assertIn('"authority_machine_id": macos_machine_id()', source)
 
     def test_authority_launch_agent_persists_quota_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
