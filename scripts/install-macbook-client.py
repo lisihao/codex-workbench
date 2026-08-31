@@ -103,15 +103,20 @@ def ssh_transport_arguments(
     configured_proxy = configured_ssh_proxycommand(destination)
     if transport == "tailscale-userspace" and configured_proxy:
         return ("-o", f"ProxyCommand={configured_proxy}")
-    tailscale = shutil.which("tailscale")
-    if not tailscale:
-        raise SystemExit(
-            "Tailscale userspace SSH transport was selected, but the tailscale CLI is unavailable"
-        )
     if transport == "tailscale-userspace":
+        tailscale = shutil.which("tailscale")
+        if not tailscale:
+            raise SystemExit(
+                "Tailscale userspace SSH transport was selected, but the tailscale CLI is unavailable"
+            )
         return ("-o", f"ProxyCommand={tailscale} nc %h %p")
     native_proxy = tailscale_proxy_command(configured_proxy, native_ssh_port)
     if native_proxy is None:
+        tailscale = shutil.which("tailscale")
+        if not tailscale:
+            raise SystemExit(
+                "Tailscale native SSH transport was selected, but no configured ProxyCommand or tailscale CLI is available"
+            )
         native_proxy = f"{tailscale} nc %h {native_ssh_port}"
     host_key_alias = "codex-workbench-" + "".join(
         character if character.isalnum() or character in ".-_" else "-"

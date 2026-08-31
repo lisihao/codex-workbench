@@ -225,6 +225,10 @@ class InstallerTests(unittest.TestCase):
                 "--socket=/Users/example/.local/share/tailscale-userspace/tailscaled.sock "
                 "nc %h %p"
             ),
+        ), mock.patch.object(
+            module.shutil,
+            "which",
+            return_value=None,
         ):
             arguments = module.ssh_transport_arguments("macmini", "auto")
 
