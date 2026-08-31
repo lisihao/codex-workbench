@@ -13,6 +13,7 @@ from codex_workbench.claude_quota import (
     ClaudeQuotaError,
     COMPATIBLE_SOURCE,
     scrubbed_environment,
+    watch_claude_quota,
 )
 from codex_workbench.quota import JsonFileQuotaAdapter
 from codex_workbench.cli import command_quota
@@ -197,6 +198,39 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
             "MY_PASSWORD": "password",
         }
         self.assertEqual(scrubbed_environment(environment), {"HOME": "/tmp/home", "HTTPS_PROXY": "http://127.0.0.1:7890"})
+
+    def test_watcher_keeps_collecting_after_a_fail_closed_observation(self) -> None:
+        snapshots: list[object] = [
+            {
+                "auth_ok": False,
+                "source": COMPATIBLE_SOURCE,
+            },
+            ClaudeQuotaError("auth status failed"),
+        ]
+
+        class Collector:
+            output = self.output
+
+            @staticmethod
+            def collect() -> dict[str, object]:
+                value = snapshots.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                assert isinstance(value, dict)
+                return value
+
+        emitted: list[dict[str, object]] = []
+        sleeps: list[float] = []
+        watch_claude_quota(
+            Collector(),  # type: ignore[arg-type]
+            interval_seconds=60,
+            emit=emitted.append,
+            sleeper=sleeps.append,
+            max_iterations=2,
+        )
+        self.assertEqual([event["ok"] for event in emitted], [True, False])
+        self.assertEqual(emitted[1]["error"], "auth status failed")
+        self.assertEqual(sleeps, [60])
 
     def test_manual_quota_set_cannot_claim_producer_source(self) -> None:
         args = SimpleNamespace(quota_action="set", source=COMPATIBLE_SOURCE)

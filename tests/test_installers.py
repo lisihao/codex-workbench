@@ -105,7 +105,7 @@ class InstallerTests(unittest.TestCase):
             "/tmp/state/claude-quota.json",
         )
 
-    def test_quota_launch_agent_is_one_shot_every_minute(self) -> None:
+    def test_quota_launch_agent_stays_alive_in_on_demand_only_gui_domain(self) -> None:
         root = Path(__file__).resolve().parents[1]
         template = (root / "launchd" / "com.lisihao.codex-workbench-quota.plist.in").read_text()
         rendered = (
@@ -118,9 +118,12 @@ class InstallerTests(unittest.TestCase):
         payload = plistlib.loads(rendered.encode())
         self.assertEqual(payload["Label"], "com.lisihao.codex-workbench-quota")
         self.assertTrue(payload["RunAtLoad"])
-        self.assertEqual(payload["StartInterval"], 60)
-        self.assertNotIn("KeepAlive", payload)
-        self.assertIn("collect-claude", payload["ProgramArguments"])
+        self.assertNotIn("StartInterval", payload)
+        self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(payload["ThrottleInterval"], 10)
+        self.assertIn("watch-claude", payload["ProgramArguments"])
+        interval_index = payload["ProgramArguments"].index("--interval")
+        self.assertEqual(payload["ProgramArguments"][interval_index + 1], "60")
         self.assertIn("/tmp/claude", payload["ProgramArguments"])
         self.assertEqual(payload["EnvironmentVariables"]["HOME"], "/Users/example")
         self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/quota.log")

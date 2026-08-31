@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.1.2 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.1.3 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.1.2 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.1.3 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -25,7 +25,7 @@
 | 持久状态机与崩溃恢复 | implemented | SQLite 状态、Receipt、事件、indeterminate + approval；协调器失败触发 launchd 重启 | A3 真机重启证据 external-pending |
 | Worker 不等于验收 | implemented | 只有独立 Sol verifier 可将任务置为 accepted；Evidence fail-closed | 无 |
 | Claude 20% 目标保留、25% 停线 | compatible-subset | 五小时、周全模型与 Sonnet 专属池；Fable 受全模型周池约束，若未来 producer 暴露独立 Fable 池则叠加其上；30% admission guard、25% 硬停线、共享容量、每个 Claude 节点后要求新快照；未知即 Codex | 被动显示接口不能约束单回合消耗；绝不跨越 20% 仍需真实窗口 Evidence，不能静态保证 |
-| Claude 被动 quota sidecar | implemented | 精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容解析；每分钟采集；`loggedOut` 或采集错误立即原子写失败闭锁；以 `max(0, 99-used)` 作为剩余下界；正式 Claude admission 只信任完整 producer/schema/source/version provenance | 不是官方 quota API；尚未完成登录态生产验证，A6/A7 仍需兼容 native-subscription 的真实窗口 Evidence |
+| Claude 被动 quota sidecar | implemented | 精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容解析；显式 kickstart 的常驻 watcher 每分钟采集，不依赖 headless GUI domain 的 `StartInterval`；`loggedOut` 或采集错误立即原子写失败闭锁；以 `max(0, 99-used)` 作为剩余下界；正式 Claude admission 只信任完整 producer/schema/source/version provenance | 不是官方 quota API；尚未完成登录态生产验证，A6/A7 仍需兼容 native-subscription 的真实窗口 Evidence |
 | 单位配额产出指标 | implemented | 每具名窗口的 accepted 加权任务点 / Claude 消耗；排除 fixture/test | 长周期趋势需真实窗口积累 |
 | 配额触线自动转 Codex | implemented | 同一 attempt 记录 node.routed，不调用 Claude 后再重启 | A8 真实配额窗口证据 external-pending |
 | MacBook 完整驾驶舱 | implemented | 任务/DAG/契约/Evidence/配额/告警、暂停恢复、优先级、steering、approval | 原文“接管异常 Agent”当前是控制与下一 attempt 指令，不是交互式终端 attach |
@@ -44,5 +44,5 @@
 
 1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现。
 2. 后续用户要求的 quota-productive routing-v2 是有意调整：Sol 仍负责规划/验收；低复杂度使用独立 Codex Spark 池，标准生产在安全配额时优先 Sonnet，高复杂度/架构审核优先 Opus/Fable，容量或配额不足由 Spark/Luna/Terra 填充。
-3. 1.1.2 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
+3. 1.1.3 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
 4. 手机接入与页面关闭后的 Web Push 是用户明确后置的 backlog；交互式终端式 Agent attach 仍未实现，三者均不冒充当前交付。

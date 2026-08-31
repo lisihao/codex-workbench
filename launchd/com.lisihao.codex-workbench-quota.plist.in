@@ -8,11 +8,13 @@
   <array>
     <string>__APP_ROOT__/bin/codex-workbench</string>
     <string>quota</string>
-    <string>collect-claude</string>
+    <string>watch-claude</string>
     <string>--claude-binary</string>
     <string>__CLAUDE_BINARY__</string>
     <string>--output</string>
     <string>__QUOTA_SNAPSHOT_FILE__</string>
+    <string>--interval</string>
+    <string>60</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -25,8 +27,13 @@
   </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>60</integer>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

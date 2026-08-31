@@ -21,7 +21,7 @@ from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
-from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector
+from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_quota
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
@@ -349,7 +349,7 @@ def command_deliver(args: argparse.Namespace) -> int:
 
 
 def command_quota(args: argparse.Namespace) -> int:
-    if args.quota_action == "collect-claude":
+    if args.quota_action in {"collect-claude", "watch-claude"}:
         root = Path(args.home).expanduser() if getattr(args, "home", None) else None
         config = WorkbenchConfig.load(root)
         selected = args.claude_binary or os.environ.get("CODEX_WORKBENCH_CLAUDE") or shutil.which("claude")
@@ -363,7 +363,18 @@ def command_quota(args: argparse.Namespace) -> int:
             if args.output
             else config.effective_quota_snapshot_file
         )
-        snapshot = ClaudeQuotaCollector(binary, output).collect()
+        collector = ClaudeQuotaCollector(binary, output)
+        if args.quota_action == "watch-claude":
+            watch_claude_quota(
+                collector,
+                interval_seconds=args.interval,
+                emit=lambda event: print(
+                    json.dumps(event, ensure_ascii=False),
+                    flush=True,
+                ),
+            )
+            return 0
+        snapshot = collector.collect()
         print(
             json.dumps(
                 {
@@ -751,6 +762,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quota_collect.add_argument("--claude-binary")
     quota_collect.add_argument("--output", help="v1 producer snapshot file; defaults to configured quota file")
+    quota_watch = quota_sub.add_parser(
+        "watch-claude",
+        help="keep passive Claude subscription quota observations fresh",
+    )
+    quota_watch.add_argument("--claude-binary")
+    quota_watch.add_argument("--output", help="v1 producer snapshot file; defaults to configured quota file")
+    quota_watch.add_argument("--interval", type=int, default=60)
     quota_set = quota_sub.add_parser("set")
     quota_set.add_argument("--auth-ok", action="store_true")
     quota_set.add_argument("--auth-method", default="none")

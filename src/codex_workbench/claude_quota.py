@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -87,6 +88,47 @@ class ClaudeQuotaCollector:
             raise ClaudeQuotaError(f"Claude command timed out after {self.timeout_seconds:g}s") from error
         except OSError as error:
             raise ClaudeQuotaError(f"Claude command could not start: {error}") from error
+
+
+def watch_claude_quota(
+    collector: ClaudeQuotaCollector,
+    *,
+    interval_seconds: float,
+    emit: Callable[[dict[str, Any]], None],
+    sleeper: Callable[[float], None] = time.sleep,
+    max_iterations: int | None = None,
+) -> None:
+    """Keep passive quota observations alive after an explicit launchd kickstart.
+
+    Headless macOS GUI domains can enter on-demand-only mode, where a
+    ``StartInterval`` trigger remains pending indefinitely.  The installer
+    therefore starts one long-running watcher and launchd restarts it only if
+    the process exits unsuccessfully.
+    """
+    if interval_seconds <= 0:
+        raise ValueError("Claude quota watch interval must be positive")
+    if max_iterations is not None and max_iterations <= 0:
+        raise ValueError("Claude quota watcher max_iterations must be positive")
+    completed = 0
+    while max_iterations is None or completed < max_iterations:
+        try:
+            snapshot = collector.collect()
+            event = {
+                "ok": True,
+                "auth_ok": snapshot["auth_ok"],
+                "source": snapshot["source"],
+                "output": str(collector.output),
+            }
+        except ClaudeQuotaError as error:
+            event = {
+                "ok": False,
+                "error": str(error),
+                "output": str(collector.output),
+            }
+        emit(event)
+        completed += 1
+        if max_iterations is None or completed < max_iterations:
+            sleeper(interval_seconds)
 
 
 def scrubbed_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
