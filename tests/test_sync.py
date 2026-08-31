@@ -47,6 +47,42 @@ class RepositorySyncTests(unittest.TestCase):
         self.assertTrue(result["changed"])
         self.assertEqual(result["after"], git(self.source, "rev-parse", "HEAD"))
 
+    def test_github_primary_refreshes_tracking_ref_with_restricted_fetch_config(self) -> None:
+        subprocess.run(
+            ["git", "config", "--unset-all", "remote.origin.fetch"],
+            cwd=self.mini,
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/tags/v0.1.0:refs/tags/v0.1.0",
+            ],
+            cwd=self.mini,
+            check=True,
+        )
+        stale_tracking_ref = git(self.mini, "rev-parse", "origin/main")
+        (self.source / "restricted-fetch.txt").write_text("github\n")
+        subprocess.run(["git", "add", "restricted-fetch.txt"], cwd=self.source, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "restricted fetch"],
+            cwd=self.source,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "push"], cwd=self.source, check=True, capture_output=True)
+
+        result = self.sync.sync_github(str(self.mini), "origin", "main")
+
+        expected = git(self.source, "rev-parse", "HEAD")
+        self.assertNotEqual(stale_tracking_ref, expected)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["after"], expected)
+        self.assertEqual(git(self.mini, "rev-parse", "origin/main"), expected)
+
     def test_tailscale_increment_imports_isolated_ref_without_moving_checkout(self) -> None:
         base = git(self.source, "rev-parse", "HEAD")
         (self.source / "increment.txt").write_text("increment\n")

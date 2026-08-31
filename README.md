@@ -1,6 +1,6 @@
 # Codex Workbench
 
-当前候选版本：`1.1.4`。
+当前候选版本：`1.1.5`。
 
 独立于 DSH 的个人开发基础设施。核心是常驻服务与统一账本，不是 Codex Skill，也不是 Codex 插件；后续插件若需要，只作为连接同一账本的薄入口。Mac mini 持有唯一任务账本、后台执行器、Git worktree 和验收证据；本阶段由 MacBook 通过 Tailscale 私网消费同一份状态。手机接入按用户最新决定移入 [`docs/backlog.md`](docs/backlog.md)，不再阻塞当前交付。
 
@@ -84,7 +84,7 @@ codex mcp get codex-workbench
 
 ## GitHub 与 Tailscale 同步
 
-GitHub 是代码主同步通道。Mac mini 只对干净工作树执行 fast-forward：
+GitHub 是代码主同步通道。Mac mini 只对干净工作树执行 fast-forward；同步命令会显式刷新所选分支的 remote-tracking ref，不依赖仓库里可能被收窄的 `remote.*.fetch` 配置：
 
 ```bash
 codex-workbench sync github \
@@ -117,7 +117,7 @@ codex-workbench deliver TASK_ID \
 
 ## Claude 配额保护
 
-Claude 没有稳定的官方 CLI 用量接口，因此系统不会猜测余额。v1.1.4 的被动 quota sidecar 只是**精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容实现，不是官方 quota API**：它读取 `auth status --json`（兼容未登录时携带有效 JSON 但退出码为 1），再以无会话持久化的 `/usage` 显示文本取样。安装器显式启动一个每分钟取样的常驻 watcher，避免无人值守 Mac mini 的 GUI launchd domain 处于 `on-demand-only` 时把 `StartInterval` 永久挂起；它既不启动 Claude 工作回合，也不使用 API key。
+Claude 没有稳定的官方 CLI 用量接口，因此系统不会猜测余额。v1.1.5 的被动 quota sidecar 只是**精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容实现，不是官方 quota API**：它读取 `auth status --json`（兼容未登录时携带有效 JSON 但退出码为 1），再以无会话持久化的 `/usage` 显示文本取样。安装器显式启动一个每分钟取样的常驻 watcher，避免无人值守 Mac mini 的 GUI launchd domain 处于 `on-demand-only` 时把 `StartInterval` 永久挂起；它既不启动 Claude 工作回合，也不使用 API key。
 
 sidecar 遇到明确 `loggedOut` 时写入 `auth_ok=false` 的失败闭锁快照；已登录但 CLI 版本未知、显示文本不符合锁定语法、认证/命令失败时也会先原子替换旧余额为不可用快照，记录本轮错误并在下一分钟继续，避免旧余额继续开闸；非预期进程故障才退出并由 launchd 重启。显示为已使用 `U%` 时，写入的安全剩余下界是 `max(0, 99 - U)%`，不会把向下取整后的显示值当作精确余额。只有同时携带 `producer=codex-workbench.claude-quota`、schema `1`、Claude `2.1.239`、来源 `claude-cli-usage-text-v1` 和 `native-subscription` 认证的兼容采样，才能启动正式 Claude 调度、进入 A6/A7、A8/A12 或单位配额产出指标；旧的手工导入只保留作观察数据，`quota set` 不能声明这组 provenance。这不是已完成的登录态生产验证，真实登录态旅程仍待外部验收。
 

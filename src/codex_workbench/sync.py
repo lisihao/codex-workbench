@@ -37,8 +37,16 @@ class RepositorySynchronizer:
                 f"GitHub sync expected checked-out branch {branch!r}, found {current_branch!r}"
             )
         before = self._git(repo, "rev-parse", "HEAD")
-        self._git(repo, "fetch", "--prune", remote, branch, timeout=300)
-        self._git(repo, "merge", "--ff-only", f"{remote}/{branch}")
+        tracking_ref = f"refs/remotes/{remote}/{branch}"
+        self._git(
+            repo,
+            "fetch",
+            "--prune",
+            remote,
+            f"refs/heads/{branch}:{tracking_ref}",
+            timeout=300,
+        )
+        self._git(repo, "merge", "--ff-only", tracking_ref)
         after = self._git(repo, "rev-parse", "HEAD")
         return {
             "ok": True,
