@@ -108,7 +108,7 @@ def submit_natural_language_request(
         claude_authenticated, _ = ClaudeExecutor(
             artifacts,
             quota,
-            os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+            os.environ.get("CODEX_WORKBENCH_CLAUDE") or "claude",
         ).authentication()
     claude_models_available = tuple(
         model for model in quota_admitted_models if claude_authenticated

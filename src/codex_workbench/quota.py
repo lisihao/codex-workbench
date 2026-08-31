@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 from typing import Protocol
 
+from .claude_quota import COMPATIBLE_SOURCE, validate_producer_snapshot
 from .model import QuotaSnapshot, canonical_hash
 from .store import WorkbenchStore
 
@@ -26,6 +27,10 @@ class JsonFileQuotaAdapter:
         if not self.path.is_file():
             return None
         raw = json.loads(self.path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError("Claude quota snapshot must be a JSON object")
+        if raw.get("producer") is not None or raw.get("producer_schema_version") is not None:
+            return self._read_producer_snapshot(raw)
         observed_at = str(
             raw.get("observed_at")
             or datetime.fromtimestamp(self.path.stat().st_mtime, UTC).isoformat(timespec="seconds")
@@ -45,6 +50,48 @@ class JsonFileQuotaAdapter:
         snapshot.validate()
         return snapshot
 
+    def _read_producer_snapshot(self, raw: object) -> QuotaSnapshot:
+        producer = validate_producer_snapshot(raw)
+        pools = producer.get("pools", {})
+        if producer["auth_ok"] is False:
+            snapshot = QuotaSnapshot(
+                observed_at=str(producer["observed_at"]),
+                auth_ok=False,
+                auth_method="none",
+                five_hour_remaining=None,
+                weekly_all_remaining=None,
+                weekly_sonnet_remaining=None,
+                weekly_fable_remaining=None,
+                source=COMPATIBLE_SOURCE,
+                five_hour_window_id=None,
+                weekly_window_id=None,
+                producer=str(producer["producer"]),
+                producer_schema_version=int(producer["producer_schema_version"]),
+                claude_version=str(producer["claude_version"]),
+            )
+            snapshot.validate()
+            return snapshot
+        five_hour = pools["five_hour"]
+        seven_day = pools["seven_day"]
+        sonnet = pools["seven_day_sonnet"]
+        snapshot = QuotaSnapshot(
+            observed_at=str(producer["observed_at"]),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=float(five_hour["remaining_lower_bound"]),
+            weekly_all_remaining=float(seven_day["remaining_lower_bound"]),
+            weekly_sonnet_remaining=float(sonnet["remaining_lower_bound"]),
+            weekly_fable_remaining=None,
+            source=COMPATIBLE_SOURCE,
+            five_hour_window_id=str(five_hour["window_id"]),
+            weekly_window_id=str(seven_day["window_id"]),
+            producer=str(producer["producer"]),
+            producer_schema_version=int(producer["producer_schema_version"]),
+            claude_version=str(producer["claude_version"]),
+        )
+        snapshot.validate()
+        return snapshot
+
 
 class QuotaRefresher:
     def __init__(
@@ -52,7 +99,7 @@ class QuotaRefresher:
         store: WorkbenchStore,
         adapter: QuotaSnapshotAdapter,
         *,
-        interval_seconds: float = 300,
+        interval_seconds: float = 60,
     ):
         if interval_seconds <= 0:
             raise ValueError("quota refresh interval must be positive")

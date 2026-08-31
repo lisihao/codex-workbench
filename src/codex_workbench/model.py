@@ -49,7 +49,8 @@ ClaudeDispatchAction = Literal["claude", "codex", "defer"]
 TERMINAL_TASK_STATES = {"accepted", "blocked", "cancelled"}
 TERMINAL_NODE_STATES = {"accepted", "failed", "blocked", "indeterminate", "cancelled"}
 DEFAULT_QUOTA_TTL_SECONDS = 15 * 60
-ROUTING_STRATEGY_VERSION = "model-routing-v1"
+LEGACY_ROUTING_STRATEGY_VERSION = "model-routing-v1"
+ROUTING_STRATEGY_VERSION = "model-routing-v2"
 CODEX_SOL_MODEL = "gpt-5.6-sol"
 
 
@@ -101,9 +102,13 @@ class RoutingStrategy:
         if not isinstance(self.complexity, str):
             raise ValueError("routing complexity must be a string")
         version = {
-            "v1": ROUTING_STRATEGY_VERSION,
-            "routing-v1": ROUTING_STRATEGY_VERSION,
-            "routing.v1": ROUTING_STRATEGY_VERSION,
+            "v1": LEGACY_ROUTING_STRATEGY_VERSION,
+            "routing-v1": LEGACY_ROUTING_STRATEGY_VERSION,
+            "routing.v1": LEGACY_ROUTING_STRATEGY_VERSION,
+            LEGACY_ROUTING_STRATEGY_VERSION: LEGACY_ROUTING_STRATEGY_VERSION,
+            "v2": ROUTING_STRATEGY_VERSION,
+            "routing-v2": ROUTING_STRATEGY_VERSION,
+            "routing.v2": ROUTING_STRATEGY_VERSION,
             ROUTING_STRATEGY_VERSION: ROUTING_STRATEGY_VERSION,
         }.get(self.version)
         if version is None:
@@ -427,6 +432,12 @@ def retry_model(model: str, attempt: int, *, verifier: bool = False) -> str:
     if verifier or attempt <= 1:
         return model
     lower = model.lower()
+    if "codex-spark" in lower:
+        if attempt == 2:
+            return "gpt-5.6-luna"
+        if attempt == 3:
+            return "gpt-5.6-terra"
+        return "gpt-5.6-sol"
     if "luna" in lower:
         return "gpt-5.6-terra" if attempt == 2 else "gpt-5.6-sol"
     if "terra" in lower:
@@ -440,6 +451,13 @@ class ClaudeDispatchDecision:
     zone: ClaudeQuotaZone
     reason: str
     max_concurrency: int
+    # ``max_concurrency`` remains the maximum simultaneous requests of the
+    # selected model family.  v2 also exposes the shared weighted capacity so
+    # callers do not mistake two Sonnet slots for an additional Opus slot.
+    capacity_units: int = 0
+    active_units: int = 0
+    requested_units: int = 0
+    available_units: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -457,6 +475,9 @@ class QuotaSnapshot:
     weekly_fable_remaining: float | None = None
     five_hour_window_id: str | None = None
     weekly_window_id: str | None = None
+    producer: str | None = None
+    producer_schema_version: int | None = None
+    claude_version: str | None = None
 
     def validate(self) -> None:
         if not self.source.strip():
@@ -476,7 +497,11 @@ class QuotaSnapshot:
         lower = model.lower()
         if "sonnet" in lower:
             values.append(self.weekly_sonnet_remaining)
-        if "fable" in lower:
+        # Claude /usage currently exposes an all-model weekly pool and a
+        # Sonnet-only pool, but no Fable-only pool.  Fable is therefore gated
+        # by the shared all-model pool unless a future producer supplies an
+        # additional Fable-specific ceiling.
+        if "fable" in lower and self.weekly_fable_remaining is not None:
             values.append(self.weekly_fable_remaining)
         return tuple(values)
 
@@ -514,6 +539,26 @@ class QuotaSnapshot:
             return "yellow", minimum
         return "green", minimum
 
+    def has_compatible_subscription_provenance(self) -> bool:
+        """Whether this is the only producer formal Claude dispatch trusts."""
+
+        # A local import keeps the model type usable by the collector while
+        # retaining one canonical provenance contract for collection, routing,
+        # and acceptance.
+        from .claude_quota import (
+            COMPATIBLE_SOURCE,
+            PRODUCER,
+            PRODUCER_SCHEMA_VERSION,
+            SUPPORTED_USAGE_VERSION,
+        )
+
+        return (
+            self.producer == PRODUCER
+            and self.producer_schema_version == PRODUCER_SCHEMA_VERSION
+            and self.source == COMPATIBLE_SOURCE
+            and self.claude_version == SUPPORTED_USAGE_VERSION
+        )
+
     def dispatch_decision(
         self,
         model: str,
@@ -521,74 +566,123 @@ class QuotaSnapshot:
         *,
         max_age_seconds: int | None = None,
         current_time: datetime | None = None,
+        shared_capacity: bool = True,
     ) -> ClaudeDispatchDecision:
+        requested_units = self._claude_capacity_units(model)
+
+        def decision(
+            action: ClaudeDispatchAction,
+            zone: ClaudeQuotaZone,
+            reason: str,
+            *,
+            capacity_units: int = 0,
+            active_units: int = 0,
+        ) -> ClaudeDispatchDecision:
+            available_units = max(capacity_units - active_units, 0)
+            max_concurrency = (
+                capacity_units // requested_units if requested_units else 0
+            )
+            return ClaudeDispatchDecision(
+                action,
+                zone,
+                reason,
+                max_concurrency,
+                capacity_units=capacity_units,
+                active_units=active_units,
+                requested_units=requested_units,
+                available_units=available_units,
+            )
+
         if max_age_seconds is not None and not self.is_fresh(
             max_age_seconds=max_age_seconds,
             current_time=current_time,
         ):
             age = self.age(current_time=current_time)
             age_text = "invalid" if age is None else f"{max(age.total_seconds(), 0):.0f}s old"
-            return ClaudeDispatchDecision(
+            return decision(
                 "codex",
                 "unknown",
                 f"Claude quota snapshot is stale ({age_text}; TTL {max_age_seconds}s)",
-                0,
+            )
+        if not self.auth_ok or self.auth_method != "native-subscription":
+            return decision(
+                "codex",
+                "auth-unavailable",
+                "Claude native-subscription authentication is unavailable",
+            )
+        if not self.has_compatible_subscription_provenance():
+            return decision(
+                "codex",
+                "unknown",
+                "Claude quota provenance is not the compatible native subscription producer",
             )
         zone, minimum = self.quota_zone(model)
-        if zone == "auth-unavailable":
-            return ClaudeDispatchDecision(
-                "codex",
-                zone,
-                "Claude native-subscription authentication is unavailable",
-                0,
-            )
         if zone == "unknown":
-            return ClaudeDispatchDecision("codex", zone, "Claude quota is unknown", 0)
+            return decision("codex", zone, "Claude quota is unknown")
         assert minimum is not None
         if zone == "protected":
-            return ClaudeDispatchDecision(
+            return decision(
                 "codex",
                 zone,
                 f"Claude quota protection active at {minimum:.1f}% remaining",
-                0,
             )
         if zone == "red":
-            return ClaudeDispatchDecision(
+            return decision(
                 "codex",
                 zone,
                 f"Claude quota red zone at {minimum:.1f}% remaining; new Claude turns are disabled",
-                0,
             )
 
         lower = model.lower()
         if zone == "yellow" and "sonnet" not in lower:
-            return ClaudeDispatchDecision(
+            return decision(
                 "codex",
                 zone,
                 f"Claude quota yellow zone at {minimum:.1f}% remaining; only Sonnet may start",
-                0,
+                capacity_units=1,
             )
-        family = "sonnet" if "sonnet" in lower else "high"
-        cap = 1 if zone == "yellow" else 2 if family == "sonnet" else 1
-        active = sum(
-            "sonnet" in active_model.lower()
-            if family == "sonnet"
-            else "sonnet" not in active_model.lower()
-            for active_model in active_models
-        )
-        if active >= cap:
-            return ClaudeDispatchDecision(
+        if not shared_capacity:
+            sonnet = "sonnet" in lower
+            capacity_units = 1 if zone == "yellow" else 2 if sonnet else 1
+            requested_units = 1
+            active_units = sum(
+                ("sonnet" in active_model.lower()) == sonnet
+                for active_model in active_models
+            )
+        else:
+            capacity_units = 1 if zone == "yellow" else 2
+            active_units = sum(
+                self._claude_capacity_units(active_model) for active_model in active_models
+            )
+        if requested_units > capacity_units - active_units:
+            return decision(
                 "defer",
                 zone,
-                f"Claude {zone} zone concurrency cap reached for {family}: {active}/{cap}",
-                cap,
+                (
+                    f"Claude {zone} shared concurrency capacity reached: "
+                    f"{active_units}/{capacity_units} units active; "
+                    f"{requested_units} units required"
+                ),
+                capacity_units=capacity_units,
+                active_units=active_units,
             )
-        return ClaudeDispatchDecision(
+        return decision(
             "claude",
             zone,
-            f"Claude {zone} zone permits {family}: {active}/{cap} active",
-            cap,
+            (
+                f"Claude {zone} shared capacity permits {requested_units}-unit "
+                f"request: {active_units}/{capacity_units} units active"
+            ),
+            capacity_units=capacity_units,
+            active_units=active_units,
         )
+
+    @staticmethod
+    def _claude_capacity_units(model: str) -> int:
+        """Return v2's shared capacity cost, conservatively for unknown models."""
+
+        lower = model.lower()
+        return 1 if "sonnet" in lower else 2
 
     def permits(self, model: str, stop_line: float = 25.0) -> tuple[bool, str]:
         if stop_line != 25.0:

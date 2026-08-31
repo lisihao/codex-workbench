@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lisihao.codex-workbench-quota</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP_ROOT__/bin/codex-workbench</string>
+    <string>quota</string>
+    <string>collect-claude</string>
+    <string>--claude-binary</string>
+    <string>__CLAUDE_BINARY__</string>
+    <string>--output</string>
+    <string>__QUOTA_SNAPSHOT_FILE__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__USER_HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__STATE_ROOT__/logs/quota.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE_ROOT__/logs/quota.error.log</string>
+</dict>
+</plist>

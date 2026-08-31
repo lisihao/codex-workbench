@@ -13,8 +13,23 @@ from codex_workbench.executors import (
     ExecutionRequest,
     codex_subscription_environment,
 )
-from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
+from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.planner import PLAN_SCHEMA, CodexPlanner
+
+
+def compatible_provenance() -> dict[str, object]:
+    return {
+        "source": COMPATIBLE_SOURCE,
+        "producer": PRODUCER,
+        "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+        "claude_version": SUPPORTED_USAGE_VERSION,
+    }
 
 
 class ModelTests(unittest.TestCase):
@@ -128,6 +143,8 @@ class ModelTests(unittest.TestCase):
         )
         self.assertIn('["sonnet"]', prompt)
         self.assertIn("only when its exact model family appears", prompt)
+        self.assertIn("model-routing-v2", prompt)
+        self.assertIn("Sonnet costs one unit", prompt)
 
     def test_codex_environment_isolates_home_and_removes_api_keys(self) -> None:
         with patch.dict(
@@ -174,7 +191,7 @@ class ModelTests(unittest.TestCase):
             five_hour_remaining=None,
             weekly_all_remaining=90,
             weekly_sonnet_remaining=90,
-            source="fixture",
+            **compatible_provenance(),
         )
         self.assertEqual(unknown.permits("sonnet"), (False, "Claude quota is unknown"))
 
@@ -185,7 +202,7 @@ class ModelTests(unittest.TestCase):
             five_hour_remaining=25,
             weekly_all_remaining=90,
             weekly_sonnet_remaining=90,
-            source="fixture",
+            **compatible_provenance(),
         )
         allowed, reason = protected.permits("sonnet")
         self.assertFalse(allowed)
@@ -198,9 +215,24 @@ class ModelTests(unittest.TestCase):
             five_hour_remaining=60,
             weekly_all_remaining=70,
             weekly_sonnet_remaining=80,
-            source="fixture",
+            **compatible_provenance(),
         )
         self.assertTrue(healthy.permits("sonnet")[0])
+
+    def test_manual_quota_snapshot_cannot_admit_formal_claude_dispatch(self) -> None:
+        manual = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            source="settings-usage",
+        )
+
+        decision = manual.dispatch_decision("sonnet")
+        self.assertEqual((decision.action, decision.zone), ("codex", "unknown"))
+        self.assertIn("provenance", decision.reason)
 
     def test_claude_quota_zones_enforce_model_and_concurrency_policy(self) -> None:
         def snapshot(remaining: float) -> QuotaSnapshot:
@@ -212,7 +244,7 @@ class ModelTests(unittest.TestCase):
                 weekly_all_remaining=remaining,
                 weekly_sonnet_remaining=remaining,
                 weekly_fable_remaining=remaining,
-                source="settings-usage",
+                **compatible_provenance(),
             )
 
         red = snapshot(27)
@@ -243,10 +275,57 @@ class ModelTests(unittest.TestCase):
             weekly_all_remaining=60,
             weekly_sonnet_remaining=60,
             weekly_fable_remaining=None,
-            source="settings-usage",
+            **compatible_provenance(),
         )
-        self.assertEqual(mixed.policy_summary()["zone"], "mixed")
-        self.assertEqual(mixed.policy_summary()["zones"]["fable"], "unknown")
+        self.assertEqual(mixed.policy_summary()["zone"], "green")
+        self.assertEqual(mixed.policy_summary()["zones"]["fable"], "green")
+        self.assertEqual(mixed.dispatch_decision("fable").action, "claude")
+
+        fable_specific_limit = QuotaSnapshot(
+            observed_at="2026-08-26T00:00:00+00:00",
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=60,
+            weekly_all_remaining=60,
+            weekly_sonnet_remaining=60,
+            weekly_fable_remaining=20,
+            **compatible_provenance(),
+        )
+        self.assertEqual(fable_specific_limit.dispatch_decision("fable").zone, "protected")
+
+    def test_green_quota_uses_one_shared_weighted_capacity_pool(self) -> None:
+        green = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=60,
+            weekly_all_remaining=60,
+            weekly_sonnet_remaining=60,
+            weekly_fable_remaining=60,
+            **compatible_provenance(),
+        )
+
+        first_sonnet = green.dispatch_decision("sonnet", ("sonnet",))
+        self.assertEqual(first_sonnet.action, "claude")
+        self.assertEqual(first_sonnet.max_concurrency, 2)
+        self.assertEqual(
+            (first_sonnet.capacity_units, first_sonnet.active_units, first_sonnet.requested_units),
+            (2, 1, 1),
+        )
+
+        two_sonnet_then_opus = green.dispatch_decision("opus", ("sonnet", "sonnet"))
+        self.assertEqual(two_sonnet_then_opus.action, "defer")
+        self.assertEqual(two_sonnet_then_opus.max_concurrency, 1)
+        self.assertEqual(
+            (two_sonnet_then_opus.capacity_units, two_sonnet_then_opus.active_units,
+             two_sonnet_then_opus.requested_units),
+            (2, 2, 2),
+        )
+
+        sonnet_then_opus = green.dispatch_decision("opus", ("sonnet",))
+        opus_then_sonnet = green.dispatch_decision("sonnet", ("opus",))
+        self.assertEqual(sonnet_then_opus.action, "defer")
+        self.assertEqual(opus_then_sonnet.action, "defer")
 
     def test_claude_quota_zone_boundaries_are_exact(self) -> None:
         def zone(remaining: float) -> str:

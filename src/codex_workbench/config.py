@@ -20,7 +20,7 @@ class WorkbenchConfig:
     authority_host: str | None = None
     authority_machine_id: str | None = None
     quota_snapshot_file: Path | None = None
-    quota_refresh_seconds: int = 300
+    quota_refresh_seconds: int = 60
 
     @property
     def effective_quota_snapshot_file(self) -> Path:
@@ -116,7 +116,7 @@ class WorkbenchConfig:
                 quota_snapshot_file=Path(raw["quota_snapshot_file"]).expanduser()
                 if raw.get("quota_snapshot_file")
                 else root / "claude-quota.json",
-                quota_refresh_seconds=int(raw.get("quota_refresh_seconds", 300)),
+                quota_refresh_seconds=int(raw.get("quota_refresh_seconds", 60)),
             )
         inferred_authority = bool(os.environ.get("CODEX_WORKBENCH_PROCESS_HOME"))
         return cls(

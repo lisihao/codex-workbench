@@ -10,6 +10,12 @@ from urllib.request import Request, urlopen
 
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.artifacts import ArtifactStore
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.store import WorkbenchStore
@@ -59,12 +65,15 @@ class APITests(unittest.TestCase):
                         five_hour_remaining=35,
                         weekly_all_remaining=60,
                         weekly_sonnet_remaining=60,
-                        source="settings-usage",
+                        source=COMPATIBLE_SOURCE,
+                        producer=PRODUCER,
+                        producer_schema_version=PRODUCER_SCHEMA_VERSION,
+                        claude_version=SUPPORTED_USAGE_VERSION,
                     )
                 )
                 with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
                     snapshot = json.load(response)
-                self.assertEqual(snapshot["quota_policy"]["zone"], "mixed")
+                self.assertEqual(snapshot["quota_policy"]["zone"], "yellow")
                 self.assertEqual(snapshot["quota_policy"]["zones"]["sonnet"], "yellow")
                 self.assertEqual(snapshot["quota_policy"]["models"]["sonnet"]["max_concurrency"], 1)
 

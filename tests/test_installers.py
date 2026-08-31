@@ -85,6 +85,8 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("exec /opt/homebrew/bin/python3 -m codex_workbench", source)
         self.assertIn("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE", source)
         self.assertIn('"authority_machine_id": macos_machine_id()', source)
+        self.assertIn('"--claude-binary"', source)
+        self.assertNotIn("CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude", source)
 
     def test_authority_launch_agent_persists_quota_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -102,6 +104,26 @@ class InstallerTests(unittest.TestCase):
             payload["EnvironmentVariables"]["CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE"],
             "/tmp/state/claude-quota.json",
         )
+
+    def test_quota_launch_agent_is_one_shot_every_minute(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / "com.lisihao.codex-workbench-quota.plist.in").read_text()
+        rendered = (
+            template.replace("__APP_ROOT__", "/tmp/app")
+            .replace("__STATE_ROOT__", "/tmp/state")
+            .replace("__USER_HOME__", "/Users/example")
+            .replace("__CLAUDE_BINARY__", "/tmp/claude")
+            .replace("__QUOTA_SNAPSHOT_FILE__", "/tmp/state/claude-quota.json")
+        )
+        payload = plistlib.loads(rendered.encode())
+        self.assertEqual(payload["Label"], "com.lisihao.codex-workbench-quota")
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertEqual(payload["StartInterval"], 60)
+        self.assertNotIn("KeepAlive", payload)
+        self.assertIn("collect-claude", payload["ProgramArguments"])
+        self.assertIn("/tmp/claude", payload["ProgramArguments"])
+        self.assertEqual(payload["EnvironmentVariables"]["HOME"], "/Users/example")
+        self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/quota.log")
 
     def test_macbook_tunnel_reconnect_is_bounded(self) -> None:
         root = Path(__file__).resolve().parents[1]

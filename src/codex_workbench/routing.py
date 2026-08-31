@@ -13,14 +13,17 @@ from typing import Any, Iterable, Literal
 from .model import (
     CODEX_SOL_MODEL,
     DEFAULT_QUOTA_TTL_SECONDS,
+    LEGACY_ROUTING_STRATEGY_VERSION,
     QuotaSnapshot,
     RoutingStrategy,
     TaskContract,
     ROUTING_STRATEGY_VERSION,
+    retry_model,
 )
 
 
 CODEX_LUNA_MODEL = "gpt-5.6-luna"
+CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
 CODEX_TERRA_MODEL = "gpt-5.6-terra"
 CLAUDE_FAMILIES = ("opus", "sonnet", "fable")
 RoutingRole = Literal["planner", "worker", "verifier", "challenge"]
@@ -100,6 +103,7 @@ def _claude_permitted(
     quota_snapshot: QuotaSnapshot | None,
     active_models: tuple[str, ...],
     max_age_seconds: int | None,
+    shared_capacity: bool,
 ) -> tuple[bool, str]:
     family = _family(model)
     if family is None:
@@ -107,14 +111,12 @@ def _claude_permitted(
     if not any(_family(candidate) == family for candidate in claude_models_available):
         return False, f"Claude {family} is not admitted by the current strategy context"
     if quota_snapshot is None:
-        # Submission computes this list only after native authentication and
-        # quota admission.  A caller that supplies it directly is providing
-        # that already-admitted context.
-        return True, f"Claude {family} is pre-admitted by the strategy context"
+        return False, "Claude quota provenance is unavailable"
     quota_decision = quota_snapshot.dispatch_decision(
         family,
         active_models,
         max_age_seconds=max_age_seconds,
+        shared_capacity=shared_capacity,
     )
     if quota_decision.action != "claude":
         return False, quota_decision.reason
@@ -130,6 +132,60 @@ def _strategy_for(
     if isinstance(strategy, dict):
         return RoutingStrategy.from_dict(strategy)
     return strategy.normalized()
+
+
+def _codex_fallback_base_model(strategy: RoutingStrategy) -> tuple[str, str]:
+    """Select the first Codex worker tier without consuming retry budget.
+
+    v1 intentionally keeps its former implementation-only Luna preference.
+    v2 assigns bounded low work to Spark and the next inexpensive tier to
+    standard, splittable production work;
+    architecture, review, creative, non-splittable, and high-complexity work
+    start at Terra when Claude is not currently usable.
+    """
+
+    task_type = strategy.task_type
+    complexity = strategy.complexity
+    if strategy.version == LEGACY_ROUTING_STRATEGY_VERSION:
+        if (
+            task_type == "implementation"
+            and complexity in {"low", "standard"}
+            and strategy.parallelizable
+        ):
+            return CODEX_LUNA_MODEL, "low-risk/splittable implementation"
+        if complexity == "low" and task_type in {"implementation", "tests", "docs"}:
+            return CODEX_LUNA_MODEL, "bounded low-complexity work"
+        return CODEX_TERRA_MODEL, "complex or non-mechanical work"
+
+    if complexity == "low":
+        return CODEX_SPARK_MODEL, "bounded low-complexity work uses the independent Spark pool"
+    if (
+        complexity == "standard"
+        and strategy.parallelizable
+        and task_type in {"implementation", "debugging", "tests", "docs", "exploration"}
+    ):
+        return CODEX_LUNA_MODEL, "standard splittable production work"
+    return CODEX_TERRA_MODEL, "complex, high-risk, or non-splittable work"
+
+
+def codex_fallback_model(
+    contract: TaskContract,
+    *,
+    strategy: RoutingStrategy | dict[str, Any] | None = None,
+    attempt: int = 1,
+) -> str:
+    """Return the durable Codex fallback for this attempt.
+
+    The first attempt follows the versioned routing tier. Later attempts use
+    Spark -> Luna -> Terra -> Sol or Luna -> Terra -> Sol escalation without
+    changing a high-complexity first attempt from Terra into a cheaper tier.
+    """
+
+    if attempt <= 0:
+        raise ValueError("routing attempt must be positive")
+    selected_strategy = _strategy_for(contract, strategy)
+    base_model, _ = _codex_fallback_base_model(selected_strategy)
+    return retry_model(base_model, attempt)
 
 
 def route_task(
@@ -170,20 +226,50 @@ def route_task(
 
     task_type = selected_strategy.task_type
     complexity = selected_strategy.complexity
-    claude_eligible = selected_strategy.claude_allowed and (
-        complexity == "high" or task_type in {"architecture", "review"}
-    )
+    if version == LEGACY_ROUTING_STRATEGY_VERSION:
+        claude_eligible = selected_strategy.claude_allowed and (
+            complexity == "high" or task_type in {"architecture", "review"}
+        )
+    else:
+        # v2 treats paid Claude capacity as a productive worker pool while
+        # retaining the independent Spark pool for the cheapest bounded work.
+        # Quota admission and concurrency remain enforced below and again
+        # immediately before run.
+        claude_eligible = (
+            selected_strategy.claude_allowed
+            and complexity != "low"
+            and (
+                complexity == "high"
+                or task_type in {"architecture", "review", "creative"}
+                or (
+                    complexity == "standard"
+                    and task_type
+                    in {"implementation", "debugging", "tests", "docs", "exploration"}
+                )
+            )
+        )
 
     if claude_eligible:
-        if task_type == "architecture":
-            candidates = ("opus", "sonnet")
-        elif task_type == "review":
-            candidates = ("sonnet", "opus")
-        elif task_type == "creative":
+        if version == LEGACY_ROUTING_STRATEGY_VERSION and task_type == "creative":
             candidates = ("fable", "opus")
+        elif task_type == "architecture":
+            candidates = (
+                ("opus", "sonnet")
+                if version == LEGACY_ROUTING_STRATEGY_VERSION
+                else ("opus", "fable", "sonnet")
+            )
+        elif task_type == "review":
+            candidates = (
+                ("sonnet", "opus")
+                if version == LEGACY_ROUTING_STRATEGY_VERSION
+                else ("opus", "fable", "sonnet")
+            )
+        elif task_type == "creative":
+            candidates = ("fable", "opus", "sonnet")
+        elif version != LEGACY_ROUTING_STRATEGY_VERSION and complexity == "standard":
+            candidates = ("sonnet",)
         else:
             candidates = ("opus", "sonnet")
-        candidate = None
         fallback_reason = "no eligible Claude family is admitted"
         for candidate_family in candidates:
             candidate = _first_available((candidate_family,), claude_models_available)
@@ -195,6 +281,7 @@ def route_task(
                 quota_snapshot=quota_snapshot,
                 active_models=active_models,
                 max_age_seconds=max_age_seconds,
+                shared_capacity=version != LEGACY_ROUTING_STRATEGY_VERSION,
             )
             if permitted:
                 return RoutingDecision(
@@ -209,23 +296,12 @@ def route_task(
                     claude_eligible=True,
                 )
             fallback_reason = quota_reason
-        candidate = None
     else:
-        fallback_reason = "task is not an explicitly high-complexity, architecture, or review route"
+        fallback_reason = (
+            "task is not admitted to Claude by the versioned routing strategy"
+        )
 
-    if (
-        task_type == "implementation"
-        and complexity in {"low", "standard"}
-        and selected_strategy.parallelizable
-    ):
-        fallback_model = CODEX_LUNA_MODEL
-        fallback_label = "low-risk/splittable implementation"
-    elif complexity == "low" and task_type in {"implementation", "tests", "docs"}:
-        fallback_model = CODEX_LUNA_MODEL
-        fallback_label = "bounded low-complexity work"
-    else:
-        fallback_model = CODEX_TERRA_MODEL
-        fallback_label = "complex or non-mechanical work"
+    fallback_model, fallback_label = _codex_fallback_base_model(selected_strategy)
     return RoutingDecision(
         role=role,
         executor="codex",
@@ -323,7 +399,9 @@ select_route = route_task
 __all__ = [
     "CLAUDE_FAMILIES",
     "CODEX_LUNA_MODEL",
+    "CODEX_SPARK_MODEL",
     "CODEX_TERRA_MODEL",
+    "codex_fallback_model",
     "ModelRoutingPolicy",
     "ModelRoutingStrategy",
     "ROUTING_STRATEGY_VERSION",

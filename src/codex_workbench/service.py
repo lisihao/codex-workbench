@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 import os
 from pathlib import Path
 import socket
@@ -19,10 +20,26 @@ from .executors import (
     validate_worker_scope,
 )
 from .evidence import reusable_evidence_key
-from .model import ClaudeDispatchDecision, NodeResult, QuotaSnapshot, retry_model
+from .model import (
+    LEGACY_ROUTING_STRATEGY_VERSION,
+    ClaudeDispatchDecision,
+    NodeResult,
+    QuotaSnapshot,
+    TaskContract,
+)
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
+from .routing import codex_fallback_model, route_task
 from .store import StateConflictError, WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
+
+
+@dataclass(frozen=True)
+class _ClaimRoute:
+    """Capacity decision captured atomically with a durable node claim."""
+
+    quota: QuotaSnapshot | None
+    active_claude_models: tuple[str, ...]
+    decision: ClaudeDispatchDecision | None
 
 
 class Coordinator:
@@ -35,7 +52,7 @@ class Coordinator:
         max_workers: int = 4,
         poll_seconds: float = 1.0,
         quota_ttl_seconds: int = 900,
-        quota_refresh_seconds: float = 300,
+        quota_refresh_seconds: float = 60,
         quota_snapshot_file: Path | None = None,
         fatal_exit: Callable[[int], None] | None = None,
     ):
@@ -98,35 +115,26 @@ class Coordinator:
                 worker_id = f"{socket.gethostname()}-{os.getpid()}-{worker_counter}"
                 quota = self.store.latest_quota()
                 active_claude_models = self._active_claude_models()
-
-                def admissible(spec: dict) -> bool:
-                    decision = self._claude_decision(
-                        spec,
-                        quota,
-                        active_claude_models,
-                        quota_ttl_seconds=self.quota_ttl_seconds,
-                    )
-                    return decision is None or decision.action != "defer"
-
-                claimed = self.store.claim_ready_node(
-                    worker_id,
-                    self.coordinator_epoch,
-                    admissible=admissible,
-                )
+                # Capacity saturation is not a reason to leave a global
+                # Workbench worker slot idle.  Claim the ready node and carry
+                # the exact decision into its thread, where it persistently
+                # routes to the governed Codex fallback in the same attempt.
+                claimed = self.store.claim_ready_node(worker_id, self.coordinator_epoch)
                 if claimed is None:
                     break
-                decision = self._claude_decision(
+                decision = self._claim_time_decision(
                     claimed["spec"],
+                    claimed["contract"],
                     quota,
                     active_claude_models,
-                    quota_ttl_seconds=self.quota_ttl_seconds,
                 )
+                claim_route = _ClaimRoute(quota, active_claude_models, decision)
                 active_claude_model = (
                     claimed["spec"]["model"]
                     if decision is not None and decision.action == "claude"
                     else None
                 )
-                future = self._pool.submit(self._execute_claimed, claimed)
+                future = self._pool.submit(self._execute_claimed, claimed, claim_route)
                 self._futures[future] = (
                     f"{claimed['task_id']}/{claimed['node_id']}",
                     active_claude_model,
@@ -167,6 +175,7 @@ class Coordinator:
     @staticmethod
     def _claude_decision(
         spec: dict,
+        contract_raw: dict,
         quota: QuotaSnapshot | None,
         active_models: tuple[str, ...] = (),
         *,
@@ -181,13 +190,132 @@ class Coordinator:
                 "Claude quota is unknown",
                 0,
             )
+        contract = TaskContract.from_dict(contract_raw)
+        shared_capacity = contract.strategy.version != LEGACY_ROUTING_STRATEGY_VERSION
+        governed = route_task(
+            contract,
+            claude_models_available=(str(spec["model"]),),
+            quota_snapshot=quota,
+            active_models=(),
+            max_age_seconds=quota_ttl_seconds,
+        )
+        baseline = quota.dispatch_decision(
+            spec["model"],
+            max_age_seconds=quota_ttl_seconds,
+            shared_capacity=shared_capacity,
+        )
+        if governed.executor != "claude":
+            return ClaudeDispatchDecision(
+                "codex",
+                baseline.zone,
+                f"Task routing contract does not admit Claude: {governed.reason}",
+                0,
+            )
         return quota.dispatch_decision(
             spec["model"],
             active_models,
             max_age_seconds=quota_ttl_seconds,
+            shared_capacity=shared_capacity,
         )
 
-    def _execute_claimed(self, claimed: dict) -> None:
+    @staticmethod
+    def _timestamp(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    @staticmethod
+    def _is_claude_model(model: object) -> bool:
+        lower = str(model).lower()
+        return any(family in lower for family in ("sonnet", "opus", "fable"))
+
+    def _latest_completed_claude_at(self) -> datetime | None:
+        latest: datetime | None = None
+        for task in self.store.list_tasks(limit=10_000):
+            for node in task.get("nodes", []):
+                if node.get("effective_executor") != "claude":
+                    continue
+                model = node.get("effective_model") or node.get("model")
+                if not self._is_claude_model(model):
+                    continue
+                settled_at = self._timestamp(node.get("settled_at"))
+                if settled_at is not None and (latest is None or settled_at > latest):
+                    latest = settled_at
+        return latest
+
+    def _claim_time_decision(
+        self,
+        spec: dict,
+        contract: dict,
+        quota: QuotaSnapshot | None,
+        active_models: tuple[str, ...],
+    ) -> ClaudeDispatchDecision | None:
+        decision = self._claude_decision(
+            spec,
+            contract,
+            quota,
+            active_models,
+            quota_ttl_seconds=self.quota_ttl_seconds,
+        )
+        if decision is None or decision.action != "claude" or quota is None:
+            return decision
+        last_settled_at = self._latest_completed_claude_at()
+        if last_settled_at is None:
+            return decision
+        observed_at = self._timestamp(quota.observed_at)
+        if observed_at is not None and observed_at > last_settled_at:
+            return decision
+        observed_text = quota.observed_at if observed_at is not None else "invalid"
+        return ClaudeDispatchDecision(
+            "codex",
+            "unknown",
+            (
+                "Claude quota snapshot must be newer than the most recent "
+                f"Claude completion ({last_settled_at.isoformat()}); observed_at={observed_text}"
+            ),
+            0,
+        )
+
+    def _runtime_quota_fallback(
+        self,
+        spec: dict,
+        contract: dict,
+        claim_route: _ClaimRoute,
+    ) -> ClaudeDispatchDecision | None:
+        """Only a newer runtime quota/auth state may revoke a reserved turn.
+
+        A claim already reserved shared capacity.  Do not turn that reservation
+        into a false overflow merely because the claiming node itself appears
+        in the active-model set; concurrently claimed Claude nodes may finish.
+        """
+
+        if claim_route.decision is None or claim_route.decision.action != "claude":
+            return None
+        latest = self.store.latest_quota()
+        if latest == claim_route.quota:
+            return None
+        decision = self._claude_decision(
+            spec,
+            contract,
+            latest,
+            claim_route.active_claude_models,
+            quota_ttl_seconds=self.quota_ttl_seconds,
+        )
+        if decision is not None and decision.action == "codex":
+            return decision
+        return None
+
+    def _execute_claimed(
+        self,
+        claimed: dict,
+        claim_route: _ClaimRoute | None = None,
+    ) -> None:
         request: ExecutionRequest
         try:
             spec = claimed["spec"]
@@ -237,27 +365,49 @@ class Coordinator:
                     lease_epoch=claimed["lease_epoch"],
                 )
                 return
-            decision = self._claude_decision(
-                spec,
-                self.store.latest_quota(),
-                quota_ttl_seconds=self.quota_ttl_seconds,
-            )
-            if decision is not None and decision.action == "codex":
+            if claim_route is None:
+                quota = self.store.latest_quota()
+                claim_route = _ClaimRoute(
+                    quota,
+                    (),
+                    self._claim_time_decision(spec, contract, quota, ()),
+                )
+            decision = claim_route.decision
+            if decision is not None and decision.action != "claude":
+                fallback_kind = (
+                    "claude-capacity-overflow"
+                    if decision.action == "defer"
+                    else "quota-refresh-required"
+                    if "must be newer than the most recent Claude completion" in decision.reason
+                    else "quota-or-auth-policy"
+                )
                 request, result = self._execute_codex_fallback(
                     claimed,
                     request,
                     decision.reason,
                     decision.zone,
+                    fallback_kind=fallback_kind,
                 )
             else:
-                result = self._executor(spec["executor"]).execute(request)
-                if spec["executor"] == "claude" and result.status == "blocked":
+                runtime_decision = self._runtime_quota_fallback(spec, contract, claim_route)
+                if runtime_decision is not None:
                     request, result = self._execute_codex_fallback(
                         claimed,
                         request,
-                        result.summary,
-                        decision.zone if decision is not None else "unknown",
+                        runtime_decision.reason,
+                        runtime_decision.zone,
+                        fallback_kind="runtime-quota-change",
                     )
+                else:
+                    result = self._executor(spec["executor"]).execute(request)
+                    if spec["executor"] == "claude" and result.status == "blocked":
+                        request, result = self._execute_codex_fallback(
+                            claimed,
+                            request,
+                            result.summary,
+                            decision.zone if decision is not None else "unknown",
+                            fallback_kind="claude-executor-blocked",
+                        )
             result = validate_worker_scope(self.worktrees, request, result)
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(worktree, contract["base_sha"])
@@ -308,10 +458,12 @@ class Coordinator:
         request: ExecutionRequest,
         reason: str,
         zone: str,
+        *,
+        fallback_kind: str,
     ) -> tuple[ExecutionRequest, NodeResult]:
-        fallback_model = retry_model(
-            request.contract["executor_model"],
-            int(claimed["attempt"]),
+        fallback_model = codex_fallback_model(
+            TaskContract.from_dict(request.contract),
+            attempt=int(claimed["attempt"]),
         )
         with self._routing_lock:
             self._routed_to_codex.add(f"{claimed['task_id']}/{claimed['node_id']}")
@@ -327,6 +479,7 @@ class Coordinator:
                 "model": fallback_model,
                 "zone": zone,
                 "reason": reason,
+                "fallback_kind": fallback_kind,
             },
             attempt=claimed["attempt"],
             coordinator_epoch=claimed["coordinator_epoch"],
@@ -363,7 +516,7 @@ class Coordinator:
             return ClaudeExecutor(
                 self.artifacts,
                 self.store.latest_quota(),
-                os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+                os.environ.get("CODEX_WORKBENCH_CLAUDE") or "claude",
                 self.quota_ttl_seconds,
             )
         raise ValueError(f"unsupported executor {kind!r}")

@@ -2,28 +2,44 @@ from __future__ import annotations
 
 import unittest
 
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.quota_productivity import compute_quota_productivity
+
+
+def compatible_snapshot(**values: object) -> dict[str, object]:
+    return {
+        "auth_ok": True,
+        "auth_method": "native-subscription",
+        "source": COMPATIBLE_SOURCE,
+        "producer": PRODUCER,
+        "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+        "claude_version": SUPPORTED_USAGE_VERSION,
+        **values,
+    }
 
 
 class QuotaProductivityTests(unittest.TestCase):
     def test_counts_only_real_named_windows_and_accepted_claude_tasks(self) -> None:
         snapshots = [
-            {
+            compatible_snapshot(**{
                 "observed_at": "2026-08-31T00:00:00+00:00",
-                "source": "settings-usage-export",
                 "five_hour_window_id": "five-real",
                 "weekly_window_id": "week-real",
                 "five_hour_remaining": 80,
                 "weekly_all_remaining": 75,
-            },
-            {
+            }),
+            compatible_snapshot(**{
                 "observed_at": "2026-08-31T02:00:00+00:00",
-                "source": "settings-usage-export",
                 "five_hour_window_id": "five-real",
                 "weekly_window_id": "week-real",
                 "five_hour_remaining": 70,
                 "weekly_all_remaining": 70,
-            },
+            }),
             {
                 "observed_at": "2026-08-31T00:00:00+00:00",
                 "source": "acceptance-fixture-v1",
@@ -39,6 +55,22 @@ class QuotaProductivityTests(unittest.TestCase):
                 "weekly_window_id": "week-fake",
                 "five_hour_remaining": 1,
                 "weekly_all_remaining": 1,
+            },
+            {
+                "observed_at": "2026-08-31T00:00:00+00:00",
+                "auth_ok": True,
+                "auth_method": "native-subscription",
+                "source": COMPATIBLE_SOURCE,
+                "five_hour_window_id": "forged-compatible-name",
+                "five_hour_remaining": 99,
+            },
+            {
+                "observed_at": "2026-08-31T02:00:00+00:00",
+                "auth_ok": True,
+                "auth_method": "native-subscription",
+                "source": COMPATIBLE_SOURCE,
+                "five_hour_window_id": "forged-compatible-name",
+                "five_hour_remaining": 1,
             },
         ]
         tasks = [
@@ -83,24 +115,21 @@ class QuotaProductivityTests(unittest.TestCase):
 
     def test_does_not_claim_productivity_from_one_sample_or_window_reset(self) -> None:
         snapshots = [
-            {
+            compatible_snapshot(**{
                 "observed_at": "2026-08-31T00:00:00+00:00",
-                "source": "settings-usage-export",
                 "five_hour_window_id": "one",
                 "five_hour_remaining": 50,
-            },
-            {
+            }),
+            compatible_snapshot(**{
                 "observed_at": "2026-08-31T00:00:00+00:00",
-                "source": "settings-usage-export",
                 "weekly_window_id": "reset",
                 "weekly_all_remaining": 30,
-            },
-            {
+            }),
+            compatible_snapshot(**{
                 "observed_at": "2026-08-31T01:00:00+00:00",
-                "source": "settings-usage-export",
                 "weekly_window_id": "reset",
                 "weekly_all_remaining": 80,
-            },
+            }),
         ]
 
         report = compute_quota_productivity(snapshots, [], [])

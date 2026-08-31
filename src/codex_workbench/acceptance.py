@@ -8,6 +8,12 @@ from typing import Any
 
 from .artifacts import ArtifactStore, presentation_format
 from .authority import normalize_boot_id
+from .claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from .store import WorkbenchStore
 
 
@@ -37,10 +43,10 @@ REQUIREMENTS = {
     "A12": "Claude 网页端仍可使用保留额度完成 PPT 写作",
 }
 
-
 def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     tasks = store.list_tasks(limit=500)
     events = store.read_events(after=0, limit=10_000)
+    legacy_remediations = store.legacy_evidence_remediations()
     quota = _runtime_quota_evidence(store.list_quota_snapshots(limit=5_000))
     authority = store.authority_status()
     checks = [
@@ -52,7 +58,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         _weekly_quota_check(quota),
         _fallback_check(tasks, events, quota),
         _auth_storm_check(tasks, events),
-        _accepted_evidence_check(tasks, events, store.artifacts),
+        _accepted_evidence_check(tasks, events, store.artifacts, legacy_remediations),
         _authority_check(authority),
         _ppt_reserve_check(events, quota, store.artifacts),
     ]
@@ -84,14 +90,15 @@ def _runtime_quota_evidence(quota: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
-def _is_real_quota_snapshot(snapshot: dict[str, Any]) -> bool:
-    source = snapshot.get("source")
+def _is_compatible_subscription_snapshot(snapshot: dict[str, Any]) -> bool:
+    """Accept only the version-pinned passive producer for quota-based gates."""
     return (
-        snapshot in _runtime_quota_evidence([snapshot])
-        and snapshot.get("auth_ok") is True
+        snapshot.get("auth_ok") is True
         and snapshot.get("auth_method") == "native-subscription"
-        and isinstance(source, str)
-        and bool(source.strip())
+        and snapshot.get("source") == COMPATIBLE_SOURCE
+        and snapshot.get("producer") == PRODUCER
+        and snapshot.get("producer_schema_version") == PRODUCER_SCHEMA_VERSION
+        and snapshot.get("claude_version") == SUPPORTED_USAGE_VERSION
     )
 
 
@@ -265,7 +272,7 @@ def _quota_window_snapshot(
     if not isinstance(quota_window_id, str) or not quota_window_id.strip():
         return None
     for snapshot in quota:
-        if not _is_real_quota_snapshot(snapshot):
+        if not _is_compatible_subscription_snapshot(snapshot):
             continue
         if quota_window_id in {
             snapshot.get("five_hour_window_id"),
@@ -276,13 +283,13 @@ def _quota_window_snapshot(
 
 
 def _quota_snapshot_zone(snapshot: dict[str, Any], source_model: object) -> str | None:
-    if not _is_real_quota_snapshot(snapshot):
+    if not _is_compatible_subscription_snapshot(snapshot):
         return None
     fields = ["five_hour_remaining", "weekly_all_remaining"]
     model = str(source_model or "").lower()
     if "sonnet" in model:
         fields.append("weekly_sonnet_remaining")
-    elif "fable" in model:
+    elif "fable" in model and snapshot.get("weekly_fable_remaining") is not None:
         fields.append("weekly_fable_remaining")
     values: list[float] = []
     for field in fields:
@@ -309,10 +316,10 @@ def _quota_reserve_is_intact(
     model = str(receipt.get("model", "sonnet")).lower()
     if "sonnet" in model:
         fields.append("weekly_sonnet_remaining")
-    elif "fable" in model:
+    elif "fable" in model and snapshot.get("weekly_fable_remaining") is not None:
         fields.append("weekly_fable_remaining")
-    # A supplied pool is applicable to this snapshot and must not be below the
-    # protected reserve. Missing required pools remain unknown and fail closed.
+    # The all-model pool is authoritative for Fable unless a producer supplies
+    # an additional Fable-specific pool. Missing required pools fail closed.
     values: list[float] = []
     for field in fields:
         value = snapshot.get(field)
@@ -513,13 +520,17 @@ def _sol_verifier_check(events: list[dict[str, Any]]) -> AcceptanceCheck:
 
 
 def _five_hour_quota_check(quota: list[dict[str, Any]]) -> AcceptanceCheck:
+    observed = _quota_samples(
+        quota,
+        window_field="five_hour_window_id",
+        remaining_fields=("five_hour_remaining",),
+    )
     windows = _quota_coverage(
         quota,
         window_field="five_hour_window_id",
         remaining_fields=("five_hour_remaining",),
     )
-    observed = [sample for window in windows.values() for sample in window]
-    minimum = min((value for _at, values in observed for value in values), default=None)
+    minimum = min((value for _window, (_at, values) in observed for value in values), default=None)
     if minimum is not None and minimum < 20:
         return AcceptanceCheck(
             "A6", "error", REQUIREMENTS["A6"], f"实测配额最低剩余 {minimum:.1f}%，已突破 20% 保留池"
@@ -535,13 +546,17 @@ def _five_hour_quota_check(quota: list[dict[str, Any]]) -> AcceptanceCheck:
 
 
 def _weekly_quota_check(quota: list[dict[str, Any]]) -> AcceptanceCheck:
+    observed = _quota_samples(
+        quota,
+        window_field="weekly_window_id",
+        remaining_fields=("weekly_all_remaining", "weekly_sonnet_remaining"),
+    )
     windows = _quota_coverage(
         quota,
         window_field="weekly_window_id",
         remaining_fields=("weekly_all_remaining", "weekly_sonnet_remaining"),
     )
-    observed = [sample for window in windows.values() for sample in window]
-    minimum = min((value for _at, values in observed for value in values), default=None)
+    minimum = min((value for _window, (_at, values) in observed for value in values), default=None)
     if minimum is not None and minimum < 20:
         return AcceptanceCheck(
             "A7", "error", REQUIREMENTS["A7"], f"实测周配额最低剩余 {minimum:.1f}%，已突破 20% 保留池"
@@ -563,7 +578,23 @@ def _quota_coverage(
     remaining_fields: tuple[str, ...],
 ) -> dict[str, list[tuple[datetime, tuple[float, ...]]]]:
     windows: dict[str, list[tuple[datetime, tuple[float, ...]]]] = {}
+    for window, sample in _quota_samples(quota, window_field=window_field, remaining_fields=remaining_fields):
+        windows.setdefault(window, []).append(sample)
+    for samples in windows.values():
+        samples.sort(key=lambda sample: sample[0])
+    return {window: samples for window, samples in windows.items() if not _window_remaining_increases(samples)}
+
+
+def _quota_samples(
+    quota: list[dict[str, Any]],
+    *,
+    window_field: str,
+    remaining_fields: tuple[str, ...],
+) -> list[tuple[str, tuple[datetime, tuple[float, ...]]]]:
+    samples: list[tuple[str, tuple[datetime, tuple[float, ...]]]] = []
     for snapshot in quota:
+        if not _is_compatible_subscription_snapshot(snapshot):
+            continue
         window = snapshot.get(window_field)
         if not window or any(snapshot.get(field) is None for field in remaining_fields):
             continue
@@ -572,10 +603,15 @@ def _quota_coverage(
             values = tuple(float(snapshot[field]) for field in remaining_fields)
         except (KeyError, TypeError, ValueError):
             continue
-        windows.setdefault(str(window), []).append((observed_at, values))
-    for samples in windows.values():
-        samples.sort(key=lambda sample: sample[0])
-    return windows
+        samples.append((str(window), (observed_at, values)))
+    return samples
+
+
+def _window_remaining_increases(samples: list[tuple[datetime, tuple[float, ...]]]) -> bool:
+    return any(
+        any(current_value > previous_value for previous_value, current_value in zip(previous[1], current[1]))
+        for previous, current in zip(samples, samples[1:])
+    )
 
 
 def _window_is_covered(
@@ -605,7 +641,11 @@ def _route_quota_snapshot(
         "five_hour_remaining",
         "weekly_all_remaining",
         "weekly_sonnet_remaining",
+        "weekly_fable_remaining",
         "source",
+        "producer",
+        "producer_schema_version",
+        "claude_version",
         "five_hour_window_id",
         "weekly_window_id",
     )
@@ -613,7 +653,7 @@ def _route_quota_snapshot(
         if not all(field in attached for field in required_fields):
             return None
         for snapshot in quota:
-            if _is_real_quota_snapshot(snapshot) and all(
+            if _is_compatible_subscription_snapshot(snapshot) and all(
                 attached.get(key) == snapshot.get(key)
                 for key in required_fields
             ):
@@ -636,7 +676,7 @@ def _route_quota_snapshot(
     if not all(field in attached for field in required_fields):
         return None
     for snapshot in quota:
-        if _is_real_quota_snapshot(snapshot) and all(
+        if _is_compatible_subscription_snapshot(snapshot) and all(
             attached.get(key) == snapshot.get(key)
             for key in required_fields
         ):
@@ -736,6 +776,7 @@ def _accepted_evidence_check(
     tasks: list[dict[str, Any]],
     events: list[dict[str, Any]],
     artifacts: ArtifactStore,
+    legacy_remediations: list[dict[str, Any]],
 ) -> AcceptanceCheck:
     real_tasks = [
         task for task in tasks
@@ -797,7 +838,12 @@ def _accepted_evidence_check(
             )
             for node in verifiers
         )
-        if not (valid_worker and valid_verifier and _accepted_event_chain(task, events)):
+        remediated = any(
+            _legacy_a10_overlay_is_complete(item, artifacts)
+            for item in legacy_remediations
+            if item["task_id"] == task["task_id"]
+        )
+        if not ((valid_worker and valid_verifier and _accepted_event_chain(task, events)) or remediated):
             incomplete.append(task["task_id"])
     if real_tasks and not incomplete:
         return AcceptanceCheck(
@@ -809,6 +855,56 @@ def _accepted_evidence_check(
     if incomplete:
         return AcceptanceCheck("A10", "error", REQUIREMENTS["A10"], f"Evidence 不完整：{', '.join(incomplete)}")
     return _pending("A10", "尚无 accepted 真实任务")
+
+
+def _legacy_a10_overlay_is_complete(overlay: dict[str, Any], artifacts: ArtifactStore) -> bool:
+    """A10 only sees overlays already revalidated by the Store query."""
+    workers = overlay.get("workers")
+    if not isinstance(workers, list) or not workers:
+        return False
+    valid_worker = any(
+        _is_real_model(worker.get("actual_model"))
+        and _nonempty_strings(worker.get("checks"))
+        and _artifact_is_valid(artifacts, worker.get("artifacts", {}).get("patch", {}).get("ref"))
+        and all(
+            isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref"))
+            for item in worker.get("artifacts", {}).values()
+        )
+        for worker in workers
+        if isinstance(worker, dict) and isinstance(worker.get("artifacts"), dict)
+    )
+    valid_verifier = any(
+        "sol" in str(verifier.get("actual_model", "")).lower()
+        and _is_real_model(verifier.get("actual_model"))
+        and _nonempty_strings(verifier.get("checks"))
+        and _artifact_is_valid(artifacts, verifier.get("artifacts", {}).get("test-log", {}).get("ref"))
+        and _artifact_is_valid(artifacts, verifier.get("artifacts", {}).get("verdict", {}).get("ref"))
+        and bool(verifier.get("evidence"))
+        and all(isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref")) for item in verifier["evidence"])
+        for verifier in overlay.get("verifiers", [])
+        if isinstance(verifier, dict) and isinstance(verifier.get("artifacts"), dict)
+    )
+    supplemental = overlay.get("supplemental_sol_review")
+    valid_supplemental = (
+        isinstance(supplemental, dict)
+        and "sol" in str(supplemental.get("actual_model", "")).lower()
+        and _is_real_model(supplemental.get("actual_model"))
+        and _nonempty_strings(supplemental.get("checks"))
+        and isinstance(supplemental.get("patch"), dict)
+        and _artifact_is_valid(artifacts, supplemental["patch"].get("ref"))
+        and isinstance(supplemental.get("review_receipt"), dict)
+        and _artifact_is_valid(artifacts, supplemental["review_receipt"].get("ref"))
+        and isinstance(supplemental.get("test_log"), dict)
+        and _artifact_is_valid(artifacts, supplemental["test_log"].get("ref"))
+        and isinstance(supplemental.get("verdict_artifact"), dict)
+        and _artifact_is_valid(artifacts, supplemental["verdict_artifact"].get("ref"))
+        and isinstance(supplemental.get("review_transcript"), dict)
+        and _artifact_is_valid(artifacts, supplemental["review_transcript"].get("ref"))
+        and bool(supplemental.get("evidence"))
+        and all(isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref")) for item in supplemental["evidence"])
+        and bool(supplemental.get("worker_artifacts"))
+    )
+    return valid_worker and (valid_verifier or valid_supplemental)
 
 
 def _accepted_event_chain(task: dict[str, Any], events: list[dict[str, Any]]) -> bool:

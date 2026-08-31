@@ -10,6 +10,7 @@ import tempfile
 from typing import Protocol
 
 from .artifacts import ArtifactStore
+from .claude_quota import is_native_subscription_auth
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeResult, QuotaSnapshot
 from .worktrees import WorktreeManager, scope_allows
 
@@ -329,7 +330,7 @@ class ClaudeExecutor(ProcessExecutor):
             status = json.loads(result.stdout)
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
             return False, f"Claude qualification failed: {error}"
-        if result.returncode or not status.get("loggedIn") or status.get("authMethod") in {None, "none", "api_key"}:
+        if result.returncode or not is_native_subscription_auth(status):
             return False, "Claude must attest native-subscription authentication"
         return True, "native-subscription"
 

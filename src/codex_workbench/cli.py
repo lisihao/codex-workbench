@@ -21,6 +21,7 @@ from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
+from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
@@ -348,6 +349,35 @@ def command_deliver(args: argparse.Namespace) -> int:
 
 
 def command_quota(args: argparse.Namespace) -> int:
+    if args.quota_action == "collect-claude":
+        root = Path(args.home).expanduser() if getattr(args, "home", None) else None
+        config = WorkbenchConfig.load(root)
+        selected = args.claude_binary or os.environ.get("CODEX_WORKBENCH_CLAUDE") or shutil.which("claude")
+        if not selected:
+            raise ValueError("Claude CLI is unavailable; refusing to create a quota producer")
+        binary = Path(selected).expanduser().resolve(strict=True)
+        if not binary.is_file():
+            raise ValueError("Claude CLI path is not a file")
+        output = (
+            Path(args.output).expanduser().resolve()
+            if args.output
+            else config.effective_quota_snapshot_file
+        )
+        snapshot = ClaudeQuotaCollector(binary, output).collect()
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "auth_ok": snapshot["auth_ok"],
+                    "source": snapshot["source"],
+                    "output": str(output),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    if args.quota_action == "set" and args.source == COMPATIBLE_SOURCE:
+        raise ValueError("quota set cannot claim Claude producer provenance")
     store = _store(_config(args))
     if args.quota_action == "show":
         snapshot = store.latest_quota()
@@ -397,6 +427,20 @@ def command_quota(args: argparse.Namespace) -> int:
 def command_acceptance(args: argparse.Namespace) -> int:
     config = _config(args)
     store = _store(config)
+    if args.acceptance_action == "remediate-legacy":
+        if not args.manifest or not args.command_id:
+            raise ValueError("remediate-legacy requires --manifest and --command-id")
+        manifest_path = Path(args.manifest).expanduser()
+        if not manifest_path.is_file():
+            raise ValueError("legacy remediation manifest file does not exist")
+        manifest_ref = store.artifacts.put_bytes(manifest_path.read_bytes(), "json")
+        try:
+            receipt = store.remediate_legacy_evidence(args.command_id, manifest_ref)
+        except (ValueError, CommandConflictError, StateConflictError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+            return 2
+        print(json.dumps({"ok": True, **receipt}, ensure_ascii=False, indent=2))
+        return 0
     if args.acceptance_action == "attest-a12":
         if not args.artifact or not args.quota_window or not args.note or not args.source_session_id:
             raise ValueError(
@@ -701,6 +745,12 @@ def build_parser() -> argparse.ArgumentParser:
     quota = sub.add_parser("quota")
     quota_sub = quota.add_subparsers(dest="quota_action", required=True)
     quota_sub.add_parser("show")
+    quota_collect = quota_sub.add_parser(
+        "collect-claude",
+        help="passively collect the local Claude subscription usage display",
+    )
+    quota_collect.add_argument("--claude-binary")
+    quota_collect.add_argument("--output", help="v1 producer snapshot file; defaults to configured quota file")
     quota_set = quota_sub.add_parser("set")
     quota_set.add_argument("--auth-ok", action="store_true")
     quota_set.add_argument("--auth-method", default="none")
@@ -724,7 +774,7 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument(
         "acceptance_action",
         nargs="?",
-        choices=("report", "attest-a12"),
+        choices=("report", "attest-a12", "remediate-legacy"),
         default="report",
     )
     acceptance.add_argument("--artifact")
@@ -732,6 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument("--quota-window")
     acceptance.add_argument("--source-session-id")
     acceptance.add_argument("--note")
+    acceptance.add_argument("--manifest", help="legacy A10 remediation manifest JSON")
+    acceptance.add_argument("--command-id", help="idempotency key for legacy remediation")
     acceptance.set_defaults(func=command_acceptance)
 
     client = sub.add_parser("client", help="record a trusted cockpit heartbeat")

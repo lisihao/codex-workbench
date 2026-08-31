@@ -71,7 +71,10 @@ class PlannerRoutingTests(unittest.TestCase):
 
         workers = planned[:2]
         self.assertEqual([worker.executor for worker in workers], ["codex", "codex"])
-        self.assertEqual([worker.model for worker in workers], ["gpt-5.6-luna", "gpt-5.6-luna"])
+        self.assertEqual(
+            [worker.model for worker in workers],
+            ["gpt-5.3-codex-spark", "gpt-5.3-codex-spark"],
+        )
         self.assertEqual([worker.depends_on for worker in workers], [(), ()])
         self.assertEqual(planned[-1].model, "gpt-5.6-sol")
         self.assertEqual(set(planned[-1].depends_on), {"worker-a", "worker-b"})

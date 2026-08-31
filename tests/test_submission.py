@@ -7,9 +7,24 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.model import NodeSpec, QuotaSnapshot, now_iso
 from codex_workbench.store import WorkbenchStore
 from codex_workbench.submission import submit_natural_language_request
+
+
+def compatible_provenance() -> dict[str, object]:
+    return {
+        "source": COMPATIBLE_SOURCE,
+        "producer": PRODUCER,
+        "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+        "claude_version": SUPPORTED_USAGE_VERSION,
+    }
 
 
 class SubmissionTests(unittest.TestCase):
@@ -38,7 +53,7 @@ class SubmissionTests(unittest.TestCase):
                     weekly_all_remaining=60,
                     weekly_sonnet_remaining=60,
                     weekly_fable_remaining=60,
-                    source="settings-usage",
+                    **compatible_provenance(),
                 )
             )
             planned = [

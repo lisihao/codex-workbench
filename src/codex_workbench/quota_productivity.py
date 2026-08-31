@@ -3,10 +3,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from .claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from .store import WorkbenchStore
 
 
-_NON_RUNTIME_SOURCE_MARKERS = ("fixture", "test", "controlled", "simulation")
 _CLAUDE_MODEL_MARKERS = ("claude", "opus", "sonnet", "fable")
 
 
@@ -25,7 +30,7 @@ def compute_quota_productivity(
     tasks: list[dict[str, Any]],
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    runtime = [snapshot for snapshot in snapshots if _is_runtime_source(snapshot.get("source"))]
+    runtime = [snapshot for snapshot in snapshots if _is_compatible_snapshot(snapshot)]
     accepted_at = {
         str(event["task_id"]): _parse_time(event["created_at"])
         for event in events
@@ -154,9 +159,15 @@ def _task_points(task: dict[str, Any]) -> float:
     return points if points > 0 else 1.0
 
 
-def _is_runtime_source(source: object) -> bool:
-    text = str(source or "").strip().lower()
-    return bool(text) and not any(marker in text for marker in _NON_RUNTIME_SOURCE_MARKERS)
+def _is_compatible_snapshot(snapshot: dict[str, Any]) -> bool:
+    return (
+        snapshot.get("auth_ok") is True
+        and snapshot.get("auth_method") == "native-subscription"
+        and snapshot.get("source") == COMPATIBLE_SOURCE
+        and snapshot.get("producer") == PRODUCER
+        and snapshot.get("producer_schema_version") == PRODUCER_SCHEMA_VERSION
+        and snapshot.get("claude_version") == SUPPORTED_USAGE_VERSION
+    )
 
 
 def _parse_time(value: object) -> datetime | None:

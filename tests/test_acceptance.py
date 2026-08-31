@@ -12,15 +12,49 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
-from codex_workbench.acceptance import build_acceptance_report
+from codex_workbench.acceptance import _route_quota_snapshot, build_acceptance_report
 from codex_workbench.artifacts import ArtifactStore
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.cli import command_acceptance
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
 from codex_workbench.store import WorkbenchStore
 
 
+COMPATIBLE_QUOTA_PROVENANCE = {
+    "producer": PRODUCER,
+    "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+    "claude_version": SUPPORTED_USAGE_VERSION,
+}
+
+
 class AcceptanceTests(unittest.TestCase):
+    def test_a8_route_snapshot_matches_future_fable_specific_pool(self) -> None:
+        snapshot = {
+            "observed_at": "2026-08-31T00:00:00+00:00",
+            "auth_ok": True,
+            "auth_method": "native-subscription",
+            "five_hour_remaining": 70,
+            "weekly_all_remaining": 70,
+            "weekly_sonnet_remaining": 70,
+            "weekly_fable_remaining": 30,
+            "source": COMPATIBLE_SOURCE,
+            **COMPATIBLE_QUOTA_PROVENANCE,
+            "five_hour_window_id": "five-hour",
+            "weekly_window_id": "week",
+        }
+        wrong = {**snapshot, "weekly_fable_remaining": 40}
+        event = {"cursor": 2, "payload": {"quota_snapshot": snapshot}}
+        self.assertEqual(
+            _route_quota_snapshot(event, [], [wrong, snapshot]),
+            snapshot,
+        )
+
     def test_external_journeys_require_durable_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -229,7 +263,8 @@ class AcceptanceTests(unittest.TestCase):
                             five_hour_remaining=80 - sample_index,
                             weekly_all_remaining=75,
                             weekly_sonnet_remaining=70,
-                            source="settings-usage-export",
+                            source=COMPATIBLE_SOURCE,
+                            **COMPATIBLE_QUOTA_PROVENANCE,
                             five_hour_window_id=f"five-{window_index}",
                             weekly_window_id="week-covered",
                         )
@@ -244,7 +279,8 @@ class AcceptanceTests(unittest.TestCase):
                         five_hour_remaining=70,
                         weekly_all_remaining=75 - sample_index,
                         weekly_sonnet_remaining=70 - sample_index,
-                        source="settings-usage-export",
+                        source=COMPATIBLE_SOURCE,
+                        **COMPATIBLE_QUOTA_PROVENANCE,
                         weekly_window_id="week-covered",
                     )
                 )
@@ -255,6 +291,81 @@ class AcceptanceTests(unittest.TestCase):
             }
             self.assertEqual(checks["A6"]["status"], "ok")
             self.assertEqual(checks["A7"]["status"], "ok")
+
+    def test_a6_rejects_manual_snapshots_and_reverse_remaining_in_a_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkbenchStore(Path(directory) / "state.sqlite")
+            store.initialize()
+            start = datetime(2026, 8, 24, tzinfo=UTC)
+            for source, window, reverse in (
+                ("manual", "manual-window", False),
+                (COMPATIBLE_SOURCE, "compatible-window", True),
+            ):
+                for index in range(11):
+                    remaining = 80 - index
+                    if reverse and index == 6:
+                        remaining = 90
+                    store.write_quota(
+                        QuotaSnapshot(
+                            observed_at=(start + timedelta(minutes=30 * index)).isoformat(),
+                            auth_ok=True,
+                            auth_method="native-subscription",
+                            five_hour_remaining=remaining,
+                            weekly_all_remaining=70,
+                            weekly_sonnet_remaining=70,
+                            source=source,
+                            **(
+                                COMPATIBLE_QUOTA_PROVENANCE
+                                if source == COMPATIBLE_SOURCE
+                                else {}
+                            ),
+                            five_hour_window_id=window,
+                            weekly_window_id="week",
+                        )
+                    )
+            for index in range(13):
+                weekly_remaining = 80 - index
+                if index == 7:
+                    weekly_remaining = 90
+                store.write_quota(
+                    QuotaSnapshot(
+                        observed_at=(start + timedelta(hours=12 * index)).isoformat(),
+                        auth_ok=True,
+                        auth_method="native-subscription",
+                        five_hour_remaining=70,
+                        weekly_all_remaining=weekly_remaining,
+                        weekly_sonnet_remaining=weekly_remaining,
+                        source=COMPATIBLE_SOURCE,
+                        **COMPATIBLE_QUOTA_PROVENANCE,
+                        weekly_window_id="trusted-week-with-reversal",
+                    )
+                )
+            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            self.assertEqual(checks["A6"]["status"], "pending")
+            self.assertEqual(checks["A7"]["status"], "pending")
+
+    def test_a6_low_watermark_survives_reversed_window_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkbenchStore(Path(directory) / "state.sqlite")
+            store.initialize()
+            start = datetime(2026, 8, 24, tzinfo=UTC)
+            for index, remaining in enumerate((30, 10, 20)):
+                store.write_quota(
+                    QuotaSnapshot(
+                        observed_at=(start + timedelta(minutes=30 * index)).isoformat(),
+                        auth_ok=True,
+                        auth_method="native-subscription",
+                        five_hour_remaining=remaining,
+                        weekly_all_remaining=70,
+                        weekly_sonnet_remaining=70,
+                        source=COMPATIBLE_SOURCE,
+                        **COMPATIBLE_QUOTA_PROVENANCE,
+                        five_hour_window_id="reversed-low-watermark",
+                        weekly_window_id="week",
+                    )
+                )
+            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            self.assertEqual(checks["A6"]["status"], "error")
 
     def test_lifecycle_event_without_current_authority_proof_stays_pending(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -642,7 +753,7 @@ class AcceptanceTests(unittest.TestCase):
                     five_hour_remaining=65,
                     weekly_all_remaining=70,
                     weekly_sonnet_remaining=75,
-                    source="settings-usage-export",
+                    source=COMPATIBLE_SOURCE,
                     five_hour_window_id="a12-five-hour",
                     weekly_window_id="a12-week",
                 )
@@ -673,6 +784,22 @@ class AcceptanceTests(unittest.TestCase):
                 export_receipt_ref=receipt_ref,
             )
 
+            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            self.assertEqual(checks["A12"]["status"], "pending")
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=65,
+                    weekly_all_remaining=70,
+                    weekly_sonnet_remaining=75,
+                    source=COMPATIBLE_SOURCE,
+                    **COMPATIBLE_QUOTA_PROVENANCE,
+                    five_hour_window_id="a12-five-hour",
+                    weekly_window_id="a12-week",
+                )
+            )
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
             self.assertEqual(checks["A12"]["status"], "ok")
 
@@ -755,7 +882,8 @@ class AcceptanceTests(unittest.TestCase):
                     five_hour_remaining=24,
                     weekly_all_remaining=70,
                     weekly_sonnet_remaining=70,
-                    source="settings-usage-export",
+                    source=COMPATIBLE_SOURCE,
+                    **COMPATIBLE_QUOTA_PROVENANCE,
                     five_hour_window_id="fallback-five-hour",
                     weekly_window_id="fallback-week",
                 )

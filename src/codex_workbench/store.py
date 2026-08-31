@@ -21,6 +21,7 @@ from .model import (
     retry_model,
 )
 from .artifacts import ArtifactStore, presentation_format
+from .legacy_evidence import load_manifest, validate_manifest
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
@@ -1128,6 +1129,198 @@ class WorkbenchStore:
                 }
                 for row in rows
             ]
+
+    def _events_for_task(self, task_id: str, *, event_type: str | None = None) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            if event_type is None:
+                rows = connection.execute(
+                    "SELECT * FROM events WHERE task_id = ? ORDER BY cursor", (task_id,)
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM events WHERE task_id = ? AND event_type = ? ORDER BY cursor",
+                    (task_id, event_type),
+                ).fetchall()
+        return [
+            {
+                "cursor": row["cursor"], "event_type": row["event_type"], "task_id": row["task_id"],
+                "node_id": row["node_id"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def remediate_legacy_evidence(self, command_id: str, manifest_ref: str) -> dict[str, Any]:
+        """Append one validated legacy-Evidence overlay without changing source rows."""
+        if not command_id.strip():
+            raise ValueError("legacy remediation command_id is required")
+        manifest, manifest_hash = load_manifest(self.artifacts, manifest_ref)
+        source = manifest.get("source")
+        task_id = source.get("task_id") if isinstance(source, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("legacy remediation manifest source task_id is required")
+        try:
+            task = self.get_task(task_id)
+        except KeyError as error:
+            raise ValueError("legacy remediation source task does not exist") from error
+        review_task, review_events = self._legacy_review_source(manifest, task_id)
+        validated = validate_manifest(
+            manifest, task, self._events_for_task(task_id), self.artifacts, review_task, review_events
+        )
+        request_hash = canonical_hash(
+            {
+                "kind": "legacy-evidence-remediation-v1",
+                "manifest_hash": manifest_hash,
+            }
+        )
+        with self.transaction() as connection:
+            receipt = connection.execute(
+                "SELECT request_hash, task_id FROM command_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if receipt is not None:
+                if receipt["request_hash"] != request_hash:
+                    raise CommandConflictError(
+                        f"command {command_id!r} was already used with a different request"
+                    )
+                row = connection.execute(
+                    """
+                    SELECT cursor, payload_json FROM events
+                    WHERE event_type = 'acceptance.evidence_remediated'
+                      AND task_id = ?
+                      AND json_extract(payload_json, '$.command_id') = ?
+                      AND json_extract(payload_json, '$.request_hash') = ?
+                    ORDER BY cursor DESC LIMIT 1
+                    """,
+                    (task_id, command_id, request_hash),
+                ).fetchone()
+                if row is None:
+                    raise StateConflictError("legacy remediation receipt has no matching event")
+                stored = json.loads(row["payload_json"])
+                return {
+                    "task_id": task_id,
+                    "event_cursor": int(row["cursor"]),
+                    "manifest_ref": stored["manifest_ref"],
+                    "manifest_hash": stored["manifest_hash"],
+                    "idempotent": True,
+                }
+            payload = {
+                "kind": "legacy-evidence-remediation-v1",
+                "command_id": command_id,
+                "request_hash": request_hash,
+                "manifest_ref": manifest_ref,
+                "manifest_hash": manifest_hash,
+                "task_id": validated["task_id"],
+                "contract_hash": validated["contract_hash"],
+                "base_sha": validated["base_sha"],
+                "source_event_first": validated["event_first"],
+                "source_event_last": validated["event_last"],
+            }
+            cursor = self._event(connection, "acceptance.evidence_remediated", task_id, None, payload)
+            connection.execute(
+                """
+                INSERT INTO command_receipts(command_id, request_hash, task_id, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (command_id, request_hash, task_id, now_iso()),
+            )
+        return {
+            "task_id": task_id,
+            "event_cursor": cursor,
+            "manifest_ref": manifest_ref,
+            "manifest_hash": manifest_hash,
+            "idempotent": False,
+        }
+
+    def legacy_evidence_remediations(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        """Return only overlays revalidated from ArtifactStore and receipt ledger."""
+        if task_id is None:
+            with self.connection() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM events WHERE event_type = 'acceptance.evidence_remediated' ORDER BY cursor"
+                ).fetchall()
+            candidates = [
+                {
+                    "cursor": row["cursor"], "event_type": row["event_type"], "task_id": row["task_id"],
+                    "node_id": row["node_id"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        else:
+            candidates = self._events_for_task(task_id, event_type="acceptance.evidence_remediated")
+        remediations: list[dict[str, Any]] = []
+        for event in candidates:
+            payload = event["payload"]
+            if payload.get("kind") != "legacy-evidence-remediation-v1":
+                continue
+            command_id = payload.get("command_id")
+            request_hash = payload.get("request_hash")
+            manifest_ref = payload.get("manifest_ref")
+            manifest_hash = payload.get("manifest_hash")
+            source_task_id = payload.get("task_id")
+            if not all(isinstance(value, str) and value for value in (command_id, request_hash, manifest_ref, manifest_hash, source_task_id)):
+                continue
+            try:
+                with self.connection() as connection:
+                    receipt = connection.execute(
+                        "SELECT request_hash, task_id FROM command_receipts WHERE command_id = ?", (command_id,)
+                    ).fetchone()
+                if receipt is None or receipt["request_hash"] != request_hash or receipt["task_id"] != source_task_id:
+                    continue
+                manifest, actual_manifest_hash = load_manifest(self.artifacts, manifest_ref)
+                if actual_manifest_hash != manifest_hash:
+                    continue
+                expected_hash = canonical_hash(
+                    {
+                        "kind": "legacy-evidence-remediation-v1",
+                        "manifest_hash": manifest_hash,
+                    }
+                )
+                if expected_hash != request_hash:
+                    continue
+                task = self.get_task(source_task_id)
+                review_task, review_events = self._legacy_review_source(manifest, source_task_id)
+                validated = validate_manifest(
+                    manifest,
+                    task,
+                    self._events_for_task(source_task_id),
+                    self.artifacts,
+                    review_task,
+                    review_events,
+                )
+                if any(
+                    payload.get(key) != validated[source_key]
+                    for key, source_key in (
+                        ("contract_hash", "contract_hash"),
+                        ("base_sha", "base_sha"),
+                        ("source_event_first", "event_first"),
+                        ("source_event_last", "event_last"),
+                    )
+                ):
+                    continue
+            except (KeyError, ValueError, OSError, json.JSONDecodeError):
+                continue
+            remediations.append({
+                "event_cursor": event["cursor"], "manifest_ref": manifest_ref,
+                "manifest_hash": manifest_hash, "command_id": command_id, **validated,
+            })
+        return remediations
+
+    def _legacy_review_source(
+        self,
+        manifest: dict[str, Any],
+        source_task_id: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+        overlay = manifest.get("overlay")
+        supplemental = overlay.get("supplemental_sol_review") if isinstance(overlay, dict) else None
+        if supplemental is None:
+            return None, None
+        review_source = supplemental.get("review_source") if isinstance(supplemental, dict) else None
+        review_task_id = review_source.get("task_id") if isinstance(review_source, dict) else None
+        if not isinstance(review_task_id, str) or not review_task_id or review_task_id == source_task_id:
+            raise ValueError("legacy remediation review_source task_id is required")
+        try:
+            return self.get_task(review_task_id), self._events_for_task(review_task_id)
+        except KeyError as error:
+            raise ValueError("legacy remediation review source task does not exist") from error
 
     def list_alerts(self, limit: int = 30) -> list[dict[str, Any]]:
         important = {

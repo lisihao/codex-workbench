@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import os
@@ -17,6 +18,12 @@ from urllib.request import urlopen
 from codex_workbench.acceptance import build_acceptance_report
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.service import Coordinator
 from codex_workbench.executors import FixtureExecutor
@@ -32,7 +39,48 @@ def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
     )]
 
 
+def compatible_provenance() -> dict[str, object]:
+    return {
+        "source": COMPATIBLE_SOURCE,
+        "producer": PRODUCER,
+        "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+        "claude_version": SUPPORTED_USAGE_VERSION,
+    }
+
+
 class ServiceTests(unittest.TestCase):
+    def test_runtime_rechecks_contract_before_executing_a_persisted_claude_node(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-policy",
+            repository="/tmp/runtime-policy",
+            base_sha="base",
+            objective="Claude is explicitly disabled",
+            allowed_scope=("README.md",),
+            required_artifacts=(),
+            task_type="implementation",
+            complexity="low",
+            claude_allowed=False,
+        )
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+
+        decision = Coordinator._claude_decision(
+            {"executor": "claude", "model": "sonnet"},
+            contract.to_dict(),
+            quota,
+        )
+
+        assert decision is not None
+        self.assertEqual(decision.action, "codex")
+        self.assertIn("does not admit Claude", decision.reason)
+
     def test_worker_future_exception_exits_process_and_persists_failed_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -222,7 +270,7 @@ raise AssertionError("fatal coordinator failure returned")
                     five_hour_remaining=60,
                     weekly_all_remaining=60,
                     weekly_sonnet_remaining=60,
-                    source="settings-usage",
+                    **compatible_provenance(),
                 )
             )
             contract = TaskContract(
@@ -303,7 +351,7 @@ raise AssertionError("fatal coordinator failure returned")
                     five_hour_remaining=27,
                     weekly_all_remaining=60,
                     weekly_sonnet_remaining=60,
-                    source="settings-usage",
+                    **compatible_provenance(),
                 )
             )
             contract = TaskContract(
@@ -313,14 +361,15 @@ raise AssertionError("fatal coordinator failure returned")
                 objective="route before starting Claude",
                 allowed_scope=("README.md",),
                 required_artifacts=(),
-                executor_model="gpt-5.6-luna",
+                task_type="architecture",
+                complexity="high",
             )
             node = NodeSpec(
                 "work",
                 contract.task_id,
                 "work",
                 "claude",
-                "sonnet",
+                "opus",
                 "inspect the fixture",
                 read_scopes=("README.md",),
             )
@@ -340,7 +389,7 @@ raise AssertionError("fatal coordinator failure returned")
 
             claude = StubExecutor(NodeResult("succeeded", "must not run", actual_model="sonnet"))
             codex = StubExecutor(NodeResult(
-                "succeeded", "Codex completed", actual_model="gpt-5.6-luna",
+                "succeeded", "Codex completed", actual_model="gpt-5.6-terra",
                 result_kind="worker", checks=("fixture-check",),
             ))
             with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
@@ -354,11 +403,11 @@ raise AssertionError("fatal coordinator failure returned")
                 if node["node_id"] == "work"
             )
             self.assertEqual(routed_node["effective_executor"], "codex")
-            self.assertEqual(routed_node["effective_model"], "gpt-5.6-luna")
+            self.assertEqual(routed_node["effective_model"], "gpt-5.6-terra")
             routed = [event for event in store.read_events(task_id=contract.task_id) if event["event_type"] == "node.routed"]
             self.assertEqual(routed[0]["payload"]["zone"], "red")
 
-    def test_yellow_quota_zone_limits_sonnet_but_keeps_codex_parallel(self) -> None:
+    def test_green_shared_capacity_routes_overflow_to_codex_without_idling_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repository = root / "repository"
@@ -373,32 +422,32 @@ raise AssertionError("fatal coordinator failure returned")
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
-            epoch = store.activate_coordinator("yellow-concurrency", "test-machine")
+            epoch = store.activate_coordinator("green-shared-capacity", "test-machine")
             store.write_quota(
                 QuotaSnapshot(
                     observed_at=now_iso(),
                     auth_ok=True,
                     auth_method="native-subscription",
-                    five_hour_remaining=35,
+                    five_hour_remaining=60,
                     weekly_all_remaining=60,
                     weekly_sonnet_remaining=60,
-                    source="settings-usage",
+                    **compatible_provenance(),
                 )
             )
             contract = TaskContract(
-                task_id="yellow-concurrency",
+                task_id="green-shared-capacity",
                 repository=str(repository),
                 base_sha=base_sha,
-                objective="enforce yellow-zone concurrency",
+                objective="enforce green shared Claude capacity",
                 allowed_scope=("README.md",),
                 required_artifacts=(),
             )
             nodes = [
                 NodeSpec("a", contract.task_id, "A", "claude", "sonnet", "A", read_scopes=("README.md",)),
                 NodeSpec("b", contract.task_id, "B", "claude", "sonnet", "B", read_scopes=("README.md",)),
-                NodeSpec("c", contract.task_id, "C", "codex", "gpt-5.6-luna", "C", read_scopes=("README.md",)),
+                NodeSpec("c", contract.task_id, "C", "claude", "sonnet", "C", read_scopes=("README.md",)),
             ]
-            store.create_task(contract, verified(nodes, contract.task_id), "yellow-concurrency-create")
+            store.create_task(contract, verified(nodes, contract.task_id), "green-shared-capacity-create")
             store.queue_task(contract.task_id)
             codex_started = threading.Event()
 
@@ -457,8 +506,163 @@ raise AssertionError("fatal coordinator failure returned")
                 thread.join(timeout=3)
 
             self.assertEqual(claude.calls, 2)
-            self.assertEqual(claude.max_active, 1)
+            self.assertEqual(claude.max_active, 2)
             self.assertEqual(codex.calls, 1)
+            routed = [
+                event for event in store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "node.routed"
+            ]
+            self.assertEqual(routed[0]["payload"]["fallback_kind"], "claude-capacity-overflow")
+            self.assertEqual(routed[0]["payload"]["zone"], "green")
+            overflow = next(node for node in store.get_task(contract.task_id)["nodes"] if node["node_id"] == "c")
+            self.assertEqual((overflow["effective_executor"], overflow["effective_model"]), ("codex", "gpt-5.6-luna"))
+
+    def test_completed_claude_node_requires_a_newer_quota_snapshot_before_next_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("fresh-quota", "test-machine")
+            stale_after_completion = QuotaSnapshot(
+                observed_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                auth_ok=True,
+                auth_method="native-subscription",
+                five_hour_remaining=60,
+                weekly_all_remaining=60,
+                weekly_sonnet_remaining=60,
+                **compatible_provenance(),
+            )
+            store.write_quota(stale_after_completion)
+
+            first_contract = TaskContract(
+                task_id="first-claude",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="record a completed Claude turn",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+                verifier_model="fixture",
+            )
+            first_worker = NodeSpec(
+                "work",
+                first_contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "inspect the fixture",
+                read_scopes=("README.md",),
+            )
+            store.create_task(first_contract, verified([first_worker], first_contract.task_id), "first-create")
+            store.queue_task(first_contract.task_id)
+            first_claim = store.claim_ready_node(
+                "first-worker", epoch, admissible=lambda spec: spec["node_id"] == "work"
+            )
+            assert first_claim is not None
+            store.settle_node(
+                first_contract.task_id,
+                "work",
+                NodeResult(
+                    "succeeded",
+                    "Sonnet completed",
+                    actual_model="sonnet",
+                    result_kind="worker",
+                    checks=("fixture-check",),
+                ),
+                attempt=first_claim["attempt"],
+                coordinator_epoch=first_claim["coordinator_epoch"],
+                lease_epoch=first_claim["lease_epoch"],
+            )
+
+            second_contract = TaskContract(
+                task_id="second-claude",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="must not consume Claude before a fresh snapshot",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+                verifier_model="fixture",
+            )
+            second_worker = NodeSpec(
+                "work",
+                second_contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "inspect the fixture",
+                read_scopes=("README.md",),
+            )
+            store.create_task(second_contract, verified([second_worker], second_contract.task_id), "second-create")
+            store.queue_task(second_contract.task_id)
+            second_claim = store.claim_ready_node(
+                "second-worker", epoch, admissible=lambda spec: spec["task_id"] == second_contract.task_id
+            )
+            assert second_claim is not None
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch, max_workers=1)
+
+            class StubExecutor:
+                def __init__(self, result: NodeResult):
+                    self.result = result
+                    self.calls = 0
+
+                def execute(self, _request):
+                    self.calls += 1
+                    return self.result
+
+            claude = StubExecutor(NodeResult("succeeded", "must not run", actual_model="sonnet"))
+            codex = StubExecutor(
+                NodeResult(
+                    "succeeded",
+                    "Codex completed",
+                    actual_model="gpt-5.6-luna",
+                    result_kind="worker",
+                    checks=("fixture-check",),
+                )
+            )
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=lambda kind: claude if kind == "claude" else codex,
+            ):
+                coordinator._execute_claimed(second_claim)
+            coordinator._pool.shutdown(wait=True)
+
+            self.assertEqual(claude.calls, 0)
+            self.assertEqual(codex.calls, 1)
+            route = next(
+                event for event in store.read_events(task_id=second_contract.task_id)
+                if event["event_type"] == "node.routed"
+            )
+            self.assertEqual(route["payload"]["fallback_kind"], "quota-refresh-required")
+
+            refreshed = QuotaSnapshot(
+                observed_at=datetime.now(UTC).isoformat(),
+                auth_ok=True,
+                auth_method="native-subscription",
+                five_hour_remaining=60,
+                weekly_all_remaining=60,
+                weekly_sonnet_remaining=60,
+                **compatible_provenance(),
+            )
+            store.write_quota(refreshed)
+            self.assertEqual(
+                coordinator._claim_time_decision(
+                    {"executor": "claude", "model": "sonnet"},
+                    second_contract.to_dict(),
+                    refreshed,
+                    (),
+                ).action,
+                "claude",
+            )
 
     def test_parallel_worktree_patches_are_composed_for_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

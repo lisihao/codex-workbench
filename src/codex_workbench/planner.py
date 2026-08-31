@@ -433,8 +433,9 @@ Routing strategy (versioned contract): {json.dumps(contract.strategy.to_dict(), 
 
 Rules:
 - Prefer independent parallel nodes when their write scopes do not overlap.
-- The structured routing policy is authoritative: low-risk/splittable implementation uses Codex Luna; complex work upgrades to Codex Terra.
-- Only explicitly high-complexity, architecture, review, or challenge work may use a Claude family, and only when the exact family appears in the admitted list.
+- The structured routing policy is authoritative. For model-routing-v2, bounded low work uses the independent Codex Spark pool; standard parallelizable implementation, debugging, tests, docs, and exploration prefer admitted Claude Sonnet; high-complexity, architecture, and review prefer Opus then Fable then Sonnet; creative work prefers Fable then Opus then Sonnet. When no eligible Claude family is admitted, the post-compile policy chooses Codex Spark, Luna, or Terra by complexity.
+- model-routing-v1 retains its legacy Claude eligibility and fallback behavior. Do not infer a newer policy from a task's wording.
+- Claude capacity is shared across the entire coordinator (Sonnet costs one unit; Opus/Fable cost two). Do not serialize otherwise independent nodes merely to manage capacity: the coordinator durably falls back a saturated Claude node to Codex in the same attempt.
 - Use Codex model {default_executor_model} only as the planner's legacy default; the post-compile policy may normalize it.
 - Use Claude only when its exact model family appears in the admitted list; otherwise use Codex.
 - Deterministic nodes must provide an argv command and must not use a shell string.

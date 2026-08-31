@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 LABEL = "com.lisihao.codex-workbench"
+QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 
@@ -91,6 +92,10 @@ def main() -> int:
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--state-root", default="~/Library/Application Support/Codex Workbench")
     parser.add_argument("--codex-binary", default="~/.codex/packages/standalone/current/codex")
+    parser.add_argument(
+        "--claude-binary",
+        help="absolute or resolvable Claude CLI to use for the passive quota producer",
+    )
     parser.add_argument("--quota-snapshot-file")
     parser.add_argument(
         "--tailscale-socket",
@@ -113,6 +118,7 @@ def main() -> int:
     app_root = state_root / "app"
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / f"{LABEL}.plist"
+    quota_plist_path = launch_agents / f"{QUOTA_LABEL}.plist"
     logs = state_root / "logs"
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
@@ -122,6 +128,15 @@ def main() -> int:
         if args.quota_snapshot_file
         else state_root / "claude-quota.json"
     )
+    selected_claude = args.claude_binary or shutil.which("claude")
+    if selected_claude and "/" not in selected_claude:
+        selected_claude = shutil.which(selected_claude)
+    claude_binary = None
+    if selected_claude:
+        candidate = Path(selected_claude).expanduser().resolve(strict=True)
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise SystemExit(f"Claude CLI is not executable: {candidate}")
+        claude_binary = candidate
 
     state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -136,7 +151,12 @@ def main() -> int:
             "authority_host": __import__("socket").gethostname(),
             "authority_machine_id": macos_machine_id(),
             "quota_snapshot_file": str(quota_snapshot_file),
-            "quota_refresh_seconds": int(config_raw.get("quota_refresh_seconds", 300)),
+            # Migrate the previous five-minute default to a Claude-friendly
+            # one-minute passive refresh while preserving any faster custom value.
+            "quota_refresh_seconds": min(
+                int(config_raw.get("quota_refresh_seconds", 60)),
+                60,
+            ),
         }
     )
     config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
@@ -199,14 +219,16 @@ def main() -> int:
     if not runtime_selector.is_file():
         raise SystemExit(f"Workbench Python runtime selector is missing: {runtime_selector}")
     wrapper.write_text(
+        (
         "#!/bin/zsh\n"
         f"export PYTHONPATH={str(app_root / 'src')!r}\n"
         f"export CODEX_HOME={str(codex_home)!r}\n"
         f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
         f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
         f"export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE={str(quota_snapshot_file)!r}\n"
-        "export CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude\n"
-        f"exec {str(runtime_selector)!r} -m codex_workbench \"$@\"\n"
+        )
+        + (f"export CODEX_WORKBENCH_CLAUDE={str(claude_binary)!r}\n" if claude_binary else "")
+        + f"exec {str(runtime_selector)!r} -m codex_workbench \"$@\"\n"
     )
     wrapper.chmod(0o755)
 
@@ -218,6 +240,7 @@ def main() -> int:
         .replace("__CODEX_HOME__", str(codex_home))
         .replace("__PROCESS_HOME__", str(process_home))
         .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+        .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
     )
     plistlib.loads(rendered.encode())
     launch_agents.mkdir(parents=True, exist_ok=True)
@@ -229,6 +252,25 @@ def main() -> int:
     run("launchctl", "bootstrap", domain, str(plist_path))
     run("launchctl", "enable", f"{domain}/{LABEL}")
     run("launchctl", "kickstart", "-k", f"{domain}/{LABEL}")
+    if claude_binary is not None:
+        quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
+        quota_rendered = (
+            quota_template.replace("__APP_ROOT__", str(app_root))
+            .replace("__STATE_ROOT__", str(state_root))
+            .replace("__USER_HOME__", str(Path.home()))
+            .replace("__CLAUDE_BINARY__", str(claude_binary))
+            .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+        )
+        plistlib.loads(quota_rendered.encode())
+        quota_plist_path.write_text(quota_rendered)
+        quota_plist_path.chmod(0o600)
+        run("launchctl", "bootout", domain, str(quota_plist_path), check=False)
+        run("launchctl", "bootstrap", domain, str(quota_plist_path))
+        run("launchctl", "enable", f"{domain}/{QUOTA_LABEL}")
+        run("launchctl", "kickstart", "-k", f"{domain}/{QUOTA_LABEL}")
+    else:
+        run("launchctl", "bootout", domain, str(quota_plist_path), check=False)
+        quota_plist_path.unlink(missing_ok=True)
     if args.tailscale_socket:
         socket_path = str(Path(args.tailscale_socket).expanduser().resolve(strict=True))
         tailscale = shutil.which("tailscale")
@@ -240,7 +282,8 @@ def main() -> int:
             https_port=args.tailscale_https_port,
             native_ssh_port=args.tailscale_native_ssh_port,
         )
-    print(f"installed {LABEL} from {source} to {app_root}")
+    quota_status = f"installed {QUOTA_LABEL}" if claude_binary is not None else "skipped quota producer: Claude CLI unavailable"
+    print(f"installed {LABEL} from {source} to {app_root}; {quota_status}")
     return 0
 
 

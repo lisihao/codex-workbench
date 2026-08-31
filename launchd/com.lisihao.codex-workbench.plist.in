@@ -20,7 +20,7 @@
     <key>CODEX_WORKBENCH_PROCESS_HOME</key>
     <string>__PROCESS_HOME__</string>
     <key>CODEX_WORKBENCH_CLAUDE</key>
-    <string>/opt/homebrew/bin/claude</string>
+    <string>__CLAUDE_BINARY__</string>
     <key>CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE</key>
     <string>__QUOTA_SNAPSHOT_FILE__</string>
     <key>PATH</key>

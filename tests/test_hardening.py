@@ -11,6 +11,12 @@ import zipfile
 from codex_workbench.acceptance import build_acceptance_report
 from codex_workbench.artifacts import ArtifactStore, presentation_format
 from codex_workbench.authority import normalize_boot_id
+from codex_workbench.claude_quota import (
+    COMPATIBLE_SOURCE,
+    PRODUCER,
+    PRODUCER_SCHEMA_VERSION,
+    SUPPORTED_USAGE_VERSION,
+)
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.executors import ClaudeExecutor, CodexExecutor, ExecutionRequest
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract
@@ -98,8 +104,53 @@ class WorkbenchHardeningTests(unittest.TestCase):
         refreshed = self.store.latest_quota()
         assert refreshed is not None
         self.assertEqual(refreshed.source, "settings-usage-export")
+        manual_decision = refreshed.dispatch_decision(
+            "sonnet", max_age_seconds=900, current_time=now
+        )
+        self.assertEqual((manual_decision.action, manual_decision.zone), ("codex", "unknown"))
+        self.assertIn("provenance", manual_decision.reason)
+
+        export.write_text(
+            json.dumps(
+                {
+                    "producer": PRODUCER,
+                    "producer_schema_version": PRODUCER_SCHEMA_VERSION,
+                    "source": COMPATIBLE_SOURCE,
+                    "claude_version": SUPPORTED_USAGE_VERSION,
+                    "observed_at": now.isoformat(),
+                    "auth_ok": True,
+                    "auth_method": "native-subscription",
+                    "pools": {
+                        "five_hour": {
+                            "displayed_used_percent": 10,
+                            "remaining_lower_bound": 89,
+                            "window_id": "five_hour:2099-01-01T00:00:00Z",
+                            "reset_precision": "precise",
+                            "reset_fingerprint": "4 pm (Asia/Singapore)",
+                        },
+                        "seven_day": {
+                            "displayed_used_percent": 20,
+                            "remaining_lower_bound": 79,
+                            "window_id": "weekly:2099-01-01@Asia/Singapore",
+                            "reset_precision": "date-only-compatible",
+                            "reset_fingerprint": "Jan 1, 2099 (Asia/Singapore)",
+                        },
+                        "seven_day_sonnet": {
+                            "displayed_used_percent": 25,
+                            "remaining_lower_bound": 74,
+                            "window_id": "weekly:2099-01-01@Asia/Singapore",
+                            "reset_precision": "date-only-compatible",
+                            "reset_fingerprint": "Jan 1, 2099 (Asia/Singapore)",
+                        },
+                    },
+                }
+            )
+        )
+        self.assertTrue(refresher.refresh_once())
+        compatible = self.store.latest_quota()
+        assert compatible is not None
         self.assertEqual(
-            refreshed.dispatch_decision(
+            compatible.dispatch_decision(
                 "sonnet", max_age_seconds=900, current_time=now
             ).action,
             "claude",
