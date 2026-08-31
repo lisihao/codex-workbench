@@ -90,11 +90,17 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         def runner(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             calls.append(tuple(arguments[1:]))
             if arguments[1:] == ["auth", "status", "--json"]:
-                return _completed(arguments, json.dumps({"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"}))
-            return _completed(arguments, "2.1.42")
+                return _completed(
+                    arguments,
+                    json.dumps({"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"}),
+                    returncode=1,
+                )
+            return _completed(arguments, "2.1.239")
 
         snapshot = ClaudeQuotaCollector(self.binary, self.output, runner=runner).collect()
         self.assertFalse(snapshot["auth_ok"])
+        self.assertEqual(snapshot["error"], "logged out")
+        self.assertEqual(snapshot["claude_version"], "2.1.239")
         self.assertEqual(calls, [("auth", "status", "--json"), ("--version",)])
         persisted = JsonFileQuotaAdapter(self.output).read()
         assert persisted is not None

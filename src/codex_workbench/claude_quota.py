@@ -39,14 +39,14 @@ class ClaudeQuotaCollector:
         version = "unknown"
         try:
             auth = self._command("auth", "status", "--json")
-            if auth.returncode != 0:
-                raise ClaudeQuotaError("claude auth status failed")
             auth_payload = _json_object(auth.stdout, "claude auth status")
             version = self._claude_version()
             if _is_logged_out(auth_payload):
                 snapshot = _unavailable_snapshot(version, "logged out")
                 atomic_write_snapshot(self.output, snapshot)
                 return snapshot
+            if auth.returncode != 0:
+                raise ClaudeQuotaError("claude auth status failed")
             if not is_native_subscription_auth(auth_payload):
                 raise ClaudeQuotaError("Claude is not logged in with a first-party subscription")
             if version != SUPPORTED_USAGE_VERSION:
