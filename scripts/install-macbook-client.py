@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from pathlib import Path
 import plistlib
@@ -13,6 +14,7 @@ import sys
 
 TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
 LEGACY_HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
+TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -38,6 +40,35 @@ def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=check)
 
 
+def configured_ssh_hostname(destination: str) -> str:
+    result = run("ssh", "-G", destination, check=False)
+    if result.returncode != 0:
+        return destination
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key == "hostname" and value.strip():
+            return value.strip()
+    return destination
+
+
+def ssh_transport_arguments(destination: str, transport: str) -> tuple[str, ...]:
+    if transport == "system":
+        return ()
+    hostname = configured_ssh_hostname(destination)
+    if transport == "auto":
+        try:
+            if ipaddress.ip_address(hostname) not in TAILSCALE_CGNAT:
+                return ()
+        except ValueError:
+            return ()
+    tailscale = shutil.which("tailscale")
+    if not tailscale:
+        raise SystemExit(
+            "Tailscale userspace SSH transport was selected, but the tailscale CLI is unavailable"
+        )
+    return ("-o", f"ProxyCommand={tailscale} nc %h %p")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
@@ -46,6 +77,15 @@ def main() -> int:
         default="macmini",
         help="SSH config alias or user@host for the Mac mini authority (default: macmini)",
     )
+    parser.add_argument(
+        "--ssh-transport",
+        choices=("auto", "system", "tailscale-userspace"),
+        default="auto",
+        help=(
+            "SSH data path. auto uses 'tailscale nc' when the configured host is in "
+            "100.64.0.0/10, avoiding broken macOS system routes"
+        ),
+    )
     args = parser.parse_args()
     source = Path(args.source).expanduser().resolve()
     authority_ssh_alias = args.authority_ssh_alias.strip()
@@ -53,9 +93,13 @@ def main() -> int:
         character.isspace() for character in authority_ssh_alias
     ):
         raise SystemExit("--authority-ssh-alias must be one non-option SSH destination")
+    transport_arguments = ssh_transport_arguments(
+        authority_ssh_alias,
+        args.ssh_transport,
+    )
     run(
         "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-        authority_ssh_alias, "true",
+        *transport_arguments, authority_ssh_alias, "true",
     )
 
     log_root = Path.home() / "Library" / "Logs" / "Codex Workbench"
@@ -79,8 +123,9 @@ def main() -> int:
             .replace("__CLIENT_ID__", client_id)
             .replace("__AUTHORITY_SSH_ALIAS__", authority_ssh_alias)
         )
-        plistlib.loads(rendered.encode())
-        plist_path.write_text(rendered)
+        payload = plistlib.loads(rendered.encode())
+        payload["ProgramArguments"][-2:-2] = list(transport_arguments)
+        plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
         plist_path.chmod(0o600)
         run("launchctl", "bootout", domain, str(plist_path), check=False)
         run("launchctl", "bootstrap", domain, str(plist_path))
@@ -107,12 +152,17 @@ def main() -> int:
         "ServerAliveInterval=10",
         "-o",
         "ServerAliveCountMax=2",
+        *transport_arguments,
         authority_ssh_alias,
         remote_command,
     )
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
     print("Codex native entry: MCP server 'codex-workbench'")
     print(f"Authority SSH destination: {authority_ssh_alias}")
+    print(
+        "SSH transport: "
+        + ("tailscale-userspace" if transport_arguments else "system")
+    )
     print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes over the cockpit tunnel")
     return 0
 

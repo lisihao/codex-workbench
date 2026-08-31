@@ -78,6 +78,8 @@ scripts/python-runtime scripts/install-macbook-client.py
 codex mcp get codex-workbench
 ```
 
+安装器默认使用 `--ssh-transport auto`：当 SSH 配置解析出的 authority 地址位于 Tailscale `100.64.0.0/10` 时，驾驶舱隧道和 MCP 会通过绝对路径的 `tailscale nc` 用户态 ProxyCommand 连接，避免 macOS 系统路由或其他 VPN 把 CGNAT 地址错误送到物理网卡。普通 SSH 主机继续使用系统数据路径；也可显式选择 `--ssh-transport system` 或 `tailscale-userspace`。
+
 ## GitHub 与 Tailscale 同步
 
 GitHub 是代码主同步通道。Mac mini 只对干净工作树执行 fast-forward：

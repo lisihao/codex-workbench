@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 from pathlib import Path
 import plistlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 class InstallerTests(unittest.TestCase):
+    @staticmethod
+    def _macbook_installer_module():
+        path = Path(__file__).resolve().parents[1] / "scripts" / "install-macbook-client.py"
+        spec = importlib.util.spec_from_file_location("codex_workbench_macbook_installer", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def _fake_runtime(self, directory: Path, name: str, probe_exit: int) -> Path:
         runtime = directory / name
         runtime.write_text(
@@ -118,6 +129,38 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('"--authority-ssh-alias"', source)
         self.assertIn('default="macmini"', source)
         self.assertIn('__AUTHORITY_SSH_ALIAS__', source)
+
+    def test_macbook_installer_auto_uses_userspace_tailscale_for_cgnat_host(self) -> None:
+        module = self._macbook_installer_module()
+        with mock.patch.object(
+            module,
+            "configured_ssh_hostname",
+            return_value="100.64.0.42",
+        ), mock.patch.object(
+            module.shutil,
+            "which",
+            return_value="/opt/homebrew/bin/tailscale",
+        ):
+            arguments = module.ssh_transport_arguments("macmini", "auto")
+
+        self.assertEqual(
+            arguments,
+            (
+                "-o",
+                "ProxyCommand=/opt/homebrew/bin/tailscale nc %h %p",
+            ),
+        )
+
+    def test_macbook_installer_keeps_system_ssh_for_non_tailscale_host(self) -> None:
+        module = self._macbook_installer_module()
+        with mock.patch.object(
+            module,
+            "configured_ssh_hostname",
+            return_value="git.example.test",
+        ):
+            arguments = module.ssh_transport_arguments("build-server", "auto")
+
+        self.assertEqual(arguments, ())
 
 
 if __name__ == "__main__":
