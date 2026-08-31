@@ -621,7 +621,7 @@ class AcceptanceTests(unittest.TestCase):
                     actual_model="gpt-5.6-sol",
                     result_kind="verifier",
                     checks=("tests passed",),
-                    evidence=(test_ref, verdict_ref),
+                    evidence=(test_ref, verdict_ref, empty_stderr),
                     verdict="accepted",
                 ),
             )
@@ -673,7 +673,10 @@ class AcceptanceTests(unittest.TestCase):
                 assert worker is not None
                 self.assertEqual((worker["task_id"], worker["node_id"]), (task_id, work_id))
                 worker_artifacts = (
-                    {"patch": store.artifacts.put_text(f"{task_id} patch", "patch")}
+                    {
+                        "patch": store.artifacts.put_text(f"{task_id} patch", "patch"),
+                        "stderr": store.artifacts.put_text("", "stderr.log"),
+                    }
                     if with_evidence
                     else {}
                 )
@@ -692,16 +695,17 @@ class AcceptanceTests(unittest.TestCase):
                 assert verifier is not None
                 self.assertEqual((verifier["task_id"], verifier["node_id"]), (task_id, verify_id))
                 verifier_ref = store.artifacts.put_text(f"{task_id} accepted", "json")
+                empty_stderr = store.artifacts.put_text("", "stderr.log")
                 store.settle_claimed(
                     verifier,
                     NodeResult(
                         "succeeded",
                         "Sol accepted",
-                        artifacts={"verdict": verifier_ref},
+                        artifacts={"verdict": verifier_ref, "stderr": empty_stderr},
                         actual_model="gpt-5.6-sol",
                         result_kind="verifier",
                         checks=("focused-check",),
-                        evidence=(verifier_ref,),
+                        evidence=(verifier_ref, empty_stderr),
                         verdict="accepted",
                     ),
                 )

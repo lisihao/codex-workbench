@@ -137,6 +137,16 @@ def _artifact_is_valid(artifacts: ArtifactStore, ref: object, *, non_empty: bool
     return not non_empty or size > 0
 
 
+def _evidence_artifact_is_valid(artifacts: ArtifactStore, ref: object) -> bool:
+    """Accept empty stdout/stderr diagnostics while keeping evidence payloads non-empty."""
+    suffix = ref.rsplit(":", 1)[-1] if isinstance(ref, str) else ""
+    return _artifact_is_valid(
+        artifacts,
+        ref,
+        non_empty=suffix not in {"stdout.log", "stderr.log"},
+    )
+
+
 def _artifact_digest(ref: str) -> str | None:
     try:
         algorithm, digest, _suffix = ref.split(":", 2)
@@ -457,7 +467,7 @@ def _model_worker_check(
             and bool(node["result"].get("checks"))
             and bool(node["result"].get("evidence"))
             and all(
-                _artifact_is_valid(artifacts, ref)
+                _evidence_artifact_is_valid(artifacts, ref)
                 for ref in node["result"].get("evidence", ())
             )
             for node in task["nodes"]
@@ -476,7 +486,7 @@ def _model_worker_check(
                 or not result.get("checks")
                 or not result.get("artifacts")
                 or not all(
-                    _artifact_is_valid(artifacts, ref)
+                    _evidence_artifact_is_valid(artifacts, ref)
                     for ref in result.get("artifacts", {}).values()
                 )
             ):
@@ -823,7 +833,10 @@ def _accepted_evidence_check(
             and _is_real_model(node["result"].get("actual_model"))
             and _nonempty_strings(node["result"].get("checks"))
             and _nonempty_strings(node["result"].get("evidence"))
-            and all(_artifact_is_valid(artifacts, ref) for ref in node["result"].get("evidence", ()))
+            and all(
+                _evidence_artifact_is_valid(artifacts, ref)
+                for ref in node["result"].get("evidence", ())
+            )
             and _artifact_is_valid(
                 artifacts,
                 node["result"].get("artifacts", {}).get("test-log"),
