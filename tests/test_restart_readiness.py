@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import plistlib
 import tempfile
 import unittest
 
@@ -8,6 +9,22 @@ from codex_workbench.restart_readiness import assess_restart_readiness
 
 
 class RestartReadinessTests(unittest.TestCase):
+    def test_launchd_restarts_workbench_after_nonzero_coordinator_exit(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / "com.lisihao.codex-workbench.plist.in").read_text()
+        rendered = (
+            template.replace("__APP_ROOT__", "/tmp/app")
+            .replace("__STATE_ROOT__", "/tmp/state")
+            .replace("__CODEX_BINARY__", "/tmp/codex")
+            .replace("__CODEX_HOME__", "/tmp/codex-home")
+            .replace("__PROCESS_HOME__", "/tmp/process-home")
+            .replace("__QUOTA_SNAPSHOT_FILE__", "/tmp/state/claude-quota.json")
+        )
+        payload = plistlib.loads(rendered.encode())
+
+        self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(payload["ThrottleInterval"], 10)
+
     def test_filevault_and_missing_auto_login_block_unattended_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             launch_agent = Path(directory) / "workbench.plist"

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -48,6 +49,21 @@ ClaudeDispatchAction = Literal["claude", "codex", "defer"]
 TERMINAL_TASK_STATES = {"accepted", "blocked", "cancelled"}
 TERMINAL_NODE_STATES = {"accepted", "failed", "blocked", "indeterminate", "cancelled"}
 DEFAULT_QUOTA_TTL_SECONDS = 15 * 60
+ROUTING_STRATEGY_VERSION = "model-routing-v1"
+CODEX_SOL_MODEL = "gpt-5.6-sol"
+
+
+RoutingTaskType = Literal[
+    "implementation",
+    "debugging",
+    "architecture",
+    "review",
+    "tests",
+    "docs",
+    "creative",
+    "exploration",
+]
+RoutingComplexity = Literal["low", "standard", "high"]
 
 
 def now_iso() -> str:
@@ -60,6 +76,117 @@ def canonical_json(value: Any) -> str:
 
 def canonical_hash(value: Any) -> str:
     return sha256(canonical_json(value).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class RoutingStrategy:
+    """Versioned, serializable inputs that control model selection.
+
+    The planner may describe a graph, but it cannot choose a provider outside
+    this contract.  Keeping these fields small also makes a strategy part of a
+    task's durable request hash.
+    """
+
+    version: str = ROUTING_STRATEGY_VERSION
+    task_type: RoutingTaskType = "implementation"
+    complexity: RoutingComplexity = "standard"
+    parallelizable: bool = True
+    claude_allowed: bool = True
+
+    def normalized(self) -> "RoutingStrategy":
+        if not isinstance(self.version, str):
+            raise ValueError("routing strategy version must be a string")
+        if not isinstance(self.task_type, str):
+            raise ValueError("routing task_type must be a string")
+        if not isinstance(self.complexity, str):
+            raise ValueError("routing complexity must be a string")
+        version = {
+            "v1": ROUTING_STRATEGY_VERSION,
+            "routing-v1": ROUTING_STRATEGY_VERSION,
+            "routing.v1": ROUTING_STRATEGY_VERSION,
+            ROUTING_STRATEGY_VERSION: ROUTING_STRATEGY_VERSION,
+        }.get(self.version)
+        if version is None:
+            raise ValueError(f"unsupported routing strategy version: {self.version!r}")
+        task_type = {
+            "feature": "implementation",
+            "fix": "debugging",
+            "bugfix": "debugging",
+            "documentation": "docs",
+        }.get(self.task_type, self.task_type)
+        complexity = {
+            "medium": "standard",
+            "normal": "standard",
+            "default": "standard",
+        }.get(self.complexity, self.complexity)
+        if task_type not in {
+            "implementation",
+            "debugging",
+            "architecture",
+            "review",
+            "tests",
+            "docs",
+            "creative",
+            "exploration",
+        }:
+            raise ValueError(f"unsupported routing task_type: {self.task_type!r}")
+        if complexity not in {"low", "standard", "high"}:
+            raise ValueError(f"unsupported routing complexity: {self.complexity!r}")
+        if not isinstance(self.parallelizable, bool):
+            raise ValueError("parallelizable must be a boolean")
+        if not isinstance(self.claude_allowed, bool):
+            raise ValueError("claude_allowed must be a boolean")
+        return RoutingStrategy(
+            version=version,
+            task_type=task_type,  # type: ignore[arg-type]
+            complexity=complexity,  # type: ignore[arg-type]
+            parallelizable=self.parallelizable,
+            claude_allowed=self.claude_allowed,
+        )
+
+    def validate(self) -> None:
+        self.normalized()
+
+    @property
+    def strategy_version(self) -> str:
+        return self.normalized().version
+
+    @property
+    def task_kind(self) -> str:
+        return self.normalized().task_type
+
+    @property
+    def risk_level(self) -> str:
+        return self.normalized().complexity
+
+    @property
+    def allow_claude(self) -> bool:
+        return self.normalized().claude_allowed
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self.normalized())
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RoutingStrategy":
+        aliases = {
+            "strategy_version": "version",
+            "work_type": "task_type",
+            "task_kind": "task_type",
+            "kind": "task_type",
+            "task_category": "task_type",
+            "complexity_level": "complexity",
+            "risk": "complexity",
+            "risk_level": "complexity",
+            "allow_claude": "claude_allowed",
+            "claude_enabled": "claude_allowed",
+            "claude": "claude_allowed",
+            "parallel": "parallelizable",
+        }
+        normalized = {
+            aliases.get(key, key): value
+            for key, value in raw.items()
+        }
+        return cls(**normalized).normalized()
 
 
 @dataclass(frozen=True)
@@ -81,6 +208,45 @@ class TaskContract:
     retry_limit: int = 3
     external_write_permission: bool = False
     destructive_action_permission: bool = False
+    routing_strategy: str = ROUTING_STRATEGY_VERSION
+    task_type: RoutingTaskType = "implementation"
+    complexity: RoutingComplexity = "standard"
+    parallelizable: bool = True
+    claude_allowed: bool = True
+    task_points: float = 1.0
+
+    def __post_init__(self) -> None:
+        # Sol is a role invariant.  ``fixture`` remains available for the
+        # repository's offline demonstrations and tests.
+        if self.planner_model != "fixture":
+            object.__setattr__(self, "planner_model", CODEX_SOL_MODEL)
+        if self.verifier_model != "fixture":
+            object.__setattr__(self, "verifier_model", CODEX_SOL_MODEL)
+        if isinstance(self.routing_strategy, dict):
+            strategy = RoutingStrategy.from_dict(self.routing_strategy)
+            object.__setattr__(self, "routing_strategy", strategy.version)
+            object.__setattr__(self, "task_type", strategy.task_type)
+            object.__setattr__(self, "complexity", strategy.complexity)
+            object.__setattr__(self, "parallelizable", strategy.parallelizable)
+            object.__setattr__(self, "claude_allowed", strategy.claude_allowed)
+        elif isinstance(self.routing_strategy, RoutingStrategy):
+            strategy = self.routing_strategy.normalized()
+            object.__setattr__(self, "routing_strategy", strategy.version)
+            object.__setattr__(self, "task_type", strategy.task_type)
+            object.__setattr__(self, "complexity", strategy.complexity)
+            object.__setattr__(self, "parallelizable", strategy.parallelizable)
+            object.__setattr__(self, "claude_allowed", strategy.claude_allowed)
+        else:
+            strategy = RoutingStrategy(
+                version=self.routing_strategy,
+                task_type=self.task_type,
+                complexity=self.complexity,
+                parallelizable=self.parallelizable,
+                claude_allowed=self.claude_allowed,
+            ).normalized()
+            object.__setattr__(self, "routing_strategy", strategy.version)
+            object.__setattr__(self, "task_type", strategy.task_type)
+            object.__setattr__(self, "complexity", strategy.complexity)
 
     def validate(self) -> None:
         if not self.task_id or any(ch.isspace() for ch in self.task_id):
@@ -98,6 +264,42 @@ class TaskContract:
             raise ValueError("timeout_seconds must be positive")
         if not 0 <= self.retry_limit <= 3:
             raise ValueError("retry_limit must be between 0 and 3")
+        if not isinstance(self.task_points, (int, float)) or not math.isfinite(
+            float(self.task_points)
+        ) or float(self.task_points) <= 0:
+            raise ValueError("task_points must be a positive finite number")
+        self.strategy.validate()
+
+    @property
+    def strategy(self) -> RoutingStrategy:
+        return RoutingStrategy(
+            version=self.routing_strategy,
+            task_type=self.task_type,
+            complexity=self.complexity,
+            parallelizable=self.parallelizable,
+            claude_allowed=self.claude_allowed,
+        ).normalized()
+
+    @property
+    def routing(self) -> RoutingStrategy:
+        """Compatibility alias for callers that call the policy ``routing``."""
+        return self.strategy
+
+    @property
+    def strategy_version(self) -> str:
+        return self.strategy.version
+
+    @property
+    def task_kind(self) -> str:
+        return self.task_type
+
+    @property
+    def risk_level(self) -> str:
+        return self.complexity
+
+    @property
+    def allow_claude(self) -> bool:
+        return self.claude_allowed
 
     @property
     def digest(self) -> str:
@@ -108,6 +310,35 @@ class TaskContract:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "TaskContract":
+        raw = dict(raw)
+        nested_strategy = raw.pop("strategy", raw.pop("routing", None))
+        aliases = {
+            "strategy_version": "routing_strategy",
+            "work_type": "task_type",
+            "task_kind": "task_type",
+            "kind": "task_type",
+            "task_category": "task_type",
+            "complexity_level": "complexity",
+            "risk": "complexity",
+            "risk_level": "complexity",
+            "allow_claude": "claude_allowed",
+            "claude_enabled": "claude_allowed",
+            "claude": "claude_allowed",
+            "parallel": "parallelizable",
+        }
+        normalized = {
+            aliases.get(key, key): value
+            for key, value in raw.items()
+        }
+        if nested_strategy is not None:
+            if not isinstance(nested_strategy, dict):
+                raise ValueError("strategy must be an object")
+            strategy = RoutingStrategy.from_dict(nested_strategy)
+            normalized.setdefault("routing_strategy", strategy.version)
+            normalized.setdefault("task_type", strategy.task_type)
+            normalized.setdefault("complexity", strategy.complexity)
+            normalized.setdefault("parallelizable", strategy.parallelizable)
+            normalized.setdefault("claude_allowed", strategy.claude_allowed)
         tuple_fields = {
             "allowed_scope",
             "forbidden_scope",
@@ -117,7 +348,7 @@ class TaskContract:
         }
         normalized = {
             key: tuple(value) if key in tuple_fields else value
-            for key, value in raw.items()
+            for key, value in normalized.items()
         }
         contract = cls(**normalized)
         contract.validate()

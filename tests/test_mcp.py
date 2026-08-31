@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.config import WorkbenchConfig
@@ -56,6 +57,35 @@ class MCPTests(unittest.TestCase):
         report = json.loads(self.call("workbench_acceptance_report", {})["content"][0]["text"])
         self.assertFalse(report["complete"])
         self.assertEqual(len(report["checks"]), 12)
+
+    def test_request_exposes_and_forwards_routing_controls(self) -> None:
+        with patch(
+            "codex_workbench.mcp.submit_natural_language_request",
+            return_value={"ok": True, "task_id": "routed"},
+        ) as submit:
+            result = json.loads(
+                self.call(
+                    "workbench_request",
+                    {
+                        "objective": "review the architecture",
+                        "repository": str(self.root),
+                        "allowed_scopes": ["src"],
+                        "task_type": "architecture",
+                        "complexity": "high",
+                        "parallelizable": False,
+                        "claude_allowed": False,
+                        "task_points": 3.5,
+                    },
+                )["content"][0]["text"]
+            )
+
+        self.assertEqual(result["task_id"], "routed")
+        kwargs = submit.call_args.kwargs
+        self.assertEqual(kwargs["task_type"], "architecture")
+        self.assertEqual(kwargs["complexity"], "high")
+        self.assertFalse(kwargs["parallelizable"])
+        self.assertFalse(kwargs["claude_allowed"])
+        self.assertEqual(kwargs["task_points"], 3.5)
 
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(

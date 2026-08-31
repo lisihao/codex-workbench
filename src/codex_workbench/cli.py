@@ -182,6 +182,11 @@ def command_request(args: argparse.Namespace) -> int:
             external_write_permission=args.allow_external_write,
             queue=args.queue,
             base_sha=args.base_sha,
+            task_type=args.task_type,
+            complexity=args.complexity,
+            parallelizable=not args.serial,
+            claude_allowed=not args.no_claude,
+            task_points=args.task_points,
         )
     except PlannerError as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
@@ -408,6 +413,7 @@ def command_acceptance(args: argparse.Namespace) -> int:
         if not data:
             raise ValueError("A12 artifact must not be empty")
         artifact_ref = ArtifactStore(config.state_root / "artifacts").put_bytes(data, suffix)
+        export_receipt = getattr(args, "export_receipt", None)
         cursor = store.record_acceptance_attestation(
             "A12",
             artifact_ref,
@@ -416,6 +422,7 @@ def command_acceptance(args: argparse.Namespace) -> int:
             args.quota_window,
             args.source_session_id,
             args.note,
+            export_receipt=export_receipt,
         )
         print(
             json.dumps(
@@ -608,6 +615,15 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--verifier-model", default="gpt-5.6-sol")
     request.add_argument("--timeout", type=int, default=3600)
     request.add_argument("--retry-limit", type=int, default=3)
+    request.add_argument(
+        "--task-type",
+        choices=("implementation", "debugging", "architecture", "review", "tests", "docs", "creative", "exploration"),
+        default="implementation",
+    )
+    request.add_argument("--complexity", choices=("low", "standard", "high"), default="standard")
+    request.add_argument("--serial", action="store_true", help="declare that worker nodes must not run in parallel")
+    request.add_argument("--no-claude", action="store_true", help="route the task only through Codex subscription models")
+    request.add_argument("--task-points", type=float, default=1.0, help="positive acceptance weight used for quota productivity")
     request.add_argument("--allow-external-write", action="store_true")
     request.add_argument("--queue", action="store_true")
     request.set_defaults(func=command_request)
@@ -712,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="report",
     )
     acceptance.add_argument("--artifact")
+    acceptance.add_argument("--export-receipt", help="path or content-addressed Claude export receipt")
     acceptance.add_argument("--quota-window")
     acceptance.add_argument("--source-session-id")
     acceptance.add_argument("--note")

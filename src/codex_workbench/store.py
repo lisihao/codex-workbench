@@ -1212,6 +1212,85 @@ class WorkbenchStore:
             },
         )
 
+    def _resolve_export_receipt(
+        self,
+        export_receipt: str | Path | dict[str, Any] | None,
+        export_receipt_ref: str | None,
+        *,
+        artifact_ref: str,
+        quota_window_id: str,
+        source_session_id: str,
+    ) -> str | None:
+        if export_receipt is not None and export_receipt_ref is not None:
+            raise ValueError("provide an export receipt or export_receipt_ref, not both")
+        value: str | Path | dict[str, Any] | None = (
+            export_receipt_ref if export_receipt_ref is not None else export_receipt
+        )
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            receipt_ref = self.artifacts.put_text(canonical_json(value), "json")
+        elif isinstance(value, Path):
+            if not value.is_file():
+                raise ValueError("A12 export receipt file does not exist")
+            try:
+                receipt_ref = self.artifacts.put_bytes(value.read_bytes(), "json")
+            except OSError as error:
+                raise ValueError("A12 export receipt file cannot be read") from error
+        elif isinstance(value, str) and value.startswith("sha256:"):
+            receipt_ref = value
+        elif isinstance(value, str):
+            candidate = Path(value).expanduser()
+            if candidate.is_file():
+                try:
+                    receipt_ref = self.artifacts.put_bytes(candidate.read_bytes(), "json")
+                except OSError as error:
+                    raise ValueError("A12 export receipt file cannot be read") from error
+            else:
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("A12 export receipt must be JSON or a file path") from error
+                if not isinstance(parsed, dict):
+                    raise ValueError("A12 export receipt must be a JSON object")
+                receipt_ref = self.artifacts.put_text(canonical_json(parsed), "json")
+        else:
+            raise ValueError("A12 export receipt must be JSON, a file path, or an artifact ref")
+
+        try:
+            receipt_path = self.artifacts.verify(receipt_ref)
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("A12 export receipt is not a valid content-addressed JSON artifact") from error
+        if not isinstance(receipt, dict):
+            raise ValueError("A12 export receipt must be a JSON object")
+        if receipt.get("provider") != "claude-web":
+            raise ValueError("A12 export receipt must identify claude-web")
+        if str(receipt.get("status", "")).lower() not in {
+            "completed", "exported", "succeeded", "success", "ok"
+        }:
+            raise ValueError("A12 export receipt is not completed")
+        if receipt.get("source_session_id", receipt.get("session_id")) != source_session_id:
+            raise ValueError("A12 export receipt session does not match the attestation")
+        if receipt.get("quota_window_id", receipt.get("window_id")) != quota_window_id:
+            raise ValueError("A12 export receipt quota window does not match the attestation")
+
+        receipt_artifact_ref = receipt.get("artifact_ref", receipt.get("output_artifact_ref"))
+        receipt_digest = receipt.get("artifact_sha256", receipt.get("artifact_hash"))
+        if receipt_artifact_ref is None and receipt_digest is None:
+            raise ValueError("A12 export receipt must identify the exported artifact")
+        if receipt_artifact_ref is not None and receipt_artifact_ref != artifact_ref:
+            raise ValueError("A12 export receipt artifact does not match the attestation")
+        if receipt_digest is not None:
+            normalized_digest = str(receipt_digest)
+            if normalized_digest.startswith("sha256:"):
+                normalized_digest = normalized_digest.split(":", 1)[1]
+            expected_digest = artifact_ref.split(":", 2)[1]
+            if normalized_digest != expected_digest:
+                raise ValueError("A12 export receipt artifact hash does not match the attestation")
+        return receipt_ref
+
     def record_acceptance_attestation(
         self,
         check_id: str,
@@ -1221,6 +1300,9 @@ class WorkbenchStore:
         quota_window_id: str,
         source_session_id: str,
         note: str,
+        export_receipt: str | Path | dict[str, Any] | None = None,
+        *,
+        export_receipt_ref: str | None = None,
     ) -> int:
         if check_id != "A12":
             raise ValueError("only A12 accepts a local administrator attestation")
@@ -1232,21 +1314,31 @@ class WorkbenchStore:
         detected_format = presentation_format(path)
         if detected_format is None or path.stat().st_size != artifact_size:
             raise ValueError("A12 artifact content or size is invalid")
+        receipt_ref = self._resolve_export_receipt(
+            export_receipt,
+            export_receipt_ref,
+            artifact_ref=artifact_ref,
+            quota_window_id=quota_window_id,
+            source_session_id=source_session_id,
+        )
+        payload = {
+            "check_id": check_id,
+            "artifact_ref": artifact_ref,
+            "artifact_name": artifact_name,
+            "artifact_size": artifact_size,
+            "quota_window_id": quota_window_id,
+            "source_session_id": source_session_id,
+            "provider": "claude-web",
+            "provenance_kind": "real-user-journey",
+            "detected_format": detected_format,
+            "note": note,
+            "source": "local-admin-cli",
+        }
+        if receipt_ref is not None:
+            payload["export_receipt_ref"] = receipt_ref
         return self.record_system_event(
             "acceptance.attested",
-            {
-                "check_id": check_id,
-                "artifact_ref": artifact_ref,
-                "artifact_name": artifact_name,
-                "artifact_size": artifact_size,
-                "quota_window_id": quota_window_id,
-                "source_session_id": source_session_id,
-                "provider": "claude-web",
-                "provenance_kind": "real-user-journey",
-                "detected_format": detected_format,
-                "note": note,
-                "source": "local-admin-cli",
-            },
+            payload,
         )
 
     def record_node_event(
@@ -1292,20 +1384,100 @@ class WorkbenchStore:
             ).rowcount
             if changed != 1:
                 raise StateConflictError(f"node {node_id} is not running")
-            return self._event(connection, "node.routed", task_id, node_id, payload)
+            event_payload = dict(payload)
+            # Route callers may describe why a handoff happened, but quota
+            # provenance must come from the durable snapshot ledger. Strip
+            # caller-supplied copies before attaching the latest persisted row.
+            for key in (
+                "quota_snapshot",
+                "quota_provenance",
+                "quota_snapshot_id",
+                "quota_source",
+            ):
+                event_payload.pop(key, None)
+            quota_row = connection.execute(
+                """
+                SELECT id, snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            if quota_row is not None:
+                try:
+                    event_payload["quota_snapshot_id"] = int(quota_row["id"])
+                    event_payload["quota_snapshot"] = json.loads(quota_row["snapshot_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    event_payload.pop("quota_snapshot_id", None)
+                    event_payload.pop("quota_snapshot", None)
+            return self._event(connection, "node.routed", task_id, node_id, event_payload)
 
     def authority_status(self) -> dict[str, Any] | None:
         with self.connection() as connection:
-            row = connection.execute(
+            metadata = {
+                row["key"]: row["value"]
+                for row in connection.execute(
+                    """
+                    SELECT key, value FROM metadata
+                    WHERE key IN (
+                        'authority_machine_id',
+                        'coordinator_instance_id',
+                        'coordinator_epoch'
+                    )
+                    """
+                ).fetchall()
+            }
+            rows = connection.execute(
                 """
-                SELECT event_type, payload_json, created_at FROM events
+                SELECT cursor, event_type, payload_json, created_at FROM events
                 WHERE event_type IN ('coordinator.started', 'coordinator.stopped', 'coordinator.failed')
-                ORDER BY cursor DESC LIMIT 1
+                ORDER BY cursor
                 """
-            ).fetchone()
-            if row is None or row["event_type"] != "coordinator.started":
+            ).fetchall()
+        if not rows:
+            return None
+        instance_id = str(metadata.get("coordinator_instance_id", "")).strip()
+        machine_id = str(metadata.get("authority_machine_id", "")).strip()
+        try:
+            coordinator_epoch = int(metadata.get("coordinator_epoch", "0"))
+        except (TypeError, ValueError):
+            return None
+        if not instance_id or not machine_id or coordinator_epoch <= 0:
+            return None
+
+        decoded_rows: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
                 return None
-            return {**json.loads(row["payload_json"]), "active": True, "observed_at": row["created_at"]}
+            if not isinstance(payload, dict):
+                return None
+            decoded_rows.append((row, payload))
+
+        latest_row, latest = decoded_rows[-1]
+        # A newly activated coordinator owns a strictly greater durable epoch.
+        # That epoch fences an older process even when a crash prevented it
+        # from recording coordinator.stopped.  Only the latest lifecycle event
+        # can prove that the metadata owner is currently live.
+        if latest_row["event_type"] != "coordinator.started":
+            return None
+        if latest.get("instance_id") != instance_id:
+            return None
+        latest_machine = latest.get("machine_id", latest.get("authority_machine_id"))
+        if latest_machine != machine_id:
+            return None
+        try:
+            latest_epoch = int(latest.get("coordinator_epoch", "0"))
+            pid = int(latest.get("pid", "0"))
+        except (TypeError, ValueError):
+            return None
+        if latest_epoch != coordinator_epoch or pid <= 0 or not str(latest.get("host", "")).strip():
+            return None
+        return {
+            **latest,
+            "active": True,
+            "observed_at": latest_row["created_at"],
+            "authority_epoch": coordinator_epoch,
+        }
 
     def claim_ready_node(
         self,
@@ -1743,15 +1915,38 @@ class WorkbenchStore:
 
     @staticmethod
     def _validate_actual_model(row: sqlite3.Row, result: NodeResult) -> None:
+        executor = str(row["effective_executor"] or "")
+        leased_model = str(row["effective_model"] or "")
         if (
             result.status in {"succeeded", "failed"}
-            and str(row["effective_executor"] or "") in {"codex", "claude"}
-            and result.actual_model != row["effective_model"]
+            and executor in {"codex", "claude"}
+            and not WorkbenchStore._actual_model_matches_lease(
+                executor,
+                leased_model,
+                result.actual_model,
+            )
         ):
             raise ValueError(
                 f"result actual_model {result.actual_model!r} does not match leased model "
                 f"{row['effective_model']!r}"
             )
+
+    @staticmethod
+    def _actual_model_matches_lease(
+        executor: str,
+        leased_model: str,
+        actual_model: str | None,
+    ) -> bool:
+        if actual_model is None:
+            return False
+        leased = leased_model.strip().lower()
+        actual = actual_model.strip().lower()
+        if executor != "claude":
+            return actual == leased
+        for family in ("opus", "sonnet", "fable"):
+            if leased == family:
+                return family in actual
+        return actual == leased or actual.startswith(f"{leased}-")
 
     @staticmethod
     def _missing_required_artifacts(

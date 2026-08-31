@@ -171,6 +171,236 @@ class WorkbenchHardeningTests(unittest.TestCase):
             )
         self.assertEqual((claude_result.status, claude_result.result_kind), ("blocked", "worker"))
 
+    def test_claude_worker_uses_native_structured_scope_and_model_evidence(self) -> None:
+        executor = ClaudeExecutor(self.artifacts, quota=None)
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="claude",
+            attempt=1,
+            contract={
+                "objective": "write the parser",
+                "allowed_scope": ["src"],
+                "forbidden_scope": ["src/private"],
+                "acceptance_commands": ["python -m unittest tests/test_parser.py"],
+                "timeout_seconds": 30,
+            },
+            spec={
+                "title": "parser worker",
+                "prompt": "implement the parser",
+                "model": "sonnet",
+                "verifier": False,
+                "read_scopes": ["src"],
+                "write_scopes": ["src/parser.py"],
+            },
+            worktree=self.root,
+        )
+        response = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": "parser updated",
+                "changed_paths": ["src/parser.py"],
+                "checks": ["python -m unittest tests/test_parser.py"],
+            },
+            "modelUsage": {"claude-sonnet-4-5-20250929": {"outputTokens": 4}},
+        }
+        captured: dict[str, object] = {}
+
+        def fake_run(command: list[str], **kwargs: object):
+            captured["command"] = command
+            captured["environment"] = kwargs["environment"]
+            return subprocess.CompletedProcess(command, 0, json.dumps(response), ""), {
+                "stdout": "sha256:" + "1" * 64 + ":stdout.log",
+                "stderr": "sha256:" + "2" * 64 + ":stderr.log",
+            }
+
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(executor, "_run", side_effect=fake_run),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "must-not-forward"}, clear=False),
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.summary, "parser updated")
+        self.assertEqual(result.actual_model, "claude-sonnet-4-5-20250929")
+        self.assertEqual(result.changed_paths, ("src/parser.py",))
+        self.assertEqual(result.checks, ("python -m unittest tests/test_parser.py",))
+        command = captured["command"]
+        assert isinstance(command, list)
+        self.assertIn("-p", command)
+        self.assertEqual(command[command.index("--output-format") + 1], "json")
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual(set(schema["required"]), {"status", "summary", "changed_paths", "checks"})
+        self.assertEqual(command[command.index("--permission-mode") + 1], "acceptEdits")
+        tools = command[command.index("--tools") + 1]
+        self.assertIn("Read", tools)
+        self.assertIn("Edit", tools)
+        self.assertIn("Write", tools)
+        self.assertIn("Bash", tools)
+        self.assertIn("Bash(python -m unittest tests/test_parser.py)", command)
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertNotIn("--allow-dangerously-skip-permissions", command)
+        self.assertNotIn("--fallback-model", command)
+        environment = captured["environment"]
+        assert isinstance(environment, dict)
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+
+    def test_claude_worker_fails_closed_without_structured_output_or_model_evidence(self) -> None:
+        executor = ClaudeExecutor(self.artifacts, quota=None)
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="claude",
+            attempt=1,
+            contract={
+                "objective": "inspect",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 30,
+            },
+            spec={
+                "title": "read-only worker",
+                "prompt": "inspect the source",
+                "model": "sonnet",
+                "verifier": False,
+                "write_scopes": [],
+            },
+            worktree=self.root,
+        )
+        response = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "unstructured text that must not be accepted",
+        }
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(
+                executor,
+                "_run",
+                return_value=(
+                    subprocess.CompletedProcess([], 0, json.dumps(response), ""),
+                    {},
+                ),
+            ),
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("structured", result.summary.lower())
+        self.assertIsNone(result.actual_model)
+        self.assertEqual(result.changed_paths, ())
+        self.assertEqual(result.checks, ())
+
+    def test_claude_worker_rejects_invalid_structured_payload_and_read_only_permissions(self) -> None:
+        executor = ClaudeExecutor(self.artifacts, quota=None)
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="claude",
+            attempt=1,
+            contract={
+                "objective": "inspect",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 30,
+            },
+            spec={
+                "title": "read-only worker",
+                "prompt": "inspect the source",
+                "model": "sonnet",
+                "verifier": False,
+                "write_scopes": [],
+            },
+            worktree=self.root,
+        )
+        response = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": "bad",
+                "changed_paths": [],
+                "checks": [],
+                "unexpected": True,
+            },
+            "modelUsage": {"claude-sonnet-4-5-20250929": {"outputTokens": 4}},
+        }
+        captured: dict[str, object] = {}
+
+        def fake_run(command: list[str], **_: object):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, json.dumps(response), ""), {}
+
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(executor, "_run", side_effect=fake_run),
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("structured", result.summary.lower())
+        command = captured["command"]
+        assert isinstance(command, list)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "dontAsk")
+        tools = command[command.index("--tools") + 1]
+        self.assertIn("Read", tools)
+        self.assertNotIn("Edit", tools)
+        self.assertNotIn("Write", tools)
+        self.assertNotIn("Bash", tools)
+
+    def test_claude_timeout_is_indeterminate_without_requested_model_claim(self) -> None:
+        executor = ClaudeExecutor(self.artifacts, quota=None)
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="claude",
+            attempt=1,
+            contract={
+                "objective": "inspect",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 1,
+            },
+            spec={"title": "worker", "prompt": "inspect", "model": "sonnet", "verifier": False},
+            worktree=self.root,
+        )
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(executor, "_run", side_effect=subprocess.TimeoutExpired("claude", 1)),
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "indeterminate")
+        self.assertIsNone(result.actual_model)
+
+    def test_claude_executor_is_worker_only(self) -> None:
+        executor = ClaudeExecutor(self.artifacts, quota=None)
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="verify",
+            attempt=1,
+            contract={
+                "objective": "verify",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 30,
+            },
+            spec={"title": "verifier", "prompt": "verify", "model": "sonnet", "verifier": True},
+            worktree=self.root,
+        )
+        with patch.object(executor, "qualification", side_effect=AssertionError("must not qualify")):
+            result = executor.execute(request)
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.result_kind, "worker")
+        self.assertIn("worker", result.summary.lower())
+
     def test_sol_rejection_runs_worker_repair_with_retry_escalation(self) -> None:
         repository = self.root / "repository"
         repository.mkdir()

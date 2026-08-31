@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,8 +11,12 @@ import time
 import unittest
 from concurrent.futures import Future
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 from codex_workbench.acceptance import build_acceptance_report
+from codex_workbench.api import WorkbenchHTTPServer
+from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.service import Coordinator
 from codex_workbench.executors import FixtureExecutor
@@ -27,6 +33,45 @@ def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_worker_future_exception_exits_process_and_persists_failed_health(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = """
+from concurrent.futures import Future
+from pathlib import Path
+import sys
+
+from codex_workbench.service import Coordinator
+from codex_workbench.store import WorkbenchStore
+
+root = Path(sys.argv[1])
+store = WorkbenchStore(root / "state.sqlite")
+store.initialize()
+epoch = store.activate_coordinator("fatal-worker", "test-machine")
+store.record_system_event("coordinator.started", {"instance_id": "fatal-worker"})
+coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+future = Future()
+future.set_exception(RuntimeError("subprocess worker exploded"))
+coordinator._futures[future] = ("task/node", None)
+coordinator._collect()
+raise AssertionError("fatal coordinator failure returned")
+"""
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(root)],
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 70, result.stderr)
+            health = WorkbenchStore(root / "state.sqlite").health()
+            self.assertFalse(health["ok"])
+            self.assertIn("subprocess worker exploded", health["coordinator_failure"]["error"])
+
     def test_worker_future_exception_is_persisted_and_fails_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -34,13 +79,20 @@ class ServiceTests(unittest.TestCase):
             store.initialize()
             epoch = store.activate_coordinator("future-failure", "test-machine")
             store.record_system_event("coordinator.started", {"instance_id": "future-failure"})
-            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            fatal_exit_codes: list[int] = []
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=epoch,
+                fatal_exit=fatal_exit_codes.append,
+            )
             future: Future[None] = Future()
             future.set_exception(RuntimeError("fixture worker exploded"))
             coordinator._futures[future] = ("task/node", None)
             coordinator._collect()
             coordinator._pool.shutdown(wait=True)
 
+            self.assertEqual(fatal_exit_codes, [70])
             health = store.health()
             self.assertFalse(health["ok"])
             self.assertIn("fixture worker exploded", health["coordinator_failure"]["error"])
@@ -48,6 +100,46 @@ class ServiceTests(unittest.TestCase):
                 "coordinator.failed",
                 {event["event_type"] for event in store.read_events()},
             )
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            try:
+                port = server.server_address[1]
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(f"http://127.0.0.1:{port}/health", timeout=2)
+                self.assertEqual(caught.exception.code, 503)
+                payload = json.load(caught.exception)
+                self.assertIn("fixture worker exploded", payload["coordinator_failure"]["error"])
+                caught.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+
+    def test_normal_stop_does_not_request_fatal_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("normal-stop", "test-machine")
+            fatal_exit_codes: list[int] = []
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=epoch,
+                poll_seconds=0.01,
+                fatal_exit=fatal_exit_codes.append,
+            )
+            thread = threading.Thread(target=coordinator.run_forever)
+            thread.start()
+            coordinator.stop()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(fatal_exit_codes, [])
+
     @staticmethod
     def run_until_terminal(store: WorkbenchStore, state: Path, task_id: str) -> dict:
         epoch = store.activate_coordinator(f"run-{task_id}", "test-machine")

@@ -347,6 +347,103 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(task["state"], "accepted")
         self.assertEqual(task["verdict"], "verifier accepted")
 
+    def test_claude_full_model_id_may_settle_a_matching_family_lease(self) -> None:
+        contract = TaskContract(
+            task_id="claude-model-evidence",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="preserve actual Claude model evidence",
+            allowed_scope=("src",),
+            verifier_model="fixture",
+        )
+        nodes = [
+            NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "work",
+                write_scopes=("src",),
+            ),
+            NodeSpec(
+                "verify",
+                contract.task_id,
+                "verify",
+                "fixture",
+                "fixture",
+                "accepted",
+                depends_on=("work",),
+                verifier=True,
+            ),
+        ]
+        self.store.create_task(contract, nodes, "cmd-claude-model-evidence")
+        self.store.queue_task(contract.task_id)
+        worker = self.store.claim_ready_node("claude-worker", self.epoch)
+        self.store.settle_claimed(
+            worker,
+            NodeResult(
+                "succeeded",
+                "worker done",
+                actual_model="claude-sonnet-4-5-20250929",
+                result_kind="worker",
+                checks=("structured-result",),
+            ),
+        )
+        settled_work = next(
+            node
+            for node in self.store.get_task(contract.task_id)["nodes"]
+            if node["node_id"] == "work"
+        )
+        self.assertEqual(settled_work["result"]["actual_model"], "claude-sonnet-4-5-20250929")
+        verifier = self.store.claim_ready_node("fixture-verifier", self.epoch)
+        self.assertEqual(verifier["task_id"], contract.task_id)
+        self.store.settle_claimed(verifier, NodeResult("succeeded", "accepted"))
+
+        mismatch_contract = TaskContract(
+            task_id="claude-model-mismatch",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="reject a different Claude family",
+            allowed_scope=("src",),
+            verifier_model="fixture",
+        )
+        mismatch_nodes = [
+            NodeSpec(
+                "work",
+                mismatch_contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "work",
+                write_scopes=("src",),
+            ),
+            NodeSpec(
+                "verify",
+                mismatch_contract.task_id,
+                "verify",
+                "fixture",
+                "fixture",
+                "accepted",
+                depends_on=("work",),
+                verifier=True,
+            ),
+        ]
+        self.store.create_task(mismatch_contract, mismatch_nodes, "cmd-claude-model-mismatch")
+        self.store.queue_task(mismatch_contract.task_id)
+        mismatch = self.store.claim_ready_node("claude-worker", self.epoch)
+        with self.assertRaisesRegex(ValueError, "does not match leased model"):
+            self.store.settle_claimed(
+                mismatch,
+                NodeResult(
+                    "succeeded",
+                    "wrong family",
+                    actual_model="claude-opus-4-1-20250805",
+                    result_kind="worker",
+                    checks=("structured-result",),
+                ),
+            )
+
     def test_restart_marks_running_node_indeterminate(self) -> None:
         nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
         self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-recover")

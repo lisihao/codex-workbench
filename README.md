@@ -56,6 +56,19 @@ codex-workbench request \
 
 默认路由是 `gpt-5.6-sol` 规划、`gpt-5.6-luna` 执行、`gpt-5.6-sol` 独立验收。可以用 `--executor-model gpt-5.6-terra` 或其他当前 Codex 订阅模型覆盖执行层。每个执行节点获得独立分支和 worktree，最终 verifier 只读取组合后的 patch，不与 Worker 共用上下文。
 
+路由是任务契约的一部分，而不是运行时猜测。低复杂度或可拆分实现优先 Luna，复杂实现升级 Terra；只有显式高复杂度的架构、审查、创意或探索任务，且 Claude 原生订阅认证和配额都可证明时，才允许 Opus/Sonnet/Fable。Sol 始终负责规划和最终验证。CLI 与 Codex MCP 都支持同一组控制字段：`task_type`、`complexity`、`parallelizable`、`claude_allowed` 和正数 `task_points`。
+
+```bash
+codex-workbench request \
+  "审查跨模块架构并给出可验证修复" \
+  --repository /Users/example/Projects/example \
+  --allowed-scope src \
+  --task-type architecture \
+  --complexity high \
+  --task-points 3 \
+  --queue
+```
+
 ## Codex 原生入口
 
 MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
@@ -111,6 +124,8 @@ codex-workbench quota set \
 ```
 
 任何池未知或快照超过 15 分钟时禁止新 Claude 任务；该节点在同一 attempt 内路由给 Codex，不重复调用 Claude。系统不会读取或转发 `ANTHROPIC_API_KEY`。20% 永久作为 PPT 保留池，25% 是吸收在途任务的停线。具名五小时和周窗口让跨窗口保留率成为可验证 Evidence，而不是根据采样时间猜测。fixture、test、controlled 或 simulation 来源的快照不会计入 A6/A7 配额验收。
+
+远程面板同时显示“每 10% Claude 配额产生的 accepted 加权任务点数”。统计只使用同一真实具名窗口内的订阅配额快照和任务 `task_points`；fixture/test/simulation 数据、跨窗口样本以及配额反向增加的窗口不会进入指标。
 
 长期运行时可将 Claude 设置页导出的本地 JSON 文件交给无模型调用的刷新 adapter；服务按周期读取，内容未变化时不重复写账本：
 
@@ -171,12 +186,15 @@ open http://127.0.0.1:18766
 ```bash
 codex-workbench acceptance attest-a12 \
   --artifact /path/to/slides.pptx \
+  --export-receipt /path/to/claude-export-receipt.json \
   --quota-window 2026-W35 \
   --source-session-id claude-web-session-id \
   --note "Claude web completed with the reserved quota pool"
 ```
 
-只有实际存在、SHA-256 与大小匹配、且文件签名/内部结构确认为 PPT、PPTX 或 PDF 的工件才会被账本接收；改扩展名的 fixture 不会通过。当前即使具有 Claude Web session provenance，若没有可核验的 Claude export/receipt 与对应配额快照关联，A12 仍保持 `pending` 并等待人工验收，不会自动标记 `ok`。
+只有实际存在、SHA-256 与大小匹配、且文件签名/内部结构确认为 PPT、PPTX 或 PDF 的工件才会被账本接收；改扩展名的 fixture 不会通过。A12 还要求 export receipt 与工件 digest、Claude Web session、具名真实配额窗口一致，并证明所有适用池仍不少于 20%；缺少任一证据都保持 `pending`。
+
+原始设计到当前实现的逐项状态见 [`docs/fidelity-matrix.md`](docs/fidelity-matrix.md)。矩阵中的 `partial` 和 `external-pending` 不会被描述成已完成。
 
 ## 状态语义
 

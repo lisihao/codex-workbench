@@ -236,8 +236,10 @@ class CodexExecutor(ProcessExecutor):
             f"Instructions: {request.spec['prompt']}\n"
             f"Allowed scope: {json.dumps(contract['allowed_scope'])}\n"
             f"Forbidden scope: {json.dumps(contract['forbidden_scope'])}\n"
+            f"Node write scope: {json.dumps(request.spec.get('write_scopes', ()))}\n"
             f"Acceptance commands: {json.dumps(contract['acceptance_commands'])}\n"
             f"{steering}"
+            "The node write scope is a hard boundary; an empty list means this node is read-only. "
             "Do not push, merge, release, deploy, delete unrelated files, or broaden scope. "
         )
         if request.spec.get("verifier"):
@@ -296,6 +298,9 @@ class CodexExecutor(ProcessExecutor):
 
 
 class ClaudeExecutor(ProcessExecutor):
+    _READ_TOOLS = ("Read", "Glob", "Grep")
+    _WRITE_TOOLS = ("Edit", "Write")
+
     def __init__(
         self,
         artifacts: ArtifactStore,
@@ -341,10 +346,18 @@ class ClaudeExecutor(ProcessExecutor):
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
+        if request.spec.get("verifier"):
+            return NodeResult(
+                status="blocked",
+                summary="Claude executor is worker-only; verifier must be a Codex Sol node",
+                result_kind="worker",
+            )
         qualified, reason = self.qualification(request.spec["model"])
         if not qualified:
             return NodeResult(status="blocked", summary=reason, result_kind="worker")
         prompt = CodexExecutor._prompt(request)
+        schema = self._worker_schema()
+        tools, allowed_tools, permission_mode = self._permission_args(request)
         command = [
             self.binary,
             "-p",
@@ -352,6 +365,15 @@ class ClaudeExecutor(ProcessExecutor):
             request.spec["model"],
             "--output-format",
             "json",
+            "--json-schema",
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            "--no-session-persistence",
+            "--tools",
+            ",".join(tools),
+            "--allowed-tools",
+            *allowed_tools,
+            "--permission-mode",
+            permission_mode,
             prompt,
         ]
         try:
@@ -359,25 +381,129 @@ class ClaudeExecutor(ProcessExecutor):
                 command,
                 cwd=request.worktree,
                 timeout=int(request.contract["timeout_seconds"]),
+                environment=subscription_environment(),
             )
         except subprocess.TimeoutExpired:
             return NodeResult(
                 status="indeterminate",
                 summary="Claude turn timed out; terminal state is unknown",
-                actual_model=request.spec["model"],
                 result_kind="worker",
             )
-        summary = result.stdout.strip()[-2000:] or result.stderr.strip()[-1000:]
+        if result.stdout.strip():
+            artifacts = {
+                **artifacts,
+                "structured-result": self.artifacts.put_text(result.stdout, "result.json"),
+            }
+        response, response_error = self._decode_response(result.stdout)
+        actual_model = self._actual_model(response) if response is not None else None
+        structured = response.get("structured_output") if response is not None else None
+        worker_result, worker_error = self._validate_worker_result(structured)
+        if response_error or worker_error or actual_model is None:
+            reason = response_error or worker_error or "CLI response did not attest the actual model"
+            return NodeResult(
+                status="failed",
+                summary=f"Claude structured result rejected: {reason}",
+                artifacts=artifacts,
+                actual_model=actual_model,
+                exit_code=result.returncode,
+                retryable=False,
+                result_kind="worker",
+            )
+        assert worker_result is not None
+        declared_status = worker_result["status"]
+        status = declared_status if result.returncode == 0 else "failed"
         return NodeResult(
-            status="succeeded" if result.returncode == 0 else "failed",
-            summary=summary or f"Claude exited {result.returncode}",
+            status=status,
+            summary=worker_result["summary"] or f"Claude exited {result.returncode}",
             artifacts=artifacts,
-            actual_model=request.spec["model"],
+            actual_model=actual_model,
             exit_code=result.returncode,
             retryable=False,
             result_kind="worker",
-            checks=(f"claude-exit:{result.returncode}",),
+            changed_paths=tuple(worker_result["changed_paths"]),
+            checks=tuple(worker_result["checks"]),
         )
+
+    @classmethod
+    def _permission_args(
+        cls,
+        request: ExecutionRequest,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+        """Translate the bounded worker contract into Claude's native CLI policy flags."""
+        write_scopes = tuple(request.spec.get("write_scopes", ()))
+        acceptance_commands = tuple(request.contract.get("acceptance_commands", ()))
+        tools = list(cls._READ_TOOLS)
+        allowed = list(cls._READ_TOOLS)
+        if write_scopes:
+            tools.extend(cls._WRITE_TOOLS)
+            allowed.extend(cls._WRITE_TOOLS)
+        if write_scopes and acceptance_commands:
+            tools.append("Bash")
+            allowed.extend(f"Bash({command})" for command in acceptance_commands)
+        return tuple(tools), tuple(allowed), "acceptEdits" if write_scopes else "dontAsk"
+
+    @staticmethod
+    def _worker_schema() -> dict:
+        return CodexExecutor._worker_schema()
+
+    @staticmethod
+    def _decode_response(output: str) -> tuple[dict | None, str | None]:
+        try:
+            response = json.loads(output)
+        except json.JSONDecodeError as error:
+            return None, f"CLI output is not JSON: {error.msg}"
+        if not isinstance(response, dict):
+            return None, "CLI JSON response must be an object"
+        if response.get("type") not in {None, "result"}:
+            return None, "CLI JSON response has an unexpected type"
+        if response.get("is_error") is True:
+            return None, "CLI reported an error"
+        if response.get("subtype") not in {None, "success"}:
+            return None, "CLI reported a non-success result"
+        return response, None
+
+    @staticmethod
+    def _actual_model(response: dict | None) -> str | None:
+        if response is None:
+            return None
+        model_usage = response.get("modelUsage")
+        if isinstance(model_usage, dict):
+            model_names = [
+                name.strip()
+                for name in model_usage
+                if isinstance(name, str) and name.strip()
+            ]
+            if len(model_names) == 1:
+                return model_names[0]
+            if model_names:
+                return None
+        model = response.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        return None
+
+    @staticmethod
+    def _validate_worker_result(value: object) -> tuple[dict | None, str | None]:
+        if not isinstance(value, dict):
+            return None, "structured_output is missing or is not an object"
+        expected = {"status", "summary", "changed_paths", "checks"}
+        if set(value) != expected:
+            return None, "structured_output must contain exactly status, summary, changed_paths, and checks"
+        if value["status"] not in {"succeeded", "failed", "blocked"}:
+            return None, "structured_output.status is invalid"
+        if not isinstance(value["summary"], str):
+            return None, "structured_output.summary must be a string"
+        changed_paths = value["changed_paths"]
+        if not isinstance(changed_paths, list) or not all(
+            isinstance(path, str) for path in changed_paths
+        ):
+            return None, "structured_output.changed_paths must be an array of strings"
+        checks = value["checks"]
+        if not isinstance(checks, list) or not checks or not all(
+            isinstance(check, str) for check in checks
+        ):
+            return None, "structured_output.checks must be a non-empty array of strings"
+        return value, None
 
 
 class FixtureExecutor:
@@ -399,16 +525,36 @@ def validate_worker_scope(
 ) -> NodeResult:
     if request.worktree is None or result.status != "succeeded":
         return result
-    changed = manager.changed_paths(request.worktree, request.contract["base_sha"])
-    disallowed = sorted(
+    changed = tuple(sorted(manager.changed_paths(request.worktree, request.contract["base_sha"])))
+    task_disallowed = tuple(
         path
         for path in changed
         if not scope_allows(path, request.contract["allowed_scope"], request.contract["forbidden_scope"])
     )
-    if disallowed:
+    if task_disallowed:
         return replace(
             result,
             status="failed",
-            summary=f"worker changed paths outside the task contract: {', '.join(disallowed)}",
+            summary=f"worker changed paths outside the task contract: {', '.join(task_disallowed)}",
+            changed_paths=changed,
         )
-    return replace(result, changed_paths=tuple(changed))
+    if not request.spec.get("verifier"):
+        node_write_scopes = tuple(request.spec.get("write_scopes", ()))
+        node_disallowed = tuple(
+            path
+            for path in changed
+            if not scope_allows(path, list(node_write_scopes), [])
+        )
+        if node_disallowed:
+            boundary = (
+                "worker changed paths but node declares no write scopes"
+                if not node_write_scopes
+                else "worker changed paths outside node write scopes"
+            )
+            return replace(
+                result,
+                status="failed",
+                summary=f"{boundary}: {', '.join(node_disallowed)}",
+                changed_paths=changed,
+            )
+    return replace(result, changed_paths=changed)

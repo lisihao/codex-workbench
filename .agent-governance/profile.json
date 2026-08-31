@@ -8,7 +8,7 @@
   "scope_rules": [
     {"scope": "source", "patterns": ["src/**", "tests/**", "scripts/**", "launchd/**"]},
     {"scope": "governance", "patterns": [".agent-governance/**", "AGENTS.md"], "expands": ["source"]},
-    {"scope": "docs", "patterns": ["README.md"]}
+    {"scope": "docs", "patterns": ["README.md", "docs/**"]}
   ],
   "hooks": [],
   "ci_contracts": [

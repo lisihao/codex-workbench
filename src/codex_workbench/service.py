@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import threading
 import time
+from typing import Callable
 
 from .artifacts import ArtifactStore
 from .executors import (
@@ -36,6 +37,7 @@ class Coordinator:
         quota_ttl_seconds: int = 900,
         quota_refresh_seconds: float = 300,
         quota_snapshot_file: Path | None = None,
+        fatal_exit: Callable[[int], None] | None = None,
     ):
         self.store = store
         self.state_root = state_root
@@ -50,6 +52,7 @@ class Coordinator:
         self._routed_to_codex: set[str] = set()
         self._routing_lock = threading.Lock()
         self._stop = threading.Event()
+        self._fatal_exit = fatal_exit if fatal_exit is not None else os._exit
         quota_path = os.environ.get("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE")
         quota_source = Path(quota_path).expanduser() if quota_path else quota_snapshot_file
         self._quota_refresher = (
@@ -143,11 +146,14 @@ class Coordinator:
                 try:
                     future.result()
                 except Exception as error:
-                    self.store.record_system_event(
-                        "coordinator.failed",
-                        {"worker": label, "error": f"{type(error).__name__}: {error}"},
-                    )
-                    self._stop.set()
+                    try:
+                        self.store.record_system_event(
+                            "coordinator.failed",
+                            {"worker": label, "error": f"{type(error).__name__}: {error}"},
+                        )
+                    finally:
+                        self._stop.set()
+                        self._fatal_exit(70)
 
     def _active_claude_models(self) -> tuple[str, ...]:
         with self._routing_lock:

@@ -12,6 +12,7 @@ from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .model import DEFAULT_QUOTA_TTL_SECONDS
+from .quota_productivity import build_quota_productivity
 from .store import StateConflictError, WorkbenchStore
 
 
@@ -61,6 +62,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "quota_policy": quota.policy_summary(
                         max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS
                     ) if quota else None,
+                    "quota_productivity": build_quota_productivity(self.server.store),
                     "acceptance": build_acceptance_report(self.server.store),
                     "diagnostics": {"stale_tasks": self.server.store.stale_tasks()},
                     "authenticated": self._authenticated(),

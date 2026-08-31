@@ -8,6 +8,13 @@ function metric(label, value, tone = "") {
 
 let authenticated = false;
 
+const isPhoneClient = () => /(iphone|android|mobile)/i.test(navigator.userAgent);
+
+function formatTimestamp(value) {
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? "N/A" : timestamp.toLocaleString();
+}
+
 function controls(task) {
   if (!authenticated) return '<a class="login-link" href="/login">登录后控制</a>';
   const action = ["running", "queued", "verifying"].includes(task.state) ? "pause" : ["paused", "inbox", "ready", "needs_fix"].includes(task.state) ? "resume" : null;
@@ -38,7 +45,36 @@ function renderTask(task) {
   const steer = authenticated && !["accepted", "cancelled"].includes(task.state)
     ? `<div class="steering"><input maxlength="500" data-steer-input="${escapeHtml(task.task_id)}" placeholder="给后续 attempt 补充一句指令（不扩大 scope）"><button class="small" data-steer-task="${escapeHtml(task.task_id)}" data-revision="${escapeHtml(task.state_revision)}">发送</button></div>`
     : "";
-  return `<article class="task"><div class="task-head"><div><h3>${escapeHtml(task.task_id)}</h3><p>${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="task-brief"><span>阶段 <strong>${escapeHtml(phase)}</strong></span><span>下一步 <strong>${escapeHtml(nextAction)}</strong></span><span>优先级 / 更新 <strong>${escapeHtml(task.priority)} · ${escapeHtml(new Date(task.updated_at).toLocaleString())}</strong></span><span>最新短指令 <strong>${escapeHtml(steering)}</strong></span></div><div class="nodes">${nodes}</div>${artifacts ? `<div class="artifacts">${artifacts}</div>` : ""}${steer}</article>`;
+  const contract = task.contract || {};
+  const contractDetails = `<details class="task-contract"><summary>查看任务契约、DAG 边界与验收条件</summary><dl><div><dt>仓库 / 基线</dt><dd>${escapeHtml(contract.repository || "N/A")} · ${escapeHtml(contract.base_sha || "N/A")}</dd></div><div><dt>允许范围</dt><dd>${escapeHtml((contract.allowed_scope || []).join(", ") || "N/A")}</dd></div><div><dt>禁止范围</dt><dd>${escapeHtml((contract.forbidden_scope || []).join(", ") || "无")}</dd></div><div><dt>依赖</dt><dd>${escapeHtml((contract.dependencies || []).join(", ") || "无")}</dd></div><div><dt>验收命令</dt><dd>${escapeHtml((contract.acceptance_commands || []).join(" · ") || "N/A")}</dd></div><div><dt>路由 / 权重</dt><dd>${escapeHtml(contract.task_type || "N/A")} · ${escapeHtml(contract.complexity || "N/A")} · ${escapeHtml(contract.task_points ?? 1)} 点</dd></div><div><dt>重试 / 超时</dt><dd>${escapeHtml(contract.retry_limit ?? "N/A")} 轮 · ${escapeHtml(contract.timeout_seconds ?? "N/A")} 秒</dd></div></dl></details>`;
+  return `<article class="task" data-task-card="${escapeHtml(task.task_id)}"><div class="task-head"><div class="task-identity"><h3>${escapeHtml(task.task_id)}</h3><p class="task-objective" data-task-objective="${escapeHtml(task.task_id)}">${escapeHtml(task.contract.objective)}</p></div><div class="task-actions"><span class="pill ${escapeHtml(task.state)}" data-task-state="${escapeHtml(task.task_id)}">${escapeHtml(task.state)}</span>${controls(task)}</div></div><div class="task-brief"><span>阶段 <strong>${escapeHtml(phase)}</strong></span><span>下一步 <strong>${escapeHtml(nextAction)}</strong></span><span>优先级 / 更新 <strong data-task-updated="${escapeHtml(task.task_id)}" data-updated-at="${escapeHtml(task.updated_at)}">${escapeHtml(task.priority)} · ${escapeHtml(formatTimestamp(task.updated_at))}</strong></span><span>最新短指令 <strong>${escapeHtml(steering)}</strong></span></div><div class="nodes">${nodes}</div>${contractDetails}${artifacts ? `<div class="artifacts">${artifacts}</div>` : ""}${steer}</article>`;
+}
+
+function afterNextVisualFrame() {
+  if (typeof requestAnimationFrame !== "function") return Promise.resolve();
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+async function capturePhoneRender(data) {
+  if (!data.authenticated || !isPhoneClient() || sessionStorage.getItem("workbench-phone-observed")) return null;
+  if (!Array.isArray(data.tasks) || data.tasks.length === 0) return null;
+  await afterNextVisualFrame();
+  const section = document.querySelector("#task-ledger-section");
+  const updated = document.querySelector("#updated");
+  if (!section || !updated || updated.dataset.snapshotCursor !== String(data.health.cursor || 0)) return null;
+  if (typeof getComputedStyle === "function" && getComputedStyle(section).display === "none") return null;
+  const renderedTasks = [];
+  for (const task of data.tasks) {
+    const selector = CSS.escape(String(task.task_id));
+    const card = document.querySelector(`[data-task-card="${selector}"]`);
+    const objective = card?.querySelector(`[data-task-objective="${selector}"]`);
+    const state = card?.querySelector(`[data-task-state="${selector}"]`);
+    const taskUpdated = card?.querySelector(`[data-task-updated="${selector}"]`);
+    if (!card || !objective?.textContent.trim() || state?.textContent.trim() !== String(task.state)) return null;
+    if (!taskUpdated?.textContent.trim() || taskUpdated.dataset.updatedAt !== String(task.updated_at)) return null;
+    renderedTasks.push({task_id: String(task.task_id), state: String(task.state), updated_at: String(task.updated_at)});
+  }
+  return {snapshot_cursor: data.health.cursor || 0, rendered_tasks: renderedTasks};
 }
 
 function renderAcceptance(check) {
@@ -82,6 +118,10 @@ async function refreshSnapshot() {
   const active = (counts.running || 0) + (counts.queued || 0) + (counts.verifying || 0);
   const quota = data.quota;
   const quotaPolicy = data.quota_policy;
+  const quotaProductivity = data.quota_productivity;
+  const latestFiveHourProductivity = [...(quotaProductivity?.windows || [])]
+    .reverse()
+    .find((window) => window.kind === "five-hour" && window.status === "ok");
   const activeModels = data.health.active_models || {};
   const activeSonnet = Object.entries(activeModels).filter(([model]) => model.toLowerCase().includes("sonnet")).reduce((total, [, count]) => total + count, 0);
   const activeHigh = Object.entries(activeModels).filter(([model]) => !model.toLowerCase().includes("sonnet") && (model.toLowerCase().includes("opus") || model.toLowerCase().includes("fable"))).reduce((total, [, count]) => total + count, 0);
@@ -100,6 +140,13 @@ async function refreshSnapshot() {
     metric("Claude 五小时剩余", quota?.five_hour_remaining == null ? "未知/禁用" : `${quota.five_hour_remaining}%`, quota?.five_hour_remaining > 25 ? "ok" : "error"),
     metric("Claude 调度区", quotaZones, quotaPolicy?.zone === "green" ? "ok" : quotaPolicy?.zone === "yellow" || quotaPolicy?.zone === "mixed" ? "pending" : "error"),
     metric("Claude 当前并发", `高阶 ${activeHigh}/${highCap} · S ${activeSonnet}/${sonnetCap}`, activeHigh || activeSonnet ? "running" : ""),
+    metric(
+      "每 10% Claude 配额产出",
+      latestFiveHourProductivity?.accepted_points_per_10_percent == null
+        ? "证据不足"
+        : `${latestFiveHourProductivity.accepted_points_per_10_percent} 点`,
+      latestFiveHourProductivity ? "ok" : "pending",
+    ),
     metric("验收通过", `${acceptance.counts.ok}/12`, acceptance.complete ? "ok" : "pending"),
     metric("待处理审批", approvals.length, approvals.length ? "error" : "ok"),
     metric("事件游标", data.health.cursor),
@@ -113,9 +160,12 @@ async function refreshSnapshot() {
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
   document.querySelectorAll("button[data-steer-task]").forEach((button) => button.addEventListener("click", steerTask));
   document.querySelectorAll("button[data-approval]").forEach((button) => button.addEventListener("click", decideApproval));
-  document.querySelector("#updated").textContent = `刷新 ${new Date().toLocaleTimeString()}`;
+  const updated = document.querySelector("#updated");
+  updated.textContent = `刷新 ${new Date().toLocaleTimeString()}`;
+  updated.dataset.snapshotCursor = String(data.health.cursor || 0);
   cursor = Math.max(cursor, data.health.cursor || 0);
-  await recordPhoneObservation(data);
+  const renderedReceipt = await capturePhoneRender(data);
+  await recordPhoneObservation(data, renderedReceipt);
   notifyNewAlerts(alerts);
 }
 
@@ -146,8 +196,8 @@ async function decideApproval(event) {
   await refreshSnapshot();
 }
 
-async function recordPhoneObservation(data) {
-  if (!data.authenticated || !/(iphone|android|mobile)/i.test(navigator.userAgent) || sessionStorage.getItem("workbench-phone-observed")) return;
+async function recordPhoneObservation(data, renderedReceipt) {
+  if (!renderedReceipt) return;
   let clientId = localStorage.getItem("workbench-phone-client-id");
   if (!clientId) {
     clientId = `phone-${crypto.randomUUID()}`;
@@ -156,7 +206,7 @@ async function recordPhoneObservation(data) {
   const response = await fetch("/api/clients/observe", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({client_id: clientId, snapshot_cursor: data.health.cursor || 0}),
+    body: JSON.stringify({client_id: clientId, ...renderedReceipt}),
   });
   if (response.ok) sessionStorage.setItem("workbench-phone-observed", "true");
 }

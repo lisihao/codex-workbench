@@ -8,7 +8,13 @@ import uuid
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .executors import ClaudeExecutor
-from .model import DEFAULT_QUOTA_TTL_SECONDS, TaskContract
+from .model import (
+    CODEX_SOL_MODEL,
+    DEFAULT_QUOTA_TTL_SECONDS,
+    ROUTING_STRATEGY_VERSION,
+    RoutingStrategy,
+    TaskContract,
+)
 from .planner import CodexPlanner
 from .store import WorkbenchStore
 
@@ -32,6 +38,13 @@ def submit_natural_language_request(
     external_write_permission: bool = False,
     queue: bool = True,
     base_sha: str | None = None,
+    routing_strategy: str = ROUTING_STRATEGY_VERSION,
+    task_type: str = "implementation",
+    complexity: str = "standard",
+    parallelizable: bool = True,
+    claude_allowed: bool = True,
+    task_points: float = 1.0,
+    strategy: RoutingStrategy | dict | None = None,
 ) -> dict:
     resolved_repository = Path(repository).expanduser().resolve(strict=True)
     resolved_base_sha = subprocess.check_output(
@@ -45,6 +58,17 @@ def submit_natural_language_request(
         text=True,
     ).strip()
     resolved_task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
+    if strategy is not None:
+        selected_strategy = (
+            RoutingStrategy.from_dict(strategy)
+            if isinstance(strategy, dict)
+            else strategy.normalized()
+        )
+        routing_strategy = selected_strategy.version
+        task_type = selected_strategy.task_type
+        complexity = selected_strategy.complexity
+        parallelizable = selected_strategy.parallelizable
+        claude_allowed = selected_strategy.claude_allowed
     contract = TaskContract(
         task_id=resolved_task_id,
         repository=str(resolved_repository),
@@ -60,6 +84,12 @@ def submit_natural_language_request(
         retry_limit=retry_limit,
         external_write_permission=external_write_permission,
         destructive_action_permission=False,
+        routing_strategy=routing_strategy,
+        task_type=task_type,
+        complexity=complexity,
+        parallelizable=parallelizable,
+        claude_allowed=claude_allowed,
+        task_points=task_points,
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
@@ -74,7 +104,7 @@ def submit_natural_language_request(
         ).action == "claude"
     )
     claude_authenticated = False
-    if quota_admitted_models:
+    if quota_admitted_models and contract.claude_allowed:
         claude_authenticated, _ = ClaudeExecutor(
             artifacts,
             quota,
@@ -90,7 +120,9 @@ def submit_natural_language_request(
         contract,
         claude_models_available=claude_models_available,
         default_executor_model=executor_model,
-        verifier_model=verifier_model,
+        verifier_model=contract.verifier_model or CODEX_SOL_MODEL,
+        quota_snapshot=quota,
+        strategy=contract.strategy,
     )
     resolved_command_id = command_id or f"request-{uuid.uuid4()}"
     store.create_task(contract, nodes, resolved_command_id)
@@ -103,5 +135,6 @@ def submit_natural_language_request(
         "base_sha": resolved_base_sha,
         "claude_dispatch_available": bool(claude_models_available),
         "claude_models_available": claude_models_available,
+        "routing_strategy": contract.strategy.to_dict(),
         "nodes": [node.to_dict() for node in nodes],
     }
