@@ -3,31 +3,29 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.lisihao.codex-workbench-tunnel</string>
+  <string>com.lisihao.codex-workbench-heartbeat</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/ssh</string>
     <string>-T</string>
-    <string>-N</string>
     <string>-o</string>
     <string>BatchMode=yes</string>
     <string>-o</string>
-    <string>ExitOnForwardFailure=yes</string>
+    <string>ConnectTimeout=15</string>
     <string>-o</string>
-    <string>ServerAliveInterval=30</string>
+    <string>ServerAliveInterval=10</string>
     <string>-o</string>
-    <string>ServerAliveCountMax=3</string>
-    <string>-L</string>
-    <string>127.0.0.1:18766:127.0.0.1:8766</string>
+    <string>ServerAliveCountMax=2</string>
     <string>__AUTHORITY_SSH_ALIAS__</string>
+    <string>exec &quot;$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench&quot; client heartbeat --client-id &quot;__CLIENT_ID__&quot; --kind macbook</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
   <integer>300</integer>
   <key>StandardOutPath</key>
-  <string>__LOG_ROOT__/tunnel.log</string>
+  <string>__LOG_ROOT__/heartbeat.log</string>
   <key>StandardErrorPath</key>
-  <string>__LOG_ROOT__/tunnel.error.log</string>
+  <string>__LOG_ROOT__/heartbeat.error.log</string>
 </dict>
 </plist>

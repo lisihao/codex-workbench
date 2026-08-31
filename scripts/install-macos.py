@@ -12,6 +12,8 @@ import subprocess
 import sys
 
 LABEL = "com.lisihao.codex-workbench"
+DEFAULT_TAILSCALE_HTTPS_PORT = 10443
+DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -49,12 +51,61 @@ def macos_machine_id() -> str:
     return "darwin:ioplatformuuid:" + match.group(1).lower()
 
 
+def network_port(value: str) -> int:
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def configure_tailscale_serve(
+    tailscale: str,
+    socket_path: str,
+    *,
+    https_port: int,
+    native_ssh_port: int,
+) -> None:
+    socket_argument = f"--socket={socket_path}"
+    run(
+        tailscale,
+        socket_argument,
+        "serve",
+        "--yes",
+        "--bg",
+        f"--https={https_port}",
+        "http://127.0.0.1:8766",
+    )
+    run(
+        tailscale,
+        socket_argument,
+        "serve",
+        "--yes",
+        "--bg",
+        f"--tcp={native_ssh_port}",
+        "tcp://127.0.0.1:22",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--state-root", default="~/Library/Application Support/Codex Workbench")
     parser.add_argument("--codex-binary", default="~/.codex/packages/standalone/current/codex")
     parser.add_argument("--quota-snapshot-file")
+    parser.add_argument(
+        "--tailscale-socket",
+        help="active userspace tailscaled LocalAPI socket; when set, configure tailnet-only cockpit and native SSH Serve",
+    )
+    parser.add_argument(
+        "--tailscale-https-port",
+        type=network_port,
+        default=DEFAULT_TAILSCALE_HTTPS_PORT,
+    )
+    parser.add_argument(
+        "--tailscale-native-ssh-port",
+        type=network_port,
+        default=DEFAULT_TAILSCALE_NATIVE_SSH_PORT,
+    )
     args = parser.parse_args()
 
     source = Path(args.source).expanduser().resolve()
@@ -178,6 +229,17 @@ def main() -> int:
     run("launchctl", "bootstrap", domain, str(plist_path))
     run("launchctl", "enable", f"{domain}/{LABEL}")
     run("launchctl", "kickstart", "-k", f"{domain}/{LABEL}")
+    if args.tailscale_socket:
+        socket_path = str(Path(args.tailscale_socket).expanduser().resolve(strict=True))
+        tailscale = shutil.which("tailscale")
+        if not tailscale:
+            raise SystemExit("--tailscale-socket requires the tailscale CLI")
+        configure_tailscale_serve(
+            tailscale,
+            socket_path,
+            https_port=args.tailscale_https_port,
+            native_ssh_port=args.tailscale_native_ssh_port,
+        )
     print(f"installed {LABEL} from {source} to {app_root}")
     return 0
 

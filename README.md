@@ -1,6 +1,6 @@
 # Codex Workbench
 
-独立于 DSH 的个人开发基础设施。Mac mini 持有唯一任务账本、后台执行器、Git worktree 和验收证据；MacBook 与手机通过 Tailscale 私网查看同一份状态。
+独立于 DSH 的个人开发基础设施。Mac mini 持有唯一任务账本、后台执行器、Git worktree 和验收证据；本阶段由 MacBook 通过 Tailscale 私网消费同一份状态。手机接入按用户最新决定移入 [`docs/backlog.md`](docs/backlog.md)，不再阻塞当前交付。
 
 核心约束：
 
@@ -20,7 +20,7 @@
 - Evidence 引用在结算和复用时都验证文件存在性与 SHA-256；损坏缓存不会继续复用。
 - 同一路径 scope 仅在同一规范化 repository identity 内互斥，不同仓库不会发生伪冲突；Codex 修复重试按 Luna → Terra → Sol 有界升级。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
-- A1、A2 不再永久写死为 pending：MacBook 心跳间隔和已登录手机的真实渲染回执进入 Mac mini 同一条 Evidence 账本。A12 可以导入并验证 PPT/PDF 工件，但在缺少可核验 Claude export/receipt 与配额快照关联时仍保持 `pending`，等待人工验收。
+- A1 不再永久写死为 pending：MacBook 心跳间隔进入 Mac mini 同一条 Evidence 账本。A2 手机真机接入显示为 `deferred backlog`，不参与当前完成门禁。A12 可以导入并验证 PPT/PDF 工件，但在缺少可核验 Claude export/receipt 与配额快照关联时仍保持 `pending`，等待人工验收。
 - 不确定执行会原子生成持久 `approval` 回执；手机控制面以任务阶段、阻塞原因和下一步为主视图，可带 task revision 明确选择重试、失败或取消。重复提交同一决策保持幂等，冲突决策 fail loud。
 - MacBook/手机可以 revision-fenced 地调整 `-10..10` 任务优先级，或补充最多 500 字的后续 attempt 短指令；调度器按优先级选择 ready 节点，Evidence 复用 key 包含短指令。
 - 面板从事件账本投影完成、阻塞、审批、路由和协调器提醒；用户可启用页面打开期间的浏览器前台通知。真正的页面关闭后台 Push 尚未启用，不把它冒充已交付能力。
@@ -71,14 +71,14 @@ codex-workbench request \
 
 ## Codex 原生入口
 
-MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取 A1–A12 验收报告，以及在契约授权后执行 GitHub 交付。
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取当前验收报告与 backlog，以及在契约授权后执行 GitHub 交付。
 
 ```bash
 scripts/python-runtime scripts/install-macbook-client.py
 codex mcp get codex-workbench
 ```
 
-安装器默认使用 `--ssh-transport auto`：当 SSH 配置解析出的 authority 地址位于 Tailscale `100.64.0.0/10` 时，驾驶舱隧道和 MCP 会通过绝对路径的 `tailscale nc` 用户态 ProxyCommand 连接，避免 macOS 系统路由或其他 VPN 把 CGNAT 地址错误送到物理网卡。普通 SSH 主机继续使用系统数据路径；也可显式选择 `--ssh-transport system` 或 `tailscale-userspace`。
+安装器默认使用 `--ssh-transport auto`：当 SSH 配置解析出的 authority 地址位于 Tailscale `100.64.0.0/10` 时，驾驶舱隧道和 MCP 会复用 `ssh -G` 中完整的用户态 Tailscale socket，通过 tailnet-only TCP Serve `10022` 连接 Mac mini 原生 sshd。认证由普通 SSH key 完成，不依赖会周期要求网页复核的 Tailscale SSH。普通 SSH 主机继续使用系统数据路径；`tailscale-userspace` 只保留为显式 legacy 选项。
 
 ## GitHub 与 Tailscale 同步
 
@@ -147,9 +147,9 @@ export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE="$HOME/Library/Application Support/Co
 | protected | `≤25%` | 不启动 Claude，转 Codex 并保护至少 20% |
 | unknown/auth unavailable | N/A | 不启动 Claude，转 Codex |
 
-## A1–A12 验收面
+## 当前验收面
 
-`codex-workbench acceptance`、MCP `workbench_acceptance_report`、`/api/acceptance` 与远程面板都从同一份 SQLite 账本计算验收状态。命令仅在十二项全部有真实 Evidence 时返回成功；MacBook 离线八小时、手机真机读取、Mac mini 整机重启和 Claude 网页 PPT 等外部旅程在没有回执时保持 `pending`，不会被 fixture 冒充完成。
+`codex-workbench acceptance`、MCP `workbench_acceptance_report`、`/api/acceptance` 与远程面板都从同一份 SQLite 账本计算验收状态。当前门禁包含 A1、A3–A12；只有全部具有真实 Evidence 时命令才返回成功。A2 手机真机接入按用户决定进入 `backlog` 数组，不计入 `complete`。MacBook 离线八小时、Mac mini 整机重启和 Claude 网页 PPT 等外部旅程在没有回执时保持 `pending`，不会被 fixture 冒充完成。
 
 ```bash
 codex-workbench acceptance
@@ -157,13 +157,14 @@ codex-workbench acceptance
 
 ## 远程面板
 
-Mac mini 正式服务只绑定 loopback。通过 Tailscale Serve 将其映射成 tailnet-only HTTPS 地址：
+Mac mini 正式服务只绑定 loopback。正式安装时指定实际运行的 userspace tailscaled socket；安装器会持久配置 HTTPS 驾驶舱与原生 SSH TCP Serve：
 
 ```bash
-tailscale serve --bg --https=10443 http://127.0.0.1:8766
+scripts/python-runtime scripts/install-macos.py \
+  --tailscale-socket /var/run/tailscale/tailscaled.sock
 ```
 
-MacBook 和手机读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断线只产生 stale 投影，不会启动第二个协调器。手机窄屏隐藏工程验收明细，优先显示任务阶段、阻塞/下一步和待处理审批。控制操作需要 `codex-workbench token` 返回的本地令牌。
+MacBook 读取 `/api/snapshot` 与 `/api/events?after=<cursor>`；断线只产生 stale 投影，不会启动第二个协调器。控制操作需要 `codex-workbench token` 返回的本地令牌。手机 UI 与真机回执代码保留，但当前不部署、不验收。
 
 ```bash
 codex-workbench approval list
@@ -179,9 +180,7 @@ scripts/python-runtime scripts/install-macbook-client.py
 open http://127.0.0.1:18766
 ```
 
-隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。隧道断开后最多每五分钟尝试一次重连，避免 Tailscale SSH 资格失效时形成认证重启风暴。同一条 SSH 连接每五分钟在 Mac mini 写入一次服务端时间心跳，不再启动第二条 Heartbeat SSH；同一客户端出现至少八小时心跳空窗，且期间有任务 accepted 后，A1 才会通过。
-
-手机登录控制面并成功渲染真实快照后，页面只在该浏览器会话写入一次 `client.observed` 回执。服务端根据移动 User-Agent、认证 Cookie 和当前事件游标判定 A2；普通匿名 GET 不能生成验收证据。
+隧道只转发 Mac mini 的 loopback 工作台端口；MacBook 不启动协调器、不复制 SQLite，断开也不会影响后台任务。长连接使用 `ssh -N`，远端不再驻留 heartbeat shell。独立 Heartbeat LaunchAgent 每五分钟通过同一原生 SSH-key 传输执行一次短命令并立即退出，避免 SSH 断开后产生孤儿循环或虚假在线 Evidence。同一客户端出现至少八小时心跳空窗，且期间有任务 accepted 后，A1 才会通过。
 
 完成一次 Claude 网页 PPT 旅程后，由 Mac mini 本地管理员导入真实工件：
 

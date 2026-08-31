@@ -20,6 +20,15 @@ class InstallerTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    @staticmethod
+    def _macos_installer_module():
+        path = Path(__file__).resolve().parents[1] / "scripts" / "install-macos.py"
+        spec = importlib.util.spec_from_file_location("codex_workbench_macos_installer", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def _fake_runtime(self, directory: Path, name: str, probe_exit: int) -> Path:
         runtime = directory / name
         runtime.write_text(
@@ -110,17 +119,35 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("KeepAlive", payload)
         self.assertNotIn("ThrottleInterval", payload)
         self.assertIn("127.0.0.1:18766:127.0.0.1:8766", payload["ProgramArguments"])
+        self.assertIn("-N", payload["ProgramArguments"])
+        self.assertEqual(payload["ProgramArguments"][-1], "authority-fixture")
+        self.assertNotIn("client heartbeat", " ".join(payload["ProgramArguments"]))
+
+    def test_macbook_heartbeat_uses_one_bounded_short_lived_native_ssh(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        template = (
+            root / "launchd" / "com.lisihao.codex-workbench-heartbeat.plist.in"
+        ).read_text()
+        rendered = (
+            template.replace("__LOG_ROOT__", "/tmp/logs")
+            .replace("__CLIENT_ID__", "macbook-fixture")
+            .replace("__AUTHORITY_SSH_ALIAS__", "authority-fixture")
+        )
+        payload = plistlib.loads(rendered.encode())
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertEqual(payload["StartInterval"], 300)
+        self.assertNotIn("KeepAlive", payload)
         self.assertEqual(payload["ProgramArguments"][-2], "authority-fixture")
         self.assertIn("client heartbeat", payload["ProgramArguments"][-1])
         self.assertIn("macbook-fixture", payload["ProgramArguments"][-1])
+        self.assertNotIn("while true", payload["ProgramArguments"][-1])
 
-    def test_macbook_installer_retires_the_second_ssh_heartbeat_agent(self) -> None:
+    def test_macbook_installer_installs_tunnel_and_heartbeat_agents(self) -> None:
         source = (
             Path(__file__).resolve().parents[1] / "scripts" / "install-macbook-client.py"
         ).read_text()
-        self.assertIn('LEGACY_HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"', source)
-        self.assertIn("legacy_heartbeat_path.unlink(missing_ok=True)", source)
-        self.assertNotIn("for label in (TUNNEL_LABEL, HEARTBEAT_LABEL)", source)
+        self.assertIn('HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"', source)
+        self.assertIn("for label in (TUNNEL_LABEL, HEARTBEAT_LABEL)", source)
 
     def test_macbook_installer_supports_configurable_authority_alias(self) -> None:
         source = (
@@ -130,12 +157,16 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('default="macmini"', source)
         self.assertIn('__AUTHORITY_SSH_ALIAS__', source)
 
-    def test_macbook_installer_auto_uses_userspace_tailscale_for_cgnat_host(self) -> None:
+    def test_macbook_installer_auto_uses_native_ssh_over_tailscale_serve(self) -> None:
         module = self._macbook_installer_module()
         with mock.patch.object(
             module,
             "configured_ssh_hostname",
             return_value="100.64.0.42",
+        ), mock.patch.object(
+            module,
+            "configured_ssh_proxycommand",
+            return_value=None,
         ), mock.patch.object(
             module.shutil,
             "which",
@@ -147,7 +178,62 @@ class InstallerTests(unittest.TestCase):
             arguments,
             (
                 "-o",
-                "ProxyCommand=/opt/homebrew/bin/tailscale nc %h %p",
+                "ProxyCommand=/opt/homebrew/bin/tailscale nc %h 10022",
+                "-o",
+                "HostKeyAlias=codex-workbench-100.64.0.42",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+            ),
+        )
+
+    def test_macbook_installer_can_still_select_tailscale_ssh_explicitly(self) -> None:
+        module = self._macbook_installer_module()
+        with mock.patch.object(
+            module,
+            "configured_ssh_hostname",
+            return_value="100.64.0.42",
+        ), mock.patch.object(
+            module,
+            "configured_ssh_proxycommand",
+            return_value=None,
+        ), mock.patch.object(
+            module.shutil,
+            "which",
+            return_value="/opt/homebrew/bin/tailscale",
+        ):
+            arguments = module.ssh_transport_arguments(
+                "macmini",
+                "tailscale-userspace",
+            )
+
+        self.assertEqual(
+            arguments,
+            ("-o", "ProxyCommand=/opt/homebrew/bin/tailscale nc %h %p"),
+        )
+
+    def test_native_ssh_preserves_the_configured_userspace_tailscale_socket(self) -> None:
+        module = self._macbook_installer_module()
+        with mock.patch.object(
+            module,
+            "configured_ssh_hostname",
+            return_value="100.64.0.42",
+        ), mock.patch.object(
+            module,
+            "configured_ssh_proxycommand",
+            return_value=(
+                "/opt/homebrew/bin/tailscale "
+                "--socket=/Users/example/.local/share/tailscale-userspace/tailscaled.sock "
+                "nc %h %p"
+            ),
+        ):
+            arguments = module.ssh_transport_arguments("macmini", "auto")
+
+        self.assertEqual(
+            arguments[1],
+            (
+                "ProxyCommand=/opt/homebrew/bin/tailscale "
+                "--socket=/Users/example/.local/share/tailscale-userspace/tailscaled.sock "
+                "nc %h 10022"
             ),
         )
 
@@ -161,6 +247,40 @@ class InstallerTests(unittest.TestCase):
             arguments = module.ssh_transport_arguments("build-server", "auto")
 
         self.assertEqual(arguments, ())
+
+    def test_authority_installer_configures_tailnet_only_https_and_native_ssh(self) -> None:
+        module = self._macos_installer_module()
+        with mock.patch.object(module, "run") as run:
+            module.configure_tailscale_serve(
+                "/opt/homebrew/bin/tailscale",
+                "/var/run/tailscale/tailscaled.sock",
+                https_port=10443,
+                native_ssh_port=10022,
+            )
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    "/opt/homebrew/bin/tailscale",
+                    "--socket=/var/run/tailscale/tailscaled.sock",
+                    "serve",
+                    "--yes",
+                    "--bg",
+                    "--https=10443",
+                    "http://127.0.0.1:8766",
+                ),
+                mock.call(
+                    "/opt/homebrew/bin/tailscale",
+                    "--socket=/var/run/tailscale/tailscaled.sock",
+                    "serve",
+                    "--yes",
+                    "--bg",
+                    "--tcp=10022",
+                    "tcp://127.0.0.1:22",
+                ),
+            ],
+        )
 
 
 if __name__ == "__main__":

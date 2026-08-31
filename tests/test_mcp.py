@@ -56,7 +56,8 @@ class MCPTests(unittest.TestCase):
 
         report = json.loads(self.call("workbench_acceptance_report", {})["content"][0]["text"])
         self.assertFalse(report["complete"])
-        self.assertEqual(len(report["checks"]), 12)
+        self.assertEqual(len(report["checks"]), 11)
+        self.assertEqual(report["backlog"][0]["id"], "A2")
 
     def test_request_exposes_and_forwards_routing_controls(self) -> None:
         with patch(

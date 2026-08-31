@@ -45,7 +45,6 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     authority = store.authority_status()
     checks = [
         _macbook_offline_check(tasks, events),
-        _phone_observation_check(events),
         _restart_check(tasks, events),
         _model_worker_check(tasks, store.artifacts),
         _sol_verifier_check(events),
@@ -57,11 +56,20 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         _authority_check(authority),
         _ppt_reserve_check(events, quota, store.artifacts),
     ]
+    backlog = [
+        AcceptanceCheck(
+            "A2",
+            "deferred",
+            REQUIREMENTS["A2"],
+            "用户已将手机接入移出当前交付范围；回加拿大后再恢复 tailnet 真机验收",
+        )
+    ]
     counts = {status: sum(check.status == status for check in checks) for status in ("ok", "warn", "error", "pending")}
     return {
         "complete": counts["ok"] == len(checks),
         "counts": counts,
         "checks": [check.to_dict() for check in checks],
+        "backlog": [check.to_dict() for check in backlog],
     }
 
 
@@ -760,7 +768,7 @@ def _accepted_evidence_check(
             and _artifact_is_valid(artifacts, node["result"].get("artifacts", {}).get("patch"))
             and _nonempty_strings(node["result"].get("checks"))
             and all(
-                _artifact_is_valid(artifacts, ref)
+                _artifact_is_valid(artifacts, ref, non_empty=False)
                 for ref in node["result"].get("artifacts", {}).values()
             )
             for node in workers
@@ -775,8 +783,16 @@ def _accepted_evidence_check(
             and _nonempty_strings(node["result"].get("checks"))
             and _nonempty_strings(node["result"].get("evidence"))
             and all(_artifact_is_valid(artifacts, ref) for ref in node["result"].get("evidence", ()))
+            and _artifact_is_valid(
+                artifacts,
+                node["result"].get("artifacts", {}).get("test-log"),
+            )
+            and _artifact_is_valid(
+                artifacts,
+                node["result"].get("artifacts", {}).get("verdict"),
+            )
             and all(
-                _artifact_is_valid(artifacts, ref)
+                _artifact_is_valid(artifacts, ref, non_empty=False)
                 for ref in node["result"].get("artifacts", {}).values()
             )
             for node in verifiers

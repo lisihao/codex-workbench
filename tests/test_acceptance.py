@@ -99,9 +99,12 @@ class AcceptanceTests(unittest.TestCase):
                 "completed in Claude web using the reserved pool",
             )
 
-            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            report = build_acceptance_report(store)
+            checks = {check["id"]: check for check in report["checks"]}
+            backlog = {check["id"]: check for check in report["backlog"]}
             self.assertEqual(checks["A1"]["status"], "ok")
-            self.assertEqual(checks["A2"]["status"], "ok")
+            self.assertNotIn("A2", checks)
+            self.assertEqual(backlog["A2"]["status"], "deferred")
             self.assertEqual(checks["A12"]["status"], "pending")
 
     def test_a12_cli_imports_a_content_addressed_artifact(self) -> None:
@@ -443,6 +446,77 @@ class AcceptanceTests(unittest.TestCase):
 
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
             self.assertEqual(checks["A10"]["status"], "pending")
+
+    def test_a10_allows_empty_diagnostic_stderr_when_required_evidence_is_nonempty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("a10-empty-stderr", "test-machine")
+            contract = TaskContract(
+                task_id="a10-empty-stderr",
+                repository=str(root),
+                base_sha="fixture",
+                objective="prove empty stderr is a valid diagnostic artifact",
+                allowed_scope=("src",),
+                required_artifacts=("diff", "test-log", "verdict"),
+                executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+            )
+            nodes = [
+                NodeSpec("work", contract.task_id, "work", "codex", "gpt-5.6-luna", "work"),
+                NodeSpec(
+                    "verify",
+                    contract.task_id,
+                    "verify",
+                    "codex",
+                    "gpt-5.6-sol",
+                    "verify",
+                    depends_on=("work",),
+                    verifier=True,
+                ),
+            ]
+            patch_ref = store.artifacts.put_text("diff --git a/src/a b/src/a\n", "patch")
+            empty_stderr = store.artifacts.put_text("", "stderr.log")
+            test_ref = store.artifacts.put_text("tests passed", "test-log")
+            verdict_ref = store.artifacts.put_text("accepted by Sol", "verdict")
+            store.create_task(contract, nodes, "a10-empty-stderr-create")
+            store.queue_task(contract.task_id)
+            worker = store.claim_ready_node("worker", epoch)
+            assert worker is not None
+            store.settle_claimed(
+                worker,
+                NodeResult(
+                    "succeeded",
+                    "worker complete",
+                    artifacts={"patch": patch_ref, "stderr": empty_stderr},
+                    actual_model="gpt-5.6-luna",
+                    result_kind="worker",
+                    checks=("tests passed",),
+                ),
+            )
+            verifier = store.claim_ready_node("verifier", epoch)
+            assert verifier is not None
+            store.settle_claimed(
+                verifier,
+                NodeResult(
+                    "succeeded",
+                    "accepted",
+                    artifacts={
+                        "test-log": test_ref,
+                        "verdict": verdict_ref,
+                        "stderr": empty_stderr,
+                    },
+                    actual_model="gpt-5.6-sol",
+                    result_kind="verifier",
+                    checks=("tests passed",),
+                    evidence=(test_ref, verdict_ref),
+                    verdict="accepted",
+                ),
+            )
+
+            checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
+            self.assertEqual(checks["A10"]["status"], "ok")
 
     def test_a4_requires_real_worker_artifacts_and_sol_verifier_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

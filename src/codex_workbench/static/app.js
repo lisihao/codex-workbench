@@ -147,15 +147,16 @@ async function refreshSnapshot() {
         : `${latestFiveHourProductivity.accepted_points_per_10_percent} 点`,
       latestFiveHourProductivity ? "ok" : "pending",
     ),
-    metric("验收通过", `${acceptance.counts.ok}/12`, acceptance.complete ? "ok" : "pending"),
+    metric("验收通过", `${acceptance.counts.ok}/${acceptance.checks.length}`, acceptance.complete ? "ok" : "pending"),
     metric("待处理审批", approvals.length, approvals.length ? "error" : "ok"),
     metric("事件游标", data.health.cursor),
   ].join("");
   document.querySelector("#approval-summary").textContent = approvals.length ? `${approvals.length} pending` : "0 pending";
   document.querySelector("#approvals").innerHTML = approvals.length ? approvals.map(renderApproval).join("") : '<p class="muted">当前没有待处理审批</p>';
   document.querySelector("#alerts").innerHTML = alerts.length ? alerts.slice(-8).reverse().map(renderAlert).join("") : '<p class="muted">当前没有重要提醒</p>';
-  document.querySelector("#acceptance-summary").textContent = `${acceptance.counts.ok} ok · ${acceptance.counts.pending} pending · ${acceptance.counts.error} error`;
-  document.querySelector("#acceptance").innerHTML = acceptance.checks.map(renderAcceptance).join("");
+  const backlog = acceptance.backlog || [];
+  document.querySelector("#acceptance-summary").textContent = `${acceptance.counts.ok} ok · ${acceptance.counts.pending} pending · ${acceptance.counts.error} error · ${backlog.length} backlog`;
+  document.querySelector("#acceptance").innerHTML = [...acceptance.checks, ...backlog].map(renderAcceptance).join("");
   document.querySelector("#tasks").innerHTML = data.tasks.length ? data.tasks.map(renderTask).join("") : '<p class="muted">暂无任务</p>';
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
   document.querySelectorAll("button[data-steer-task]").forEach((button) => button.addEventListener("click", steerTask));

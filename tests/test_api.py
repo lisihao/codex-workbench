@@ -35,7 +35,8 @@ class APITests(unittest.TestCase):
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
                 self.assertIsNone(snapshot["quota_policy"])
-                self.assertEqual(len(snapshot["acceptance"]["checks"]), 12)
+                self.assertEqual(len(snapshot["acceptance"]["checks"]), 11)
+                self.assertEqual(snapshot["acceptance"]["backlog"][0]["id"], "A2")
                 with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
                     acceptance = json.load(response)
                 self.assertFalse(acceptance["complete"])
@@ -85,7 +86,9 @@ class APITests(unittest.TestCase):
                 with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
                     acceptance = json.load(response)
                 checks = {check["id"]: check for check in acceptance["checks"]}
-                self.assertEqual(checks["A2"]["status"], "ok")
+                backlog = {check["id"]: check for check in acceptance["backlog"]}
+                self.assertNotIn("A2", checks)
+                self.assertEqual(backlog["A2"]["status"], "deferred")
 
                 contract = TaskContract(
                     task_id="phone-approval",

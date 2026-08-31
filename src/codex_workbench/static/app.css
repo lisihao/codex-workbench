@@ -66,6 +66,7 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .ok, .accepted { color: var(--green); }
 .running, .verifying { color: var(--blue); }
 .pending, .queued, .inbox { color: var(--amber); }
+.deferred { color: var(--muted); }
 .error, .blocked, .failed, .needs_fix, .needs_approval, .indeterminate { color: var(--red); }
 .events { display: grid; gap: 7px; max-height: 330px; overflow: auto; }
 .event { display: grid; grid-template-columns: 72px minmax(110px, 1fr) 2fr; gap: 10px; font: 11px ui-monospace, monospace; padding: 8px 0; border-bottom: 1px solid var(--line); }

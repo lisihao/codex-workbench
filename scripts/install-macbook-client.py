@@ -6,6 +6,7 @@ import ipaddress
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import socket
 import subprocess
@@ -13,8 +14,9 @@ import sys
 
 
 TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
-LEGACY_HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
+HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
 TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -51,7 +53,43 @@ def configured_ssh_hostname(destination: str) -> str:
     return destination
 
 
-def ssh_transport_arguments(destination: str, transport: str) -> tuple[str, ...]:
+def configured_ssh_proxycommand(destination: str) -> str | None:
+    result = run("ssh", "-G", destination, check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key == "proxycommand" and value.strip() not in {"", "none"}:
+            return value.strip()
+    return None
+
+
+def tailscale_proxy_command(command: str | None, port: int) -> str | None:
+    if not command:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not any(Path(token).name == "tailscale" for token in tokens) or "nc" not in tokens:
+        return None
+    if "%p" not in tokens:
+        return None
+    return shlex.join(str(port) if token == "%p" else token for token in tokens)
+
+
+def network_port(value: str) -> int:
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def ssh_transport_arguments(
+    destination: str,
+    transport: str,
+    native_ssh_port: int = DEFAULT_TAILSCALE_NATIVE_SSH_PORT,
+) -> tuple[str, ...]:
     if transport == "system":
         return ()
     hostname = configured_ssh_hostname(destination)
@@ -61,12 +99,32 @@ def ssh_transport_arguments(destination: str, transport: str) -> tuple[str, ...]
                 return ()
         except ValueError:
             return ()
+        transport = "tailscale-native-ssh"
+    configured_proxy = configured_ssh_proxycommand(destination)
+    if transport == "tailscale-userspace" and configured_proxy:
+        return ("-o", f"ProxyCommand={configured_proxy}")
     tailscale = shutil.which("tailscale")
     if not tailscale:
         raise SystemExit(
             "Tailscale userspace SSH transport was selected, but the tailscale CLI is unavailable"
         )
-    return ("-o", f"ProxyCommand={tailscale} nc %h %p")
+    if transport == "tailscale-userspace":
+        return ("-o", f"ProxyCommand={tailscale} nc %h %p")
+    native_proxy = tailscale_proxy_command(configured_proxy, native_ssh_port)
+    if native_proxy is None:
+        native_proxy = f"{tailscale} nc %h {native_ssh_port}"
+    host_key_alias = "codex-workbench-" + "".join(
+        character if character.isalnum() or character in ".-_" else "-"
+        for character in hostname
+    )
+    return (
+        "-o",
+        f"ProxyCommand={native_proxy}",
+        "-o",
+        f"HostKeyAlias={host_key_alias}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    )
 
 
 def main() -> int:
@@ -79,12 +137,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--ssh-transport",
-        choices=("auto", "system", "tailscale-userspace"),
+        choices=("auto", "system", "tailscale-native-ssh", "tailscale-userspace"),
         default="auto",
         help=(
-            "SSH data path. auto uses 'tailscale nc' when the configured host is in "
-            "100.64.0.0/10, avoiding broken macOS system routes"
+            "SSH data path. auto uses tailnet-only Tailscale Serve plus the authority's "
+            "native SSH key when the configured host is in 100.64.0.0/10; "
+            "tailscale-userspace retains built-in Tailscale SSH as an explicit legacy option"
         ),
+    )
+    parser.add_argument(
+        "--tailscale-native-ssh-port",
+        type=network_port,
+        default=DEFAULT_TAILSCALE_NATIVE_SSH_PORT,
+        help="tailnet-only TCP Serve port forwarding to authority sshd (default: 10022)",
     )
     args = parser.parse_args()
     source = Path(args.source).expanduser().resolve()
@@ -96,6 +161,7 @@ def main() -> int:
     transport_arguments = ssh_transport_arguments(
         authority_ssh_alias,
         args.ssh_transport,
+        args.tailscale_native_ssh_port,
     )
     run(
         "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
@@ -111,11 +177,7 @@ def main() -> int:
         character if character.isalnum() or character in ".-_" else "-"
         for character in socket.gethostname()
     )
-    legacy_heartbeat_path = launch_agents / f"{LEGACY_HEARTBEAT_LABEL}.plist"
-    run("launchctl", "bootout", domain, str(legacy_heartbeat_path), check=False)
-    legacy_heartbeat_path.unlink(missing_ok=True)
-
-    for label in (TUNNEL_LABEL,):
+    for label in (TUNNEL_LABEL, HEARTBEAT_LABEL):
         plist_path = launch_agents / f"{label}.plist"
         template = (source / "launchd" / f"{label}.plist.in").read_text()
         rendered = (
@@ -124,7 +186,9 @@ def main() -> int:
             .replace("__AUTHORITY_SSH_ALIAS__", authority_ssh_alias)
         )
         payload = plistlib.loads(rendered.encode())
-        payload["ProgramArguments"][-2:-2] = list(transport_arguments)
+        program_arguments = payload["ProgramArguments"]
+        authority_index = program_arguments.index(authority_ssh_alias)
+        program_arguments[authority_index:authority_index] = list(transport_arguments)
         plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
         plist_path.chmod(0o600)
         run("launchctl", "bootout", domain, str(plist_path), check=False)
@@ -159,10 +223,10 @@ def main() -> int:
     print("Codex Workbench cockpit: http://127.0.0.1:18766")
     print("Codex native entry: MCP server 'codex-workbench'")
     print(f"Authority SSH destination: {authority_ssh_alias}")
-    print(
-        "SSH transport: "
-        + ("tailscale-userspace" if transport_arguments else "system")
-    )
+    transport_label = args.ssh_transport
+    if transport_label == "auto":
+        transport_label = "tailscale-native-ssh" if transport_arguments else "system"
+    print(f"SSH transport: {transport_label}")
     print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes over the cockpit tunnel")
     return 0
 
