@@ -867,8 +867,13 @@ def _legacy_a10_overlay_is_complete(overlay: dict[str, Any], artifacts: Artifact
         and _nonempty_strings(worker.get("checks"))
         and _artifact_is_valid(artifacts, worker.get("artifacts", {}).get("patch", {}).get("ref"))
         and all(
-            isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref"))
-            for item in worker.get("artifacts", {}).values()
+            isinstance(item, dict)
+            and _artifact_is_valid(
+                artifacts,
+                item.get("ref"),
+                non_empty=name == "patch",
+            )
+            for name, item in worker.get("artifacts", {}).items()
         )
         for worker in workers
         if isinstance(worker, dict) and isinstance(worker.get("artifacts"), dict)
@@ -880,7 +885,11 @@ def _legacy_a10_overlay_is_complete(overlay: dict[str, Any], artifacts: Artifact
         and _artifact_is_valid(artifacts, verifier.get("artifacts", {}).get("test-log", {}).get("ref"))
         and _artifact_is_valid(artifacts, verifier.get("artifacts", {}).get("verdict", {}).get("ref"))
         and bool(verifier.get("evidence"))
-        and all(isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref")) for item in verifier["evidence"])
+        and all(
+            isinstance(item, dict)
+            and _artifact_is_valid(artifacts, item.get("ref"), non_empty=False)
+            for item in verifier["evidence"]
+        )
         for verifier in overlay.get("verifiers", [])
         if isinstance(verifier, dict) and isinstance(verifier.get("artifacts"), dict)
     )
@@ -901,7 +910,11 @@ def _legacy_a10_overlay_is_complete(overlay: dict[str, Any], artifacts: Artifact
         and isinstance(supplemental.get("review_transcript"), dict)
         and _artifact_is_valid(artifacts, supplemental["review_transcript"].get("ref"))
         and bool(supplemental.get("evidence"))
-        and all(isinstance(item, dict) and _artifact_is_valid(artifacts, item.get("ref")) for item in supplemental["evidence"])
+        and all(
+            isinstance(item, dict)
+            and _artifact_is_valid(artifacts, item.get("ref"), non_empty=False)
+            for item in supplemental["evidence"]
+        )
         and bool(supplemental.get("worker_artifacts"))
     )
     return valid_worker and (valid_verifier or valid_supplemental)

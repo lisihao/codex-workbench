@@ -204,7 +204,11 @@ def validate_manifest(
         artifacts_raw = item.get("artifacts")
         if not isinstance(artifacts_raw, dict) or "patch" not in artifacts_raw:
             raise ValueError("legacy remediation worker requires a patch artifact")
-        normalized_artifacts = {name: _artifact(artifacts, value) for name, value in artifacts_raw.items() if isinstance(name, str)}
+        normalized_artifacts = {
+            name: _artifact(artifacts, value, required_nonempty=name == "patch")
+            for name, value in artifacts_raw.items()
+            if isinstance(name, str)
+        }
         if len(normalized_artifacts) != len(artifacts_raw):
             raise ValueError("legacy remediation worker artifact names are invalid")
         source_artifact_refs = set(result.get("artifacts", {}).values())
@@ -242,8 +246,19 @@ def validate_manifest(
         artifacts_raw = item.get("artifacts")
         if not isinstance(artifacts_raw, dict) or not {"test-log", "verdict"} <= set(artifacts_raw):
             raise ValueError("legacy remediation verifier requires test-log and verdict artifacts")
-        normalized_artifacts = {name: _artifact(artifacts, value) for name, value in artifacts_raw.items() if isinstance(name, str)}
-        evidence = [_artifact(artifacts, value) for value in item.get("evidence", [])]
+        normalized_artifacts = {
+            name: _artifact(
+                artifacts,
+                value,
+                required_nonempty=name in {"test-log", "verdict"},
+            )
+            for name, value in artifacts_raw.items()
+            if isinstance(name, str)
+        }
+        evidence = [
+            _artifact(artifacts, value, required_nonempty=False)
+            for value in item.get("evidence", [])
+        ]
         if not evidence:
             raise ValueError("legacy remediation verifier requires Evidence artifacts")
         result_artifacts = result.get("artifacts")
@@ -272,7 +287,10 @@ def validate_manifest(
         declared_worker_artifacts = supplemental.get("worker_artifacts")
         if not isinstance(declared_worker_artifacts, list) or not declared_worker_artifacts:
             raise ValueError("legacy remediation supplemental Sol review must bind worker artifacts")
-        bound_worker_artifacts = [_artifact(artifacts, value) for value in declared_worker_artifacts]
+        bound_worker_artifacts = [
+            _artifact(artifacts, value, required_nonempty=False)
+            for value in declared_worker_artifacts
+        ]
         worker_refs = {item["ref"] for item in worker_artifacts}
         if patch["ref"] not in worker_refs or any(item["ref"] not in worker_refs for item in bound_worker_artifacts):
             raise ValueError("legacy remediation supplemental Sol review does not bind the worker overlay")
@@ -401,7 +419,10 @@ def validate_manifest(
         evidence_raw = supplemental.get("evidence")
         if not isinstance(evidence_raw, list) or not evidence_raw:
             raise ValueError("legacy remediation supplemental Sol review requires Evidence artifacts")
-        evidence = [_artifact(artifacts, value) for value in evidence_raw]
+        evidence = [
+            _artifact(artifacts, value, required_nonempty=False)
+            for value in evidence_raw
+        ]
         if (
             any(item["ref"] not in review_artifact_refs for item in (test_log, verdict, review_transcript, review_receipt))
             or tuple(item["ref"] for item in evidence) != review_evidence_refs

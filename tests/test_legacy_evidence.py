@@ -181,6 +181,7 @@ class LegacyEvidenceTests(unittest.TestCase):
         verdict = self._artifact(f"{task_id}: Sol accepted review\n", "verdict")
         transcript = self._artifact(f"{task_id}: independent Sol review transcript\n", "review.log")
         receipt = self._artifact(f"{task_id}: durable review receipt\n", "receipt")
+        empty_stderr = self._artifact("", "stderr.log")
         self.store.settle_claimed(
             verifier,
             NodeResult(
@@ -188,9 +189,10 @@ class LegacyEvidenceTests(unittest.TestCase):
                 artifacts={
                     "test-log": test_log["ref"], "verdict": verdict["ref"],
                     "review-transcript": transcript["ref"], "receipt": receipt["ref"],
+                    "stderr": empty_stderr["ref"],
                 },
                 actual_model="gpt-5.6-sol", result_kind="verifier", checks=("focused review",),
-                evidence=(test_log["ref"], verdict["ref"]), verdict="accepted",
+                evidence=(test_log["ref"], verdict["ref"], empty_stderr["ref"]), verdict="accepted",
             ),
         )
         review_task = self.store.get_task(task_id)
