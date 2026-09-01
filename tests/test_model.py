@@ -164,6 +164,10 @@ class ModelTests(unittest.TestCase):
         self.assertIn("model-routing-v2", prompt)
         self.assertIn("Sonnet costs one unit", prompt)
         self.assertIn("Governance profile: code-as-harness/v1", prompt)
+        self.assertIn("Research routing policy: research-skill/v2", prompt)
+        self.assertIn("Research route: mode=none", prompt)
+        self.assertIn("Only when the user explicitly requests deep, extensive, or parallel research", prompt)
+        self.assertIn("distinguish source evidence from engineering inference", prompt)
 
     def test_codex_environment_isolates_home_and_removes_api_keys(self) -> None:
         with patch.dict(

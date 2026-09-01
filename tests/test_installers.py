@@ -87,6 +87,28 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('"authority_machine_id": macos_machine_id()', source)
         self.assertIn('"--claude-binary"', source)
         self.assertNotIn("CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude", source)
+        self.assertIn('default="~/.agents/skills/research"', source)
+
+    def test_macos_installer_copies_only_managed_research_skill(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            process_home = root / "process-home"
+            for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            unrelated = process_home / ".agents" / "skills" / "unrelated" / "SKILL.md"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text("keep")
+
+            destination = module.install_research_skill(source, process_home)
+
+            self.assertEqual(destination, process_home / ".agents" / "skills" / "research")
+            for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
+                self.assertTrue((destination / relative).is_file())
+            self.assertEqual(unrelated.read_text(), "keep")
 
     def test_authority_launch_agent_persists_quota_source(self) -> None:
         root = Path(__file__).resolve().parents[1]

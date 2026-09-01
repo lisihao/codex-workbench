@@ -17,6 +17,7 @@ from .model import (
     TaskContract,
 )
 from .planner import CodexPlanner
+from .research import route_research
 from .store import WorkbenchStore
 
 
@@ -147,6 +148,7 @@ def submit_natural_language_request(
         "claude_dispatch_available": bool(claude_models_available),
         "claude_models_available": claude_models_available,
         "routing_strategy": contract.strategy.to_dict(),
+        "research": route_research(contract).to_dict(),
         "governance": {
             **governance_status(),
             "verification_tier": contract.verification_tier,

@@ -44,9 +44,13 @@ def governance_directive(contract: Mapping[str, Any]) -> str:
 
 
 def governance_status() -> dict[str, object]:
+    from .research import RESEARCH_POLICY_VERSION, RESEARCH_SKILL_NAME
+
     return {
         "profile": CODE_AS_HARNESS_PROFILE,
         "default_verification_tier": DEFAULT_VERIFICATION_TIER,
         "enforced": True,
         "execution_location": "authority",
+        "research_policy": RESEARCH_POLICY_VERSION,
+        "research_skill": RESEARCH_SKILL_NAME,
     }

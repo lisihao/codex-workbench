@@ -15,6 +15,12 @@ LABEL = "com.lisihao.codex-workbench"
 QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
+RESEARCH_SKILL_REQUIRED_FILES = (
+    "SKILL.md",
+    "UrlVerificationProtocol.md",
+    "Workflows/StandardResearch.md",
+    "Workflows/DeepInvestigation.md",
+)
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -87,6 +93,21 @@ def configure_tailscale_serve(
     )
 
 
+def install_research_skill(source: Path, process_home: Path) -> Path:
+    source = source.expanduser().resolve(strict=True)
+    missing = [name for name in RESEARCH_SKILL_REQUIRED_FILES if not (source / name).is_file()]
+    if missing:
+        raise SystemExit(
+            "Research skill is incomplete; missing required files: " + ", ".join(missing)
+        )
+    destination = process_home / ".agents" / "skills" / "research"
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+    return destination
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]))
@@ -97,6 +118,11 @@ def main() -> int:
         help="absolute or resolvable Claude CLI to use for the passive quota producer",
     )
     parser.add_argument("--quota-snapshot-file")
+    parser.add_argument(
+        "--research-skill-source",
+        default="~/.agents/skills/research",
+        help="complete Research skill copied into the isolated Sol planner home",
+    )
     parser.add_argument(
         "--tailscale-socket",
         help="active userspace tailscaled LocalAPI socket; when set, configure tailnet-only cockpit and native SSH Serve",
@@ -143,6 +169,10 @@ def main() -> int:
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    research_skill = install_research_skill(
+        Path(args.research_skill_source),
+        process_home,
+    )
     config_file = state_root / "config.json"
     config_raw = json.loads(config_file.read_text()) if config_file.exists() else {}
     config_raw.update(
@@ -206,6 +236,12 @@ def main() -> int:
                 "tag": tag,
                 "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "codex_version": codex_version,
+                "research_skill": {
+                    "name": "Research",
+                    "policy": "research-skill/v2",
+                    "source": str(Path(args.research_skill_source).expanduser().resolve()),
+                    "managed_path": str(research_skill),
+                },
             },
             indent=2,
         )

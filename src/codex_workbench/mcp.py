@@ -31,7 +31,7 @@ TOOLS: list[dict[str, Any]] = [
                 "allowed_scopes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                 "source_thread_id": {
                     "type": "string",
-                    "description": "Use the latest /WB context receipt for this Codex thread.",
+                    "description": "Use the latest WB context receipt for this Codex thread.",
                 },
                 "forbidden_scopes": {"type": "array", "items": {"type": "string"}},
                 "acceptance_commands": {"type": "array", "items": {"type": "string"}},
@@ -66,7 +66,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_get_session",
-        "description": "Read the durable /WB binding and active task for one Codex thread.",
+        "description": "Read the durable WB binding and active task for one Codex thread.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -296,7 +296,7 @@ class WorkbenchMCPServer:
             )
             if not repository or not allowed_scopes:
                 raise ValueError(
-                    "repository and allowed_scopes are required unless source_thread_id has an active /WB binding"
+                    "repository and allowed_scopes are required unless source_thread_id has an active WB binding"
                 )
             return self._text(
                 submit_natural_language_request(

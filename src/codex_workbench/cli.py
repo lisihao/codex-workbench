@@ -28,6 +28,7 @@ from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .planner import PlannerError
+from .research import managed_research_skill_status
 from .restart_readiness import assess_restart_readiness
 from .service import Coordinator
 from .session_context import import_session_context
@@ -571,7 +572,10 @@ def command_doctor(args: argparse.Namespace) -> int:
     claude_ok, claude_reason = ClaudeExecutor(artifacts, quota, claude_binary).qualification("sonnet")
     git_code, git_output = _run(["git", "--version"])
     restart_recovery = assess_restart_readiness()
-    overall_ok = codex_ok and git_code == 0 and (
+    research_skill = managed_research_skill_status(
+        os.environ.get("CODEX_WORKBENCH_PROCESS_HOME")
+    )
+    overall_ok = codex_ok and git_code == 0 and research_skill["ok"] is not False and (
         restart_recovery["ready"] if args.require_restart_ready else True
     )
     report = {
@@ -590,6 +594,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "api_key_environment_forwarded": False,
         "restart_recovery": restart_recovery,
         "governance": governance_status(),
+        "research_skill": research_skill,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if overall_ok else 1
