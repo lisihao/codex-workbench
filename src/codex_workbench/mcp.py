@@ -24,11 +24,15 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["objective", "repository", "allowed_scopes"],
+            "required": ["objective"],
             "properties": {
                 "objective": {"type": "string"},
                 "repository": {"type": "string"},
                 "allowed_scopes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "source_thread_id": {
+                    "type": "string",
+                    "description": "Use the latest /WB context receipt for this Codex thread.",
+                },
                 "forbidden_scopes": {"type": "array", "items": {"type": "string"}},
                 "acceptance_commands": {"type": "array", "items": {"type": "string"}},
                 "task_id": {"type": "string"},
@@ -58,6 +62,16 @@ TOOLS: list[dict[str, Any]] = [
                 "external_write_permission": {"type": "boolean", "default": False},
                 "queue": {"type": "boolean", "default": True},
             },
+        },
+    },
+    {
+        "name": "workbench_get_session",
+        "description": "Read the durable /WB binding and active task for one Codex thread.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["source_thread_id"],
+            "properties": {"source_thread_id": {"type": "string"}},
         },
     },
     {
@@ -268,13 +282,29 @@ class WorkbenchMCPServer:
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "workbench_request":
+            source_thread_id = arguments.get("source_thread_id")
+            binding = (
+                self.store.get_session_binding(source_thread_id)
+                if source_thread_id
+                else None
+            )
+            repository = arguments.get("repository") or (
+                binding["repository"] if binding else None
+            )
+            allowed_scopes = arguments.get("allowed_scopes") or (
+                binding["allowed_scopes"] if binding else None
+            )
+            if not repository or not allowed_scopes:
+                raise ValueError(
+                    "repository and allowed_scopes are required unless source_thread_id has an active /WB binding"
+                )
             return self._text(
                 submit_natural_language_request(
                     self.config,
                     self.store,
                     objective=arguments["objective"],
-                    repository=arguments["repository"],
-                    allowed_scope=arguments["allowed_scopes"],
+                    repository=repository,
+                    allowed_scope=allowed_scopes,
                     forbidden_scope=arguments.get("forbidden_scopes", ()),
                     acceptance_commands=arguments.get("acceptance_commands", ()),
                     task_id=arguments.get("task_id"),
@@ -290,8 +320,16 @@ class WorkbenchMCPServer:
                     retry_limit=int(arguments.get("retry_limit", 3)),
                     external_write_permission=bool(arguments.get("external_write_permission", False)),
                     queue=bool(arguments.get("queue", True)),
-                    base_sha=arguments.get("base_sha"),
+                    base_sha=arguments.get("base_sha") or (binding["base_sha"] if binding else None),
+                    source_thread_id=source_thread_id,
+                    context_bundle_ref=binding["context_ref"] if binding else None,
+                    context_excerpt=binding["context_excerpt"] if binding else None,
                 )
+            )
+        if name == "workbench_get_session":
+            binding = self.store.get_session_binding(arguments["source_thread_id"])
+            return self._text(
+                {key: value for key, value in binding.items() if key != "context_excerpt"}
             )
         if name == "workbench_sync_github":
             return self._text(

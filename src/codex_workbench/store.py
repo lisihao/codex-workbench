@@ -26,7 +26,7 @@ from .legacy_evidence import load_manifest, validate_manifest
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _repository_identity(repository: str) -> str:
@@ -175,11 +175,32 @@ class WorkbenchStore:
                     last_used_at TEXT NOT NULL,
                     use_count INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS context_import_receipts (
+                    command_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    source_thread_id TEXT NOT NULL,
+                    context_ref TEXT NOT NULL,
+                    archive_ref TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    allowed_scopes_json TEXT NOT NULL,
+                    context_excerpt TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS session_bindings (
+                    source_thread_id TEXT PRIMARY KEY,
+                    context_ref TEXT NOT NULL,
+                    active_task_id TEXT REFERENCES tasks(task_id),
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
                 CREATE INDEX IF NOT EXISTS task_steering_task_created_idx
                     ON task_steering(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS context_import_thread_created_idx
+                    ON context_import_receipts(source_thread_id, created_at);
                 """
             )
             current = connection.execute(
@@ -190,7 +211,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -1366,6 +1387,147 @@ class WorkbenchStore:
     def record_system_event(self, event_type: str, payload: dict[str, Any]) -> int:
         with self.transaction() as connection:
             return self._event(connection, event_type, None, None, payload)
+
+    def record_session_context(
+        self,
+        *,
+        command_id: str,
+        request_hash: str,
+        source_thread_id: str,
+        context_ref: str,
+        archive_ref: str,
+        manifest: dict[str, Any],
+        repository: str,
+        base_sha: str,
+        allowed_scopes: tuple[str, ...],
+        context_excerpt: str,
+    ) -> dict[str, Any]:
+        if not command_id or not source_thread_id:
+            raise ValueError("command_id and source_thread_id are required")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM context_import_receipts WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise CommandConflictError(
+                        f"command {command_id!r} was already used with a different context bundle"
+                    )
+                return self._context_receipt(existing)
+            connection.execute(
+                """
+                INSERT INTO context_import_receipts(
+                    command_id, request_hash, source_thread_id, context_ref,
+                    archive_ref, manifest_json, repository, base_sha,
+                    allowed_scopes_json, context_excerpt, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command_id,
+                    request_hash,
+                    source_thread_id,
+                    context_ref,
+                    archive_ref,
+                    canonical_json(manifest),
+                    repository,
+                    base_sha,
+                    canonical_json(allowed_scopes),
+                    context_excerpt,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO session_bindings(
+                    source_thread_id, context_ref, active_task_id, updated_at
+                ) VALUES(?, ?, NULL, ?)
+                ON CONFLICT(source_thread_id) DO UPDATE SET
+                    context_ref = excluded.context_ref,
+                    updated_at = excluded.updated_at
+                """,
+                (source_thread_id, context_ref, timestamp),
+            )
+            self._event(
+                connection,
+                "context.imported",
+                None,
+                None,
+                {
+                    "source_thread_id": source_thread_id,
+                    "context_ref": context_ref,
+                    "archive_ref": archive_ref,
+                    "repository": repository,
+                    "base_sha": base_sha,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM context_import_receipts WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            assert row is not None
+            return self._context_receipt(row)
+
+    @staticmethod
+    def _context_receipt(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "command_id": row["command_id"],
+            "source_thread_id": row["source_thread_id"],
+            "context_ref": row["context_ref"],
+            "archive_ref": row["archive_ref"],
+            "manifest": json.loads(row["manifest_json"]),
+            "repository": row["repository"],
+            "base_sha": row["base_sha"],
+            "allowed_scopes": json.loads(row["allowed_scopes_json"]),
+            "context_excerpt": row["context_excerpt"],
+            "created_at": row["created_at"],
+        }
+
+    def get_session_binding(self, source_thread_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            binding = connection.execute(
+                "SELECT * FROM session_bindings WHERE source_thread_id = ?",
+                (source_thread_id,),
+            ).fetchone()
+            if binding is None:
+                raise KeyError(source_thread_id)
+            receipt = connection.execute(
+                """
+                SELECT * FROM context_import_receipts
+                WHERE source_thread_id = ? AND context_ref = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (source_thread_id, binding["context_ref"]),
+            ).fetchone()
+            if receipt is None:
+                raise StateConflictError("session binding points to a missing context receipt")
+            return {
+                **self._context_receipt(receipt),
+                "active_task_id": binding["active_task_id"],
+                "updated_at": binding["updated_at"],
+            }
+
+    def bind_task_to_session(self, source_thread_id: str, task_id: str) -> None:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE session_bindings
+                SET active_task_id = ?, updated_at = ?
+                WHERE source_thread_id = ?
+                """,
+                (task_id, timestamp, source_thread_id),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(source_thread_id)
+            self._event(
+                connection,
+                "context.task_bound",
+                task_id,
+                None,
+                {"source_thread_id": source_thread_id},
+            )
 
     def record_client_heartbeat(self, client_id: str, client_kind: str) -> int:
         if not client_id or len(client_id) > 128 or any(character.isspace() for character in client_id):

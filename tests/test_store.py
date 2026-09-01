@@ -48,7 +48,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 8)
+        self.assertEqual(self.store.health()["schema_version"], 9)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -86,13 +86,37 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 8)
+        self.assertEqual(migrated.health()["schema_version"], 9)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
             }
         self.assertIn("effective_executor", columns)
         self.assertIn("effective_model", columns)
+
+    def test_context_receipt_binds_latest_context_and_task(self) -> None:
+        receipt = self.store.record_session_context(
+            command_id="context-1",
+            request_hash="request-hash",
+            source_thread_id="thread-1",
+            context_ref="sha256:" + "a" * 64 + ":tar.gz",
+            archive_ref="sha256:" + "a" * 64 + ":tar.gz",
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            allowed_scopes=("src",),
+            context_excerpt="history",
+        )
+        self.assertEqual(receipt["source_thread_id"], "thread-1")
+        self.store.create_task(
+            self.contract,
+            verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1"),
+            "context-task",
+        )
+        self.store.bind_task_to_session("thread-1", "task-1")
+        binding = self.store.get_session_binding("thread-1")
+        self.assertEqual(binding["active_task_id"], "task-1")
+        self.assertEqual(binding["context_excerpt"], "history")
 
     def test_nonfixture_result_must_match_governance_contract(self) -> None:
         contract = TaskContract(

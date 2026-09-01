@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.1.6 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.2.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,11 +9,12 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.1.6 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.2.0 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
-| Codex 唯一用户入口 | implemented | Codex stdio MCP 与 CLI 均提交同一 TaskContract | 无独立 DSH 依赖 |
+| Codex 唯一用户入口 | implemented | Codex stdio MCP、CLI 与个人 `/WB` 薄插件均进入同一 Mac mini TaskContract/SQLite；插件不持有第二份任务状态 | 无独立 DSH 依赖 |
+| `/WB` 新旧会话接管 | implemented | UserPromptSubmit Hook 生成经脱敏的 Context Bundle；同步对话、Git patch、untracked/显式关联文件；Mac mini ArtifactStore + SQLite receipt + 隔离 worktree 导入后才返回 active；断网明确回退 MacBook 并保留 outbox | Codex 首次安装/Hook 内容变化后必须由用户在 `/hooks` 完成官方信任流程 |
 | Sol 需求编译与 DAG | implemented | Sol planner 生成 DAG；图验证、依赖闭包、scope 冲突门禁 | 真实 Sol 质量由具体订阅回合决定 |
 | Sol 规划、分层执行、Sol 验收 | implemented | Sol 固定 planner/verifier；routing-v2 以独立 Codex Spark 池处理低复杂度微任务，在配额安全时以 Sonnet 承担标准生产，以 Opus/Fable 承担架构挑战，Luna/Terra 接管回退 | routing-v1 仅为旧合同兼容，不作为新任务默认 |
 | Claude Opus/Sonnet/Fable Worker | implemented | 原生订阅资格、结构化 JSON Schema、工具/权限映射、实际模型证明 | A4 真实 Sonnet 工件仍需一次最小真实回合 |
@@ -45,5 +46,5 @@
 
 1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现。
 2. 后续用户要求的 quota-productive routing-v2 是有意调整：Sol 仍负责规划/验收；低复杂度使用独立 Codex Spark 池，标准生产在安全配额时优先 Sonnet，高复杂度/架构审核优先 Opus/Fable，容量或配额不足由 Spark/Luna/Terra 填充。
-3. 1.1.6 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
+3. 1.2.0 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
 4. 手机接入与页面关闭后的 Web Push 是用户明确后置的 backlog；交互式终端式 Agent attach 仍未实现，三者均不冒充当前交付。

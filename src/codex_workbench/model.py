@@ -228,6 +228,8 @@ class TaskContract:
     task_points: float = 1.0
     governance_profile: str = CODE_AS_HARNESS_PROFILE
     verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
+    source_thread_id: str | None = None
+    context_bundle_ref: str | None = None
 
     def __post_init__(self) -> None:
         # Sol is a role invariant.  ``fixture`` remains available for the
@@ -274,6 +276,14 @@ class TaskContract:
             raise ValueError("objective is required")
         if not self.allowed_scope:
             raise ValueError("allowed_scope must not be empty")
+        if bool(self.source_thread_id) != bool(self.context_bundle_ref):
+            raise ValueError(
+                "source_thread_id and context_bundle_ref must be supplied together"
+            )
+        if self.source_thread_id and any(ch.isspace() for ch in self.source_thread_id):
+            raise ValueError("source_thread_id must contain no whitespace")
+        if self.context_bundle_ref and not self.context_bundle_ref.startswith("sha256:"):
+            raise ValueError("context_bundle_ref must be a content-addressed artifact ref")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if not 0 <= self.retry_limit <= 3:

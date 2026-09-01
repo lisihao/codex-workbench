@@ -34,6 +34,19 @@ def compatible_provenance() -> dict[str, object]:
 
 
 class ModelTests(unittest.TestCase):
+    def test_context_reference_and_source_thread_are_a_paired_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            contract = TaskContract(
+                task_id="context-contract",
+                repository=str(Path(directory).resolve()),
+                base_sha="fixture",
+                objective="continue imported work",
+                allowed_scope=("src",),
+                source_thread_id="thread-1",
+            )
+            with self.assertRaisesRegex(ValueError, "supplied together"):
+                contract.validate()
+
     def test_artifact_refs_reject_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))

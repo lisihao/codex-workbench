@@ -30,6 +30,7 @@ from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContr
 from .planner import PlannerError
 from .restart_readiness import assess_restart_readiness
 from .service import Coordinator
+from .session_context import import_session_context
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
 from .sync import RepositorySynchronizer
@@ -205,6 +206,30 @@ def command_mcp(args: argparse.Namespace) -> int:
 
     config = _config(args)
     serve_stdio(config, _store(config))
+    return 0
+
+
+def command_context(args: argparse.Namespace) -> int:
+    if args.context_action != "import":
+        raise AssertionError(args.context_action)
+    config = _config(args)
+    store = _store(config)
+    if args.archive == "-":
+        result = import_session_context(
+            config,
+            store,
+            sys.stdin.buffer,
+            command_id=args.command_id,
+        )
+    else:
+        with Path(args.archive).expanduser().open("rb") as source:
+            result = import_session_context(
+                config,
+                store,
+                source,
+                command_id=args.command_id,
+            )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -654,6 +679,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     mcp = sub.add_parser("mcp", help="serve the Codex-native Workbench tools over stdio")
     mcp.set_defaults(func=command_mcp)
+
+    context = sub.add_parser("context", help="import and bind a Codex session context")
+    context_sub = context.add_subparsers(dest="context_action", required=True)
+    context_import = context_sub.add_parser("import")
+    context_import.add_argument("--archive", required=True, help="tar.gz path or '-' for stdin")
+    context_import.add_argument("--command-id", required=True)
+    context.set_defaults(func=command_context)
 
     submit = sub.add_parser("submit")
     submit.add_argument("file")

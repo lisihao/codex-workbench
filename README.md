@@ -1,8 +1,8 @@
 # Codex Workbench
 
-当前候选版本：`1.1.6`。
+当前候选版本：`1.2.0`。
 
-独立于 DSH 的个人开发基础设施。核心是常驻服务与统一账本，不是 Codex Skill，也不是 Codex 插件；后续插件若需要，只作为连接同一账本的薄入口。Mac mini 持有唯一任务账本、后台执行器、Git worktree 和验收证据；本阶段由 MacBook 通过 Tailscale 私网消费同一份状态。手机接入按用户最新决定移入 [`docs/backlog.md`](docs/backlog.md)，不再阻塞当前交付。
+独立于 DSH 的个人开发基础设施。核心仍是常驻服务与统一账本；个人 Codex 插件只是 `/WB` 薄入口，不持有第二份任务状态。Mac mini 持有唯一任务账本、后台执行器、Git worktree 和验收证据；本阶段由 MacBook 通过 Tailscale 私网消费同一份状态。手机接入按用户最新决定移入 [`docs/backlog.md`](docs/backlog.md)，不再阻塞当前交付。
 
 核心约束：
 
@@ -19,7 +19,7 @@
 - 非 fixture 任务只有在契约要求的 diff、测试日志与 verifier verdict 全部存在时才能进入 `accepted`。
 - Claude 因认证或保护配额不可用时，同一 attempt 只调用一次 Codex 订阅算子接管，并记录 `node.routed`；不会重启 Claude 或创建第二个任务。
 - Claude 调度严格执行四区策略：`>40%` 绿区共享 2 个容量单位（Sonnet 占 1，Opus/Fable 占 2）；`30%–40%` 黄区仅允许 Sonnet 1；`>25%–<30%` 红区以及 `≤25%` 保护区直接路由 Codex。达到 Claude 容量或上一 Claude 节点完成后尚无更新配额快照时，空余总 Worker 槽由 Spark/Luna/Terra 接管，不闲置队列。
-- SQLite v8 分开保存原始节点契约、`effective_executor/effective_model`、coordinator/node lease epoch 与运行时任务优先级，并在迁移时清除没有治理 receipt 的旧 Evidence ABI 缓存；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
+- SQLite v9 分开保存原始节点契约、`effective_executor/effective_model`、coordinator/node lease epoch、运行时任务优先级，以及 `/WB` Context Bundle receipt 与会话绑定；迁移时清除没有治理 receipt 的旧 Evidence ABI 缓存；短指令使用独立 append-only 记录，不修改原任务契约或 scope。
 - Evidence 引用在结算和复用时都验证文件存在性与 SHA-256；损坏缓存不会继续复用。
 - 同一路径 scope 仅在同一规范化 repository identity 内互斥，不同仓库不会发生伪冲突；微任务使用独立 Codex Spark 池并按 Spark → Luna → Terra → Sol 有界升级，标准任务从 Luna → Terra → Sol 升级。
 - GitHub CI 支持自动 push/PR 与显式 `workflow_dispatch`；纯 Python 门禁使用 Ubuntu 双版本矩阵，macOS 真实性由固定标签的 Mac mini 安装验收覆盖。
@@ -74,12 +74,20 @@ codex-workbench request \
 
 ## Codex 原生入口
 
-MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十一个工具：提交自然语言任务、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取当前验收报告与 backlog，以及在契约授权后执行 GitHub 交付。
+MacBook 安装器会把 `codex-workbench` 注册成 Codex stdio MCP。MCP 默认通过现有 `macmini` SSH/Tailscale 通道在 Mac mini 启动，也可用 `--authority-ssh-alias <SSH别名或user@host>` 指定其他权威端点；它不复制 SQLite，也不依赖 DSH。Codex 可直接使用十二个工具：提交自然语言任务、读取 `/WB` 会话绑定、同步 GitHub、列出/查看任务、控制任务、列出/决策持久审批、读取事件、读取 Evidence Artifact、读取当前验收报告与 backlog，以及在契约授权后执行 GitHub 交付。
 
 ```bash
 scripts/python-runtime scripts/install-macbook-client.py
 codex mcp get codex-workbench
 ```
+
+### `/WB` 会话接管
+
+安装个人插件后，在新的或已有 Codex 会话中输入 `/WB`。插件的 `UserPromptSubmit` Hook 会先生成确定性的 Context Bundle：只保留用户/助手消息、工具调用名称与回合状态，不复制原始工具输出、系统/开发者指令或加密 reasoning；同步当前 `HEAD`、二进制 Git patch、可接受的 untracked 文件和会话中明确引用的本地文件，并排除 `.env`、credential、secret 和 private-key 文件。
+
+Mac mini 先验证压缩包边界与 manifest，再把内容写入 ArtifactStore、持久 receipt 与 SQLite 会话绑定，并在独立 worktree 中提交导入快照。只有拿到 `state=active`、内容地址、导入仓库和 base SHA 的回执后，当前请求才可进入 Workbench；网络不可用时插件保存本地 outbox，明确回退当前 MacBook checkout，并在下一条消息重试。普通未绑定会话不会触发同步。
+
+Codex 对非托管 Hook 要求一次人工信任。安装或更新插件后使用 `/hooks` 审核当前定义；信任按 Hook 内容哈希记录，定义改变后需要重新审核。
 
 安装器默认使用 `--ssh-transport auto`：当 SSH 配置解析出的 authority 地址位于 Tailscale `100.64.0.0/10` 时，驾驶舱隧道和 MCP 会复用 `ssh -G` 中完整的用户态 Tailscale socket，通过 tailnet-only TCP Serve `10022` 连接 Mac mini 原生 sshd。认证由普通 SSH key 完成，不依赖会周期要求网页复核的 Tailscale SSH。普通 SSH 主机继续使用系统数据路径；`tailscale-userspace` 只保留为显式 legacy 选项。
 
@@ -118,7 +126,7 @@ codex-workbench deliver TASK_ID \
 
 ## Claude 配额保护
 
-Claude 没有稳定的官方 CLI 用量接口，因此系统不会猜测余额。v1.1.6 的被动 quota sidecar 只是**精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容实现，不是官方 quota API**：它读取 `auth status --json`（兼容未登录时携带有效 JSON 但退出码为 1），再以无会话持久化的 `/usage` 显示文本取样。安装器显式启动一个每分钟取样的常驻 watcher，避免无人值守 Mac mini 的 GUI launchd domain 处于 `on-demand-only` 时把 `StartInterval` 永久挂起；它既不启动 Claude 工作回合，也不使用 API key。
+Claude 没有稳定的官方 CLI 用量接口，因此系统不会猜测余额。v1.2.0 的被动 quota sidecar 只是**精确锁定 Claude CLI `2.1.239` 的 `/usage` display-text 兼容实现，不是官方 quota API**：它读取 `auth status --json`（兼容未登录时携带有效 JSON 但退出码为 1），再以无会话持久化的 `/usage` 显示文本取样。安装器显式启动一个每分钟取样的常驻 watcher，避免无人值守 Mac mini 的 GUI launchd domain 处于 `on-demand-only` 时把 `StartInterval` 永久挂起；它既不启动 Claude 工作回合，也不使用 API key。
 
 sidecar 遇到明确 `loggedOut` 时写入 `auth_ok=false` 的失败闭锁快照；已登录但 CLI 版本未知、显示文本不符合锁定语法、认证/命令失败时也会先原子替换旧余额为不可用快照，记录本轮错误并在下一分钟继续，避免旧余额继续开闸；非预期进程故障才退出并由 launchd 重启。显示为已使用 `U%` 时，写入的安全剩余下界是 `max(0, 99 - U)%`，不会把向下取整后的显示值当作精确余额。只有同时携带 `producer=codex-workbench.claude-quota`、schema `1`、Claude `2.1.239`、来源 `claude-cli-usage-text-v1` 和 `native-subscription` 认证的兼容采样，才能启动正式 Claude 调度、进入 A6/A7、A8/A12 或单位配额产出指标；旧的手工导入只保留作观察数据，`quota set` 不能声明这组 provenance。这不是已完成的登录态生产验证，真实登录态旅程仍待外部验收。
 

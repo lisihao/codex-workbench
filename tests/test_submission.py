@@ -28,6 +28,70 @@ def compatible_provenance() -> dict[str, object]:
 
 
 class SubmissionTests(unittest.TestCase):
+    def test_imported_context_is_persisted_in_contract_and_bound_to_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            config = WorkbenchConfig(root / "state")
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            context_ref = "sha256:" + "d" * 64 + ":tar.gz"
+            store.record_session_context(
+                command_id="context-import",
+                request_hash="context-hash",
+                source_thread_id="thread-submission",
+                context_ref=context_ref,
+                archive_ref=context_ref,
+                manifest={"schema_version": 1},
+                repository=str(repository),
+                base_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
+                allowed_scopes=("README.md",),
+                context_excerpt="prior context",
+            )
+            planned = [
+                NodeSpec(
+                    "verify",
+                    "task-context",
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    verifier=True,
+                )
+            ]
+            with patch(
+                "codex_workbench.submission.CodexPlanner.compile",
+                return_value=planned,
+            ) as compile_plan:
+                submit_natural_language_request(
+                    config,
+                    store,
+                    objective="continue",
+                    repository=str(repository),
+                    allowed_scope=("README.md",),
+                    task_id="task-context",
+                    queue=False,
+                    source_thread_id="thread-submission",
+                    context_bundle_ref=context_ref,
+                    context_excerpt="prior context",
+                )
+            contract = store.get_task("task-context")["contract"]
+            self.assertEqual(contract["source_thread_id"], "thread-submission")
+            self.assertEqual(contract["context_bundle_ref"], context_ref)
+            self.assertEqual(
+                store.get_session_binding("thread-submission")["active_task_id"],
+                "task-context",
+            )
+            self.assertEqual(compile_plan.call_args.kwargs["context_excerpt"], "prior context")
+
     def test_yellow_zone_exposes_only_authenticated_sonnet_to_planner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -41,6 +41,7 @@ class MCPTests(unittest.TestCase):
             names,
             {
                 "workbench_request",
+                "workbench_get_session",
                 "workbench_sync_github",
                 "workbench_list_tasks",
                 "workbench_inspect_task",
@@ -89,6 +90,40 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(kwargs["claude_allowed"])
         self.assertEqual(kwargs["task_points"], 3.5)
         self.assertEqual(kwargs["verification_tier"], "L3")
+
+    def test_request_resolves_repository_and_scope_from_wb_binding(self) -> None:
+        context_ref = "sha256:" + "b" * 64 + ":tar.gz"
+        self.store.record_session_context(
+            command_id="import-thread",
+            request_hash="context-hash",
+            source_thread_id="thread-wb",
+            context_ref=context_ref,
+            archive_ref=context_ref,
+            manifest={"schema_version": 1},
+            repository=str(self.root),
+            base_sha="fixture-base",
+            allowed_scopes=("src", "tests"),
+            context_excerpt="prior requirement",
+        )
+        with patch(
+            "codex_workbench.mcp.submit_natural_language_request",
+            return_value={"ok": True, "task_id": "from-context"},
+        ) as submit:
+            result = json.loads(
+                self.call(
+                    "workbench_request",
+                    {"objective": "continue", "source_thread_id": "thread-wb"},
+                )["content"][0]["text"]
+            )
+        self.assertEqual(result["task_id"], "from-context")
+        kwargs = submit.call_args.kwargs
+        self.assertEqual(kwargs["repository"], str(self.root))
+        self.assertEqual(kwargs["allowed_scope"], ["src", "tests"])
+        self.assertEqual(kwargs["context_bundle_ref"], context_ref)
+        binding = json.loads(
+            self.call("workbench_get_session", {"source_thread_id": "thread-wb"})["content"][0]["text"]
+        )
+        self.assertNotIn("context_excerpt", binding)
 
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(

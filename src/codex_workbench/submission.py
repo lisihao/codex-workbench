@@ -47,6 +47,9 @@ def submit_natural_language_request(
     task_points: float = 1.0,
     verification_tier: VerificationTier = "L2",
     strategy: RoutingStrategy | dict | None = None,
+    source_thread_id: str | None = None,
+    context_bundle_ref: str | None = None,
+    context_excerpt: str | None = None,
 ) -> dict:
     resolved_repository = Path(repository).expanduser().resolve(strict=True)
     resolved_base_sha = subprocess.check_output(
@@ -93,6 +96,8 @@ def submit_natural_language_request(
         claude_allowed=claude_allowed,
         task_points=task_points,
         verification_tier=verification_tier,
+        source_thread_id=source_thread_id,
+        context_bundle_ref=context_bundle_ref,
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
@@ -126,11 +131,14 @@ def submit_natural_language_request(
         verifier_model=contract.verifier_model or CODEX_SOL_MODEL,
         quota_snapshot=quota,
         strategy=contract.strategy,
+        context_excerpt=context_excerpt,
     )
     resolved_command_id = command_id or f"request-{uuid.uuid4()}"
     store.create_task(contract, nodes, resolved_command_id)
     if queue:
         store.queue_task(resolved_task_id)
+    if source_thread_id:
+        store.bind_task_to_session(source_thread_id, resolved_task_id)
     return {
         "ok": True,
         "task_id": resolved_task_id,
