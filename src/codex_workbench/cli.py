@@ -25,6 +25,7 @@ from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
+from .governance import VERIFICATION_TIERS, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .planner import PlannerError
 from .restart_readiness import assess_restart_readiness
@@ -101,6 +102,7 @@ def command_serve(args: argparse.Namespace) -> int:
             {
                 **identity.to_dict(),
                 "coordinator_epoch": coordinator_epoch,
+                "governance": governance_status(),
                 "ledger_cursor_before_start": ledger["cursor"],
                 "ledger_task_count": sum(ledger["task_counts"].values()),
                 "recovered_indeterminate": recovered,
@@ -125,6 +127,7 @@ def command_serve(args: argparse.Namespace) -> int:
                         "version": __version__,
                         "listen": f"http://{config.host}:{config.port}",
                         "authority": identity.to_dict(),
+                        "governance": governance_status(),
                         "recovered_indeterminate": recovered,
                     }
                 ),
@@ -188,6 +191,7 @@ def command_request(args: argparse.Namespace) -> int:
             parallelizable=not args.serial,
             claude_allowed=not args.no_claude,
             task_points=args.task_points,
+            verification_tier=args.verification_tier,
         )
     except PlannerError as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
@@ -560,6 +564,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "git": {"ok": git_code == 0, "version": git_output},
         "api_key_environment_forwarded": False,
         "restart_recovery": restart_recovery,
+        "governance": governance_status(),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if overall_ok else 1
@@ -679,6 +684,12 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--serial", action="store_true", help="declare that worker nodes must not run in parallel")
     request.add_argument("--no-claude", action="store_true", help="route the task only through Codex subscription models")
     request.add_argument("--task-points", type=float, default=1.0, help="positive acceptance weight used for quota productivity")
+    request.add_argument(
+        "--verification-tier",
+        choices=VERIFICATION_TIERS,
+        default="L2",
+        help="code-as-harness verification tier persisted in the task contract",
+    )
     request.add_argument("--allow-external-write", action="store_true")
     request.add_argument("--queue", action="store_true")
     request.set_defaults(func=command_request)

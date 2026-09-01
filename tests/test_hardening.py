@@ -171,9 +171,9 @@ class WorkbenchHardeningTests(unittest.TestCase):
         loaded = WorkbenchConfig.load(config.state_root)
         self.assertEqual(loaded.effective_quota_snapshot_file, config.state_root / "claude-quota.json")
 
-    def test_schema_v7_invalidates_v1_evidence_cache(self) -> None:
+    def test_schema_v8_invalidates_pre_governance_evidence_cache(self) -> None:
         with self.store.connection() as connection:
-            connection.execute("UPDATE metadata SET value = '6' WHERE key = 'schema_version'")
+            connection.execute("UPDATE metadata SET value = '7' WHERE key = 'schema_version'")
             connection.execute(
                 "INSERT INTO evidence_cache(cache_key,result_json,source_task_id,source_node_id,created_at,last_used_at,use_count) "
                 "VALUES('v1','{}','old','old','now','now',0)"
@@ -279,10 +279,15 @@ class WorkbenchHardeningTests(unittest.TestCase):
         self.assertEqual(result.actual_model, "claude-sonnet-4-5-20250929")
         self.assertEqual(result.changed_paths, ("src/parser.py",))
         self.assertEqual(result.checks, ("python -m unittest tests/test_parser.py",))
+        self.assertEqual(result.governance_profile, "code-as-harness/v1")
+        self.assertEqual(result.verification_tier, "L2")
         command = captured["command"]
         assert isinstance(command, list)
         self.assertIn("-p", command)
         self.assertEqual(command[command.index("--output-format") + 1], "json")
+        governance = command[command.index("--append-system-prompt") + 1]
+        self.assertIn("Governance profile: code-as-harness/v1", governance)
+        self.assertIn("Verification tier: L2", governance)
         schema = json.loads(command[command.index("--json-schema") + 1])
         self.assertEqual(set(schema["required"]), {"status", "summary", "changed_paths", "checks"})
         self.assertEqual(command[command.index("--permission-mode") + 1], "acceptEdits")

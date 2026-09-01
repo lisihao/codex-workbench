@@ -8,6 +8,13 @@ import math
 from pathlib import Path
 from typing import Any, Literal
 
+from .governance import (
+    CODE_AS_HARNESS_PROFILE,
+    DEFAULT_VERIFICATION_TIER,
+    VerificationTier,
+    governance_identity,
+)
+
 
 TaskState = Literal[
     "inbox",
@@ -219,6 +226,8 @@ class TaskContract:
     parallelizable: bool = True
     claude_allowed: bool = True
     task_points: float = 1.0
+    governance_profile: str = CODE_AS_HARNESS_PROFILE
+    verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
 
     def __post_init__(self) -> None:
         # Sol is a role invariant.  ``fixture`` remains available for the
@@ -273,6 +282,7 @@ class TaskContract:
             float(self.task_points)
         ) or float(self.task_points) <= 0:
             raise ValueError("task_points must be a positive finite number")
+        governance_identity(asdict(self))
         self.strategy.validate()
 
     @property
@@ -330,6 +340,7 @@ class TaskContract:
             "claude_enabled": "claude_allowed",
             "claude": "claude_allowed",
             "parallel": "parallelizable",
+            "governance_tier": "verification_tier",
         }
         normalized = {
             aliases.get(key, key): value
@@ -413,6 +424,8 @@ class NodeResult:
     checks: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
     verdict: Literal["accepted", "needs_fix", "blocked"] | None = None
+    governance_profile: str = CODE_AS_HARNESS_PROFILE
+    verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

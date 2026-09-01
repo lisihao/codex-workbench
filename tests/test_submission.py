@@ -82,6 +82,8 @@ class SubmissionTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["claude_models_available"], ("sonnet",))
+            self.assertEqual(result["governance"]["profile"], "code-as-harness/v1")
+            self.assertEqual(result["governance"]["verification_tier"], "L2")
             self.assertEqual(compile_plan.call_args.kwargs["claude_models_available"], ("sonnet",))
 
     def test_structured_routing_strategy_is_forwarded_without_claude_auth(self) -> None:

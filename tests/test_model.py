@@ -13,6 +13,7 @@ from codex_workbench.executors import (
     ExecutionRequest,
     codex_subscription_environment,
 )
+from codex_workbench.governance import CODE_AS_HARNESS_PROFILE
 from codex_workbench.claude_quota import (
     COMPATIBLE_SOURCE,
     PRODUCER,
@@ -58,6 +59,8 @@ class ModelTests(unittest.TestCase):
         prompt = CodexExecutor._prompt(request)
         self.assertIn("Runtime steering: [\"保留公开接口\"]", prompt)
         self.assertIn('Allowed scope: ["src/parser"]', prompt)
+        self.assertIn("Governance profile: code-as-harness/v1", prompt)
+        self.assertIn("Verification tier: L2", prompt)
 
     def test_codex_qualification_requires_companion_host(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -121,7 +124,9 @@ class ModelTests(unittest.TestCase):
                 patch.object(executor, "qualification", return_value=(True, "native-subscription")),
                 patch.object(executor, "_run", side_effect=fake_run),
             ):
-                executor.execute(request)
+                result = executor.execute(request)
+            self.assertEqual(result.governance_profile, CODE_AS_HARNESS_PROFILE)
+            self.assertEqual(result.verification_tier, "L2")
 
     def test_planner_schema_requires_every_declared_property(self) -> None:
         item = PLAN_SCHEMA["properties"]["nodes"]["items"]
@@ -145,6 +150,7 @@ class ModelTests(unittest.TestCase):
         self.assertIn("only when its exact model family appears", prompt)
         self.assertIn("model-routing-v2", prompt)
         self.assertIn("Sonnet costs one unit", prompt)
+        self.assertIn("Governance profile: code-as-harness/v1", prompt)
 
     def test_codex_environment_isolates_home_and_removes_api_keys(self) -> None:
         with patch.dict(
@@ -171,6 +177,20 @@ class ModelTests(unittest.TestCase):
             allowed_scope=("src",),
         )
         self.assertEqual(contract.digest, TaskContract.from_dict(contract.to_dict()).digest)
+        self.assertEqual(contract.governance_profile, CODE_AS_HARNESS_PROFILE)
+        self.assertEqual(contract.verification_tier, "L2")
+
+    def test_contract_rejects_unsupported_governance(self) -> None:
+        contract = TaskContract(
+            task_id="task-1",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            governance_profile="other/v1",
+        )
+        with self.assertRaisesRegex(ValueError, "governance profile"):
+            contract.validate()
 
     def test_contract_rejects_relative_repository(self) -> None:
         contract = TaskContract(

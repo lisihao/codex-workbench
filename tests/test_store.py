@@ -48,7 +48,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 7)
+        self.assertEqual(self.store.health()["schema_version"], 8)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -86,13 +86,62 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 7)
+        self.assertEqual(migrated.health()["schema_version"], 8)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
             }
         self.assertIn("effective_executor", columns)
         self.assertIn("effective_model", columns)
+
+    def test_nonfixture_result_must_match_governance_contract(self) -> None:
+        contract = TaskContract(
+            task_id="governed-task",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="enforce governance receipt",
+            allowed_scope=("src",),
+            verification_tier="L1",
+            verifier_model="fixture",
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec(
+                    "work",
+                    contract.task_id,
+                    "work",
+                    "codex",
+                    "gpt-5.6-luna",
+                    "work",
+                ),
+                NodeSpec(
+                    "verify",
+                    contract.task_id,
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    depends_on=("work",),
+                    verifier=True,
+                ),
+            ],
+            "governed-create",
+        )
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("worker", self.epoch)
+        with self.assertRaisesRegex(ValueError, "verification tier"):
+            self.store.settle_claimed(
+                claimed,
+                NodeResult(
+                    "succeeded",
+                    "done",
+                    actual_model="gpt-5.6-luna",
+                    result_kind="worker",
+                    checks=("focused",),
+                    verification_tier="L2",
+                ),
+            )
 
     def test_cycle_is_rejected(self) -> None:
         nodes = [

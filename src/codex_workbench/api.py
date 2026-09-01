@@ -11,6 +11,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
+from .governance import governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
 from .quota_productivity import build_quota_productivity
 from .store import StateConflictError, WorkbenchStore
@@ -45,7 +46,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             health = self.server.store.health()
             return self._json(
-                {"version": __version__, "build": self._build_manifest(), **health},
+                {
+                    "version": __version__,
+                    "build": self._build_manifest(),
+                    "governance": governance_status(),
+                    **health,
+                },
                 HTTPStatus.OK if health["ok"] else HTTPStatus.SERVICE_UNAVAILABLE,
             )
         if parsed.path == "/api/snapshot":
@@ -54,6 +60,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 {
                     "version": __version__,
                     "build": self._build_manifest(),
+                    "governance": governance_status(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "approvals": self.server.store.list_approvals(),

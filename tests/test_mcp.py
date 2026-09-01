@@ -76,6 +76,7 @@ class MCPTests(unittest.TestCase):
                         "parallelizable": False,
                         "claude_allowed": False,
                         "task_points": 3.5,
+                        "verification_tier": "L3",
                     },
                 )["content"][0]["text"]
             )
@@ -87,6 +88,7 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(kwargs["parallelizable"])
         self.assertFalse(kwargs["claude_allowed"])
         self.assertEqual(kwargs["task_points"], 3.5)
+        self.assertEqual(kwargs["verification_tier"], "L3")
 
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(

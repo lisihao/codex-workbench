@@ -21,11 +21,12 @@ from .model import (
     retry_model,
 )
 from .artifacts import ArtifactStore, presentation_format
+from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _repository_identity(repository: str) -> str:
@@ -189,7 +190,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -218,8 +219,8 @@ class WorkbenchStore:
                     "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
-                # v7 changes the reusable Evidence ABI; old rows cannot prove
-                # the new structured result and artifact invariants.
+                # v8 binds reusable Evidence to the code-as-harness governance
+                # receipt; older rows cannot prove which profile governed them.
                 connection.execute("DELETE FROM evidence_cache")
             elif int(current["value"]) != SCHEMA_VERSION:
                 raise RuntimeError(
@@ -2078,6 +2079,18 @@ class WorkbenchStore:
     ) -> None:
         if spec.get("executor") == "fixture" or spec.get("model") == "fixture":
             return
+        contract = json.loads(row["contract_json"])
+        expected_profile, expected_tier = governance_identity(contract)
+        if result.governance_profile != expected_profile:
+            raise ValueError(
+                f"result governance profile {result.governance_profile!r} does not match "
+                f"contract profile {expected_profile!r}"
+            )
+        if result.verification_tier != expected_tier:
+            raise ValueError(
+                f"result verification tier {result.verification_tier!r} does not match "
+                f"contract tier {expected_tier!r}"
+            )
         if spec.get("verifier"):
             if result.result_kind != "verifier":
                 raise ValueError("verifier result must declare result_kind=verifier")

@@ -8,6 +8,7 @@ import uuid
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .executors import ClaudeExecutor
+from .governance import VerificationTier, governance_status
 from .model import (
     CODEX_SOL_MODEL,
     DEFAULT_QUOTA_TTL_SECONDS,
@@ -44,6 +45,7 @@ def submit_natural_language_request(
     parallelizable: bool = True,
     claude_allowed: bool = True,
     task_points: float = 1.0,
+    verification_tier: VerificationTier = "L2",
     strategy: RoutingStrategy | dict | None = None,
 ) -> dict:
     resolved_repository = Path(repository).expanduser().resolve(strict=True)
@@ -90,6 +92,7 @@ def submit_natural_language_request(
         parallelizable=parallelizable,
         claude_allowed=claude_allowed,
         task_points=task_points,
+        verification_tier=verification_tier,
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
@@ -136,5 +139,9 @@ def submit_natural_language_request(
         "claude_dispatch_available": bool(claude_models_available),
         "claude_models_available": claude_models_available,
         "routing_strategy": contract.strategy.to_dict(),
+        "governance": {
+            **governance_status(),
+            "verification_tier": contract.verification_tier,
+        },
         "nodes": [node.to_dict() for node in nodes],
     }

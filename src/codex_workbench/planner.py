@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from typing import Any
 
+from .governance import governance_directive
 from .model import (
     CODEX_SOL_MODEL,
     DEFAULT_QUOTA_TTL_SECONDS,
@@ -418,7 +419,9 @@ class CodexPlanner:
         default_executor_model: str,
         verifier_model: str,
     ) -> str:
-        return f"""Compile this request into a bounded development DAG. Do not execute tools or modify files.
+        return f"""{governance_directive(contract.to_dict())}
+
+Compile this request into a bounded development DAG. Do not execute tools or modify files.
 
 Objective: {contract.objective}
 Repository: {contract.repository}

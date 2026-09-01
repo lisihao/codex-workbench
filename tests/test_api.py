@@ -38,6 +38,9 @@ class APITests(unittest.TestCase):
                 with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
                     snapshot = json.load(response)
                 self.assertTrue(snapshot["health"]["ok"])
+                self.assertEqual(snapshot["governance"]["profile"], "code-as-harness/v1")
+                self.assertTrue(snapshot["governance"]["enforced"])
+                self.assertEqual(snapshot["governance"]["execution_location"], "authority")
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
                 self.assertIsNone(snapshot["quota_policy"])

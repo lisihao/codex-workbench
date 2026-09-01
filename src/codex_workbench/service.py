@@ -20,6 +20,7 @@ from .executors import (
     validate_worker_scope,
 )
 from .evidence import reusable_evidence_key
+from .governance import governance_receipt_fields
 from .model import (
     LEGACY_ROUTING_STRATEGY_VERSION,
     ClaudeDispatchDecision,
@@ -432,12 +433,14 @@ class Coordinator:
                 summary=f"worktree unavailable: {error}",
                 result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
                 verdict="blocked" if claimed["spec"].get("verifier") else None,
+                **governance_receipt_fields(claimed["contract"]),
             )
         except Exception as error:
             result = NodeResult(
                 status="indeterminate",
                 summary=f"worker crashed: {type(error).__name__}: {error}",
                 result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                **governance_receipt_fields(claimed["contract"]),
             )
         try:
             self.store.settle_node(

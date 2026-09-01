@@ -11,6 +11,7 @@ from typing import Protocol
 
 from .artifacts import ArtifactStore
 from .claude_quota import is_native_subscription_auth
+from .governance import governance_directive, governance_receipt_fields
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeResult, QuotaSnapshot
 from .worktrees import WorktreeManager, scope_allows
 
@@ -95,6 +96,7 @@ class DeterministicExecutor(ProcessExecutor):
             checks=("process-exit:0",) if result.returncode == 0 else (f"process-exit:{result.returncode}",),
             evidence=tuple(artifacts.values()) if verifier else (),
             verdict=("accepted" if result.returncode == 0 else "needs_fix") if verifier else None,
+            **governance_receipt_fields(request.contract),
         )
 
 
@@ -135,6 +137,7 @@ class CodexExecutor(ProcessExecutor):
                 status="blocked", summary=reason,
                 result_kind="verifier" if verifier else "worker",
                 verdict="blocked" if verifier else None,
+                **governance_receipt_fields(request.contract),
             )
         prompt = self._prompt(request)
         schema = self._verifier_schema() if verifier else self._worker_schema()
@@ -182,6 +185,7 @@ class CodexExecutor(ProcessExecutor):
                     summary="Codex turn timed out; terminal state is unknown",
                     actual_model=request.spec["model"],
                     result_kind="verifier" if verifier else "worker",
+                    **governance_receipt_fields(request.contract),
                 )
             structured = None
             if output_path.exists():
@@ -220,10 +224,11 @@ class CodexExecutor(ProcessExecutor):
             checks=tuple(structured.get("checks", ())) if isinstance(structured, dict) else (),
             evidence=tuple(artifacts.values()) if verifier else (),
             verdict=structured.get("verdict") if verifier and isinstance(structured, dict) else None,
+            **governance_receipt_fields(request.contract),
         )
 
     @staticmethod
-    def _prompt(request: ExecutionRequest) -> str:
+    def _prompt(request: ExecutionRequest, *, include_governance: bool = True) -> str:
         contract = request.contract
         steering = (
             f"Runtime steering: {json.dumps(request.steering, ensure_ascii=False)}\n"
@@ -243,12 +248,13 @@ class CodexExecutor(ProcessExecutor):
             "The node write scope is a hard boundary; an empty list means this node is read-only. "
             "Do not push, merge, release, deploy, delete unrelated files, or broaden scope. "
         )
+        governed = governance_directive(contract) + "\n\n" if include_governance else ""
         if request.spec.get("verifier"):
-            return base + (
+            return governed + base + (
                 "You are the independent verifier, not the implementation worker. Inspect the composed diff, "
                 "run the declared acceptance commands, and return accepted only when evidence proves the contract."
             )
-        return base + "Return the structured worker result with changed paths and checks actually run."
+        return governed + base + "Return the structured worker result with changed paths and checks actually run."
 
     @staticmethod
     def _worker_schema() -> dict:
@@ -352,11 +358,17 @@ class ClaudeExecutor(ProcessExecutor):
                 status="blocked",
                 summary="Claude executor is worker-only; verifier must be a Codex Sol node",
                 result_kind="worker",
+                **governance_receipt_fields(request.contract),
             )
         qualified, reason = self.qualification(request.spec["model"])
         if not qualified:
-            return NodeResult(status="blocked", summary=reason, result_kind="worker")
-        prompt = CodexExecutor._prompt(request)
+            return NodeResult(
+                status="blocked",
+                summary=reason,
+                result_kind="worker",
+                **governance_receipt_fields(request.contract),
+            )
+        prompt = CodexExecutor._prompt(request, include_governance=False)
         schema = self._worker_schema()
         tools, allowed_tools, permission_mode = self._permission_args(request)
         command = [
@@ -369,6 +381,8 @@ class ClaudeExecutor(ProcessExecutor):
             "--json-schema",
             json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
             "--no-session-persistence",
+            "--append-system-prompt",
+            governance_directive(request.contract),
             "--tools",
             ",".join(tools),
             "--allowed-tools",
@@ -389,6 +403,7 @@ class ClaudeExecutor(ProcessExecutor):
                 status="indeterminate",
                 summary="Claude turn timed out; terminal state is unknown",
                 result_kind="worker",
+                **governance_receipt_fields(request.contract),
             )
         if result.stdout.strip():
             artifacts = {
@@ -409,6 +424,7 @@ class ClaudeExecutor(ProcessExecutor):
                 exit_code=result.returncode,
                 retryable=False,
                 result_kind="worker",
+                **governance_receipt_fields(request.contract),
             )
         assert worker_result is not None
         declared_status = worker_result["status"]
@@ -423,6 +439,7 @@ class ClaudeExecutor(ProcessExecutor):
             result_kind="worker",
             changed_paths=tuple(worker_result["changed_paths"]),
             checks=tuple(worker_result["checks"]),
+            **governance_receipt_fields(request.contract),
         )
 
     @classmethod
@@ -516,7 +533,12 @@ class FixtureExecutor:
         status = "failed" if outcome.startswith("fail:") else "succeeded"
         summary = outcome.split(":", 1)[1] if ":" in outcome else outcome
         ref = self.artifacts.put_text(summary, "fixture.txt")
-        return NodeResult(status=status, summary=summary, artifacts={"fixture": ref})
+        return NodeResult(
+            status=status,
+            summary=summary,
+            artifacts={"fixture": ref},
+            **governance_receipt_fields(request.contract),
+        )
 
 
 def validate_worker_scope(
