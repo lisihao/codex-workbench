@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from codex_workbench.model import TaskContract
+from codex_workbench.model import NodeSpec, TaskContract
 from codex_workbench.planner import CodexPlanner, PlannerError
 
 
@@ -44,6 +44,39 @@ def node(
 
 
 class PlannerRoutingTests(unittest.TestCase):
+    def test_normalization_accepts_nodes_serialized_with_archify_metadata(self) -> None:
+        contract = make_contract()
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "worker",
+            "codex",
+            "gpt-5.6-luna",
+            "bounded work",
+            read_scopes=("src/worker",),
+            write_scopes=("src/worker",),
+        )
+        verifier = NodeSpec(
+            "verify",
+            contract.task_id,
+            "verify",
+            "codex",
+            "gpt-5.6-sol",
+            "accept",
+            depends_on=("worker",),
+            verifier=True,
+        )
+
+        planned = CodexPlanner.normalize_and_validate_plan(
+            contract,
+            {"summary": "serialized nodes", "nodes": [worker.to_dict(), verifier.to_dict()]},
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual([node.node_id for node in planned], ["worker", "verify"])
+
     def test_normalization_keeps_disjoint_workers_parallel_and_routes_them(self) -> None:
         raw = {
             "summary": "parallel work",
@@ -79,6 +112,78 @@ class PlannerRoutingTests(unittest.TestCase):
         self.assertEqual(planned[-1].model, "gpt-5.6-sol")
         self.assertEqual(set(planned[-1].depends_on), {"worker-a", "worker-b"})
         self.assertEqual(planned[-1].write_scopes, ())
+        self.assertEqual(
+            [(worker.task_type, worker.complexity, worker.parallelizable) for worker in workers],
+            [("implementation", "low", True), ("implementation", "low", True)],
+        )
+        self.assertEqual(
+            [(worker.model_profile, worker.model_reasoning_effort) for worker in workers],
+            [("spark_worker", "xhigh"), ("spark_worker", "xhigh")],
+        )
+
+    def test_mixed_dag_routes_each_node_from_its_typed_metadata(self) -> None:
+        contract = make_contract(complexity="standard")
+        micro = node("micro", write_scope="src/micro")
+        micro.update(
+            {
+                "task_type": "tests",
+                "complexity": "low",
+                "parallelizable": True,
+                "claude_allowed": True,
+                "routing_strategy": "model-routing-v2",
+            }
+        )
+        feature = node("feature", write_scope="src/feature")
+        feature.update(
+            {
+                "task_type": "implementation",
+                "complexity": "standard",
+                "parallelizable": True,
+                "claude_allowed": False,
+                "routing_strategy": "model-routing-v2",
+            }
+        )
+        large = node("large", write_scope="src/large")
+        large.update(
+            {
+                "task_type": "implementation",
+                "complexity": "high",
+                "parallelizable": True,
+                "claude_allowed": False,
+                "routing_strategy": "model-routing-v2",
+            }
+        )
+        verifier = node(
+            "verify",
+            write_scope="",
+            executor="codex",
+            model="gpt-5.6-sol",
+            depends_on=("micro", "feature", "large"),
+            verifier=True,
+        )
+        planned = CodexPlanner.normalize_and_validate_plan(
+            contract,
+            {"summary": "mixed routing", "nodes": [micro, feature, large, verifier]},
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(
+            [
+                (item.node_id, item.model, item.model_profile, item.model_reasoning_effort)
+                for item in planned[:3]
+            ],
+            [
+                ("micro", "gpt-5.3-codex-spark", "spark_worker", "xhigh"),
+                ("feature", "gpt-5.6-luna", "luna_worker", "max"),
+                ("large", "gpt-5.6-terra", "terra_worker", "max"),
+            ],
+        )
+        self.assertEqual(
+            (planned[-1].model, planned[-1].model_profile, planned[-1].model_reasoning_effort),
+            ("gpt-5.6-sol", "sol_control_plane", "max"),
+        )
 
     def test_overlapping_parallel_access_is_rejected_instead_of_serialized(self) -> None:
         raw = {

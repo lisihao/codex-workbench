@@ -8,11 +8,19 @@ from codex_workbench.claude_quota import (
     PRODUCER_SCHEMA_VERSION,
     SUPPORTED_USAGE_VERSION,
 )
-from codex_workbench.model import LEGACY_ROUTING_STRATEGY_VERSION, QuotaSnapshot, TaskContract, now_iso
+from codex_workbench.model import (
+    LEGACY_ROUTING_STRATEGY_VERSION,
+    NodeSpec,
+    QuotaSnapshot,
+    TaskContract,
+    now_iso,
+)
 from codex_workbench.routing import (
     ROUTING_STRATEGY_VERSION,
     codex_fallback_model,
+    route_node,
     route_task,
+    strategy_for_node,
 )
 
 
@@ -101,6 +109,79 @@ class RoutingTests(unittest.TestCase):
                     quota_snapshot=healthy_quota(),
                 )
                 self.assertEqual((decision.executor, decision.model), ("claude", "sonnet"))
+
+    def test_route_decision_exposes_explicit_codex_profile_and_effort(self) -> None:
+        for complexity, expected_model, expected_profile, expected_effort in (
+            ("low", "gpt-5.3-codex-spark", "spark_worker", "xhigh"),
+            ("standard", "gpt-5.6-luna", "luna_worker", "max"),
+            ("high", "gpt-5.6-terra", "terra_worker", "max"),
+        ):
+            with self.subTest(complexity=complexity):
+                decision = route_task(
+                    make_contract(complexity=complexity),
+                    claude_models_available=(),
+                    quota_snapshot=healthy_quota(auth_ok=False),
+                )
+                self.assertEqual(decision.model, expected_model)
+                self.assertEqual(decision.model_profile, expected_profile)
+                self.assertEqual(decision.model_reasoning_effort, expected_effort)
+
+    def test_node_metadata_overrides_contract_for_mixed_dag_routing(self) -> None:
+        contract = make_contract(complexity="standard")
+        cases = (
+            ("micro", "low", True, "gpt-5.3-codex-spark"),
+            ("feature", "standard", True, "gpt-5.6-luna"),
+            ("slice", "high", True, "gpt-5.6-terra"),
+        )
+        for node_id, complexity, parallelizable, expected_model in cases:
+            with self.subTest(node_id=node_id):
+                node = NodeSpec(
+                    node_id,
+                    contract.task_id,
+                    node_id,
+                    "codex",
+                    "gpt-5.6-luna",
+                    "bounded work",
+                    complexity=complexity,
+                    parallelizable=parallelizable,
+                    task_type="implementation",
+                )
+                decision = route_node(
+                    contract,
+                    node,
+                    claude_models_available=(),
+                    quota_snapshot=healthy_quota(auth_ok=False),
+                )
+                self.assertEqual(decision.model, expected_model)
+                self.assertEqual(
+                    strategy_for_node(contract, node).complexity,
+                    complexity,
+                )
+
+    def test_node_cannot_downgrade_the_task_routing_strategy_version(self) -> None:
+        contract = make_contract(routing_strategy=ROUTING_STRATEGY_VERSION)
+        node = {
+            "routing_strategy": LEGACY_ROUTING_STRATEGY_VERSION,
+            "task_type": "implementation",
+            "complexity": "standard",
+            "parallelizable": True,
+            "claude_allowed": True,
+        }
+        with self.assertRaisesRegex(ValueError, "must match task strategy"):
+            strategy_for_node(contract, node)
+
+    def test_node_cannot_reopen_claude_disabled_by_task_contract(self) -> None:
+        contract = make_contract(claude_allowed=False)
+        node = {
+            "routing_strategy": ROUTING_STRATEGY_VERSION,
+            "task_type": "implementation",
+            "complexity": "standard",
+            "parallelizable": True,
+            "claude_allowed": True,
+        }
+
+        with self.assertRaisesRegex(ValueError, "cannot widen task contract"):
+            strategy_for_node(contract, node)
 
     def test_v2_claude_family_priorities_are_contractual(self) -> None:
         cases = (

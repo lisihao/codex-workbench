@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import socket
@@ -17,6 +18,7 @@ from .executors import (
     DeterministicExecutor,
     ExecutionRequest,
     FixtureExecutor,
+    validate_archify_verifier_packets,
     validate_worker_scope,
 )
 from .evidence import reusable_evidence_key
@@ -27,11 +29,16 @@ from .model import (
     NodeResult,
     QuotaSnapshot,
     TaskContract,
+    codex_model_profile,
+    codex_model_reasoning_effort,
 )
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
-from .routing import codex_fallback_model, route_task
+from .routing import codex_fallback_model, route_task, strategy_for_node
 from .store import StateConflictError, WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
+
+
+_ARCHIFY_COMMANDS = frozenset({"deliver", "compare", "visual-check", "validate", "migrate"})
 
 
 @dataclass(frozen=True)
@@ -192,13 +199,15 @@ class Coordinator:
                 0,
             )
         contract = TaskContract.from_dict(contract_raw)
-        shared_capacity = contract.strategy.version != LEGACY_ROUTING_STRATEGY_VERSION
+        node_strategy = strategy_for_node(contract, spec)
+        shared_capacity = node_strategy.version != LEGACY_ROUTING_STRATEGY_VERSION
         governed = route_task(
             contract,
             claude_models_available=(str(spec["model"]),),
             quota_snapshot=quota,
             active_models=(),
             max_age_seconds=quota_ttl_seconds,
+            strategy=node_strategy,
         )
         baseline = quota.dispatch_decision(
             spec["model"],
@@ -349,23 +358,43 @@ class Coordinator:
                 worktree=worktree,
                 steering=claimed["steering"],
             )
+            if spec.get("verifier") and spec.get("executor") != "fixture":
+                request = replace(
+                    request,
+                    archify_receipts=self._archify_receipt_packets(claimed["task_id"]),
+                )
             cache_key = reusable_evidence_key(contract, spec, worktree, request.steering)
             cached = self.store.cached_evidence(cache_key) if cache_key else None
             if cached is not None:
-                self.store.record_evidence_reuse(
-                    cache_key,
-                    claimed["task_id"],
-                    claimed["node_id"],
-                )
-                self.store.settle_node(
-                    claimed["task_id"],
-                    claimed["node_id"],
-                    NodeResult.from_dict(cached["result"]),
-                    attempt=claimed["attempt"],
-                    coordinator_epoch=claimed["coordinator_epoch"],
-                    lease_epoch=claimed["lease_epoch"],
-                )
-                return
+                packet_refs: tuple[str, ...] = ()
+                if spec.get("verifier") and request.archify_receipts:
+                    cache_packet_error, packet_refs = validate_archify_verifier_packets(
+                        request,
+                        self.artifacts,
+                    )
+                    if cache_packet_error is not None:
+                        cached = None
+                if cached is not None:
+                    result = NodeResult.from_dict(cached["result"])
+                    if packet_refs:
+                        result = replace(
+                            result,
+                            evidence=tuple(dict.fromkeys((*result.evidence, *packet_refs))),
+                        )
+                    self.store.record_evidence_reuse(
+                        cache_key,
+                        claimed["task_id"],
+                        claimed["node_id"],
+                    )
+                    self.store.settle_node(
+                        claimed["task_id"],
+                        claimed["node_id"],
+                        result,
+                        attempt=claimed["attempt"],
+                        coordinator_epoch=claimed["coordinator_epoch"],
+                        lease_epoch=claimed["lease_epoch"],
+                    )
+                    return
             if claim_route is None:
                 quota = self.store.latest_quota()
                 claim_route = _ClaimRoute(
@@ -401,13 +430,13 @@ class Coordinator:
                     )
                 else:
                     result = self._executor(spec["executor"]).execute(request)
-                    if spec["executor"] == "claude" and result.status == "blocked":
+                    if spec["executor"] == "claude" and result.status in {"failed", "blocked"}:
                         request, result = self._execute_codex_fallback(
                             claimed,
                             request,
                             result.summary,
                             decision.zone if decision is not None else "unknown",
-                            fallback_kind="claude-executor-blocked",
+                            fallback_kind=f"claude-executor-{result.status}",
                         )
             result = validate_worker_scope(self.worktrees, request, result)
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
@@ -464,8 +493,11 @@ class Coordinator:
         *,
         fallback_kind: str,
     ) -> tuple[ExecutionRequest, NodeResult]:
+        contract = TaskContract.from_dict(request.contract)
+        node_strategy = strategy_for_node(contract, request.spec)
         fallback_model = codex_fallback_model(
-            TaskContract.from_dict(request.contract),
+            contract,
+            strategy=node_strategy,
             attempt=int(claimed["attempt"]),
         )
         with self._routing_lock:
@@ -480,6 +512,8 @@ class Coordinator:
                 "from": "claude",
                 "to": "codex",
                 "model": fallback_model,
+                "model_profile": codex_model_profile(fallback_model),
+                "model_reasoning_effort": codex_model_reasoning_effort(fallback_model),
                 "zone": zone,
                 "reason": reason,
                 "fallback_kind": fallback_kind,
@@ -493,9 +527,16 @@ class Coordinator:
             node_id=request.node_id,
             attempt=request.attempt,
             contract=request.contract,
-            spec={**request.spec, "executor": "codex", "model": fallback_model},
+            spec={
+                **request.spec,
+                "executor": "codex",
+                "model": fallback_model,
+                "model_profile": codex_model_profile(fallback_model),
+                "model_reasoning_effort": codex_model_reasoning_effort(fallback_model),
+            },
             worktree=request.worktree,
             steering=request.steering,
+            archify_receipts=request.archify_receipts,
         )
         return routed_request, self._executor("codex").execute(routed_request)
 
@@ -507,6 +548,75 @@ class Coordinator:
             patch_ref = node["result"].get("artifacts", {}).get("patch")
             if patch_ref:
                 self.worktrees.apply_patch(worktree, self.artifacts.path_for(patch_ref))
+
+    def _archify_receipt_packets(self, task_id: str) -> tuple[dict, ...]:
+        """Load every required Archify receipt for the final Sol verifier.
+
+        Worker receipt artifacts are immutable ArtifactStore objects.  The
+        packet preserves each role and its scope metadata so the verifier
+        cannot accidentally inspect only the first normalized Archify role.
+        Renderer-owning commands carry a pinned artifact-check envelope;
+        ``validate`` carries a pinned command-replay envelope.  The final host
+        gate sees both, so command-only evidence cannot bypass Sol review.
+        ``migrate`` remains unavailable to current role contracts and is
+        rejected before settlement.
+        """
+
+        task = self.store.get_task(task_id)
+        packets: list[dict] = []
+        for node in task["nodes"]:
+            if node.get("verifier"):
+                continue
+            directive = node.get("archify")
+            if not (
+                isinstance(directive, dict)
+                and directive.get("schema_version") == 1
+                and directive.get("artifact_required") is True
+                and isinstance(directive.get("role"), str)
+            ):
+                continue
+            result = node.get("result")
+            artifacts = result.get("artifacts") if isinstance(result, dict) else None
+            receipt_ref = artifacts.get("archify-receipt") if isinstance(artifacts, dict) else None
+            execution_ref = artifacts.get("archify-execution") if isinstance(artifacts, dict) else None
+            if node.get("state") != "accepted" or not isinstance(receipt_ref, str):
+                raise ValueError(f"accepted Archify worker {node['node_id']} lacks validated receipt evidence")
+            if not isinstance(node.get("worktree"), str) or not node["worktree"]:
+                raise ValueError(f"accepted Archify worker {node['node_id']} lacks a worktree")
+            try:
+                receipt = json.loads(self.artifacts.verify(receipt_ref).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"accepted Archify worker {node['node_id']} has unreadable receipt evidence: {error}"
+                ) from error
+            if not isinstance(receipt, dict):
+                raise ValueError(f"accepted Archify worker {node['node_id']} receipt artifact is not an object")
+            command = receipt.get("command")
+            if command not in _ARCHIFY_COMMANDS:
+                raise ValueError(
+                    f"accepted Archify worker {node['node_id']} has unsupported receipt command {command!r}"
+                )
+            if not isinstance(execution_ref, str):
+                raise ValueError(f"accepted Archify worker {node['node_id']} lacks validated receipt evidence")
+            try:
+                self.artifacts.verify(execution_ref)
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"accepted Archify worker {node['node_id']} has unreadable execution evidence: {error}"
+                ) from error
+            packets.append(
+                {
+                    "node_id": node["node_id"],
+                    "role": directive["role"],
+                    "receipt_ref": receipt_ref,
+                    "execution_ref": execution_ref,
+                    "receipt": receipt,
+                    "worktree": node["worktree"],
+                    "read_scopes": list(node.get("read_scopes", ())),
+                    "write_scopes": list(node.get("write_scopes", ())),
+                }
+            )
+        return tuple(packets)
 
     def _executor(self, kind: str):
         if kind == "fixture":

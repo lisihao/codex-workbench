@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import Future
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -24,9 +24,11 @@ from codex_workbench.claude_quota import (
     PRODUCER_SCHEMA_VERSION,
     SUPPORTED_USAGE_VERSION,
 )
+from codex_workbench.evidence import evidence_fingerprint
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
-from codex_workbench.service import Coordinator
-from codex_workbench.executors import FixtureExecutor
+from codex_workbench.service import Coordinator, _ClaimRoute
+from codex_workbench.executors import ExecutionRequest, FixtureExecutor
+from codex_workbench.planner import archify_internal_directive
 from codex_workbench.store import WorkbenchStore
 
 
@@ -49,6 +51,49 @@ def compatible_provenance() -> dict[str, object]:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_evidence_fingerprint_binds_repository_base_and_required_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            (repository / "checked.txt").write_text("stable\n")
+            subprocess.run(["git", "add", "checked.txt"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=fixture@example.invalid", "-c", "user.name=Fixture", "commit", "-qm", "base"],
+                cwd=repository,
+                check=True,
+            )
+            contract = {
+                "repository": str(repository),
+                "base_sha": "base-sha",
+                "objective": "verify the declared input",
+                "allowed_scope": ("checked.txt",),
+                "forbidden_scope": (),
+                "required_artifacts": ("test-log", "verdict"),
+                "acceptance_commands": ("python -m unittest",),
+                "verification_tier": "L3",
+                "governance_profile": "code-as-harness/v1",
+            }
+            spec = {
+                "executor": "deterministic",
+                "verifier": True,
+                "read_scopes": ("checked.txt",),
+                "write_scopes": (),
+                "model": "fixture",
+            }
+            baseline = evidence_fingerprint(contract, spec, repository)
+
+            for field, value in (
+                ("repository", "/different/repository"),
+                ("base_sha", "different-base-sha"),
+                ("required_artifacts", ("test-log", "verdict", "manifest")),
+            ):
+                changed = {**contract, field: value}
+                self.assertNotEqual(
+                    baseline,
+                    evidence_fingerprint(changed, spec, repository),
+                    field,
+                )
+
     def test_runtime_rechecks_contract_before_executing_a_persisted_claude_node(self) -> None:
         contract = TaskContract(
             task_id="runtime-policy",
@@ -80,6 +125,162 @@ class ServiceTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.action, "codex")
         self.assertIn("does not admit Claude", decision.reason)
+
+    def test_runtime_routes_high_architecture_node_using_node_metadata(self) -> None:
+        contract = TaskContract(
+            task_id="node-routing-architecture",
+            repository="/tmp/node-routing-architecture",
+            base_sha="base",
+            objective="ordinary implementation task",
+            allowed_scope=("README.md",),
+            task_type="implementation",
+            complexity="standard",
+        )
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+        decision = Coordinator._claude_decision(
+            {
+                "executor": "claude",
+                "model": "opus",
+                "routing_strategy": "model-routing-v2",
+                "task_type": "architecture",
+                "complexity": "high",
+                "parallelizable": True,
+                "claude_allowed": True,
+            },
+            contract.to_dict(),
+            quota,
+        )
+
+        assert decision is not None
+        self.assertEqual(decision.action, "claude")
+
+    def test_runtime_honors_node_claude_allowed_false(self) -> None:
+        contract = TaskContract(
+            task_id="node-routing-no-claude",
+            repository="/tmp/node-routing-no-claude",
+            base_sha="base",
+            objective="architecture review",
+            allowed_scope=("README.md",),
+            task_type="architecture",
+            complexity="high",
+            claude_allowed=True,
+        )
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+        decision = Coordinator._claude_decision(
+            {
+                "executor": "claude",
+                "model": "opus",
+                "routing_strategy": "model-routing-v2",
+                "task_type": "architecture",
+                "complexity": "high",
+                "parallelizable": True,
+                "claude_allowed": False,
+            },
+            contract.to_dict(),
+            quota,
+        )
+
+        assert decision is not None
+        self.assertEqual(decision.action, "codex")
+        self.assertIn("does not admit Claude", decision.reason)
+
+    def test_codex_fallback_uses_high_architecture_node_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            coordinator = Coordinator(store, root, coordinator_epoch=7)
+            request = ExecutionRequest(
+                task_id="node-fallback",
+                node_id="architecture",
+                attempt=1,
+                contract=TaskContract(
+                    task_id="node-fallback",
+                    repository=str(root),
+                    base_sha="base",
+                    objective="ordinary implementation",
+                    allowed_scope=("README.md",),
+                    task_type="implementation",
+                    complexity="standard",
+                ).to_dict(),
+                spec={
+                    "executor": "claude",
+                    "model": "opus",
+                    "routing_strategy": "model-routing-v2",
+                    "task_type": "architecture",
+                    "complexity": "high",
+                    "parallelizable": True,
+                    "claude_allowed": True,
+                },
+                worktree=root,
+            )
+            claimed = {
+                "task_id": "node-fallback",
+                "node_id": "architecture",
+                "attempt": 1,
+                "coordinator_epoch": 7,
+                "lease_epoch": 1,
+            }
+            codex = MagicMock()
+            codex.execute.return_value = NodeResult(
+                status="succeeded",
+                summary="fallback complete",
+                actual_model="gpt-5.6-terra",
+                checks=("focused-check",),
+            )
+            with patch.object(coordinator, "_executor", return_value=codex):
+                routed, _ = coordinator._execute_codex_fallback(
+                    claimed,
+                    request,
+                    "Claude unavailable",
+                    "unknown",
+                    fallback_kind="test",
+                )
+
+            self.assertEqual(routed.spec["model"], "gpt-5.6-terra")
+            route_payload = store.record_node_route.call_args.kwargs["payload"]
+            self.assertEqual(route_payload["model"], "gpt-5.6-terra")
+
+    def test_archify_receipt_packets_require_host_execution_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            coordinator = Coordinator(store, root, coordinator_epoch=7)
+            receipt_ref = coordinator.artifacts.put_text(
+                json.dumps({"command": "validate"}),
+                "archify-receipt.json",
+            )
+            store.get_task.return_value = {
+                "nodes": [
+                    {
+                        "node_id": "worker",
+                        "state": "accepted",
+                        "worktree": str(root),
+                        "read_scopes": ["src"],
+                        "write_scopes": [],
+                        "archify": archify_internal_directive("architecture", True),
+                        "result": {"artifacts": {"archify-receipt": receipt_ref}},
+                    }
+                ]
+            }
+
+            with self.assertRaisesRegex(ValueError, "lacks validated receipt evidence"):
+                coordinator._archify_receipt_packets("archify-validate")
 
     def test_worker_future_exception_exits_process_and_persists_failed_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +527,88 @@ raise AssertionError("fatal coordinator failure returned")
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
             self.assertEqual(checks["A8"]["status"], "pending")
             self.assertEqual(checks["A9"]["status"], "ok")
+
+    def test_failed_claude_node_falls_back_once_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("failed-fallback", "test-machine")
+            store.write_quota(
+                QuotaSnapshot(
+                    observed_at=now_iso(),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=60,
+                    weekly_all_remaining=60,
+                    weekly_sonnet_remaining=60,
+                    **compatible_provenance(),
+                )
+            )
+            contract = TaskContract(
+                task_id="failed-fallback",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="fallback after a failed Claude attempt",
+                allowed_scope=("README.md",),
+                executor_model="gpt-5.6-luna",
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "claude",
+                "sonnet",
+                "inspect the fixture",
+                read_scopes=("README.md",),
+            )
+            store.create_task(contract, verified([node], contract.task_id), "failed-fallback-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("worker-1", epoch)
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch, max_workers=1)
+
+            class StubExecutor:
+                def __init__(self, result: NodeResult):
+                    self.result = result
+                    self.calls = 0
+
+                def execute(self, _request):
+                    self.calls += 1
+                    return self.result
+
+            claude = StubExecutor(NodeResult("failed", "Claude execution failed"))
+            codex = StubExecutor(NodeResult(
+                "succeeded", "Codex fallback completed", actual_model="gpt-5.6-luna",
+                result_kind="worker", checks=("fixture-check",),
+            ))
+            with patch.object(coordinator, "_executor", side_effect=lambda kind: claude if kind == "claude" else codex):
+                coordinator._execute_claimed(claimed)
+            coordinator._pool.shutdown(wait=True)
+
+            task = store.get_task(contract.task_id)
+            work = next(node for node in task["nodes"] if node["node_id"] == "work")
+            self.assertEqual(work["state"], "accepted")
+            self.assertEqual(work["effective_executor"], "codex")
+            self.assertEqual(work["effective_model"], "gpt-5.6-luna")
+            self.assertEqual(claude.calls, 1)
+            self.assertEqual(codex.calls, 1)
+            routed = [
+                event
+                for event in store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "node.routed"
+            ]
+            self.assertEqual(len(routed), 1)
+            self.assertEqual(routed[0]["payload"]["reason"], "Claude execution failed")
 
     def test_red_quota_zone_routes_to_codex_without_starting_claude(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -743,6 +1026,93 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual((verifier_worktree / "tests/a.txt").read_text(), "A")
             self.assertEqual((verifier_worktree / "tests/b.txt").read_text(), "B")
 
+    def test_cached_verifier_revalidates_current_archify_packets_before_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            worktree = root / "worktree"
+            state.mkdir()
+            worktree.mkdir()
+            store = MagicMock()
+            coordinator = Coordinator(store, state, coordinator_epoch=7)
+            packet = {"node_id": "worker-a", "role": "architecture"}
+            cached = NodeResult(
+                status="succeeded",
+                summary="cached verifier result",
+                result_kind="verifier",
+                verdict="accepted",
+            )
+            store.cached_evidence.return_value = {"result": cached.to_dict()}
+            claimed = {
+                "task_id": "cache-host-gate",
+                "node_id": "verify",
+                "attempt": 1,
+                "coordinator_epoch": 7,
+                "lease_epoch": 1,
+                "steering": (),
+                "contract": {
+                    "repository": str(worktree),
+                    "base_sha": "fixture-base",
+                    "allowed_scope": (),
+                    "forbidden_scope": (),
+                },
+                "spec": {
+                    "executor": "deterministic",
+                    "model": "fixture",
+                    "verifier": True,
+                    "read_scopes": (),
+                    "write_scopes": (),
+                },
+            }
+            route = _ClaimRoute(None, (), None)
+            with (
+                patch.object(coordinator.worktrees, "prepare", return_value=worktree),
+                patch.object(coordinator, "_compose_worker_patches"),
+                patch.object(coordinator, "_archify_receipt_packets", return_value=(packet,)),
+                patch("codex_workbench.service.reusable_evidence_key", return_value="cache-key"),
+                patch(
+                    "codex_workbench.service.validate_archify_verifier_packets",
+                    return_value=(None, ("receipt-ref", "execution-ref")),
+                ) as host_gate,
+            ):
+                coordinator._execute_claimed(claimed, route)
+
+            host_gate.assert_called_once()
+            request = host_gate.call_args.args[0]
+            self.assertEqual(request.archify_receipts, (packet,))
+            store.record_evidence_reuse.assert_called_once_with(
+                "cache-key", "cache-host-gate", "verify"
+            )
+            reused_result = store.settle_node.call_args.args[2]
+            self.assertEqual(set(reused_result.evidence), {"receipt-ref", "execution-ref"})
+
+            store.reset_mock()
+            store.cached_evidence.return_value = {"result": cached.to_dict()}
+            executor = MagicMock()
+            executor.execute.return_value = NodeResult(
+                status="succeeded",
+                summary="host gate reran verifier",
+                result_kind="verifier",
+                verdict="accepted",
+            )
+            with (
+                patch.object(coordinator.worktrees, "prepare", return_value=worktree),
+                patch.object(coordinator, "_compose_worker_patches"),
+                patch.object(coordinator, "_archify_receipt_packets", return_value=(packet,)),
+                patch.object(coordinator, "_executor", return_value=executor),
+                patch("codex_workbench.service.reusable_evidence_key", return_value="cache-key"),
+                patch(
+                    "codex_workbench.service.validate_archify_verifier_packets",
+                    return_value=("forged provenance", ()),
+                ) as host_gate,
+                patch("codex_workbench.service.validate_worker_scope", side_effect=lambda _, __, result: result),
+            ):
+                coordinator._execute_claimed(claimed, route)
+
+            host_gate.assert_called_once()
+            store.record_evidence_reuse.assert_not_called()
+            executor.execute.assert_called_once()
+
     def test_verified_evidence_is_reused_until_its_declared_input_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -760,7 +1130,7 @@ raise AssertionError("fatal coordinator failure returned")
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
 
-            def create_and_run(task_id: str) -> dict:
+            def create_and_run(task_id: str, verification_tier: str = "L3") -> dict:
                 base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
                 contract = TaskContract(
                     task_id=task_id,
@@ -770,6 +1140,7 @@ raise AssertionError("fatal coordinator failure returned")
                     allowed_scope=("checked.txt",),
                     required_artifacts=("test-log", "verdict"),
                     verifier_model="fixture",
+                    verification_tier=verification_tier,
                 )
                 script = (
                     "from pathlib import Path; "
@@ -795,15 +1166,18 @@ raise AssertionError("fatal coordinator failure returned")
             subprocess.run(["git", "add", "unrelated.txt"], cwd=repository, check=True)
             subprocess.run(["git", "commit", "-m", "unrelated"], cwd=repository, check=True, capture_output=True)
             self.assertEqual(create_and_run("cache-2")["state"], "accepted")
-            self.assertEqual(counter.read_text().splitlines(), ["run"])
+            self.assertEqual(counter.read_text().splitlines(), ["run", "run"])
             reused = store.read_events(task_id="cache-2")
-            self.assertIn("node.evidence_reused", {event["event_type"] for event in reused})
+            self.assertNotIn("node.evidence_reused", {event["event_type"] for event in reused})
+
+            self.assertEqual(create_and_run("cache-tier-change", "L2")["state"], "accepted")
+            self.assertEqual(counter.read_text().splitlines(), ["run", "run", "run"])
 
             (repository / "checked.txt").write_text("changed\n")
             subprocess.run(["git", "add", "checked.txt"], cwd=repository, check=True)
             subprocess.run(["git", "commit", "-m", "checked"], cwd=repository, check=True, capture_output=True)
             self.assertEqual(create_and_run("cache-3")["state"], "accepted")
-            self.assertEqual(counter.read_text().splitlines(), ["run", "run"])
+            self.assertEqual(counter.read_text().splitlines(), ["run", "run", "run", "run"])
 
 
 if __name__ == "__main__":

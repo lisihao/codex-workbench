@@ -18,6 +18,8 @@ from .model import (
     RoutingStrategy,
     TaskContract,
     ROUTING_STRATEGY_VERSION,
+    codex_model_profile,
+    codex_model_reasoning_effort,
     retry_model,
 )
 
@@ -39,6 +41,28 @@ class RoutingDecision:
     strategy_version: str
     reason: str
     claude_eligible: bool = False
+    model_profile: str | None = None
+    model_reasoning_effort: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.executor != "codex":
+            return
+        expected_profile = codex_model_profile(self.model)
+        expected_effort = codex_model_reasoning_effort(self.model)
+        if expected_profile is not None:
+            if self.model_profile is None:
+                object.__setattr__(self, "model_profile", expected_profile)
+            elif self.model_profile != expected_profile:
+                raise ValueError(
+                    f"routing model_profile {self.model_profile!r} does not match {self.model!r}"
+                )
+        if expected_effort is not None:
+            if self.model_reasoning_effort is None:
+                object.__setattr__(self, "model_reasoning_effort", expected_effort)
+            elif self.model_reasoning_effort != expected_effort:
+                raise ValueError(
+                    f"routing model_reasoning_effort {self.model_reasoning_effort!r} does not match {self.model!r}"
+                )
 
     @property
     def provider(self) -> str:
@@ -132,6 +156,47 @@ def _strategy_for(
     if isinstance(strategy, dict):
         return RoutingStrategy.from_dict(strategy)
     return strategy.normalized()
+
+
+def strategy_for_node(
+    contract: TaskContract,
+    node: Any,
+    strategy: RoutingStrategy | dict[str, Any] | None = None,
+) -> RoutingStrategy:
+    """Resolve a node's typed routing metadata over the task defaults.
+
+    Older plans have no node metadata and inherit the contract unchanged.  A
+    newer plan may specialize task type, complexity, parallelizability, or
+    Claude admission for one DAG node.  The policy version itself cannot be
+    downgraded by a node, so a mismatched explicit version is rejected.
+    """
+
+    base = _strategy_for(contract, strategy)
+    raw = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+    fields = {
+        name: raw[name]
+        for name in ("routing_strategy", "task_type", "complexity", "parallelizable", "claude_allowed")
+        if name in raw and raw[name] is not None
+    }
+    if not base.claude_allowed and fields.get("claude_allowed") is True:
+        raise ValueError(
+            "node claude_allowed=True cannot widen task contract with claude_allowed=False"
+        )
+    version = fields.get("routing_strategy", base.version)
+    # Normalize legacy spellings (v1/v2) before comparing the immutable
+    # contract version, while still rejecting an actual policy downgrade.
+    normalized_version = RoutingStrategy(
+        version=version,
+        task_type=fields.get("task_type", base.task_type),
+        complexity=fields.get("complexity", base.complexity),
+        parallelizable=fields.get("parallelizable", base.parallelizable),
+        claude_allowed=fields.get("claude_allowed", base.claude_allowed),
+    ).normalized()
+    if normalized_version.version != base.version:
+        raise ValueError(
+            f"node routing_strategy {version!r} must match task strategy {base.version!r}"
+        )
+    return normalized_version
 
 
 def _codex_fallback_base_model(strategy: RoutingStrategy) -> tuple[str, str]:
@@ -325,6 +390,7 @@ def route_node(
     """Route one planner node while preserving deterministic executors."""
 
     raw = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+    node_strategy = strategy_for_node(contract, raw, strategy)
     if raw.get("verifier"):
         return route_task(
             contract,
@@ -333,7 +399,7 @@ def route_node(
             quota_snapshot=quota_snapshot,
             active_models=active_models,
             max_age_seconds=max_age_seconds,
-            strategy=strategy,
+            strategy=node_strategy,
         )
     executor = raw.get("executor")
     if executor in {"deterministic", "fixture"}:
@@ -341,7 +407,7 @@ def route_node(
             role="worker",
             executor=executor,
             model=str(raw.get("model") or executor),
-            strategy_version=_strategy_for(contract, strategy).version,
+            strategy_version=node_strategy.version,
             reason=f"{executor} is an explicit non-model execution node",
         )
     return route_task(
@@ -351,7 +417,7 @@ def route_node(
         quota_snapshot=quota_snapshot,
         active_models=active_models,
         max_age_seconds=max_age_seconds,
-        strategy=strategy,
+        strategy=node_strategy,
     )
 
 
@@ -411,5 +477,6 @@ __all__ = [
     "route_model",
     "route_node",
     "route_task",
+    "strategy_for_node",
     "select_route",
 ]

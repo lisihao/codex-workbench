@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.3.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.4.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,14 +9,14 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.3.0 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.4.0 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
-| Codex 唯一用户入口 | implemented | Codex stdio MCP、CLI 与个人 `wb` 薄插件均进入同一 Mac mini TaskContract/SQLite；插件不持有第二份任务状态 | Codex 0.149.1 不支持插件自定义顶层 `/WB`；默认输入 `wb`，`$WB` 与 `/skills` 仍可用 |
+| Codex 唯一用户入口 | implemented | Codex stdio MCP、CLI 与个人 `wb` 薄插件均进入同一 Mac mini TaskContract/SQLite；插件不持有第二份任务状态 | 当前两台设备已核验的 Codex CLI 均不支持插件自定义顶层 `/WB`；默认输入 `wb`，`$WB` 与 `/skills` 仍可用；能力按设备实际版本核验，不要求版本相同 |
 | WB 新旧会话接管 | implemented | UserPromptSubmit Hook 生成经脱敏的 Context Bundle；同步对话、Git patch、untracked/显式关联文件；Mac mini ArtifactStore + SQLite receipt + 隔离 worktree 导入后才返回 active；断网明确回退 MacBook 并保留 outbox | Codex 首次安装/Hook 内容变化后必须由用户在 `/hooks` 完成官方信任流程 |
 | Sol 需求编译与 DAG | implemented | Sol planner 生成 DAG；图验证、依赖闭包、scope 冲突门禁 | 真实 Sol 质量由具体订阅回合决定 |
-| 多场景必经 Research Skill | implemented | Authority 安装器将一份完整 Research Skill 复制到隔离 planner HOME；`research-skill/v2` 先用可测试路由判定架构/探索、高复杂度、论文/上游、选型/迁移、性能/基准、最佳实践、兼容性/安全、竞品/可行性等场景，再强制 Sol planner 显式调用 `$Research` | 默认由单一 Sol planner 执行 Standard 方法；只有用户明确要求深度、广泛或并行研究时才扩展多研究节点 |
+| 多场景必经 Research Skill | compatible-subset | Authority 安装器将一份完整 Research Skill 复制到隔离 planner HOME；`research-skill/v2` 先用可测试路由判定架构/探索、高复杂度、论文/上游、选型/迁移、性能/基准、最佳实践、兼容性/安全、竞品/可行性等场景，再向 Sol planner 注入强制 `$Research` directive | 默认由单一 Sol planner 执行 Standard 方法，只有用户明确要求深度、广泛或并行研究时才扩展多研究节点；当前可证明 Skill 安装与 prompt wiring，尚无 host-side runtime research receipt |
 | Sol 规划、分层执行、Sol 验收 | implemented | Sol 固定 planner/verifier；routing-v2 以独立 Codex Spark 池处理低复杂度微任务，在配额安全时以 Sonnet 承担标准生产，以 Opus/Fable 承担架构挑战，Luna/Terra 接管回退 | routing-v1 仅为旧合同兼容，不作为新任务默认 |
 | Claude Opus/Sonnet/Fable Worker | implemented | 原生订阅资格、结构化 JSON Schema、工具/权限映射、实际模型证明 | A4 真实 Sonnet 工件仍需一次最小真实回合 |
 | Codex Worker | implemented | 原生订阅 CLI、结构化 worker/verifier 结果；低复杂度使用独立 `gpt-5.3-codex-spark` 池并按 Spark→Luna→Terra→Sol 有界升级；A4 已有 Luna + Sol 真实 Evidence | 无 |
@@ -24,7 +24,8 @@
 | 一个 Worker 一个 worktree/branch | implemented | base SHA、规范化仓库、独立 worktree、作用域验证 | 无 |
 | DAG 并行与冲突消除 | implemented | 无依赖且 scope 不冲突才并行；read/read 可并行；父子 scope 互斥 | Planner 产生冲突时 fail loud，不猜测自动串行化 |
 | 结构化任务契约 | implemented | repository/base/objective/scope/dependency/acceptance/model/quota/timeout/retry/权限/任务点 | 无 |
-| `code-as-harness` 统一治理 | implemented | Mac mini Authority 固定 `code-as-harness/v1`；TaskContract 持久化 L0–L3；Sol planner、Codex/Claude Worker 与 verifier 接收同一治理指令；NodeResult receipt 与合同不一致时 fail closed；health/doctor 暴露运行身份 | 不加载或依赖个人 Codex/Claude 插件目录 |
+| `code-as-harness` 统一治理 | compatible-subset | Workbench canonical Skill 安装到 Codex/Claude Code 的全局 skills 目录，标记化 `AGENTS.md` / `CLAUDE.md` policy 保留用户内容；TaskContract 持久化 L0–L3；Sol planner、Codex/Claude Worker 与 verifier 接收同一治理指令；health 分开验证二进制、真实 Skill/policy 与无 CLI 静态注入 | canonical Skill 覆盖 Workbench 所需的证据确认、代码级 harness、并行、Evidence reuse 与 active-objective continuation；不声称外部平台专属 rich-card、thread-routing 或 plugin runtime 已执行 |
+| Archify 架构工件 Skill | compatible-subset | 固定 vendored Archify `v2.16.0` stable core（MIT，tag/commit 见 `vendor/archify/SOURCE-LOCK.json`）并以 thin adapter 暴露四类 role contract；Sol planner 与匹配的 Codex/Claude Worker/verifier 仅在架构类 artifact 需要时注入 `$archify`、typed JSON IR、`validate`/`deliver` receipt 和外部 semantic evidence；两设备安装器先同时预检两端再写入 | Archify renderer/schema 的 9/9 与 composition pass 只证明 artifact 约束，不证明语义正确、运行时因果或推理质量；semantic evidence 与真实视觉 reviewer 仍须由外部/人工证据提供，不把它包装成完整 native plugin |
 | 持久状态机与崩溃恢复 | implemented | SQLite 状态、Receipt、事件、indeterminate + approval；协调器失败触发 launchd 重启 | A3 真机重启证据 external-pending |
 | Worker 不等于验收 | implemented | 只有独立 Sol verifier 可将任务置为 accepted；Evidence fail-closed | 无 |
 | Claude 20% 目标保留、25% 停线 | compatible-subset | 五小时、周全模型与 Sonnet 专属池；Fable 受全模型周池约束，若未来 producer 暴露独立 Fable 池则叠加其上；30% admission guard、25% 硬停线、共享容量、每个 Claude 节点后要求新快照；未知即 Codex | 被动显示接口不能约束单回合消耗；绝不跨越 20% 仍需真实窗口 Evidence，不能静态保证 |
@@ -47,5 +48,5 @@
 
 1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现。
 2. 后续用户要求的 quota-productive routing-v2 是有意调整：Sol 仍负责规划/验收；低复杂度使用独立 Codex Spark 池，标准生产在安全配额时优先 Sonnet，高复杂度/架构审核优先 Opus/Fable，容量或配额不足由 Spark/Luna/Terra 填充。
-3. 1.3.0 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
+3. 1.4.0 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
 4. 手机接入与页面关闭后的 Web Push 是用户明确后置的 backlog；交互式终端式 Agent attach 仍未实现，三者均不冒充当前交付。

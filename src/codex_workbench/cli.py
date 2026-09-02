@@ -25,7 +25,7 @@ from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
-from .governance import VERIFICATION_TIERS, governance_status
+from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .planner import PlannerError
 from .research import managed_research_skill_status
@@ -542,6 +542,13 @@ def command_token(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_harness(args: argparse.Namespace) -> int:
+    config = _config(args)
+    report = code_as_harness_health(config)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["ok"] else 1
+
+
 def _run(command: list[str], timeout: int = 15) -> tuple[int, str]:
     try:
         result = subprocess.run(
@@ -575,7 +582,8 @@ def command_doctor(args: argparse.Namespace) -> int:
     research_skill = managed_research_skill_status(
         os.environ.get("CODEX_WORKBENCH_PROCESS_HOME")
     )
-    overall_ok = codex_ok and git_code == 0 and research_skill["ok"] is not False and (
+    harness_health = code_as_harness_health(config)
+    overall_ok = codex_ok and git_code == 0 and bool(harness_health["ok"]) and research_skill["ok"] is not False and (
         restart_recovery["ready"] if args.require_restart_ready else True
     )
     report = {
@@ -594,6 +602,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "api_key_environment_forwarded": False,
         "restart_recovery": restart_recovery,
         "governance": governance_status(),
+        "harness": harness_health,
         "research_skill": research_skill,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -831,6 +840,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     token = sub.add_parser("token")
     token.set_defaults(func=command_token)
+
+    harness = sub.add_parser(
+        "harness",
+        help="inspect the managed Code-as-Harness capability without logging in or calling a model",
+    )
+    harness_sub = harness.add_subparsers(dest="harness_action", required=True)
+    harness_sub.add_parser("health")
+    harness.set_defaults(func=command_harness)
 
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--require-restart-ready", action="store_true")

@@ -144,6 +144,36 @@ class ModelTests(unittest.TestCase):
     def test_planner_schema_requires_every_declared_property(self) -> None:
         item = PLAN_SCHEMA["properties"]["nodes"]["items"]
         self.assertEqual(set(item["required"]), set(item["properties"]))
+        self.assertEqual(
+            set(item["required"])
+            & {"routing_strategy", "task_type", "complexity", "parallelizable", "claude_allowed"},
+            {"routing_strategy", "task_type", "complexity", "parallelizable", "claude_allowed"},
+        )
+
+    def test_luna_command_emits_explicit_max_effort_and_profile_metadata(self) -> None:
+        request = ExecutionRequest(
+            task_id="task-1",
+            node_id="worker",
+            attempt=1,
+            contract={"objective": "bounded work", "allowed_scope": ["src"], "forbidden_scope": [], "acceptance_commands": []},
+            spec={
+                "title": "worker",
+                "prompt": "implement",
+                "model": "gpt-5.6-luna",
+                "model_profile": "luna_worker",
+                "model_reasoning_effort": "max",
+                "verifier": False,
+            },
+            worktree=Path("/tmp/worktree"),
+        )
+        command = CodexExecutor._command("codex", request, Path("schema.json"), Path("result.json"))
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
+        self.assertEqual(
+            command[command.index("--config") + 1],
+            "model_reasoning_effort=max",
+        )
+        self.assertIn("Execution profile: luna_worker", CodexExecutor._prompt(request))
+        self.assertIn("Model reasoning effort: max", CodexExecutor._prompt(request))
 
     def test_planner_receives_only_quota_admitted_claude_models(self) -> None:
         contract = TaskContract(

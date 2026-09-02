@@ -11,7 +11,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
-from .governance import governance_status
+from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
 from .quota_productivity import build_quota_productivity
 from .store import StateConflictError, WorkbenchStore
@@ -44,15 +44,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/login":
             return self._html(self._login_page())
         if parsed.path == "/health":
-            health = self.server.store.health()
+            store_health = self.server.store.health()
+            harness_health = code_as_harness_health(self.server.config)
+            overall_ok = bool(store_health["ok"]) and bool(harness_health["ok"])
             return self._json(
                 {
                     "version": __version__,
                     "build": self._build_manifest(),
                     "governance": governance_status(),
-                    **health,
+                    **store_health,
+                    "harness": harness_health,
+                    "ok": overall_ok,
                 },
-                HTTPStatus.OK if health["ok"] else HTTPStatus.SERVICE_UNAVAILABLE,
+                HTTPStatus.OK if overall_ok else HTTPStatus.SERVICE_UNAVAILABLE,
             )
         if parsed.path == "/api/snapshot":
             quota = self.server.store.latest_quota()
@@ -61,6 +65,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "version": __version__,
                     "build": self._build_manifest(),
                     "governance": governance_status(),
+                    "harness": code_as_harness_health(self.server.config),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "approvals": self.server.store.list_approvals(),
@@ -79,7 +84,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return self._json(build_acceptance_report(self.server.store))
         if parsed.path == "/api/events":
             query = parse_qs(parsed.query)
-            after = int(query.get("after", ["0"])[0])
+            try:
+                after = int(query.get("after", ["0"])[0])
+            except (TypeError, ValueError):
+                return self._json(
+                    {"error": "after must be an integer"}, HTTPStatus.BAD_REQUEST
+                )
             task_id = query.get("task_id", [None])[0]
             return self._json(
                 {"events": self.server.store.read_events(after=after, task_id=task_id)}

@@ -17,6 +17,8 @@ from .model import (
     TaskContract,
     canonical_hash,
     canonical_json,
+    codex_model_profile,
+    codex_model_reasoning_effort,
     now_iso,
     retry_model,
 )
@@ -26,7 +28,9 @@ from .legacy_evidence import load_manifest, validate_manifest
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+_ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
+_ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 
 
 def _repository_identity(repository: str) -> str:
@@ -155,7 +159,8 @@ class WorkbenchStore:
                     steering_id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
                     instruction TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    sequence INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS delivery_receipts (
                     command_id TEXT PRIMARY KEY,
@@ -211,7 +216,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -236,6 +241,39 @@ class WorkbenchStore:
                     connection.execute(
                         "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
                     )
+                steering_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(task_steering)"
+                    ).fetchall()
+                }
+                if "sequence" not in steering_columns:
+                    connection.execute(
+                        "ALTER TABLE task_steering ADD COLUMN sequence INTEGER"
+                    )
+                # v9 had no explicit sequence.  Its durable semantics were
+                # chronological steering with the stable steering ID as the
+                # tie-breaker; rowid reflected insertion/storage order only
+                # and can be reversed by import/rebuild paths.
+                steering_rows = connection.execute(
+                    """
+                    SELECT rowid, task_id, steering_id, created_at, sequence
+                    FROM task_steering
+                    ORDER BY task_id, created_at, steering_id, rowid
+                    """
+                ).fetchall()
+                next_sequences: dict[str, int] = {}
+                for steering_row in steering_rows:
+                    task_id = str(steering_row["task_id"])
+                    current_sequence = next_sequences.get(task_id, 0)
+                    stored_sequence = steering_row["sequence"]
+                    if stored_sequence is None or int(stored_sequence) <= current_sequence:
+                        stored_sequence = current_sequence + 1
+                        connection.execute(
+                            "UPDATE task_steering SET sequence = ? WHERE rowid = ?",
+                            (stored_sequence, steering_row["rowid"]),
+                        )
+                    next_sequences[task_id] = int(stored_sequence)
                 connection.execute(
                     "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -247,6 +285,10 @@ class WorkbenchStore:
                 raise RuntimeError(
                     f"unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
                 )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS task_steering_task_sequence_idx "
+                "ON task_steering(task_id, sequence)"
+            )
         self.path.chmod(0o600)
 
     @property
@@ -684,7 +726,6 @@ class WorkbenchStore:
                 connection.execute(
                     """
                     UPDATE nodes SET state = 'pending', worker_id = NULL,
-                                     effective_executor = NULL, effective_model = NULL,
                                      started_at = NULL, settled_at = NULL, updated_at = ?
                     WHERE task_id = ? AND state = 'failed'
                     """,
@@ -745,52 +786,137 @@ class WorkbenchStore:
         *,
         expected_revision: int,
     ) -> int:
+        with self.transaction() as connection:
+            receipt = self._append_task_steering(
+                connection,
+                task_id,
+                instruction,
+                expected_revision=expected_revision,
+            )
+            return int(receipt["revision"])
+
+    @staticmethod
+    def _next_steering_sequence(
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+            "FROM task_steering WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None
+        return int(row["next_sequence"])
+
+    def append_active_session_steering(
+        self,
+        source_thread_id: str,
+        instruction: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Append a user message to its bound task without changing that task's objective or state."""
+
+        if not source_thread_id or any(character.isspace() for character in source_thread_id):
+            raise ValueError("source_thread_id must be non-empty and contain no whitespace")
+        with self.transaction() as connection:
+            binding = connection.execute(
+                "SELECT active_task_id FROM session_bindings WHERE source_thread_id = ?",
+                (source_thread_id,),
+            ).fetchone()
+            if binding is None:
+                raise KeyError(source_thread_id)
+            task_id = binding["active_task_id"]
+            if task_id is None:
+                raise StateConflictError("session has no active task to continue")
+            task = connection.execute(
+                "SELECT state FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise StateConflictError("session active task is missing")
+            if task["state"] in {"accepted", "blocked", "cancelled"}:
+                raise StateConflictError(
+                    f"session active task is terminal: {task['state']}"
+                )
+            receipt = self._append_task_steering(
+                connection,
+                task_id,
+                instruction,
+                expected_revision=expected_revision,
+            )
+            self._event(
+                connection,
+                "session.active_task_message_appended",
+                task_id,
+                None,
+                {
+                    "source_thread_id": source_thread_id,
+                    "steering_id": receipt["steering_id"],
+                    "revision": receipt["revision"],
+                    "state": receipt["state"],
+                },
+            )
+            return {"task_id": task_id, **receipt}
+
+    def _append_task_steering(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        instruction: str,
+        *,
+        expected_revision: int | None,
+    ) -> dict[str, Any]:
         instruction = instruction.strip()
         if not instruction or len(instruction) > 500:
             raise ValueError("instruction must contain 1 to 500 characters")
         timestamp = now_iso()
-        with self.transaction() as connection:
-            task = connection.execute(
-                "SELECT state, state_revision FROM tasks WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            if task is None:
-                raise KeyError(task_id)
-            if int(task["state_revision"]) != expected_revision:
-                raise StateConflictError(
-                    f"expected task revision {expected_revision}, found {task['state_revision']}"
-                )
-            if task["state"] in {"accepted", "cancelled"}:
-                raise StateConflictError(f"cannot steer task in {task['state']}")
-            revision = int(task["state_revision"]) + 1
-            steering_id = "steering-" + canonical_hash(
-                {
-                    "task_id": task_id,
-                    "revision": revision,
-                    "instruction": instruction,
-                }
-            )[:24]
-            connection.execute(
-                """
-                INSERT INTO task_steering(steering_id, task_id, instruction, created_at)
-                VALUES(?, ?, ?, ?)
-                """,
-                (steering_id, task_id, instruction, timestamp),
+        task = connection.execute(
+            "SELECT state, state_revision FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        if expected_revision is not None and int(task["state_revision"]) != expected_revision:
+            raise StateConflictError(
+                f"expected task revision {expected_revision}, found {task['state_revision']}"
             )
-            connection.execute(
-                """
-                UPDATE tasks SET state_revision = ?, updated_at = ? WHERE task_id = ?
-                """,
-                (revision, timestamp, task_id),
-            )
-            self._event(
-                connection,
-                "task.steering_added",
-                task_id,
-                None,
-                {"steering_id": steering_id, "revision": revision},
-            )
-            return revision
+        if task["state"] in {"accepted", "cancelled"}:
+            raise StateConflictError(f"cannot steer task in {task['state']}")
+        revision = int(task["state_revision"]) + 1
+        sequence = self._next_steering_sequence(connection, task_id)
+        steering_id = "steering-" + canonical_hash(
+            {
+                "task_id": task_id,
+                "revision": revision,
+                "instruction": instruction,
+            }
+        )[:24]
+        connection.execute(
+            """
+            INSERT INTO task_steering(steering_id, task_id, instruction, created_at, sequence)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (steering_id, task_id, instruction, timestamp, sequence),
+        )
+        connection.execute(
+            """
+            UPDATE tasks SET state_revision = ?, updated_at = ? WHERE task_id = ?
+            """,
+            (revision, timestamp, task_id),
+        )
+        self._event(
+            connection,
+            "task.steering_added",
+            task_id,
+            None,
+            {"steering_id": steering_id, "revision": revision},
+        )
+        return {
+            "steering_id": steering_id,
+            "revision": revision,
+            "state": task["state"],
+            "objective_preserved": True,
+        }
 
     def resolve_indeterminate(
         self,
@@ -1086,8 +1212,8 @@ class WorkbenchStore:
         ).fetchall()
         steering_rows = connection.execute(
             """
-            SELECT steering_id, instruction, created_at FROM task_steering
-            WHERE task_id = ? ORDER BY created_at, steering_id
+            SELECT steering_id, instruction, created_at, sequence FROM task_steering
+            WHERE task_id = ? ORDER BY sequence
             """,
             (row["task_id"],),
         ).fetchall()
@@ -1438,17 +1564,50 @@ class WorkbenchStore:
                     timestamp,
                 ),
             )
+            previous_binding = connection.execute(
+                """
+                SELECT active_task_id, context_ref FROM session_bindings
+                WHERE source_thread_id = ?
+                """,
+                (source_thread_id,),
+            ).fetchone()
+            previous_task_id = (
+                previous_binding["active_task_id"] if previous_binding is not None else None
+            )
+            context_changed = (
+                previous_binding is not None
+                and previous_binding["context_ref"] != context_ref
+            )
             connection.execute(
                 """
                 INSERT INTO session_bindings(
                     source_thread_id, context_ref, active_task_id, updated_at
-                ) VALUES(?, ?, NULL, ?)
+                ) VALUES(?, ?, ?, ?)
                 ON CONFLICT(source_thread_id) DO UPDATE SET
                     context_ref = excluded.context_ref,
+                    active_task_id = excluded.active_task_id,
                     updated_at = excluded.updated_at
                 """,
-                (source_thread_id, context_ref, timestamp),
+                (
+                    source_thread_id,
+                    context_ref,
+                    None if context_changed else previous_task_id,
+                    timestamp,
+                ),
             )
+            if context_changed and previous_task_id is not None:
+                self._event(
+                    connection,
+                    "context.active_task_invalidated",
+                    previous_task_id,
+                    None,
+                    {
+                        "source_thread_id": source_thread_id,
+                        "previous_context_ref": previous_binding["context_ref"],
+                        "new_context_ref": context_ref,
+                        "reason": "context_bundle_replaced",
+                    },
+                )
             self._event(
                 connection,
                 "context.imported",
@@ -1856,15 +2015,20 @@ class WorkbenchStore:
                 """
             ).fetchall()
             running_accesses: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+            running_task_parallelism: dict[str, bool] = {}
             for running in connection.execute(
                 """
-                SELECT n.spec_json, t.contract_json
+                SELECT n.task_id, n.spec_json, t.contract_json
                 FROM nodes n JOIN tasks t USING(task_id)
                 WHERE n.state = 'running'
                 """
             ).fetchall():
                 running_spec = json.loads(running["spec_json"])
                 running_contract = json.loads(running["contract_json"])
+                task_id = str(running["task_id"])
+                running_task_parallelism[task_id] = running_task_parallelism.get(task_id, False) or (
+                    running_spec.get("parallelizable") is False
+                )
                 running_accesses.append(
                     (
                         _repository_identity(running_contract["repository"]),
@@ -1886,6 +2050,12 @@ class WorkbenchStore:
                     ).fetchall()
                     if len(states) != len(dependencies) or any(row["state"] != "accepted" for row in states):
                         continue
+                candidate_task_id = str(candidate["task_id"])
+                candidate_parallelizable = spec.get("parallelizable") is not False
+                if candidate_task_id in running_task_parallelism and (
+                    not candidate_parallelizable or running_task_parallelism[candidate_task_id]
+                ):
+                    continue
                 read_scopes = tuple(spec.get("read_scopes", []))
                 write_scopes = tuple(spec.get("write_scopes", []))
                 candidate_contract = json.loads(candidate["contract_json"])
@@ -1907,8 +2077,9 @@ class WorkbenchStore:
 
             attempt = int(selected["attempt"]) + 1
             lease_epoch = self._next_lease_epoch(connection)
+            effective_executor = str(selected["effective_executor"] or selected_spec["executor"])
             effective_model = retry_model(
-                selected_spec["model"],
+                str(selected["effective_model"] or selected_spec["model"]),
                 attempt,
                 verifier=bool(selected_spec.get("verifier")),
             )
@@ -1923,7 +2094,7 @@ class WorkbenchStore:
                 (
                     attempt,
                     worker_id,
-                    selected_spec["executor"],
+                    effective_executor,
                     effective_model,
                     coordinator_epoch,
                     lease_epoch,
@@ -1957,8 +2128,10 @@ class WorkbenchStore:
                 {
                     "attempt": attempt,
                     "worker_id": worker_id,
-                    "executor": selected_spec["executor"],
+                    "executor": effective_executor,
                     "model": effective_model,
+                    "model_profile": codex_model_profile(effective_model),
+                    "model_reasoning_effort": codex_model_reasoning_effort(effective_model),
                     "coordinator_epoch": coordinator_epoch,
                     "lease_epoch": lease_epoch,
                 },
@@ -1968,7 +2141,7 @@ class WorkbenchStore:
                 for row in connection.execute(
                     """
                     SELECT instruction FROM task_steering
-                    WHERE task_id = ? ORDER BY created_at, steering_id
+                    WHERE task_id = ? ORDER BY sequence
                     """,
                     (selected["task_id"],),
                 ).fetchall()
@@ -1979,7 +2152,13 @@ class WorkbenchStore:
                 "attempt": attempt,
                 "coordinator_epoch": coordinator_epoch,
                 "lease_epoch": lease_epoch,
-                "spec": {**selected_spec, "model": effective_model},
+                "spec": {
+                    **selected_spec,
+                    "executor": effective_executor,
+                    "model": effective_model,
+                    "model_profile": codex_model_profile(effective_model),
+                    "model_reasoning_effort": codex_model_reasoning_effort(effective_model),
+                },
                 "contract": json.loads(selected["contract_json"]),
                 "steering": steering,
             }
@@ -2131,13 +2310,14 @@ class WorkbenchStore:
                             "feedback": feedback,
                         }
                     )[:24]
+                    sequence = self._next_steering_sequence(connection, task_id)
                     connection.execute(
                         """
                         INSERT OR IGNORE INTO task_steering(
-                            steering_id, task_id, instruction, created_at
-                        ) VALUES(?, ?, ?, ?)
+                            steering_id, task_id, instruction, created_at, sequence
+                        ) VALUES(?, ?, ?, ?, ?)
                         """,
-                        (steering_id, task_id, feedback, timestamp),
+                        (steering_id, task_id, feedback, timestamp, sequence),
                     )
                     connection.execute(
                         """
@@ -2167,7 +2347,6 @@ class WorkbenchStore:
                     connection.execute(
                         """
                         UPDATE nodes SET state = 'pending', worker_id = NULL,
-                                         effective_executor = NULL, effective_model = NULL,
                                          started_at = NULL, settled_at = NULL, updated_at = ?
                         WHERE task_id = ? AND node_id = ?
                         """,
@@ -2233,8 +2412,8 @@ class WorkbenchStore:
             lease_epoch=int(claimed["lease_epoch"]),
         )
 
-    @staticmethod
     def _validate_result_contract(
+        self,
         spec: dict[str, Any],
         row: sqlite3.Row,
         result: NodeResult,
@@ -2280,6 +2459,169 @@ class WorkbenchStore:
         WorkbenchStore._validate_actual_model(row, result)
         if result.status == "succeeded" and not result.checks:
             raise ValueError("successful worker result must contain structured checks")
+        directive = spec.get("archify")
+        if (
+            result.status == "succeeded"
+            and isinstance(directive, dict)
+            and directive.get("schema_version") == 1
+            and directive.get("artifact_required") is True
+        ):
+            self._validate_archify_worker_evidence(result)
+
+    def _validate_archify_worker_evidence(self, result: NodeResult) -> None:
+        """Validate command-appropriate Archify evidence before persistence.
+
+        Renderer-owning commands use the existing pinned render-validation
+        envelope.  ``validate`` and ``migrate`` do not own a graphic output,
+        but their command execution must still be replayed by the host and
+        bound to the frozen inputs.  A receipt-only model claim is not
+        persistence-worthy evidence.
+        """
+
+        receipt_ref = result.artifacts.get("archify-receipt")
+        if not isinstance(receipt_ref, str):
+            raise ValueError(
+                "successful Archify worker result must contain independent receipt evidence: "
+                "archify-receipt"
+            )
+        try:
+            receipt_path = self.artifacts.verify(receipt_ref)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"Archify receipt evidence is unreadable: {error}") from error
+        if not isinstance(receipt, dict):
+            raise ValueError("Archify receipt evidence must decode to an object")
+        command = receipt.get("command")
+        if command not in _ARCHIFY_RENDER_COMMANDS | _ARCHIFY_RECEIPT_ONLY_COMMANDS:
+            raise ValueError(f"Archify receipt command is unsupported: {command!r}")
+
+        execution_ref = result.artifacts.get("archify-execution")
+        if not isinstance(execution_ref, str):
+            raise ValueError(
+                "successful Archify worker result must contain command execution evidence: "
+                "archify-execution"
+            )
+        try:
+            execution_path = self.artifacts.verify(execution_ref)
+            execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError(f"Archify execution evidence is unreadable: {error}") from error
+        if not isinstance(execution, dict):
+            raise ValueError("Archify execution evidence must decode to an object")
+        if (
+            execution.get("schema_version") != 1
+            or execution.get("receipt_ref") != receipt_ref
+            or execution.get("receipt_command") != command
+        ):
+            raise ValueError("Archify execution evidence is not bound to its command receipt")
+        if command in _ARCHIFY_RECEIPT_ONLY_COMMANDS:
+            expected_fields = {
+                "schema_version",
+                "kind",
+                "receipt_ref",
+                "receipt_command",
+                "frozen_input",
+                "frozen_source",
+                "frozen_destination",
+                "proof",
+                "argv",
+                "stdout",
+                "stderr",
+                "exit_code",
+                "provenance",
+                "stdout_ref",
+                "stderr_ref",
+                "cli_receipt",
+            }
+            if set(execution) != expected_fields or execution.get("kind") != "archify-executor-command-validation":
+                raise ValueError(
+                    "validate/migrate Archify execution evidence must use the host command-validation envelope"
+                )
+            expected_mode = (
+                "pinned-validate-and-frozen-input-binding"
+                if command == "validate"
+                else "pinned-migrate-and-frozen-source-destination-binding"
+            )
+            if execution.get("proof") != {
+                "mode": expected_mode,
+                "renderer_check": "not-applicable",
+            }:
+                raise ValueError(
+                    "validate/migrate Archify execution evidence must preserve host input binding"
+                )
+
+            def valid_binding(value: object, label: str) -> dict[str, Any]:
+                if not isinstance(value, dict) or set(value) != {"path", "sha256", "bytes"}:
+                    raise ValueError(f"Archify {command} execution evidence has invalid {label} binding")
+                path = value.get("path")
+                digest = value.get("sha256")
+                byte_count = value.get("bytes")
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or not isinstance(byte_count, int)
+                    or isinstance(byte_count, bool)
+                    or byte_count < 0
+                ):
+                    raise ValueError(f"Archify {command} execution evidence has invalid {label} binding")
+                return value
+
+            if not isinstance(execution.get("argv"), list) or any(
+                not isinstance(value, str) or not value for value in execution["argv"]
+            ):
+                raise ValueError("Archify command execution evidence argv is invalid")
+            if not isinstance(execution.get("stdout"), str) or not isinstance(execution.get("stderr"), str):
+                raise ValueError("Archify command execution evidence logs are invalid")
+            if execution.get("exit_code") != 0:
+                raise ValueError("successful Archify command execution evidence must have exit_code 0")
+            if not isinstance(execution.get("provenance"), dict) or execution["provenance"].get("ok") is not True:
+                raise ValueError("Archify command execution evidence provenance is invalid")
+            if not isinstance(execution.get("cli_receipt"), dict):
+                raise ValueError("Archify command execution evidence CLI receipt is invalid")
+
+            stdout_ref = execution.get("stdout_ref")
+            stderr_ref = execution.get("stderr_ref")
+            if not isinstance(stdout_ref, str) or not isinstance(stderr_ref, str):
+                raise ValueError("Archify command execution evidence log references are invalid")
+            try:
+                stdout = self.artifacts.verify(stdout_ref).read_text(encoding="utf-8")
+                stderr = self.artifacts.verify(stderr_ref).read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as error:
+                raise ValueError(f"Archify command execution evidence logs are unreadable: {error}") from error
+            if stdout != execution["stdout"] or stderr != execution["stderr"]:
+                raise ValueError("Archify command execution evidence logs do not match their artifacts")
+
+            if command == "validate":
+                frozen_input = valid_binding(execution.get("frozen_input"), "frozen_input")
+                if execution.get("frozen_source") is not None or execution.get("frozen_destination") is not None:
+                    raise ValueError("validate Archify execution evidence must not contain migration bindings")
+                receipt_input = receipt.get("input")
+                if not isinstance(receipt_input, str) or not receipt_input:
+                    raise ValueError("validate Archify receipt is missing its input binding")
+                if Path(receipt_input).expanduser().is_absolute():
+                    try:
+                        if Path(receipt_input).expanduser().resolve() != Path(frozen_input["path"]).expanduser().resolve():
+                            raise ValueError("validate Archify execution evidence is not bound to frozen_input")
+                    except OSError as error:
+                        raise ValueError(f"validate Archify input binding cannot be resolved: {error}") from error
+            else:
+                if execution.get("frozen_input") is not None:
+                    raise ValueError("migrate Archify execution evidence must not contain a validate binding")
+                frozen_source = valid_binding(execution.get("frozen_source"), "frozen_source")
+                frozen_destination = valid_binding(execution.get("frozen_destination"), "frozen_destination")
+                for label, frozen in (("source", frozen_source), ("destination", frozen_destination)):
+                    receipt_binding = receipt.get(label)
+                    if not isinstance(receipt_binding, dict) or any(
+                        receipt_binding.get(key) != frozen[key] for key in ("path", "sha256", "bytes")
+                    ):
+                        raise ValueError(f"migrate Archify execution evidence is not bound to frozen_{label}")
+        elif execution.get("kind") != "archify-executor-render-validation":
+            raise ValueError(
+                "deliver/compare/visual-check Archify execution evidence must use render validation"
+            )
 
     @staticmethod
     def _validate_actual_model(row: sqlite3.Row, result: NodeResult) -> None:

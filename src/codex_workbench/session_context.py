@@ -65,9 +65,12 @@ def _extract_archive(data: bytes, destination: Path) -> dict[str, Any]:
     with archive:
         for member in archive:
             relative = _safe_relative(member.name)
-            if member.name in names:
-                raise ValueError(f"duplicate context bundle member: {member.name}")
-            names.add(member.name)
+            canonical_name = relative.as_posix()
+            if canonical_name in names:
+                raise ValueError(
+                    f"duplicate context bundle member after normalization: {member.name}"
+                )
+            names.add(canonical_name)
             if member.isdir():
                 (destination / Path(*relative.parts)).mkdir(parents=True, exist_ok=True)
                 continue
@@ -102,7 +105,11 @@ def _validated_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported context bundle schema_version")
     thread_id = manifest.get("source_thread_id")
     repository = manifest.get("repository")
-    if not isinstance(thread_id, str) or _IDENTIFIER.fullmatch(thread_id) is None:
+    if (
+        not isinstance(thread_id, str)
+        or _IDENTIFIER.fullmatch(thread_id) is None
+        or thread_id in {".", ".."}
+    ):
         raise ValueError("source_thread_id is invalid")
     if not isinstance(repository, dict):
         raise ValueError("repository metadata is required")

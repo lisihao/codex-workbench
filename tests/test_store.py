@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
+from codex_workbench.planner import archify_internal_directive
 from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
@@ -48,7 +51,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 9)
+        self.assertEqual(self.store.health()["schema_version"], 10)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -86,13 +89,60 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 9)
+        self.assertEqual(migrated.health()["schema_version"], 10)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
             }
         self.assertIn("effective_executor", columns)
         self.assertIn("effective_model", columns)
+
+    def test_schema_nine_migrates_steering_sequence_by_legacy_timestamp_and_id(self) -> None:
+        path = Path(self.temp.name) / "schema-nine.sqlite"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '9');
+                CREATE TABLE tasks (
+                    task_id TEXT PRIMARY KEY,
+                    contract_json TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    state_revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    blocker TEXT,
+                    verdict TEXT
+                );
+                INSERT INTO tasks(
+                    task_id, contract_json, contract_hash, state, created_at, updated_at
+                ) VALUES('old-task', '{}', 'hash', 'queued', 'one', 'one');
+                CREATE TABLE task_steering (
+                    steering_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    instruction TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO task_steering(steering_id, task_id, instruction, created_at)
+                VALUES
+                    ('later', 'old-task', 'later instruction', '2026-09-02T12:00:01+00:00'),
+                    ('second', 'old-task', 'same timestamp, second id', '2026-09-02T12:00:00+00:00'),
+                    ('first', 'old-task', 'same timestamp, first id', '2026-09-02T12:00:00+00:00');
+                """
+            )
+
+        migrated = WorkbenchStore(path)
+        migrated.initialize()
+        with migrated.connection() as connection:
+            rows = connection.execute(
+                "SELECT steering_id, sequence FROM task_steering "
+                "WHERE task_id = 'old-task' ORDER BY sequence"
+            ).fetchall()
+        self.assertEqual(
+            [(row["steering_id"], row["sequence"]) for row in rows],
+            [("first", 1), ("second", 2), ("later", 3)],
+        )
 
     def test_context_receipt_binds_latest_context_and_task(self) -> None:
         receipt = self.store.record_session_context(
@@ -117,6 +167,145 @@ class StoreTests(unittest.TestCase):
         binding = self.store.get_session_binding("thread-1")
         self.assertEqual(binding["active_task_id"], "task-1")
         self.assertEqual(binding["context_excerpt"], "history")
+
+    def test_reimported_context_invalidates_stale_active_task_binding(self) -> None:
+        first_ref = "sha256:" + "a" * 64 + ":tar.gz"
+        second_ref = "sha256:" + "b" * 64 + ":tar.gz"
+        self.store.record_session_context(
+            command_id="context-reimport-first",
+            request_hash="context-reimport-first-request",
+            source_thread_id="thread-reimport",
+            context_ref=first_ref,
+            archive_ref=first_ref,
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            allowed_scopes=("src",),
+            context_excerpt="old history",
+        )
+        self.store.create_task(
+            self.contract,
+            verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1"),
+            "context-reimport-task",
+        )
+        self.store.bind_task_to_session("thread-reimport", "task-1")
+
+        self.store.record_session_context(
+            command_id="context-reimport-second",
+            request_hash="context-reimport-second-request",
+            source_thread_id="thread-reimport",
+            context_ref=second_ref,
+            archive_ref=second_ref,
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="def456",
+            allowed_scopes=("tests",),
+            context_excerpt="new history",
+        )
+
+        binding = self.store.get_session_binding("thread-reimport")
+        self.assertEqual(binding["context_ref"], second_ref)
+        self.assertIsNone(binding["active_task_id"])
+        self.assertEqual(binding["context_excerpt"], "new history")
+        invalidated = [
+            event
+            for event in self.store.read_events()
+            if event["event_type"] == "context.active_task_invalidated"
+        ]
+        self.assertEqual(invalidated[-1]["task_id"], "task-1")
+        self.assertEqual(invalidated[-1]["payload"]["previous_context_ref"], first_ref)
+        with self.assertRaisesRegex(StateConflictError, "no active task"):
+            self.store.append_active_session_steering("thread-reimport", "不应继续旧任务")
+
+    def test_active_session_steering_appends_without_terminating_task(self) -> None:
+        context_ref = "sha256:" + "c" * 64 + ":tar.gz"
+        self.store.record_session_context(
+            command_id="active-steering-context",
+            request_hash="active-steering-request",
+            source_thread_id="thread-active-steering",
+            context_ref=context_ref,
+            archive_ref=context_ref,
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            allowed_scopes=("src",),
+            context_excerpt="original objective",
+        )
+        self.store.create_task(
+            self.contract,
+            verified([NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")], "task-1"),
+            "active-steering-task",
+        )
+        self.store.bind_task_to_session("thread-active-steering", "task-1")
+        self.store.queue_task("task-1")
+        self.store.claim_ready_node("fixture-worker", self.epoch)
+        before = self.store.get_task("task-1")
+
+        result = self.store.append_active_session_steering(
+            "thread-active-steering",
+            "继续当前目标，并补充验证边界。",
+        )
+
+        self.assertTrue({"task_id", "revision", "state", "steering_id"} <= set(result))
+        self.assertEqual(result["task_id"], "task-1")
+        self.assertEqual(result["revision"], before["state_revision"] + 1)
+        self.assertEqual(result["state"], "running")
+        after = self.store.get_task("task-1")
+        self.assertEqual(after["state"], "running")
+        self.assertEqual(after["contract"], before["contract"])
+        work_node = next(node for node in after["nodes"] if node["node_id"] == "work")
+        self.assertEqual(work_node["state"], "running")
+        self.assertEqual(after["steering"][-1]["steering_id"], result["steering_id"])
+        self.assertEqual(after["steering"][-1]["instruction"], "继续当前目标，并补充验证边界。")
+        steering_events = [
+            event
+            for event in self.store.read_events(task_id="task-1")
+            if event["event_type"] == "task.steering_added"
+        ]
+        self.assertEqual(steering_events[-1]["payload"]["steering_id"], result["steering_id"])
+
+        ordered_messages = [f"追加消息 {index}" for index in range(20)]
+        for instruction in ordered_messages:
+            self.store.append_active_session_steering(
+                "thread-active-steering",
+                instruction,
+            )
+        steering = self.store.get_task("task-1")["steering"]
+        self.assertEqual(
+            [item["instruction"] for item in steering],
+            ["继续当前目标，并补充验证边界。", *ordered_messages],
+        )
+
+    def test_active_session_steering_rejects_missing_and_terminal_tasks(self) -> None:
+        with self.assertRaises((KeyError, StateConflictError)):
+            self.store.append_active_session_steering("unknown-thread", "继续")
+
+        context_ref = "sha256:" + "d" * 64 + ":tar.gz"
+        self.store.record_session_context(
+            command_id="terminal-steering-context",
+            request_hash="terminal-steering-request",
+            source_thread_id="thread-terminal-steering",
+            context_ref=context_ref,
+            archive_ref=context_ref,
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            allowed_scopes=("src",),
+            context_excerpt="terminal objective",
+        )
+        self.store.create_task(
+            self.contract,
+            verified([NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")], "task-1"),
+            "terminal-steering-task",
+        )
+        self.store.bind_task_to_session("thread-terminal-steering", "task-1")
+        revision = self.store.transition_task("task-1", "cancelled", expected_revision=1)
+        with self.assertRaises(StateConflictError):
+            self.store.append_active_session_steering(
+                "thread-terminal-steering",
+                "不应追加到终态任务",
+                expected_revision=revision,
+            )
 
     def test_nonfixture_result_must_match_governance_contract(self) -> None:
         contract = TaskContract(
@@ -215,6 +404,57 @@ class StoreTests(unittest.TestCase):
         third = self.store.claim_ready_node("worker-3", self.epoch)
         self.assertEqual(third["node_id"], "b")
 
+    def test_nonparallel_node_serializes_only_its_own_task(self) -> None:
+        nodes = [
+            NodeSpec(
+                "serial",
+                "task-1",
+                "serial",
+                "fixture",
+                "fixture",
+                "serial work",
+                parallelizable=False,
+                ordinal=1,
+            ),
+            NodeSpec(
+                "parallel",
+                "task-1",
+                "parallel",
+                "fixture",
+                "fixture",
+                "parallel work",
+                parallelizable=True,
+                ordinal=2,
+            ),
+        ]
+        second_contract = TaskContract(
+            task_id="task-2",
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="independent task",
+            allowed_scope=("src",),
+        )
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-serial-task")
+        self.store.create_task(
+            second_contract,
+            verified(
+                [NodeSpec("other", "task-2", "other", "fixture", "fixture", "other work")],
+                "task-2",
+            ),
+            "cmd-independent-task",
+        )
+        self.store.queue_task("task-1")
+        self.store.queue_task("task-2")
+        self.store.set_task_priority("task-1", 1, expected_revision=2)
+
+        first = self.store.claim_ready_node("worker-1", self.epoch)
+        self.assertEqual((first["task_id"], first["node_id"]), ("task-1", "serial"))
+        second = self.store.claim_ready_node("worker-2", self.epoch)
+        self.assertEqual((second["task_id"], second["node_id"]), ("task-2", "other"))
+        self.store.settle_claimed(first, NodeResult("succeeded", "serial complete"))
+        third = self.store.claim_ready_node("worker-3", self.epoch)
+        self.assertEqual((third["task_id"], third["node_id"]), ("task-1", "parallel"))
+
     def test_priority_orders_ready_tasks_and_steering_reaches_future_attempts(self) -> None:
         second_contract = TaskContract(
             task_id="task-2",
@@ -255,6 +495,304 @@ class StoreTests(unittest.TestCase):
         event_types = {event["event_type"] for event in self.store.read_events(task_id="task-2")}
         self.assertIn("task.priority_changed", event_types)
         self.assertIn("task.steering_added", event_types)
+
+    def test_claim_exposes_effective_codex_profile_and_reasoning_effort(self) -> None:
+        worker = NodeSpec(
+            "worker",
+            "task-1",
+            "worker",
+            "codex",
+            "gpt-5.6-luna",
+            "perform bounded work",
+            write_scopes=("src",),
+        )
+        self.store.create_task(self.contract, verified([worker], "task-1"), "cmd-luna-profile")
+        self.store.queue_task("task-1")
+
+        claimed = self.store.claim_ready_node("worker-1", self.epoch)
+
+        self.assertEqual(claimed["spec"]["model"], "gpt-5.6-luna")
+        self.assertEqual(claimed["spec"]["model_profile"], "luna_worker")
+        self.assertEqual(claimed["spec"]["model_reasoning_effort"], "max")
+        started = [event for event in self.store.read_events(task_id="task-1") if event["event_type"] == "node.started"]
+        self.assertEqual(started[-1]["payload"]["model_profile"], "luna_worker")
+        self.assertEqual(started[-1]["payload"]["model_reasoning_effort"], "max")
+
+    def test_retry_after_codex_fallback_keeps_codex_route(self) -> None:
+        contract = TaskContract(
+            task_id="fallback-retry",
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="preserve fallback route across retry",
+            allowed_scope=("src",),
+            retry_limit=1,
+        )
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "worker",
+            "claude",
+            "sonnet",
+            "bounded work",
+            read_scopes=("src",),
+        )
+        self.store.create_task(contract, verified([worker], contract.task_id), "fallback-retry-create")
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("worker-1", self.epoch)
+        self.store.record_node_route(
+            contract.task_id,
+            "worker",
+            executor="codex",
+            model="gpt-5.6-luna",
+            payload={"from": "claude", "to": "codex", "reason": "test fallback"},
+            attempt=claimed["attempt"],
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+        )
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "failed",
+                "Codex transient failure",
+                actual_model="gpt-5.6-luna",
+                retryable=True,
+                result_kind="worker",
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+
+        retried = self.store.claim_ready_node("worker-2", self.epoch)
+        self.assertEqual(retried["attempt"], 2)
+        self.assertEqual(retried["spec"]["executor"], "codex")
+        self.assertEqual(retried["spec"]["model"], "gpt-5.6-terra")
+        task_node = next(node for node in self.store.get_task(contract.task_id)["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(task_node["effective_executor"], "codex")
+        self.assertEqual(task_node["effective_model"], "gpt-5.6-terra")
+
+        self.store.settle_claimed(
+            retried,
+            NodeResult(
+                "failed",
+                "Codex retry exhausted",
+                actual_model="gpt-5.6-terra",
+                result_kind="worker",
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+        self.store.queue_task(contract.task_id)
+        manually_retried = self.store.claim_ready_node("worker-3", self.epoch)
+        self.assertEqual(manually_retried["spec"]["executor"], "codex")
+        self.assertEqual(manually_retried["spec"]["model"], "gpt-5.6-sol")
+
+    def test_archify_validate_and_migrate_persist_host_command_validation_evidence(self) -> None:
+        for command in ("validate", "migrate"):
+            with self.subTest(command=command):
+                task_id = f"archify-{command}"
+                contract = TaskContract(
+                    task_id=task_id,
+                    repository=str(Path(self.temp.name).resolve()),
+                    base_sha="abc123",
+                    objective="Create an architecture artifact",
+                    allowed_scope=("src",),
+                    task_type="architecture",
+                    complexity="high",
+                    verifier_model="fixture",
+                )
+                worker = NodeSpec(
+                    "worker",
+                    task_id,
+                    "worker",
+                    "codex",
+                    "gpt-5.6-luna",
+                    "create the bounded architecture evidence",
+                    read_scopes=("src",),
+                    write_scopes=("src",),
+                    archify=archify_internal_directive("architecture", True),
+                )
+                self.store.create_task(contract, verified([worker], task_id), f"{task_id}-create")
+                self.store.queue_task(task_id)
+                claimed = self.store.claim_ready_node(
+                    f"{command}-worker",
+                    self.epoch,
+                    admissible=lambda spec: not spec.get("verifier"),
+                )
+                assert claimed is not None
+                def binding(path: Path) -> dict[str, object]:
+                    data = path.read_bytes()
+                    return {
+                        "path": str(path.resolve()),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "bytes": len(data),
+                    }
+
+                if command == "validate":
+                    input_path = Path(self.temp.name) / "validate-input.json"
+                    input_path.write_text("{}", encoding="utf-8")
+                    receipt = {
+                        "command": command,
+                        "input": str(input_path.resolve()),
+                    }
+                    frozen_input = binding(input_path)
+                    frozen_source = None
+                    frozen_destination = None
+                else:
+                    source_path = Path(self.temp.name) / "source.workflow.json"
+                    destination_path = Path(self.temp.name) / "destination.workflow.json"
+                    source_path.write_text("{\"schema_version\":1}", encoding="utf-8")
+                    destination_path.write_text("{\"schema_version\":2}", encoding="utf-8")
+                    frozen_source = binding(source_path)
+                    frozen_destination = binding(destination_path)
+                    receipt = {
+                        "command": command,
+                        "source": frozen_source,
+                        "destination": frozen_destination,
+                    }
+                    frozen_input = None
+                receipt_ref = self.store.artifacts.put_text(
+                    json.dumps(receipt),
+                    "archify-receipt.json",
+                )
+                stdout = '{"ok":true}\n'
+                stderr = ""
+                stdout_ref = self.store.artifacts.put_text(stdout, "archify-command.stdout.log")
+                stderr_ref = self.store.artifacts.put_text(stderr, "archify-command.stderr.log")
+                execution_ref = self.store.artifacts.put_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "kind": "archify-executor-command-validation",
+                            "receipt_ref": receipt_ref,
+                            "receipt_command": command,
+                            "frozen_input": frozen_input,
+                            "frozen_source": frozen_source,
+                            "frozen_destination": frozen_destination,
+                            "proof": {
+                                "mode": (
+                                    "pinned-validate-and-frozen-input-binding"
+                                    if command == "validate"
+                                    else "pinned-migrate-and-frozen-source-destination-binding"
+                                ),
+                                "renderer_check": "not-applicable",
+                            },
+                            "argv": ["/usr/bin/node", "/workbench/archify.mjs", command],
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": 0,
+                            "provenance": {"schema_version": 1, "ok": True},
+                            "stdout_ref": stdout_ref,
+                            "stderr_ref": stderr_ref,
+                            "cli_receipt": {"ok": True},
+                        }
+                    ),
+                    "archify-execution.json",
+                )
+                result = NodeResult(
+                    status="succeeded",
+                    summary=f"{command} receipt accepted",
+                    actual_model="gpt-5.6-luna",
+                    result_kind="worker",
+                    artifacts={
+                        "archify-receipt": receipt_ref,
+                        "archify-execution": execution_ref,
+                    },
+                    checks=(f"archify:{command}",),
+                )
+
+                self.store.settle_claimed(claimed, result)
+
+                worker_row = next(
+                    node for node in self.store.get_task(task_id)["nodes"] if node["node_id"] == "worker"
+                )
+                self.assertEqual(worker_row["state"], "accepted")
+                self.assertEqual(worker_row["result"]["artifacts"]["archify-execution"], execution_ref)
+
+    def test_archify_legacy_receipt_only_evidence_is_rejected(self) -> None:
+        receipt_ref = self.store.artifacts.put_text(
+            json.dumps({"command": "validate"}),
+            "archify-receipt.json",
+        )
+        execution_ref = self.store.artifacts.put_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "archify-executor-command-evidence",
+                    "receipt_ref": receipt_ref,
+                    "receipt_command": "validate",
+                    "proof": {
+                        "mode": "command-specific-receipt",
+                        "renderer_check": "not-applicable",
+                    },
+                    "artifact_checker": {"exit_code": 0},
+                }
+            ),
+            "archify-execution.json",
+        )
+        result = NodeResult(
+            status="succeeded",
+            summary="invalid command evidence",
+            artifacts={
+                "archify-receipt": receipt_ref,
+                "archify-execution": execution_ref,
+            },
+            checks=("archify:validate",),
+        )
+
+        with self.assertRaisesRegex(ValueError, "host command-validation envelope"):
+            self.store._validate_archify_worker_evidence(result)
+
+    def test_archify_command_validation_rejects_log_mismatch(self) -> None:
+        input_path = Path(self.temp.name) / "validate-input.json"
+        input_path.write_text("{}", encoding="utf-8")
+        receipt_ref = self.store.artifacts.put_text(
+            json.dumps({"command": "validate", "input": str(input_path.resolve())}),
+            "archify-receipt.json",
+        )
+        stdout_ref = self.store.artifacts.put_text('{"actual":true}\n', "archify-command.stdout.log")
+        stderr_ref = self.store.artifacts.put_text("", "archify-command.stderr.log")
+        execution_ref = self.store.artifacts.put_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "archify-executor-command-validation",
+                    "receipt_ref": receipt_ref,
+                    "receipt_command": "validate",
+                    "frozen_input": {
+                        "path": str(input_path.resolve()),
+                        "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+                        "bytes": input_path.stat().st_size,
+                    },
+                    "frozen_source": None,
+                    "frozen_destination": None,
+                    "proof": {
+                        "mode": "pinned-validate-and-frozen-input-binding",
+                        "renderer_check": "not-applicable",
+                    },
+                    "argv": ["/usr/bin/node", "/workbench/archify.mjs", "validate"],
+                    "stdout": '{"claimed":true}\n',
+                    "stderr": "",
+                    "exit_code": 0,
+                    "provenance": {"schema_version": 1, "ok": True},
+                    "stdout_ref": stdout_ref,
+                    "stderr_ref": stderr_ref,
+                    "cli_receipt": {"ok": True},
+                }
+            ),
+            "archify-execution.json",
+        )
+        result = NodeResult(
+            status="succeeded",
+            summary="invalid command log evidence",
+            artifacts={
+                "archify-receipt": receipt_ref,
+                "archify-execution": execution_ref,
+            },
+            checks=("archify:validate",),
+        )
+
+        with self.assertRaisesRegex(ValueError, "logs do not match"):
+            self.store._validate_archify_worker_evidence(result)
 
     def test_parent_and_child_write_scopes_conflict(self) -> None:
         nodes = [

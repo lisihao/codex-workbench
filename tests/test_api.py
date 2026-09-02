@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from http import HTTPStatus
 import json
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -22,6 +24,55 @@ from codex_workbench.store import WorkbenchStore
 
 
 class APITests(unittest.TestCase):
+    def test_events_rejects_invalid_after_as_json_400(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(
+                        f"http://127.0.0.1:{server.server_address[1]}/api/events?after=not-an-int",
+                        timeout=2,
+                    )
+                self.assertEqual(caught.exception.code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(json.load(caught.exception), {"error": "after must be an integer"})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_health_is_unavailable_when_harness_or_archify_health_is_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch(
+                    "codex_workbench.api.code_as_harness_health",
+                    return_value={"ok": False, "archify": {"ok": False}},
+                ):
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(f"http://127.0.0.1:{server.server_address[1]}/health", timeout=2)
+                payload = json.load(caught.exception)
+                self.assertFalse(payload["ok"])
+                self.assertFalse(payload["harness"]["ok"])
+                self.assertFalse(payload["harness"]["archify"]["ok"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_snapshot_is_readable_and_control_requires_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -39,6 +90,10 @@ class APITests(unittest.TestCase):
                     snapshot = json.load(response)
                 self.assertTrue(snapshot["health"]["ok"])
                 self.assertEqual(snapshot["governance"]["profile"], "code-as-harness/v1")
+                self.assertIn("harness", snapshot)
+                self.assertIn("archify", snapshot["harness"])
+                self.assertFalse(snapshot["harness"]["archify"]["authentication_checked"])
+                self.assertFalse(snapshot["harness"]["archify"]["model_called"])
                 self.assertTrue(snapshot["governance"]["enforced"])
                 self.assertEqual(snapshot["governance"]["execution_location"], "authority")
                 self.assertFalse(snapshot["authenticated"])
@@ -46,6 +101,14 @@ class APITests(unittest.TestCase):
                 self.assertIsNone(snapshot["quota_policy"])
                 self.assertEqual(len(snapshot["acceptance"]["checks"]), 11)
                 self.assertEqual(snapshot["acceptance"]["backlog"][0]["id"], "A2")
+                with mock.patch(
+                    "codex_workbench.api.code_as_harness_health",
+                    return_value={"ok": True, "archify": {"ok": True}},
+                ):
+                    with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                        health_endpoint = json.load(response)
+                self.assertIn("harness", health_endpoint)
+                self.assertIn("archify", health_endpoint["harness"])
                 with urlopen(f"http://127.0.0.1:{port}/api/acceptance", timeout=2) as response:
                     acceptance = json.load(response)
                 self.assertFalse(acceptance["complete"])

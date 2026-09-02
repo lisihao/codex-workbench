@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 
+from .governance import governance_receipt_fields
 from .model import canonical_hash
 from .worktrees import normalize_scope
 
@@ -25,19 +26,45 @@ def reusable_evidence_key(
     scopes = tuple(dict.fromkeys((*spec.get("read_scopes", ()), *spec.get("write_scopes", ()))))
     if not scopes:
         return None
+    return evidence_fingerprint(contract, spec, worktree, steering, scopes=scopes)
+
+
+def evidence_fingerprint(
+    contract: dict,
+    spec: dict,
+    worktree: Path,
+    steering: tuple[str, ...] = (),
+    *,
+    scopes: tuple[str, ...] | None = None,
+) -> str:
+    """Identify reusable verifier evidence, including the governing full-gate tier."""
+
+    selected_scopes = scopes or tuple(
+        dict.fromkeys((*spec.get("read_scopes", ()), *spec.get("write_scopes", ())))
+    )
+    if not selected_scopes:
+        raise ValueError("Evidence fingerprint requires at least one declared scope")
     executor = spec["executor"]
     return canonical_hash(
         {
-            "kind": "verified-evidence-v2",
+            "kind": "verified-evidence-v3",
+            "contract": {
+                "repository": contract["repository"],
+                "base_sha": contract["base_sha"],
+                "allowed_scope": contract.get("allowed_scope", ()),
+                "forbidden_scope": contract.get("forbidden_scope", ()),
+                "required_artifacts": contract.get("required_artifacts", ()),
+            },
             "objective": contract["objective"],
             "acceptance_commands": contract.get("acceptance_commands", ()),
+            "governance": governance_receipt_fields(contract),
             "spec": {
                 key: value
                 for key, value in spec.items()
                 if key not in {"task_id", "node_id", "ordinal", "depends_on"}
             },
             "steering": steering,
-            "scope_fingerprint": _scope_fingerprint(worktree, scopes),
+            "scope_fingerprint": _scope_fingerprint(worktree, selected_scopes),
             "runtime": _runtime_identity(executor),
         }
     )

@@ -72,6 +72,49 @@ RoutingTaskType = Literal[
     "exploration",
 ]
 RoutingComplexity = Literal["low", "standard", "high"]
+RoutingProfile = Literal[
+    "spark_worker",
+    "luna_worker",
+    "terra_worker",
+    "sol_control_plane",
+]
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+
+# These are deliberately derived from the selected model, rather than trusted
+# from planner prose.  The values are persisted on normalized NodeSpec rows
+# and are also used by the Codex executor to emit an explicit CLI override.
+CODEX_MODEL_PROFILES: dict[str, RoutingProfile] = {
+    "gpt-5.3-codex-spark": "spark_worker",
+    "gpt-5.6-luna": "luna_worker",
+    "gpt-5.6-terra": "terra_worker",
+    "gpt-5.6-sol": "sol_control_plane",
+}
+CODEX_MODEL_REASONING_EFFORTS: dict[str, ReasoningEffort] = {
+    "gpt-5.3-codex-spark": "xhigh",
+    "gpt-5.6-luna": "max",
+    "gpt-5.6-terra": "max",
+    "gpt-5.6-sol": "max",
+}
+
+
+def codex_model_profile(model: object) -> str | None:
+    """Return the canonical execution profile for a known Codex model."""
+
+    value = str(model).lower()
+    for model_name, profile in CODEX_MODEL_PROFILES.items():
+        if model_name in value:
+            return profile
+    return None
+
+
+def codex_model_reasoning_effort(model: object) -> str | None:
+    """Return the explicit reasoning effort required for a known Codex model."""
+
+    value = str(model).lower()
+    for model_name, effort in CODEX_MODEL_REASONING_EFFORTS.items():
+        if model_name in value:
+            return effort
+    return None
 
 
 def now_iso() -> str:
@@ -395,6 +438,30 @@ class NodeSpec:
     write_scopes: tuple[str, ...] = ()
     verifier: bool = False
     ordinal: int = 0
+    # Populated only by the normalized planner.  This durable metadata keeps
+    # model/user prompt text from becoming an execution-control channel.
+    archify: dict[str, Any] | None = None
+    # Optional on input for compatibility with pre-v2 persisted plans; the
+    # planner fills these fields from the task contract before persistence.
+    routing_strategy: str | None = None
+    task_type: RoutingTaskType | None = None
+    complexity: RoutingComplexity | None = None
+    parallelizable: bool | None = None
+    claude_allowed: bool | None = None
+    # Effective Codex invocation metadata.  These values are derived from the
+    # selected model and make Luna's max-effort/profile semantics inspectable.
+    model_profile: str | None = None
+    model_reasoning_effort: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.executor != "codex":
+            return
+        profile = codex_model_profile(self.model)
+        effort = codex_model_reasoning_effort(self.model)
+        if profile is not None and self.model_profile is None:
+            object.__setattr__(self, "model_profile", profile)
+        if effort is not None and self.model_reasoning_effort is None:
+            object.__setattr__(self, "model_reasoning_effort", effort)
 
     def validate(self) -> None:
         if not self.node_id or not self.task_id:
@@ -403,8 +470,55 @@ class NodeSpec:
             raise ValueError("deterministic nodes require command")
         if self.executor in {"codex", "claude"} and not self.prompt.strip():
             raise ValueError("model nodes require prompt")
+        if self.routing_strategy is not None:
+            RoutingStrategy(
+                version=self.routing_strategy,
+                task_type=self.task_type or "implementation",
+                complexity=self.complexity or "standard",
+                parallelizable=True if self.parallelizable is None else self.parallelizable,
+                claude_allowed=True if self.claude_allowed is None else self.claude_allowed,
+            ).validate()
+        if self.parallelizable is not None and not isinstance(self.parallelizable, bool):
+            raise ValueError("node parallelizable must be a boolean")
+        if self.claude_allowed is not None and not isinstance(self.claude_allowed, bool):
+            raise ValueError("node claude_allowed must be a boolean")
+        expected_profile = codex_model_profile(self.model)
+        if expected_profile is not None and self.model_profile not in {None, expected_profile}:
+            raise ValueError(
+                f"node model_profile {self.model_profile!r} does not match {self.model!r}"
+            )
+        expected_effort = codex_model_reasoning_effort(self.model)
+        if expected_effort is not None and self.model_reasoning_effort not in {
+            None,
+            expected_effort,
+        }:
+            raise ValueError(
+                f"node model_reasoning_effort {self.model_reasoning_effort!r} does not match {self.model!r}"
+            )
         if self.verifier and self.executor == "fixture":
             return
+
+    @property
+    def routing(self) -> RoutingStrategy | None:
+        """Return node routing metadata when it was explicitly normalized."""
+
+        if self.routing_strategy is None:
+            return None
+        return RoutingStrategy(
+            version=self.routing_strategy,
+            task_type=self.task_type or "implementation",
+            complexity=self.complexity or "standard",
+            parallelizable=True if self.parallelizable is None else self.parallelizable,
+            claude_allowed=True if self.claude_allowed is None else self.claude_allowed,
+        ).normalized()
+
+    @property
+    def profile(self) -> str | None:
+        return self.model_profile
+
+    @property
+    def reasoning_effort(self) -> str | None:
+        return self.model_reasoning_effort
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

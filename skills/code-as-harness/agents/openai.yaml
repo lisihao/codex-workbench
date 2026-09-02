@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code as Harness"
+  short_description: "按风险分层选择测试与治理，复用可信证据并避免重复全量验证"
+  default_prompt: "Use $code-as-harness to classify this change and run only the proportional evidence gates required for completion."

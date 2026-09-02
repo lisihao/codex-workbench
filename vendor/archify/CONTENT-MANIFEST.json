@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/tt-a1i/archify",
+    "tag": "v2.16.0",
+    "commit": "c826e6c3a7abad19c0f3cd1ca57207d54b1ad8de",
+    "version": "2.16.0",
+    "license": "MIT"
+  },
+  "content": {
+    "algorithm": "sha256-path-size-bytes-v1",
+    "file_count": 190,
+    "tree_sha256": "daad1a13acd18647c951bf1776af278347cf59bc29671951aa6f8ea112eb050f"
+  }
+}

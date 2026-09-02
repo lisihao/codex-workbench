@@ -11,11 +11,43 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench.config import WorkbenchConfig
-from codex_workbench.session_context import import_session_context
+from codex_workbench.session_context import (
+    _extract_archive,
+    _validated_manifest,
+    import_session_context,
+)
 from codex_workbench.store import WorkbenchStore
 
 
 class SessionContextTests(unittest.TestCase):
+    def test_archive_members_must_be_unique_after_path_normalization(self) -> None:
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+            for name, data in (
+                ("manifest.json", b"{}"),
+                ("files/a", b"first"),
+                ("files//a", b"second"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                bundle.addfile(info, io.BytesIO(data))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "after normalization"):
+                _extract_archive(archive.getvalue(), Path(directory))
+
+    def test_context_dot_identifiers_are_rejected_before_worktree_materialization(self) -> None:
+        for thread_id in (".", ".."):
+            manifest = {
+                "schema_version": 1,
+                "source_thread_id": thread_id,
+                "repository": {"name": "project", "head": "a" * 40},
+                "suggested_scopes": ["src"],
+                "files": [],
+            }
+            with self.subTest(thread_id=thread_id):
+                with self.assertRaisesRegex(ValueError, "source_thread_id is invalid"):
+                    _validated_manifest(manifest)
+
     def test_import_materializes_isolated_worktree_and_durable_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

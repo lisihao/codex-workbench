@@ -11,6 +11,7 @@ from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
+from .governance import code_as_harness_health
 from .planner import PlannerError
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
@@ -72,6 +73,29 @@ TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
             "required": ["source_thread_id"],
             "properties": {"source_thread_id": {"type": "string"}},
+        },
+    },
+    {
+        "name": "workbench_continue_session",
+        "description": "Append a user message to the active task bound to this Codex thread. It never pauses, cancels, or replaces that objective; use explicit task control for those actions.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["source_thread_id", "instruction"],
+            "properties": {
+                "source_thread_id": {"type": "string"},
+                "instruction": {"type": "string", "minLength": 1, "maxLength": 500},
+                "expected_revision": {"type": "integer", "minimum": 0},
+            },
+        },
+    },
+    {
+        "name": "workbench_harness_health",
+        "description": "Report Codex/Claude binaries, canonical Skill and policy artifacts, plus static Workbench Code-as-Harness wiring. It never authenticates or invokes a model.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
         },
     },
     {
@@ -331,6 +355,25 @@ class WorkbenchMCPServer:
             return self._text(
                 {key: value for key, value in binding.items() if key != "context_excerpt"}
             )
+        if name == "workbench_continue_session":
+            receipt = self.store.append_active_session_steering(
+                arguments["source_thread_id"],
+                arguments["instruction"],
+                expected_revision=(
+                    int(arguments["expected_revision"])
+                    if "expected_revision" in arguments
+                    else None
+                ),
+            )
+            return self._text(
+                {
+                    "ok": True,
+                    "continuation": "active-objective-preserved",
+                    **receipt,
+                }
+            )
+        if name == "workbench_harness_health":
+            return self._text(code_as_harness_health(self.config))
         if name == "workbench_sync_github":
             return self._text(
                 RepositorySynchronizer().sync_github(

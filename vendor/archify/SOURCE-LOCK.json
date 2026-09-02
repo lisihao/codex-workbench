@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/tt-a1i/archify",
+  "tag": "v2.16.0",
+  "commit": "c826e6c3a7abad19c0f3cd1ca57207d54b1ad8de",
+  "version": "2.16.0",
+  "license": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "content_manifest": {
+    "path": "CONTENT-MANIFEST.json",
+    "sha256": "de13ea9f8a1c344461b35df1ca4faea4ad90673f969f618af5f3b89dac7ad950",
+    "file_count": 190,
+    "tree_sha256": "daad1a13acd18647c951bf1776af278347cf59bc29671951aa6f8ea112eb050f"
+  },
+  "upstream_license_files": [
+    "LICENSE",
+    "archify/LICENSE"
+  ],
+  "release_date": "2026-08-30",
+  "source_note": "Pinned from the annotated v2.16.0 tag; do not substitute the older archify-dsh-v0.1.0 / Archify 2.14 snapshot."
+}
