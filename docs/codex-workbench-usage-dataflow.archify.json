@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Codex Workbench 使用方式与数据流",
+    "subtitle": "MacBook 是入口，Mac mini 是唯一 Authority，Evidence 是完成条件",
+    "output": "docs/codex-workbench-usage-dataflow.html",
+    "locale": "zh-CN",
+    "viewBox": [1000, 900],
+    "animation": "trace",
+    "visual_preset": "editorial",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "how_to_use",
+        "label": "怎么使用",
+        "focus": ["codex_session", "wb_plugin", "context_bundle", "secure_transport", "authority_planner"],
+        "note": "在任意新会话或已有会话输入 wb，Workbench 会打包受控上下文并连接 Mac mini。"
+      },
+      {
+        "id": "execution_loop",
+        "label": "执行与验收",
+        "focus": ["authority_planner", "worker_pool", "isolated_worktrees", "harness_verifier", "sqlite_ledger"],
+        "note": "Sol 规划，Spark、Luna max、Terra 和受配额保护的 Claude 并行执行，最后由 Evidence 验收。"
+      },
+      {
+        "id": "result_return",
+        "label": "结果如何回来",
+        "focus": ["sqlite_ledger", "cockpit_return", "codex_session"],
+        "note": "状态快照、cursor 事件和验收 Evidence 回到原 Codex 会话；离线时落回当前 MacBook checkout。"
+      }
+    ],
+    "legend": {
+      "mode": "all",
+      "entries": {
+        "default": { "label": "命令或数据" },
+        "emphasis": { "label": "主执行链路" },
+        "security": { "label": "治理与验收" },
+        "dashed": { "label": "离线回落" },
+        "database": { "label": "唯一任务账本" }
+      }
+    }
+  },
+  "stages": [
+    { "label": "MacBook · 使用入口" },
+    { "label": "受控传输" },
+    { "label": "Mac mini · 唯一 Authority" },
+    { "label": "验收回传" }
+  ],
+  "nodes": [
+    {
+      "id": "codex_session",
+      "type": "frontend",
+      "label": "Codex 会话",
+      "sublabel": "新会话或已有会话",
+      "stage": 0,
+      "row": 0,
+      "tag": "输入 wb"
+    },
+    {
+      "id": "wb_plugin",
+      "type": "backend",
+      "label": "Workbench 插件",
+      "sublabel": "UserPromptSubmit hook",
+      "stage": 0,
+      "row": 2,
+      "tag": "会话同步"
+    },
+    {
+      "id": "context_bundle",
+      "type": "security",
+      "label": "Context Bundle",
+      "sublabel": "摘要、Git patch、受控文件",
+      "stage": 0,
+      "row": 4,
+      "tag": "有界 + 脱敏"
+    },
+    {
+      "id": "secure_transport",
+      "type": "cloud",
+      "label": "SSH / Tailscale + MCP",
+      "sublabel": "双向受控通道",
+      "stage": 1,
+      "row": 2,
+      "width": 172,
+      "tag": "WB_SYNC_RECEIPT"
+    },
+    {
+      "id": "authority_planner",
+      "type": "backend",
+      "label": "Authority + Sol 规划器",
+      "sublabel": "导入上下文，生成 TaskContract + DAG",
+      "stage": 2,
+      "row": 0,
+      "width": 206,
+      "tag": "Mac mini · 需求拆解"
+    },
+    {
+      "id": "worker_pool",
+      "type": "messagebus",
+      "label": "并行 Worker 池",
+      "sublabel": "Spark · Luna max · Terra · Claude",
+      "stage": 2,
+      "row": 1,
+      "width": 176,
+      "tag": "按风险路由"
+    },
+    {
+      "id": "isolated_worktrees",
+      "type": "backend",
+      "label": "隔离 Worktrees",
+      "sublabel": "范围不冲突才并行",
+      "stage": 2,
+      "row": 2,
+      "width": 158,
+      "tag": "并行写入"
+    },
+    {
+      "id": "harness_verifier",
+      "type": "security",
+      "label": "Code-as-Harness + Sol 验收",
+      "sublabel": "diff、测试、Artifact、Evidence → verdict",
+      "stage": 2,
+      "row": 3,
+      "width": 216,
+      "tag": "accepted / needs_fix"
+    },
+    {
+      "id": "sqlite_ledger",
+      "type": "database",
+      "label": "SQLite 唯一账本",
+      "sublabel": "任务、事件、Evidence、cursor",
+      "stage": 2,
+      "row": 4,
+      "width": 168,
+      "tag": "single authority"
+    },
+    {
+      "id": "cockpit_return",
+      "type": "frontend",
+      "label": "Codex 驾驶舱回显",
+      "sublabel": "进度、结果、Evidence",
+      "stage": 3,
+      "row": 2,
+      "tag": "原会话可见"
+    }
+  ],
+  "flows": [
+    {
+      "from": "codex_session",
+      "to": "wb_plugin",
+      "label": "① 输入 wb",
+      "classification": "用户意图",
+      "variant": "emphasis",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "wb_plugin",
+      "to": "context_bundle",
+      "label": "② 规范化并打包",
+      "classification": "受控上下文",
+      "variant": "security",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "context_bundle",
+      "to": "secure_transport",
+      "label": "③ Context Bundle",
+      "classification": "secret-name exclusion",
+      "variant": "emphasis",
+      "route": "vertical-channel",
+      "labelAt": [208, 656]
+    },
+    {
+      "from": "secure_transport",
+      "to": "authority_planner",
+      "label": "④ 导入 + receipt",
+      "classification": "MCP",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[415, 385], [415, 157]],
+      "labelAt": [368, 470]
+    },
+    {
+      "from": "authority_planner",
+      "to": "worker_pool",
+      "label": "⑤ 就绪 DAG 节点",
+      "classification": "并行调度",
+      "variant": "emphasis",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "worker_pool",
+      "to": "isolated_worktrees",
+      "label": "⑥ 实现与聚焦检查",
+      "classification": "scope-disjoint",
+      "variant": "emphasis",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "isolated_worktrees",
+      "to": "harness_verifier",
+      "label": "⑦ diff + test logs",
+      "classification": "可验证产物",
+      "variant": "security",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "harness_verifier",
+      "to": "sqlite_ledger",
+      "label": "⑧ verdict + cursor",
+      "classification": "durable state",
+      "variant": "security",
+      "route": "vertical-channel"
+    },
+    {
+      "from": "sqlite_ledger",
+      "to": "cockpit_return",
+      "label": "⑨ snapshot + events",
+      "classification": "状态与 Evidence",
+      "variant": "emphasis",
+      "route": "vertical-channel",
+      "labelAt": [652, 656]
+    },
+    {
+      "from": "cockpit_return",
+      "to": "codex_session",
+      "label": "⑩ 原会话显示",
+      "classification": "进度 / 结果",
+      "variant": "emphasis",
+      "route": "top-channel"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "发往 Mac mini",
+      "items": [
+        "规范化的用户与助手消息",
+        "工具调用名称、Git patch、显式允许文件",
+        "会话与仓库绑定所需的最小元数据"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "不会打包",
+      "items": [
+        "原始推理与原始工具输出",
+        "认证材料、SSH 密钥、.env 与 secret-named 文件",
+        "第二份 Authority SQLite 账本"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "完成条件",
+      "items": [
+        "结果必须携带 diff、聚焦测试和必要 Artifact",
+        "Sol 验收通过后才进入 accepted",
+        "Claude 受登录状态与至少 20% 配额保护"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "断网回落",
+      "items": [
+        "返回 degraded receipt，在当前 MacBook checkout 继续",
+        "待同步数据写入 outbox，并在下次提示时重试",
+        "始终不创建第二个 Authority 或第二份任务账本"
+      ]
+    }
+  ]
+}

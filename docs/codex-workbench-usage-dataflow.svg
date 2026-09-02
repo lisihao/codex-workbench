@@ -1,0 +1,272 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Workbench 使用方式与数据流</title>
+  <desc id="desc">从 MacBook 的任意 Codex 会话输入 wb，经受控上下文同步到 Mac mini Authority，由 Sol 规划并调度 Spark、Luna、Terra 与受配额保护的 Claude Worker，在隔离 worktree 中执行，经过 Evidence 验收后将状态和结果回传原会话。网络中断时回落到 MacBook 当前 checkout 并写入待重试 outbox。</desc>
+
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#18253f" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5.5 L0,11 Z" fill="#2367c9"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5.5 L0,11 Z" fill="#1a8164"/>
+    </marker>
+    <marker id="arrow-coral" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5.5 L0,11 Z" fill="#c55b47"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; fill: #17243d; }
+      .mono { font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace; }
+      .eyebrow { font-size: 16px; font-weight: 700; letter-spacing: 2.4px; fill: #2367c9; }
+      .title { font-size: 42px; font-weight: 760; letter-spacing: -0.8px; }
+      .subtitle { font-size: 19px; fill: #586579; }
+      .lane-title { font-size: 19px; font-weight: 720; }
+      .lane-subtitle { font-size: 13px; fill: #6b7687; letter-spacing: 0.7px; }
+      .step { font-size: 13px; font-weight: 800; letter-spacing: 1.2px; fill: #2367c9; }
+      .card-title { font-size: 19px; font-weight: 720; }
+      .card-copy { font-size: 14px; fill: #5c687a; }
+      .small { font-size: 12px; fill: #6b7687; }
+      .pill { font-size: 12px; font-weight: 700; }
+      .flow-label { font-size: 13px; font-weight: 700; fill: #2367c9; }
+      .return-label { font-size: 13px; font-weight: 700; fill: #1a8164; }
+      .section-title { font-size: 18px; font-weight: 740; }
+      .footer-copy { font-size: 13px; fill: #5f6b7e; }
+      .node { fill: #ffffff; stroke: #d9e0ea; stroke-width: 1.5; }
+      .blue-node { fill: #f2f7ff; stroke: #9bbce8; stroke-width: 1.6; }
+      .amber-node { fill: #fff8e9; stroke: #ddb96a; stroke-width: 1.6; }
+      .green-node { fill: #effaf6; stroke: #7fc0aa; stroke-width: 1.6; }
+      .coral-node { fill: #fff4f1; stroke: #dc9a8c; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1100" fill="#f5f1e8"/>
+  <path d="M0 0H1600V15H0Z" fill="#17243d"/>
+
+  <g transform="translate(58 58)">
+    <text class="eyebrow" x="0" y="0">CODEX WORKBENCH</text>
+    <text class="title" x="0" y="52">怎么使用，以及数据怎样流动</text>
+    <text class="subtitle" x="0" y="89">MacBook 是入口 · Mac mini 是唯一 Authority · Evidence 是完成条件</text>
+  </g>
+
+  <g transform="translate(1150 48)">
+    <rect width="388" height="86" rx="18" fill="#17243d"/>
+    <circle cx="28" cy="26" r="5" fill="#6ca5ed"/>
+    <text x="44" y="31" font-size="13" font-weight="700" fill="#f7f9fc">蓝色：命令与数据</text>
+    <circle cx="210" cy="26" r="5" fill="#63b596"/>
+    <text x="226" y="31" font-size="13" font-weight="700" fill="#f7f9fc">绿色：验收回传</text>
+    <path d="M24 59H36" stroke="#ef8d77" stroke-width="3" stroke-dasharray="5 4"/>
+    <text x="44" y="64" font-size="13" font-weight="700" fill="#f7f9fc">虚线：断网回落</text>
+    <text x="210" y="64" font-size="12" fill="#cbd5e4">①—⑧ 是一次完整任务</text>
+  </g>
+
+  <!-- Main operating surface -->
+  <rect x="48" y="170" width="1504" height="640" rx="30" fill="#fffdf8" stroke="#d8d2c6" stroke-width="1.5" filter="url(#shadow)"/>
+
+  <!-- Lane headers -->
+  <g transform="translate(78 204)">
+    <rect width="338" height="48" rx="14" fill="#eaf3ff"/>
+    <text class="lane-title" x="18" y="23">MacBook · Codex 驾驶舱</text>
+    <text class="lane-subtitle mono" x="18" y="40">USER ENTRY / LOCAL FALLBACK</text>
+  </g>
+  <g transform="translate(452 204)">
+    <rect width="244" height="48" rx="14" fill="#edf4fb"/>
+    <text class="lane-title" x="18" y="23">受控传输</text>
+    <text class="lane-subtitle mono" x="18" y="40">SSH · TAILSCALE · MCP</text>
+  </g>
+  <g transform="translate(732 204)">
+    <rect width="788" height="48" rx="14" fill="#fff4d8"/>
+    <text class="lane-title" x="18" y="23">Mac mini · 唯一 Authority</text>
+    <text class="lane-subtitle mono" x="18" y="40">ALWAYS-ON CONTROL PLANE / SINGLE TASK LEDGER</text>
+  </g>
+
+  <!-- MacBook cards -->
+  <g transform="translate(78 278)">
+    <rect class="blue-node" width="338" height="112" rx="18"/>
+    <rect x="18" y="18" width="36" height="26" rx="8" fill="#2367c9"/>
+    <text class="step mono" x="28" y="36" fill="#ffffff">01</text>
+    <text class="card-title" x="68" y="38">打开任意 Codex 会话</text>
+    <text class="card-copy" x="18" y="68">新会话或已有会话都可以</text>
+    <rect x="18" y="82" width="90" height="22" rx="11" fill="#dceaff"/>
+    <text class="pill mono" x="33" y="97" fill="#1e5bad">输入 wb</text>
+  </g>
+
+  <path d="M247 390V416" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <text class="flow-label" x="266" y="410">触发插件</text>
+
+  <g transform="translate(78 430)">
+    <rect class="node" width="338" height="132" rx="18"/>
+    <rect x="18" y="18" width="36" height="26" rx="8" fill="#2367c9"/>
+    <text class="step mono" x="28" y="36" fill="#ffffff">02</text>
+    <text class="card-title" x="68" y="38">Workbench Plugin + Hook</text>
+    <text class="card-copy" x="18" y="68">规范化会话，并建立受控上下文边界</text>
+    <g transform="translate(18 86)">
+      <rect width="86" height="26" rx="13" fill="#eef2f7"/><text class="pill mono" x="13" y="18" fill="#4f5c70">history</text>
+      <rect x="94" width="92" height="26" rx="13" fill="#eef2f7"/><text class="pill mono" x="108" y="18" fill="#4f5c70">git patch</text>
+      <rect x="194" width="120" height="26" rx="13" fill="#eef2f7"/><text class="pill mono" x="207" y="18" fill="#4f5c70">allowed files</text>
+    </g>
+  </g>
+
+  <path d="M247 562V590" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <text class="flow-label" x="266" y="584">打包</text>
+
+  <g transform="translate(78 604)">
+    <rect class="blue-node" width="338" height="112" rx="18"/>
+    <rect x="18" y="18" width="36" height="26" rx="8" fill="#2367c9"/>
+    <text class="step mono" x="28" y="36" fill="#ffffff">03</text>
+    <text class="card-title" x="68" y="38">Context Bundle</text>
+    <text class="card-copy" x="18" y="68">有界会话摘要 + Git 上下文 + 显式文件</text>
+    <text class="small" x="18" y="94">会话文本脱敏 · secret-named 文件排除</text>
+  </g>
+
+  <!-- Transport -->
+  <g transform="translate(452 350)">
+    <rect class="blue-node" width="244" height="222" rx="22"/>
+    <circle cx="122" cy="55" r="31" fill="#2367c9"/>
+    <path d="M104 55H140M122 37V73" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+    <text class="card-title" x="122" y="109" text-anchor="middle">MCP 双向通道</text>
+    <text class="card-copy" x="122" y="138" text-anchor="middle">SSH / Tailscale</text>
+    <rect x="35" y="160" width="174" height="34" rx="17" fill="#dceaff"/>
+    <text class="pill mono" x="122" y="182" text-anchor="middle" fill="#1e5bad">WB_SYNC_RECEIPT</text>
+  </g>
+
+  <path d="M416 660H438V461H452" fill="none" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <rect x="426" y="594" width="134" height="28" rx="14" fill="#fffdf8" stroke="#b7c9e3"/>
+  <text class="flow-label mono" x="493" y="613" text-anchor="middle">④ SEND</text>
+
+  <!-- Authority envelope -->
+  <rect x="732" y="270" width="788" height="470" rx="24" fill="#fffaf0" stroke="#e1c98e" stroke-width="1.5"/>
+
+  <g transform="translate(764 296)">
+    <rect class="amber-node" width="724" height="82" rx="17"/>
+    <rect x="18" y="18" width="36" height="26" rx="8" fill="#b67b12"/>
+    <text class="step mono" x="28" y="36" fill="#ffffff">05</text>
+    <text class="card-title" x="68" y="37">Sol 规划器：恢复目标与验收边界</text>
+    <text class="card-copy" x="68" y="62">导入会话与仓库状态 → TaskContract → scope-aware DAG</text>
+  </g>
+
+  <path d="M696 461H716V337H752" fill="none" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <text class="flow-label" x="713" y="448" text-anchor="middle" transform="rotate(-90 713 448)">导入 + receipt</text>
+
+  <g transform="translate(764 404)">
+    <text class="step mono" x="0" y="0">06 · READY DAG NODES PARALLELIZE</text>
+    <g transform="translate(0 18)">
+      <rect class="node" width="164" height="86" rx="15"/>
+      <rect x="14" y="13" width="48" height="20" rx="10" fill="#17243d"/>
+      <text class="pill mono" x="38" y="27" text-anchor="middle" fill="#ffffff">SPARK</text>
+      <text class="card-title" x="14" y="55" font-size="17">短且机械可验</text>
+      <text class="small" x="14" y="75">独立配额池</text>
+    </g>
+    <g transform="translate(178 18)">
+      <rect class="blue-node" width="164" height="86" rx="15"/>
+      <rect x="14" y="13" width="74" height="20" rx="10" fill="#2367c9"/>
+      <text class="pill mono" x="51" y="27" text-anchor="middle" fill="#ffffff">LUNA MAX</text>
+      <text class="card-title" x="14" y="55" font-size="17">常规实现默认</text>
+      <text class="small" x="14" y="75">边界明确</text>
+    </g>
+    <g transform="translate(356 18)">
+      <rect class="node" width="164" height="86" rx="15"/>
+      <rect x="14" y="13" width="52" height="20" rx="10" fill="#6c5ab8"/>
+      <text class="pill mono" x="40" y="27" text-anchor="middle" fill="#ffffff">TERRA</text>
+      <text class="card-title" x="14" y="55" font-size="17">较大独立切片</text>
+      <text class="small" x="14" y="75">更多仓库上下文</text>
+    </g>
+    <g transform="translate(534 18)">
+      <rect class="node" width="190" height="86" rx="15"/>
+      <rect x="14" y="13" width="60" height="20" rx="10" fill="#b66b43"/>
+      <text class="pill mono" x="44" y="27" text-anchor="middle" fill="#ffffff">CLAUDE</text>
+      <text class="card-title" x="14" y="55" font-size="17">可选订阅 Worker</text>
+      <text class="small" x="14" y="75">登录新鲜 · 保护 ≥20%</text>
+    </g>
+  </g>
+
+  <path d="M1126 508V534" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+
+  <g transform="translate(764 548)">
+    <rect class="node" width="220" height="104" rx="17"/>
+    <text class="step mono" x="18" y="24">07A</text>
+    <text class="card-title" x="18" y="51">隔离 Git worktrees</text>
+    <text class="card-copy" x="18" y="77">scope 不冲突才并行</text>
+    <text class="small mono" x="18" y="96">diff + focused tests</text>
+  </g>
+  <path d="M984 600H1008" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <g transform="translate(1022 548)">
+    <rect class="green-node" width="254" height="104" rx="17"/>
+    <text class="step mono" x="18" y="24" fill="#1a8164">07B</text>
+    <text class="card-title" x="18" y="51">Code-as-Harness</text>
+    <text class="card-copy" x="18" y="77">Artifact + Evidence + Sol 验收</text>
+    <text class="small mono" x="18" y="96">accepted / needs_fix</text>
+  </g>
+  <path d="M1276 600H1300" stroke="#1a8164" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <g transform="translate(1314 548)">
+    <rect class="green-node" width="174" height="104" rx="17"/>
+    <text class="step mono" x="18" y="24" fill="#1a8164">08</text>
+    <text class="card-title" x="18" y="51">SQLite 账本</text>
+    <text class="card-copy" x="18" y="77">task · event</text>
+    <text class="small mono" x="18" y="96">evidence · cursor</text>
+  </g>
+
+  <g transform="translate(764 676)">
+    <rect width="724" height="42" rx="14" fill="#17243d"/>
+    <circle cx="22" cy="21" r="5" fill="#63b596"/>
+    <text x="38" y="26" font-size="13" font-weight="700" fill="#ffffff">只有 Evidence 与 verdict 一致，任务才进入 accepted；“Worker 跑完”不等于完成。</text>
+  </g>
+
+  <!-- Return path -->
+  <path d="M1401 652V760H247V730" fill="none" stroke="#1a8164" stroke-width="4" marker-end="url(#arrow-green)"/>
+  <rect x="96" y="742" width="344" height="36" rx="18" fill="#fffdf8" stroke="#7fc0aa"/>
+  <text class="return-label" x="268" y="765" text-anchor="middle">回到原 Codex 会话显示进度与结果</text>
+  <rect x="775" y="742" width="348" height="36" rx="18" fill="#effaf6" stroke="#7fc0aa"/>
+  <text class="return-label mono" x="949" y="765" text-anchor="middle">SNAPSHOT + CURSOR EVENTS + EVIDENCE</text>
+
+  <!-- Bottom explanatory rail -->
+  <g transform="translate(48 838)">
+    <rect width="1504" height="214" rx="28" fill="#17243d"/>
+
+    <g transform="translate(30 28)">
+      <text x="0" y="0" font-size="15" font-weight="800" letter-spacing="1.5" fill="#ef8d77">网络中断时</text>
+      <rect class="coral-node" x="0" y="20" width="574" height="132" rx="18"/>
+      <path d="M25 55H545" stroke="#c55b47" stroke-width="3" stroke-dasharray="9 7" marker-end="url(#arrow-coral)"/>
+      <g transform="translate(18 72)">
+        <rect width="162" height="42" rx="12" fill="#ffffff"/>
+        <text class="pill mono" x="81" y="18" text-anchor="middle" fill="#a74837">DEGRADED RECEIPT</text>
+        <text class="small" x="81" y="34" text-anchor="middle">明确告知已回落</text>
+      </g>
+      <g transform="translate(196 72)">
+        <rect width="168" height="42" rx="12" fill="#ffffff"/>
+        <text class="pill" x="84" y="18" text-anchor="middle" fill="#a74837">当前 checkout 继续</text>
+        <text class="small" x="84" y="34" text-anchor="middle">MacBook 本地开发</text>
+      </g>
+      <g transform="translate(380 72)">
+        <rect width="176" height="42" rx="12" fill="#ffffff"/>
+        <text class="pill mono" x="88" y="18" text-anchor="middle" fill="#a74837">OUTBOX → RETRY</text>
+        <text class="small" x="88" y="34" text-anchor="middle">下次提示重新同步</text>
+      </g>
+      <text class="footer-copy" x="18" y="140">不会静默创建第二个 Authority，也不会复制第二份任务账本。</text>
+    </g>
+
+    <line x1="638" y1="28" x2="638" y2="186" stroke="#3a4861"/>
+
+    <g transform="translate(672 28)">
+      <text x="0" y="0" font-size="15" font-weight="800" letter-spacing="1.5" fill="#8fbae9">数据边界</text>
+      <g transform="translate(0 22)">
+        <rect width="362" height="132" rx="18" fill="#23324c"/>
+        <circle cx="22" cy="25" r="6" fill="#63b596"/>
+        <text x="38" y="31" font-size="15" font-weight="720" fill="#ffffff">会发送</text>
+        <text x="22" y="61" font-size="13" fill="#d4deec">• 规范化的用户与助手消息</text>
+        <text x="22" y="86" font-size="13" fill="#d4deec">• 工具调用名称、Git patch、允许文件</text>
+        <text x="22" y="111" font-size="13" fill="#d4deec">• 会话和仓库绑定所需最小元数据</text>
+      </g>
+      <g transform="translate(382 22)">
+        <rect width="420" height="132" rx="18" fill="#23324c"/>
+        <circle cx="22" cy="25" r="6" fill="#ef8d77"/>
+        <text x="38" y="31" font-size="15" font-weight="720" fill="#ffffff">不会打包</text>
+        <text x="22" y="61" font-size="13" fill="#d4deec">• 原始推理与原始工具输出</text>
+        <text x="22" y="86" font-size="13" fill="#d4deec">• 认证材料、SSH 密钥、.env、secret-named 文件</text>
+        <text x="22" y="111" font-size="13" fill="#d4deec">• 第二份 Authority SQLite</text>
+      </g>
+    </g>
+  </g>
+
+  <text x="800" y="1081" text-anchor="middle" font-size="12" fill="#7a756b">Codex Workbench · macOS-only · self-hosted · evidence-gated</text>
+</svg>

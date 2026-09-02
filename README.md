@@ -8,6 +8,8 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 
 它适合已经有一台可长期运行的 Mac mini、主要在 MacBook 上使用 Codex、并希望把 Claude Code 订阅作为受控后台算力的人。它不是云端 SaaS，不是通用的“一键式 Codex 插件”，也不依赖或管理 DSH、Solar 或 AI4Research。
 
+![Codex Workbench 使用方式与数据流](docs/codex-workbench-usage-dataflow.svg)
+
 ## 它解决什么问题
 
 日常 AI 开发很容易在设备切换、网络中断、并行写冲突、重复测试和配额透支中失去上下文。Workbench 将这些问题变成可执行的系统约束：
