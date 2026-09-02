@@ -1,0 +1,18 @@
+{
+  "description": "Synchronize only explicitly WB-bound Codex sessions with Codex Workbench.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$PLUGIN_ROOT/scripts/wb_hook.py\"",
+            "timeout": 90,
+            "statusMessage": "正在同步会话到 Codex Workbench",
+            "additionalContextLimit": 12000
+          }
+        ]
+      }
+    ]
+  }
+}

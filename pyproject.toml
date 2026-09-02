@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codex-workbench"
 version = "1.4.0"
-description = "Persistent Codex-first development coordinator for a private Mac mini."
+description = "Self-hosted macOS control plane for durable, evidence-gated AI development."
 requires-python = ">=3.11"
 dependencies = []
 

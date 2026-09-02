@@ -1,0 +1,33 @@
+{
+  "name": "codex-workbench",
+  "version": "1.4.0",
+  "description": "Explicitly bind a Codex conversation to a configured persistent Codex Workbench.",
+  "author": {
+    "name": "Codex Workbench contributors"
+  },
+  "homepage": "https://github.com/lisihao/codex-workbench",
+  "repository": "https://github.com/lisihao/codex-workbench",
+  "keywords": [
+    "codex",
+    "developer-tools",
+    "macos",
+    "agent-orchestration"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Codex Workbench",
+    "shortDescription": "Bind an explicit Codex session to your Workbench.",
+    "longDescription": "Adds the WB skill and an opt-in hook that synchronizes a bounded conversation and repository context to the Codex Workbench MCP endpoint you configure.",
+    "developerName": "Codex Workbench contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Activate Codex Workbench for this conversation.",
+      "Show whether this conversation is bound to Codex Workbench."
+    ]
+  }
+}
