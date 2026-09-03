@@ -184,18 +184,19 @@ class ArchifyTests(unittest.TestCase):
             self.assertTrue(migration_verdict["ok"], migration_verdict)
             self.assertEqual(json.loads(migrated.read_text(encoding="utf-8"))["schema_version"], 2)
 
-            visual_result = self._run_cli("visual-check", str(delivered), "--json", check=False)
-            self.assertIn(visual_result.returncode, {0, 2}, visual_result.stderr)
+            # Keep this receipt-shape integration deterministic across CI images.
+            # The pinned vendor suite separately exercises real Chrome containment;
+            # this test only needs the truthful unavailable-Chrome receipt path.
+            with mock.patch.dict(
+                "os.environ",
+                {"ARCHIFY_CHROME": str(root / "missing-chrome")},
+            ):
+                visual_result = self._run_cli("visual-check", str(delivered), "--json", check=False)
+            self.assertEqual(visual_result.returncode, 2, visual_result.stderr)
             visual = json.loads(visual_result.stdout)
-            self.assertIn(visual["status"], {"pass", "skipped"})
+            self.assertEqual(visual["status"], "skipped")
             visual_verdict = validate_receipt(visual)
-            if visual["status"] == "pass":
-                self.assertTrue(visual_verdict["ok"], visual_verdict)
-                self.assertFalse(visual_verdict["visual_pass"])
-                reviewed = validate_receipt(visual, require_visual_review=True)
-                self.assertFalse(reviewed["ok"])
-            else:
-                self.assertFalse(visual_verdict["ok"])
+            self.assertFalse(visual_verdict["ok"])
 
     def test_receipt_validator_rejects_renderer_only_and_bad_visual_claims(self) -> None:
         valid = self._json_cli(
