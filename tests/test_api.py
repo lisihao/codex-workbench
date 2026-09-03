@@ -332,8 +332,15 @@ class APITests(unittest.TestCase):
                         active_payload = json.load(response)
                     self.assertTrue(active_payload["ok"])
                     self.assertEqual(active_payload["active"]["catalog_id"], active["catalog_id"])
-                    with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
-                        health = json.load(response)
+                    # This test owns capability serialization, not host-global
+                    # harness installation.  Keep CI and developer machines on
+                    # the same explicit healthy-harness input.
+                    with mock.patch(
+                        "codex_workbench.api.code_as_harness_health",
+                        return_value={"ok": True, "archify": {"ok": True}},
+                    ):
+                        with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                            health = json.load(response)
                     self.assertEqual(health["capability_registry"]["active_generation_id"], active["catalog_id"])
                     self.assertEqual(
                         health["capability_registry"]["active"]["models"][0]["model_id"],
