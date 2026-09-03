@@ -447,6 +447,97 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(cursors, sorted(cursors))
             self.assertIn("task.state_changed", {event["event_type"] for event in events})
 
+    def test_spark_lane_is_claimed_before_higher_priority_general_work_and_general_borrows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("spark-priority", "test-machine")
+            spark_contract = TaskContract(
+                task_id="spark-task",
+                repository=str(root),
+                base_sha="fixture",
+                objective="bounded Spark work",
+                allowed_scope=("src",),
+            )
+            general_contract = TaskContract(
+                task_id="general-task",
+                repository=str(root),
+                base_sha="fixture",
+                objective="higher priority general work",
+                allowed_scope=("tests",),
+            )
+            store.create_task(
+                spark_contract,
+                verified([NodeSpec("spark", "spark-task", "spark", "codex", "gpt-5.3-codex-spark", "bounded work")], "spark-task"),
+                "spark-create",
+            )
+            store.create_task(
+                general_contract,
+                verified([NodeSpec("general", "general-task", "general", "fixture", "fixture", "ok")], "general-task"),
+                "general-create",
+            )
+            store.queue_task("spark-task")
+            store.queue_task("general-task")
+            general = store.get_task("general-task")
+            store.set_task_priority("general-task", 10, expected_revision=general["state_revision"])
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=epoch,
+                max_workers=2,
+                spark_workers=1,
+            )
+            try:
+                first = coordinator._claim_next_ready_node("worker-1")
+                second = coordinator._claim_next_ready_node("worker-2")
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            assert first is not None and second is not None
+            self.assertEqual((first["task_id"], first["node_id"]), ("spark-task", "spark"))
+            self.assertEqual((second["task_id"], second["node_id"]), ("general-task", "general"))
+
+    def test_general_work_uses_an_idle_global_slot_when_spark_has_no_ready_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("spark-borrow", "test-machine")
+            contract = TaskContract(
+                task_id="general-only",
+                repository=str(root),
+                base_sha="fixture",
+                objective="general work",
+                allowed_scope=("src",),
+            )
+            store.create_task(
+                contract,
+                verified([NodeSpec("general", "general-only", "general", "fixture", "fixture", "ok")], "general-only"),
+                "general-only-create",
+            )
+            store.queue_task("general-only")
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=epoch,
+                max_workers=2,
+                spark_workers=1,
+            )
+            try:
+                claimed = coordinator._claim_next_ready_node("worker-1")
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            assert claimed is not None
+            self.assertEqual(claimed["node_id"], "general")
+            started = [
+                event for event in store.read_events(task_id="general-only")
+                if event["event_type"] == "node.started"
+            ][-1]
+            self.assertEqual(started["payload"]["execution_lane"], "general")
+            self.assertEqual(started["payload"]["lane_capacity"], 2)
+
     def test_unavailable_claude_node_falls_back_once_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

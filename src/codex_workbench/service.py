@@ -58,15 +58,27 @@ class Coordinator:
         *,
         coordinator_epoch: int,
         max_workers: int = 4,
+        spark_workers: int | None = None,
         poll_seconds: float = 1.0,
         quota_ttl_seconds: int = 900,
         quota_refresh_seconds: float = 60,
         quota_snapshot_file: Path | None = None,
         fatal_exit: Callable[[int], None] | None = None,
     ):
+        if max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        resolved_spark_workers = min(4, max_workers) if spark_workers is None else spark_workers
+        if not 0 <= resolved_spark_workers <= max_workers:
+            raise ValueError("spark_workers must be between 0 and max_workers")
         self.store = store
         self.state_root = state_root
         self.max_workers = max_workers
+        self.spark_workers = resolved_spark_workers
+        self._lane_capacities = {
+            "spark": self.spark_workers,
+            "general": self.max_workers,
+            "control": self.max_workers,
+        }
         self.poll_seconds = poll_seconds
         self.coordinator_epoch = coordinator_epoch
         self.quota_ttl_seconds = quota_ttl_seconds
@@ -127,7 +139,7 @@ class Coordinator:
                 # Workbench worker slot idle.  Claim the ready node and carry
                 # the exact decision into its thread, where it persistently
                 # routes to the governed Codex fallback in the same attempt.
-                claimed = self.store.claim_ready_node(worker_id, self.coordinator_epoch)
+                claimed = self._claim_next_ready_node(worker_id)
                 if claimed is None:
                     break
                 decision = self._claim_time_decision(
@@ -149,6 +161,30 @@ class Coordinator:
                 )
             self._stop.wait(self.poll_seconds)
         self._pool.shutdown(wait=True, cancel_futures=False)
+
+    def _claim_next_ready_node(self, worker_id: str) -> dict | None:
+        """Prefer ready, admissible Spark work without reserving idle threads.
+
+        The store re-applies task priority, dependency, parallelizability,
+        scope-conflict, authority, and lane-capacity checks for both attempts.
+        General/control work borrows every slot Spark cannot currently use.
+        """
+
+        if self.spark_workers:
+            spark = self.store.claim_ready_node(
+                worker_id,
+                self.coordinator_epoch,
+                execution_lanes=("spark",),
+                lane_capacities=self._lane_capacities,
+            )
+            if spark is not None:
+                return spark
+        return self.store.claim_ready_node(
+            worker_id,
+            self.coordinator_epoch,
+            execution_lanes=("general", "control"),
+            lane_capacities=self._lane_capacities,
+        )
 
     def stop(self) -> None:
         self._stop.set()

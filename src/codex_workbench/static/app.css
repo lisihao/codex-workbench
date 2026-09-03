@@ -35,6 +35,12 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .capability-model-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .capability-model-head strong { font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
 .capability-model p { color: var(--muted); font: 11px ui-monospace, monospace; line-height: 1.45; margin-top: 7px; }
+.performance-grid, .scheduler-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 9px; }
+.performance-card, .scheduler-card { border: 1px solid var(--line); border-radius: 11px; padding: 11px; background: var(--panel-2); }
+.performance-card span, .scheduler-card span { color: var(--muted); font: 11px ui-monospace, monospace; }
+.performance-card strong, .scheduler-card strong { display: block; margin-top: 7px; overflow-wrap: anywhere; }
+.performance-card p, .scheduler-card p { color: var(--muted); font-size: 11px; line-height: 1.45; margin-top: 7px; }
+.spark-title { margin-top: 18px; }
 .approvals { display: grid; gap: 10px; }
 .alerts { display: grid; gap: 8px; }
 .alert { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; border-bottom: 1px solid var(--line); padding: 8px 0; }
@@ -118,6 +124,7 @@ button.quiet { background: transparent; color: var(--text); }
   .steering input, .steering button { width: 100%; }
   .nodes { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 3px; scrollbar-width: thin; }
   .node { flex: 0 0 auto; border-radius: 999px; }
+  .performance-grid, .scheduler-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-contract dl { grid-template-columns: 1fr; }
   .event { grid-template-columns: 64px 1fr; }
   .event span:last-child { grid-column: 1 / -1; }

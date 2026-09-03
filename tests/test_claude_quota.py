@@ -43,10 +43,14 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
     def _logged_in(self) -> str:
         return json.dumps({"loggedIn": True, "authMethod": "subscription", "apiProvider": "firstParty"})
 
-    def _assert_fail_closed_snapshot(self) -> None:
+    def _assert_fail_closed_snapshot(self, *, auth_ok: bool = False) -> None:
         persisted = json.loads(self.output.read_text())
-        self.assertFalse(persisted["auth_ok"])
-        self.assertEqual(persisted["auth_method"], "none")
+        self.assertEqual(persisted["auth_ok"], auth_ok)
+        self.assertEqual(
+            persisted["auth_method"],
+            "native-subscription" if auth_ok else "none",
+        )
+        self.assertFalse(persisted["quota_ok"])
         self.assertTrue(persisted["error"])
         adapted = JsonFileQuotaAdapter(self.output).read()
         assert adapted is not None
@@ -128,6 +132,39 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         self.assertEqual(derived.producer_schema_version, 1)
         self.assertEqual(derived.claude_version, "2.1.239")
 
+    def test_json_array_envelope_and_fable_pool_are_supported_without_idle_reset(self) -> None:
+        text = "\n".join((
+            "You are currently using your subscription to power your Claude Code usage",
+            "Current session: 0% used",
+            "Current week (all models): 0% used · resets Sep 9 at 1am (America/Toronto)",
+            "Current week (Fable): 1% used · resets Sep 9 at 1am (America/Toronto)",
+        ))
+        result = json.loads(self._usage(text))
+        responses = {
+            ("auth", "status", "--json"): _completed([], self._logged_in()),
+            ("--version",): _completed([], "2.1.239 (Claude Code)\n"),
+            ("-p", "/usage", "--output-format", "json", "--no-session-persistence"): _completed(
+                [],
+                json.dumps([
+                    {"type": "system", "subtype": "init"},
+                    {"type": "assistant", "message": {"model": "<synthetic>"}},
+                    result,
+                ]),
+            ),
+        }
+
+        snapshot = self._collector(responses).collect()
+
+        self.assertEqual(snapshot["pools"]["five_hour"]["window_id"], "five_hour:idle")
+        self.assertEqual(snapshot["pools"]["five_hour"]["reset_precision"], "idle")
+        self.assertIn("seven_day_fable", snapshot["pools"])
+        self.assertNotIn("seven_day_sonnet", snapshot["pools"])
+        derived = JsonFileQuotaAdapter(self.output).read()
+        assert derived is not None
+        self.assertEqual(derived.weekly_fable_remaining, 98.0)
+        self.assertIsNone(derived.weekly_sonnet_remaining)
+        self.assertEqual(derived.dispatch_decision("fable").action, "claude")
+
     def test_missing_pool_or_format_drift_immediately_replaces_old_quota_with_fail_closed_snapshot(self) -> None:
         self.output.write_text("last-known-good\n")
         responses = {
@@ -137,7 +174,14 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         }
         with self.assertRaises(ClaudeQuotaError):
             self._collector(responses).collect()
-        self._assert_fail_closed_snapshot()
+        persisted = json.loads(self.output.read_text())
+        self.assertTrue(persisted["auth_ok"])
+        self.assertFalse(persisted["quota_ok"])
+        adapted = JsonFileQuotaAdapter(self.output).read()
+        assert adapted is not None
+        self.assertTrue(adapted.auth_ok)
+        self.assertEqual(adapted.quota_zone("sonnet")[0], "unknown")
+        self.assertEqual(adapted.dispatch_decision("sonnet").action, "codex")
 
     def test_nonzero_turn_token_or_cost_invalidates_old_quota(self) -> None:
         for field, value in (("num_turns", 1), ("duration_api_ms", 1), ("total_cost_usd", 0.1)):
@@ -151,7 +195,7 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
                 }
                 with self.assertRaises(ClaudeQuotaError):
                     self._collector(responses).collect()
-                self._assert_fail_closed_snapshot()
+                self._assert_fail_closed_snapshot(auth_ok=True)
 
         self.output = self.root / "quota-token.json"
         self.output.write_text("last-known-good\n")
@@ -164,7 +208,7 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         }
         with self.assertRaises(ClaudeQuotaError):
             self._collector(responses).collect()
-        self._assert_fail_closed_snapshot()
+        self._assert_fail_closed_snapshot(auth_ok=True)
 
     def test_different_weekly_reset_windows_invalidate_old_quota(self) -> None:
         self.output.write_text("last-known-good\n")
@@ -176,7 +220,7 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         }
         with self.assertRaises(ClaudeQuotaError):
             self._collector(responses).collect()
-        self._assert_fail_closed_snapshot()
+        self._assert_fail_closed_snapshot(auth_ok=True)
 
     def test_auth_command_failure_invalidates_a_previous_usable_snapshot(self) -> None:
         self.output.write_text("last-known-good\n")

@@ -93,6 +93,51 @@ def request(**changes: object) -> dict[str, object]:
 
 
 class RoutingV3Tests(unittest.TestCase):
+    def _calibration(self, *candidates: dict[str, object], **metadata: object) -> dict[str, object]:
+        values: dict[str, object] = {
+            "status": "ok",
+            "snapshot_id": "performance-" + "a" * 16,
+            "digest": "b" * 64,
+            "task_type": "implementation",
+            "complexity": "standard",
+            "candidates": list(candidates),
+        }
+        values.update(metadata)
+        return values
+
+    @staticmethod
+    def _calibrated_candidate(
+        provider: str,
+        model_id: str,
+        lower_bound: float,
+        *,
+        runtime_samples: int = 5,
+        agent_version: str = "unattested",
+        first_pass: float | None = None,
+        rework_rate: float | None = None,
+        latency_ms: float | None = None,
+    ) -> dict[str, object]:
+        quality: dict[str, object] = {
+            "prior": {"evidence_status": "available"},
+            "posterior": {
+                "lower_bound_95": lower_bound,
+                "runtime_sample_count": runtime_samples,
+            },
+        }
+        result: dict[str, object] = {
+            "provider": provider,
+            "model_id": model_id,
+            "agent_version": agent_version,
+            "quality": quality,
+        }
+        if first_pass is not None:
+            result["first_pass_rate"] = first_pass
+        if rework_rate is not None:
+            result["rework_rate"] = rework_rate
+        if latency_ms is not None:
+            result["latency_ms"] = latency_ms
+        return result
+
     def test_known_model_role_profiles_cover_sol_spark_luna_terra_and_claude_families(self) -> None:
         cases = (
             (
@@ -323,6 +368,264 @@ class RoutingV3Tests(unittest.TestCase):
         self.assertEqual(decision.selected.quality_score, 80)  # type: ignore[union-attr]
         self.assertEqual(decision.selected.estimated_cost_units, 2)  # type: ignore[union-attr]
         self.assertEqual(decision.selected.concurrency_utilization, 0.25)  # type: ignore[union-attr]
+
+    def test_exact_calibrated_lower_bound_changes_rank_after_hard_gates(self) -> None:
+        luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1)
+        terra = capability("codex", "gpt-5.6-terra", quality=80, cost=100)
+        catalog = snapshot(luna, terra)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.45),
+            self._calibrated_candidate("codex", "gpt-5.6-terra", 0.75),
+        )
+
+        first = route_capability_snapshot(catalog, request(independent_slice=True))
+        self.assertEqual(first.model, "gpt-5.6-terra")
+        self.assertEqual(first.selected.quality_source, "calibrated")  # type: ignore[union-attr]
+        self.assertEqual(first.selected.quality_score, 80)  # type: ignore[union-attr]
+        self.assertEqual(first.selected.ranking_quality_score, 75)  # type: ignore[union-attr]
+        self.assertEqual(first.selected.runtime_sample_count, 5)  # type: ignore[union-attr]
+
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.85),
+            self._calibrated_candidate("codex", "gpt-5.6-terra", 0.35),
+        )
+        second = route_capability_snapshot(catalog, request(independent_slice=True))
+        self.assertEqual(second.model, "gpt-5.6-luna")
+        self.assertEqual(second.performance_snapshot_id, "performance-" + "a" * 16)
+        self.assertEqual(second.performance_digest, "b" * 64)
+
+    def test_runtime_first_pass_rework_and_latency_break_equal_quality_bounds(self) -> None:
+        luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1)
+        terra = capability("codex", "gpt-5.6-terra", quality=80, cost=100)
+        catalog = snapshot(luna, terra)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate(
+                "codex",
+                "gpt-5.6-luna",
+                0.70,
+                first_pass=0.80,
+                rework_rate=0.20,
+                latency_ms=300,
+            ),
+            self._calibrated_candidate(
+                "codex",
+                "gpt-5.6-terra",
+                0.70,
+                first_pass=0.80,
+                rework_rate=0.10,
+                latency_ms=100,
+            ),
+        )
+
+        decision = route_capability_snapshot(catalog, request(independent_slice=True))
+
+        self.assertEqual(decision.model, "gpt-5.6-terra")
+        self.assertEqual(decision.selected.performance_rework_rate, 0.10)  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.performance_latency_ms, 100)  # type: ignore[union-attr]
+
+    def test_performance_cannot_bypass_quality_or_capability_hard_gates(self) -> None:
+        low_quality = capability("codex", "gpt-5.6-luna", quality=60)
+        good = capability("codex", "gpt-5.6-terra", quality=80)
+        catalog = snapshot(low_quality, good)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.99),
+            self._calibrated_candidate("codex", "gpt-5.6-terra", 0.20),
+        )
+
+        decision = route_capability_snapshot(
+            catalog,
+            request(quality_floor=70, independent_slice=True),
+        )
+
+        self.assertEqual(decision.model, "gpt-5.6-terra")
+        rejection = next(
+            item for item in decision.rejected_candidates if item.model == "gpt-5.6-luna"
+        )
+        self.assertIn("below required quality floor", " ".join(rejection.reasons))
+
+    def test_spark_without_public_pass_rate_uses_declared_quality_only(self) -> None:
+        spark = capability(
+            "codex",
+            "gpt-5.3-codex-spark",
+            complexities=("low",),
+            quality=60,
+        )
+        catalog = snapshot(spark)
+        catalog["performance_calibration"] = self._calibration(
+            {
+                "provider": "codex",
+                "model_id": "gpt-5.3-codex-spark",
+                "agent_version": "unattested",
+                "quality": {
+                    "prior": {"evidence_status": "unavailable"},
+                    "posterior": {
+                        "lower_bound_95": 0.99,
+                        "runtime_sample_count": 0,
+                    },
+                },
+            },
+            complexity="low",
+        )
+        decision = route_capability_snapshot(
+            catalog,
+            request(
+                complexity="low",
+                quality_floor=60,
+                low_risk=True,
+                short_task=True,
+                mechanically_verifiable=True,
+            ),
+        )
+
+        self.assertEqual(decision.model, "gpt-5.3-codex-spark")
+        self.assertEqual(decision.selected.quality_source, "declared")  # type: ignore[union-attr]
+        self.assertIsNone(decision.selected.performance_lower_bound_95)  # type: ignore[union-attr]
+
+    def test_performance_contexts_select_exact_dag_bucket(self) -> None:
+        # The task-level calibration is implementation/standard, but the
+        # planner may specialize one node into docs/low.  The exact context
+        # must win over both the task-level candidates and declared cost.
+        luna = capability(
+            "codex",
+            "gpt-5.6-luna",
+            task_types=("docs",),
+            complexities=("low",),
+            quality=80,
+            cost=1,
+        )
+        sonnet = capability(
+            "claude",
+            "sonnet",
+            task_types=("docs",),
+            complexities=("low",),
+            quality=80,
+            cost=100,
+        )
+        calibration = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.95),
+            self._calibrated_candidate("claude", "sonnet", 0.10),
+            contexts=[
+                {
+                    "task_type": "implementation",
+                    "complexity": "standard",
+                    "candidates": [
+                        self._calibrated_candidate("codex", "gpt-5.6-luna", 0.95),
+                        self._calibrated_candidate("claude", "sonnet", 0.10),
+                    ],
+                },
+                {
+                    "task_type": "docs",
+                    "complexity": "low",
+                    "candidates": [
+                        self._calibrated_candidate("codex", "gpt-5.6-luna", 0.20),
+                        self._calibrated_candidate("claude", "sonnet", 0.90),
+                    ],
+                },
+            ],
+        )
+        catalog = snapshot(luna, sonnet)
+        catalog["performance_calibration"] = calibration
+
+        decision = route_capability_snapshot(
+            catalog,
+            request(task_type="docs", complexity="low"),
+        )
+
+        self.assertEqual(decision.model, "sonnet")
+        self.assertEqual(decision.selected.quality_source, "calibrated")  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.performance_lower_bound_95, 0.90)  # type: ignore[union-attr]
+        self.assertEqual(decision.performance_snapshot_id, "performance-" + "a" * 16)
+        self.assertEqual(decision.performance_digest, "b" * 64)
+
+    def test_performance_contexts_without_exact_bucket_fall_back_to_declared(self) -> None:
+        luna = capability(
+            "codex",
+            "gpt-5.6-luna",
+            task_types=("tests",),
+            complexities=("standard",),
+            quality=80,
+            cost=1,
+        )
+        sonnet = capability(
+            "claude",
+            "sonnet",
+            task_types=("tests",),
+            complexities=("standard",),
+            quality=85,
+            cost=100,
+        )
+        catalog = snapshot(luna, sonnet)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.99),
+            contexts=[
+                {
+                    "task_type": "docs",
+                    "complexity": "low",
+                    "candidates": [
+                        self._calibrated_candidate("codex", "gpt-5.6-luna", 0.99),
+                        self._calibrated_candidate("claude", "sonnet", 0.01),
+                    ],
+                }
+            ],
+        )
+
+        decision = route_capability_snapshot(
+            catalog,
+            request(task_type="tests", complexity="standard"),
+        )
+
+        self.assertEqual(decision.model, "sonnet")
+        self.assertEqual(decision.selected.quality_source, "declared")  # type: ignore[union-attr]
+        self.assertIsNone(decision.selected.performance_lower_bound_95)  # type: ignore[union-attr]
+        self.assertEqual(decision.performance_snapshot_id, "performance-" + "a" * 16)
+        self.assertEqual(decision.performance_digest, "b" * 64)
+
+    def test_performance_context_identity_conflict_is_rejected(self) -> None:
+        luna = capability(
+            "codex",
+            "gpt-5.6-luna",
+            task_types=("docs",),
+            complexities=("low",),
+        )
+        candidate = self._calibrated_candidate("codex", "gpt-5.6-luna", 0.8)
+        for field, value, message in (
+            (
+                "snapshot_id",
+                "performance-" + "c" * 16,
+                "performance calibration context snapshot",
+            ),
+            ("digest", "c" * 64, "performance calibration context digest"),
+        ):
+            with self.subTest(field=field):
+                context = {
+                    "task_type": "docs",
+                    "complexity": "low",
+                    "candidates": [candidate],
+                    field: value,
+                }
+                catalog = snapshot(luna)
+                catalog["performance_calibration"] = self._calibration(
+                    contexts=[context]
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    route_capability_snapshot(
+                        catalog,
+                        request(task_type="docs", complexity="low"),
+                    )
+
+    def test_performance_snapshot_mismatch_is_rejected(self) -> None:
+        catalog = snapshot(capability("codex", "gpt-5.6-luna"))
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.8),
+        )
+        with self.assertRaisesRegex(ValueError, "performance snapshot"):
+            route_capability_snapshot(
+                catalog,
+                request(
+                    performance_snapshot_id="performance-" + "c" * 16,
+                    performance_digest="b" * 64,
+                ),
+            )
 
 
 if __name__ == "__main__":

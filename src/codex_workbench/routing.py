@@ -55,8 +55,24 @@ class RoutingDecision:
     agent_name: str | None = None
     agent_version: str | None = None
     routing_policy_version: str | None = None
+    # Performance calibration receipt.  These fields remain optional for
+    # routing-v1/v2 and legacy fixtures, but are populated for an exact v3
+    # performance generation or an explicitly pinned task contract.
+    performance_snapshot_id: str | None = None
+    performance_digest: str | None = None
+    performance_status: str | None = None
+    quality_source: str = "declared"
+    performance_lower_bound_95: float | None = None
+    runtime_sample_count: int = 0
+    performance_first_pass_rate: float | None = None
+    performance_rework_rate: float | None = None
+    performance_latency_ms: float | None = None
 
     def __post_init__(self) -> None:
+        if (self.performance_snapshot_id is None) != (self.performance_digest is None):
+            raise ValueError(
+                "routing performance_snapshot_id and performance_digest must be supplied together"
+            )
         if self.executor != "codex":
             return
         expected_profile = codex_model_profile(self.model)
@@ -91,6 +107,18 @@ class RoutingDecision:
     @property
     def selected_executor(self) -> str:
         return self.executor
+
+    @property
+    def lower_bound_95(self) -> float | None:
+        return self.performance_lower_bound_95
+
+    @property
+    def performance_quality_source(self) -> str:
+        return self.quality_source
+
+    @property
+    def performance_runtime_sample_count(self) -> int:
+        return self.runtime_sample_count
 
     @property
     def family(self) -> str:
@@ -170,6 +198,16 @@ def _strategy_for(
     return strategy.normalized()
 
 
+def _contract_performance_kwargs(contract: TaskContract) -> dict[str, Any]:
+    """Return the task's immutable performance binding for legacy receipts."""
+
+    return {
+        "performance_snapshot_id": contract.performance_snapshot_id,
+        "performance_digest": contract.performance_digest,
+        "performance_status": contract.performance_status,
+    }
+
+
 def strategy_for_node(
     contract: TaskContract,
     node: Any,
@@ -215,8 +253,8 @@ def _codex_fallback_base_model(strategy: RoutingStrategy) -> tuple[str, str]:
     """Select the first Codex worker tier without consuming retry budget.
 
     v1 intentionally keeps its former implementation-only Luna preference.
-    v2 assigns bounded low work to Spark and the next inexpensive tier to
-    standard, splittable production work;
+    v2 assigns bounded low, mechanically verifiable work to Spark and the next
+    inexpensive tier to standard, splittable production work;
     architecture, review, creative, non-splittable, and high-complexity work
     start at Terra when Claude is not currently usable.
     """
@@ -235,6 +273,8 @@ def _codex_fallback_base_model(strategy: RoutingStrategy) -> tuple[str, str]:
         return CODEX_TERRA_MODEL, "complex or non-mechanical work"
 
     if complexity == "low":
+        if task_type in {"architecture", "review", "creative"}:
+            return CODEX_TERRA_MODEL, "low-complexity control/challenge work stays off the Spark pool"
         return CODEX_SPARK_MODEL, "bounded low-complexity work uses the independent Spark pool"
     if (
         complexity == "standard"
@@ -253,15 +293,23 @@ def codex_fallback_model(
 ) -> str:
     """Return the durable Codex fallback for this attempt.
 
-    The first attempt follows the versioned routing tier. Later attempts use
+    The first attempt follows the versioned routing tier. Legacy policies use
     Spark -> Luna -> Terra -> Sol or Luna -> Terra -> Sol escalation without
-    changing a high-complexity first attempt from Terra into a cheaper tier.
+    downgrading a high-complexity first attempt.  Routing-v3 keeps the pinned
+    capability immutable; a planner repair must route a replacement node when
+    a different capability is required.
     """
 
     if attempt <= 0:
         raise ValueError("routing attempt must be positive")
     selected_strategy = _strategy_for(contract, strategy)
     base_model, _ = _codex_fallback_base_model(selected_strategy)
+    if base_model == CODEX_SPARK_MODEL and not _is_explicit_spark_lane(
+        contract,
+        selected_strategy,
+        None,
+    ):
+        base_model = CODEX_LUNA_MODEL
     return retry_model(base_model, attempt)
 
 
@@ -358,14 +406,48 @@ def _is_explicit_spark_lane(
     raw = dict(node_context or {})
     writes = raw.get("write_scopes")
     write_count = len(writes) if isinstance(writes, (tuple, list)) else 0
-    dependencies = raw.get("depends_on")
-    dependency_count = len(dependencies) if isinstance(dependencies, (tuple, list)) else 0
+    # A ready node may depend on several completed nodes.  Dependency count is
+    # a graph-readiness property, not a measure of whether the node itself is a
+    # short mechanical action, so it must not suppress the dedicated Spark
+    # lane.
+    task_text = " ".join(
+        [
+            str(contract.objective),
+            str(strategy.task_type),
+            *(str(raw.get(field, "")) for field in ("title", "prompt", "task_type", "role", "routing_role")),
+        ]
+    ).lower()
+    forbidden_markers = (
+        "architecture",
+        "architectural",
+        "review",
+        "security",
+        "migration",
+        "release",
+        "cross-module",
+        "cross module",
+        "跨模块",
+        "架构",
+        "审核",
+        "安全",
+        "迁移",
+        "发布",
+    )
+    if raw.get("verifier") is True or any(marker in task_text for marker in forbidden_markers):
+        return False
+    command = raw.get("command")
+    has_node_command = isinstance(command, (tuple, list)) and any(
+        isinstance(value, str) and value.strip() for value in command
+    )
+    has_task_command = any(
+        isinstance(value, str) and value.strip()
+        for value in contract.acceptance_commands
+    )
     return (
         strategy.complexity == "low"
         and strategy.parallelizable
-        and bool(contract.acceptance_commands or raw.get("command"))
+        and (has_task_command or has_node_command)
         and write_count <= 1
-        and dependency_count <= 1
     )
 
 
@@ -555,9 +637,14 @@ def _v3_request(
     raw = dict(node_context or {})
     writes = raw.get("write_scopes")
     write_count = len(writes) if isinstance(writes, (tuple, list)) else 0
-    dependencies = raw.get("depends_on")
-    dependency_count = len(dependencies) if isinstance(dependencies, (tuple, list)) else 0
-    mechanical = bool(contract.acceptance_commands) or bool(raw.get("command"))
+    node_command = raw.get("command")
+    mechanical = any(
+        isinstance(value, str) and value.strip()
+        for value in contract.acceptance_commands
+    ) or (
+        isinstance(node_command, (tuple, list))
+        and any(isinstance(value, str) and value.strip() for value in node_command)
+    )
     is_control_plane = role in {"planner", "verifier", "control"}
     # Current passive Sol metadata intentionally advertises architecture and
     # exploration control work rather than every worker task type.  Planning
@@ -574,12 +661,16 @@ def _v3_request(
         "quality_floor": 60 if low and mechanical else 80,
         "acceptance_risk": strategy.complexity,
         "low_risk": low,
-        "short_task": low and strategy.parallelizable and write_count <= 1 and dependency_count <= 1,
+        "short_task": low and strategy.parallelizable and write_count <= 1 and mechanical,
         "mechanically_verifiable": mechanical,
         "bounded": bounded,
         "independent_slice": independent,
         "allow_parallel_providers": strategy.parallelizable and not is_control_plane,
         "preferred_families": _v3_preferred_families(strategy, role=role),
+        "performance_snapshot_id": contract.performance_snapshot_id,
+        "performance_digest": contract.performance_digest,
+        "performance_status": contract.performance_status,
+        "performance_calibration": raw.get("performance_calibration"),
         "claude_quota": _quota_payload(quota_snapshot, max_age_seconds=max_age_seconds),
         "provider_capacity": _provider_capacity(
             quota_snapshot,
@@ -634,6 +725,7 @@ def _agent_identity(snapshot: Mapping[str, Any], provider: str) -> tuple[str, st
 def _decision_from_v3(
     decision: RoutingV3Decision,
     *,
+    contract: TaskContract,
     role: RoutingRole,
     strategy: RoutingStrategy,
     snapshot: Mapping[str, Any],
@@ -664,6 +756,17 @@ def _decision_from_v3(
         agent_name=agent_name,
         agent_version=agent_version,
         routing_policy_version=decision.policy_version,
+        performance_snapshot_id=(
+            decision.performance_snapshot_id or contract.performance_snapshot_id
+        ),
+        performance_digest=(decision.performance_digest or contract.performance_digest),
+        performance_status=(decision.performance_status or contract.performance_status),
+        quality_source=selected.quality_source,
+        performance_lower_bound_95=selected.performance_lower_bound_95,
+        runtime_sample_count=selected.runtime_sample_count,
+        performance_first_pass_rate=selected.performance_first_pass_rate,
+        performance_rework_rate=selected.performance_rework_rate,
+        performance_latency_ms=selected.performance_latency_ms,
     )
 
 
@@ -705,6 +808,7 @@ def _route_catalog_task(
     max_age_seconds: int | None,
     node_context: Mapping[str, Any] | None,
     provider_capacity: Mapping[str, Any] | None,
+    performance_calibration: Mapping[str, Any] | None,
 ) -> RoutingDecision:
     snapshot_id, digest = _catalog_identity(capability_snapshot)
     if contract.capability_snapshot_id is not None and contract.capability_snapshot_id != snapshot_id:
@@ -740,6 +844,8 @@ def _route_catalog_task(
         max_age_seconds=max_age_seconds,
         provider_capacity=provider_capacity,
     )
+    if performance_calibration is not None:
+        request["performance_calibration"] = dict(performance_calibration)
     decision = route_capability_snapshot(
         routing_view,
         request,
@@ -749,6 +855,7 @@ def _route_catalog_task(
     if decision.accepted:
         return _decision_from_v3(
             decision,
+            contract=contract,
             role=selected_role,
             strategy=strategy,
             snapshot=capability_snapshot,
@@ -805,6 +912,7 @@ def _route_catalog_task(
             if control_decision.accepted:
                 return _decision_from_v3(
                     control_decision,
+                    contract=contract,
                     role="control",
                     strategy=strategy,
                     snapshot=capability_snapshot,
@@ -829,6 +937,7 @@ def route_task(
     capability_snapshot: Mapping[str, Any] | None = None,
     node_context: Mapping[str, Any] | None = None,
     provider_capacity: Mapping[str, Any] | None = None,
+    performance_calibration: Mapping[str, Any] | None = None,
 ) -> RoutingDecision:
     """Select a model from immutable contract inputs.
 
@@ -855,6 +964,7 @@ def route_task(
             max_age_seconds=max_age_seconds,
             node_context=node_context,
             provider_capacity=provider_capacity,
+            performance_calibration=performance_calibration,
         )
 
     if role in {"planner", "verifier"}:
@@ -864,6 +974,7 @@ def route_task(
             model=CODEX_SOL_MODEL,
             strategy_version=version,
             reason=f"{role} role is fixed to the independent Codex Sol control plane",
+            **_contract_performance_kwargs(contract),
         )
 
     if role == "control":
@@ -873,6 +984,7 @@ def route_task(
             model=CODEX_SOL_MODEL,
             strategy_version=version,
             reason="control role is fixed to the Codex Sol cross-module control plane",
+            **_contract_performance_kwargs(contract),
         )
 
     if role not in {"worker", "challenge"}:
@@ -948,6 +1060,7 @@ def route_task(
                         f"admitted Claude {candidate} ({quota_reason})"
                     ),
                     claude_eligible=True,
+                    **_contract_performance_kwargs(contract),
                 )
             fallback_reason = quota_reason
     else:
@@ -956,6 +1069,16 @@ def route_task(
         )
 
     fallback_model, fallback_label = _codex_fallback_base_model(selected_strategy)
+    if fallback_model == CODEX_SPARK_MODEL and (
+        role != "worker"
+        or not _is_explicit_spark_lane(
+            contract,
+            selected_strategy,
+            node_context,
+        )
+    ):
+        fallback_model = CODEX_LUNA_MODEL
+        fallback_label = "low-complexity work lacks a mechanical Spark contract"
     return RoutingDecision(
         role=role,
         executor="codex",
@@ -963,6 +1086,7 @@ def route_task(
         strategy_version=version,
         reason=f"{fallback_label} uses Codex {fallback_model}; {fallback_reason}",
         claude_eligible=claude_eligible,
+        **_contract_performance_kwargs(contract),
     )
 
 
@@ -977,6 +1101,7 @@ def route_node(
     strategy: RoutingStrategy | dict[str, Any] | None = None,
     capability_snapshot: Mapping[str, Any] | None = None,
     provider_capacity: Mapping[str, Any] | None = None,
+    performance_calibration: Mapping[str, Any] | None = None,
 ) -> RoutingDecision:
     """Route one planner node while preserving deterministic executors."""
 
@@ -994,6 +1119,7 @@ def route_node(
             capability_snapshot=capability_snapshot,
             node_context=raw,
             provider_capacity=provider_capacity,
+            performance_calibration=performance_calibration,
         )
     executor = raw.get("executor")
     if executor in {"deterministic", "fixture"}:
@@ -1003,6 +1129,7 @@ def route_node(
             model=str(raw.get("model") or executor),
             strategy_version=node_strategy.version,
             reason=f"{executor} is an explicit non-model execution node",
+            **_contract_performance_kwargs(contract),
         )
     return route_task(
         contract,
@@ -1015,6 +1142,7 @@ def route_node(
         capability_snapshot=capability_snapshot,
         node_context=raw,
         provider_capacity=provider_capacity,
+        performance_calibration=performance_calibration,
     )
 
 
@@ -1030,6 +1158,7 @@ class ModelRoutingPolicy:
         max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
         capability_snapshot: Mapping[str, Any] | None = None,
         provider_capacity: Mapping[str, Any] | None = None,
+        performance_calibration: Mapping[str, Any] | None = None,
     ) -> None:
         self.claude_models_available = tuple(claude_models_available)
         self.quota_snapshot = quota_snapshot
@@ -1037,6 +1166,7 @@ class ModelRoutingPolicy:
         self.max_age_seconds = max_age_seconds
         self.capability_snapshot = capability_snapshot
         self.provider_capacity = provider_capacity
+        self.performance_calibration = performance_calibration
 
     def route(
         self,
@@ -1055,6 +1185,7 @@ class ModelRoutingPolicy:
             strategy=strategy,
             capability_snapshot=self.capability_snapshot,
             provider_capacity=self.provider_capacity,
+            performance_calibration=self.performance_calibration,
         )
 
 

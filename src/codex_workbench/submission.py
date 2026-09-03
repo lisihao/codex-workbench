@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, get_args
 
 from .artifacts import ArtifactStore
 from .capabilities import CapabilityCatalogError, CapabilityRegistry
@@ -15,12 +15,23 @@ from .model import (
     CODEX_SOL_MODEL,
     DEFAULT_QUOTA_TTL_SECONDS,
     ROUTING_STRATEGY_VERSION,
+    RoutingComplexity,
     RoutingStrategy,
+    RoutingTaskType,
     TaskContract,
 )
+from .performance import PerformanceRegistry, PerformanceRegistryError
 from .planner import CodexPlanner
 from .research import route_research
 from .store import WorkbenchStore
+
+
+_PERFORMANCE_CALIBRATION_TASK_TYPES = tuple(
+    str(value) for value in get_args(RoutingTaskType)
+)
+_PERFORMANCE_CALIBRATION_COMPLEXITIES = tuple(
+    str(value) for value in get_args(RoutingComplexity)
+)
 
 
 def _catalog_claude_families(catalog: Mapping[str, Any] | None) -> frozenset[str]:
@@ -93,6 +104,104 @@ def _capability_catalog_for_submission(
     }
 
 
+def _performance_calibration_for_submission(
+    config: WorkbenchConfig,
+    store: WorkbenchStore,
+    catalog: Mapping[str, Any] | None,
+    *,
+    task_type: str,
+    complexity: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Pin a content-addressed performance generation before planning.
+
+    Calibration is intentionally advisory: a failure does not turn a normal
+    governed submission into an apparent model failure.  With no active
+    capability catalog there is no exact provider/model/version identity to
+    bind, so the result remains explicitly unavailable rather than inventing a
+    cross-version score.
+    """
+
+    if catalog is None:
+        return None, {
+            "status": "unavailable",
+            "snapshot_id": None,
+            "digest": None,
+            "policy": "benchmark-prior-plus-runtime-ledger-v1",
+            "reason": "no active capability catalog to bind performance calibration",
+        }
+    registry = PerformanceRegistry(config.state_root)
+    try:
+        refreshed = registry.refresh(store, catalog)
+        snapshot = refreshed["snapshot"]
+        calibration = registry.calibrate(catalog, task_type, complexity)
+        calibration_matrix = registry.calibrate_matrix(
+            catalog,
+            _PERFORMANCE_CALIBRATION_TASK_TYPES,
+            _PERFORMANCE_CALIBRATION_COMPLEXITIES,
+        )
+        snapshot_id = str(snapshot["snapshot_id"])
+        snapshot_digest = str(snapshot["digest"])
+        if calibration.get("snapshot_id") != snapshot_id:
+            raise PerformanceRegistryError(
+                "current-task performance calibration does not match the refreshed generation"
+            )
+        if calibration_matrix.get("snapshot_id") != snapshot_id:
+            raise PerformanceRegistryError(
+                "performance calibration matrix does not match the refreshed generation"
+            )
+        raw_contexts = calibration_matrix.get("contexts")
+        if not isinstance(raw_contexts, list):
+            raise PerformanceRegistryError("performance calibration matrix contexts are missing")
+        expected_contexts = {
+            (candidate_task_type, candidate_complexity)
+            for candidate_task_type in _PERFORMANCE_CALIBRATION_TASK_TYPES
+            for candidate_complexity in _PERFORMANCE_CALIBRATION_COMPLEXITIES
+        }
+        observed_contexts = {
+            (str(context.get("task_type")), str(context.get("complexity")))
+            for context in raw_contexts
+            if isinstance(context, Mapping)
+        }
+        if observed_contexts != expected_contexts or len(raw_contexts) != len(expected_contexts):
+            raise PerformanceRegistryError(
+                "performance calibration matrix does not cover every routing task type and complexity"
+            )
+        calibration = {
+            **calibration,
+            "performance_snapshot_id": snapshot_id,
+            "performance_digest": snapshot_digest,
+            "digest": snapshot_digest,
+            "contexts": [
+                {
+                    **context,
+                    "performance_snapshot_id": snapshot_id,
+                    "performance_digest": snapshot_digest,
+                    "digest": snapshot_digest,
+                }
+                for context in raw_contexts
+            ],
+        }
+    except PerformanceRegistryError as error:
+        return None, {
+            "status": "unavailable",
+            "snapshot_id": None,
+            "digest": None,
+            "policy": "benchmark-prior-plus-runtime-ledger-v1",
+            "reason": str(error),
+        }
+    return calibration, {
+        "status": str(calibration["status"]),
+        "snapshot_id": snapshot["snapshot_id"],
+        "digest": snapshot["digest"],
+        "policy": "benchmark-prior-plus-runtime-ledger-v1",
+        "activated": bool(refreshed["activated"]),
+        "unchanged": bool(refreshed["unchanged"]),
+        "event_cursor": snapshot["event_cursor"],
+        "advisory_only": True,
+        "hard_capability_gates_required": True,
+    }
+
+
 def submit_natural_language_request(
     config: WorkbenchConfig,
     store: WorkbenchStore,
@@ -148,6 +257,21 @@ def submit_natural_language_request(
         parallelizable = selected_strategy.parallelizable
         claude_allowed = selected_strategy.claude_allowed
     capability_catalog, capability_registry = _capability_catalog_for_submission(config)
+    performance_calibration, performance_registry = _performance_calibration_for_submission(
+        config,
+        store,
+        capability_catalog,
+        task_type=task_type,
+        complexity=complexity,
+    )
+    routing_catalog = (
+        {
+            **capability_catalog,
+            "performance_calibration": performance_calibration,
+        }
+        if capability_catalog is not None
+        else None
+    )
     contract = TaskContract(
         task_id=resolved_task_id,
         repository=str(resolved_repository),
@@ -182,6 +306,10 @@ def submit_natural_language_request(
             if capability_catalog is not None
             else None
         ),
+        performance_snapshot_id=performance_registry["snapshot_id"],
+        performance_digest=performance_registry["digest"],
+        performance_policy=performance_registry["policy"],
+        performance_status=performance_registry["status"],
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
@@ -218,8 +346,9 @@ def submit_natural_language_request(
         quota_snapshot=quota,
         strategy=contract.strategy,
         context_excerpt=context_excerpt,
-        capability_snapshot=capability_catalog,
+        capability_snapshot=routing_catalog,
         provider_capacity={"codex": {"capacity": config.max_workers, "active": 0}},
+        performance_calibration=performance_calibration,
     )
     resolved_command_id = command_id or f"request-{uuid.uuid4()}"
     store.create_task(contract, nodes, resolved_command_id)
@@ -239,8 +368,31 @@ def submit_natural_language_request(
             "version": "model-routing-v3" if capability_catalog is not None else contract.strategy.version,
             "catalog_id": contract.capability_snapshot_id,
             "capability_digest": contract.capability_digest,
+            "performance_snapshot_id": contract.performance_snapshot_id,
+            "performance_digest": contract.performance_digest,
+            "performance_policy": contract.performance_policy,
+            "performance_status": contract.performance_status,
         },
         "capability_registry": capability_registry,
+        "performance": {
+            **performance_registry,
+            # The complete 24-context matrix is an internal deterministic
+            # normalizer input.  Returning it through MCP would waste caller
+            # context tokens, so expose only the requested task bucket plus a
+            # count proving the matrix was present.
+            "calibration": (
+                {
+                    **{
+                        key: value
+                        for key, value in performance_calibration.items()
+                        if key != "contexts"
+                    },
+                    "matrix_context_count": len(performance_calibration.get("contexts", ())),
+                }
+                if performance_calibration is not None
+                else None
+            ),
+        },
         "research": route_research(contract).to_dict(),
         "governance": {
             **governance_status(),

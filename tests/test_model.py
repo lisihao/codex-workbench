@@ -25,6 +25,9 @@ from codex_workbench.model import (
     NodeSpec,
     QuotaSnapshot,
     TaskContract,
+    codex_model_profile,
+    codex_model_reasoning_effort,
+    derive_execution_lane,
     now_iso,
     retry_model,
 )
@@ -41,6 +44,20 @@ def compatible_provenance() -> dict[str, object]:
 
 
 class ModelTests(unittest.TestCase):
+    def test_codex_model_profiles_require_exact_known_ids(self) -> None:
+        self.assertEqual(codex_model_profile(" gpt-5.3-codex-spark "), "spark_worker")
+        self.assertEqual(codex_model_reasoning_effort("gpt-5.3-codex-spark"), "xhigh")
+        self.assertIsNone(codex_model_profile("gpt-5.3-codex-spark-evil"))
+        self.assertIsNone(codex_model_reasoning_effort("gpt-5.3-codex-spark-evil"))
+        self.assertEqual(
+            retry_model("gpt-5.3-codex-spark-evil", 2),
+            "gpt-5.3-codex-spark-evil",
+        )
+        self.assertEqual(
+            derive_execution_lane("codex", "gpt-5.3-codex-spark-evil"),
+            "general",
+        )
+
     def test_routing_v3_retry_preserves_the_pinned_worker_capability(self) -> None:
         self.assertEqual(
             retry_model(
@@ -109,6 +126,66 @@ class ModelTests(unittest.TestCase):
             capability_digest="b" * 64,
         )
         self.assertNotEqual(without_snapshot.digest, with_snapshot.digest)
+
+    def test_performance_snapshot_roundtrips_and_changes_contract_digest(self) -> None:
+        values = {
+            "task_id": "performance-digest",
+            "repository": "/tmp/example",
+            "base_sha": "abc123",
+            "objective": "bounded work",
+            "allowed_scope": ("src",),
+        }
+        without_snapshot = TaskContract(**values)
+        with_snapshot = TaskContract(
+            **values,
+            performance_snapshot_id="performance-" + "a" * 16,
+            performance_digest="b" * 64,
+            performance_policy="quality-first-v1",
+            performance_status="cold-start",
+        )
+        with_snapshot.validate()
+        self.assertNotEqual(without_snapshot.digest, with_snapshot.digest)
+        self.assertEqual(TaskContract.from_dict(with_snapshot.to_dict()), with_snapshot)
+
+        node = NodeSpec(
+            "worker",
+            with_snapshot.task_id,
+            "worker",
+            "codex",
+            "gpt-5.6-luna",
+            "bounded work",
+            performance_snapshot_id=with_snapshot.performance_snapshot_id,
+            performance_digest=with_snapshot.performance_digest,
+            performance_policy=with_snapshot.performance_policy,
+            performance_status=with_snapshot.performance_status,
+            performance_quality_source="declared",
+        )
+        node.validate()
+        self.assertEqual(NodeSpec.from_dict(node.to_dict()), node)
+
+    def test_performance_snapshot_requires_a_complete_pair(self) -> None:
+        contract = TaskContract(
+            task_id="half-performance-contract",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            performance_snapshot_id="performance-" + "a" * 16,
+        )
+        with self.assertRaisesRegex(ValueError, "performance_snapshot_id"):
+            contract.validate()
+
+        node = NodeSpec(
+            "half-performance-node",
+            "half-performance-contract",
+            "worker",
+            "fixture",
+            "fixture",
+            "ok",
+            performance_digest="c" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "performance_snapshot_id"):
+            node.validate()
 
     def test_capability_snapshot_requires_a_complete_pair(self) -> None:
         contract = TaskContract(
@@ -193,6 +270,54 @@ class ModelTests(unittest.TestCase):
         restored_node = NodeSpec.from_dict(legacy_node)
         self.assertIsNone(restored_node.capability_snapshot_id)
         self.assertIsNone(restored_node.capability_digest)
+
+    def test_node_derives_and_validates_execution_lane_and_quota_pool(self) -> None:
+        spark = NodeSpec(
+            "spark",
+            "lane-contract",
+            "mechanical worker",
+            "codex",
+            "gpt-5.3-codex-spark",
+            "run the bounded command",
+        )
+        self.assertEqual(spark.execution_lane, "spark")
+        self.assertEqual(spark.quota_pool_id, "codex-spark")
+
+        verifier = NodeSpec(
+            "verify",
+            "lane-contract",
+            "verifier",
+            "codex",
+            "gpt-5.6-sol",
+            "inspect the result",
+            verifier=True,
+        )
+        self.assertEqual(verifier.execution_lane, "control")
+        self.assertEqual(verifier.quota_pool_id, "codex-control")
+
+        with self.assertRaisesRegex(ValueError, "execution_lane"):
+            NodeSpec(
+                "forged-lane",
+                "lane-contract",
+                "worker",
+                "codex",
+                "gpt-5.6-luna",
+                "bounded work",
+                execution_lane="spark",
+                quota_pool_id="codex-spark",
+            ).validate()
+
+        with self.assertRaisesRegex(ValueError, "quota_pool_id"):
+            NodeSpec(
+                "forged-pool",
+                "lane-contract",
+                "worker",
+                "codex",
+                "gpt-5.6-luna",
+                "bounded work",
+                execution_lane="general",
+                quota_pool_id="codex-spark",
+            ).validate()
 
     def test_node_result_capability_provenance_roundtrips(self) -> None:
         result = NodeResult(

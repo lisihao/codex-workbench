@@ -17,12 +17,26 @@ PRODUCER_SCHEMA_VERSION = 1
 # Version-pinned interpretation of CLI display text; not an official quota API.
 COMPATIBLE_SOURCE = "claude-cli-usage-text-v1"
 SUPPORTED_USAGE_VERSION = "2.1.239"
-POOL_NAMES = ("five_hour", "seven_day", "seven_day_sonnet")
+BASE_POOL_NAMES = ("five_hour", "seven_day")
+MODEL_POOL_LABELS = {
+    "Current week (Sonnet only)": "seven_day_sonnet",
+    "Current week (Fable)": "seven_day_fable",
+}
+POOL_NAMES = (*BASE_POOL_NAMES, *MODEL_POOL_LABELS.values())
 _SECRET_ENV_PARTS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
-_TEXT_LABELS = ("Current session", "Current week (all models)", "Current week (Sonnet only)")
-_TEXT_LINE = re.compile(r"^(?P<label>[^:]+): (?P<used>\d{1,3})% used · resets (?P<reset>.+)$", re.MULTILINE)
+_BASE_TEXT_LABELS = ("Current session", "Current week (all models)")
+_TEXT_LINE = re.compile(
+    r"^(?P<label>[^\r\n:]+): (?P<used>\d{1,3})% used(?: · resets (?P<reset>.+))?$",
+    re.MULTILINE,
+)
 _TIME_RESET = re.compile(r"^(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm) \((?P<zone>[^()]+)\)$", re.I)
 _DATE_RESET = re.compile(r"^(?P<month>[A-Z][a-z]{2}) (?P<day>\d{1,2})(?:,? (?P<year>\d{4}))? \((?P<zone>[^()]+)\)$")
+_DATE_TIME_RESET = re.compile(
+    r"^(?P<month>[A-Z][a-z]{2}) (?P<day>\d{1,2})(?:,? (?P<year>\d{4}))? "
+    r"at (?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm) "
+    r"\((?P<zone>[^()]+)\)$",
+    re.I,
+)
 
 
 class ClaudeQuotaError(ValueError):
@@ -38,6 +52,7 @@ class ClaudeQuotaCollector:
 
     def collect(self) -> dict[str, Any]:
         version = "unknown"
+        native_auth_ok = False
         try:
             auth = self._command("auth", "status", "--json")
             auth_payload = _json_object(auth.stdout, "claude auth status")
@@ -50,12 +65,13 @@ class ClaudeQuotaCollector:
                 raise ClaudeQuotaError("claude auth status failed")
             if not is_native_subscription_auth(auth_payload):
                 raise ClaudeQuotaError("Claude is not logged in with a first-party subscription")
+            native_auth_ok = True
             if version != SUPPORTED_USAGE_VERSION:
                 raise ClaudeQuotaError(f"unsupported Claude /usage display version: {version}")
             usage = self._command("-p", "/usage", "--output-format", "json", "--no-session-persistence")
             if usage.returncode != 0:
                 raise ClaudeQuotaError("claude /usage command failed")
-            outer = _json_object(usage.stdout, "claude /usage output")
+            outer = _json_result_object(usage.stdout, "claude /usage output")
             _validate_passive_usage(outer)
             observed = datetime.now(UTC)
             pools = _validated_pools(_parse_usage_text(str(outer["result"]), observed))
@@ -64,12 +80,20 @@ class ClaudeQuotaCollector:
                 "source": COMPATIBLE_SOURCE, "claude_version": version,
                 "observed_at": observed.isoformat(timespec="seconds"),
                 "auth_ok": True, "auth_method": "native-subscription",
+                "quota_ok": True,
                 "pools": pools,
             }
             atomic_write_snapshot(self.output, snapshot)
             return snapshot
         except ClaudeQuotaError as error:
-            atomic_write_snapshot(self.output, _unavailable_snapshot(version, str(error)))
+            atomic_write_snapshot(
+                self.output,
+                _unavailable_snapshot(
+                    version,
+                    str(error),
+                    auth_ok=native_auth_ok,
+                ),
+            )
             raise
 
     def _claude_version(self) -> str:
@@ -169,21 +193,32 @@ def validate_producer_snapshot(raw: object) -> dict[str, Any]:
         return dict(raw)
     if raw.get("auth_ok") is not True or raw.get("auth_method") != "native-subscription":
         raise ValueError("Claude quota producer authentication is invalid")
+    if raw.get("quota_ok") is False:
+        if not isinstance(raw.get("error"), str) or not raw["error"].strip():
+            raise ValueError("unavailable Claude quota snapshot must contain an error")
+        return dict(raw)
     pools = _validated_pools(raw.get("pools"))
-    if pools["seven_day"]["window_id"] != pools["seven_day_sonnet"]["window_id"]:
+    model_pool = next(name for name in MODEL_POOL_LABELS.values() if name in pools)
+    if pools["seven_day"]["window_id"] != pools[model_pool]["window_id"]:
         raise ClaudeQuotaError("weekly quota pools must share one reset window")
     return {**raw, "pools": pools}
 
 
-def _unavailable_snapshot(version: str, reason: str) -> dict[str, Any]:
+def _unavailable_snapshot(
+    version: str,
+    reason: str,
+    *,
+    auth_ok: bool = False,
+) -> dict[str, Any]:
     return {
         "producer": PRODUCER,
         "producer_schema_version": PRODUCER_SCHEMA_VERSION,
         "source": COMPATIBLE_SOURCE,
         "claude_version": version,
         "observed_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "auth_ok": False,
-        "auth_method": "none",
+        "auth_ok": auth_ok,
+        "auth_method": "native-subscription" if auth_ok else "none",
+        "quota_ok": False,
         "error": reason,
         "pools": {
             name: {
@@ -205,6 +240,26 @@ def _json_object(text: str, description: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ClaudeQuotaError(f"{description} is not an object")
     return value
+
+
+def _json_result_object(text: str, description: str) -> dict[str, Any]:
+    """Accept Claude's object or JSON-array envelope and return one final result."""
+
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ClaudeQuotaError(f"{description} is not JSON") from error
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        results = [
+            item
+            for item in value
+            if isinstance(item, dict) and item.get("type") == "result"
+        ]
+        if len(results) == 1:
+            return results[0]
+    raise ClaudeQuotaError(f"{description} does not contain exactly one result object")
 
 
 def _is_logged_out(payload: Mapping[str, Any]) -> bool:
@@ -261,24 +316,44 @@ def _zero_number(container: object, field: str) -> None:
 
 def _parse_usage_text(text: str, observed: datetime) -> dict[str, dict[str, Any]]:
     matches = list(_TEXT_LINE.finditer(text))
-    if [match.group("label") for match in matches] != list(_TEXT_LABELS):
+    labels = [match.group("label") for match in matches]
+    if (
+        labels[:2] != list(_BASE_TEXT_LABELS)
+        or len(labels) != 3
+        or labels[2] not in MODEL_POOL_LABELS
+    ):
         raise ClaudeQuotaError("Claude /usage display labels are missing, duplicated, or reordered")
     pools: dict[str, dict[str, Any]] = {}
-    for name, match in zip(POOL_NAMES, matches):
+    names = (*BASE_POOL_NAMES, MODEL_POOL_LABELS[labels[2]])
+    for name, match in zip(names, matches):
         used = int(match.group("used"))
         if not 0 <= used <= 100:
             raise ClaudeQuotaError(f"quota pool {name} displayed utilization is invalid")
         reset = match.group("reset")
-        window, precision = _five_hour_window_id(reset, observed) if name == "five_hour" else _week_window_id(name, reset, observed)
-        pools[name] = {"displayed_used_percent": used, "remaining_lower_bound": max(0, 99 - used), "window_id": window, "reset_precision": precision, "reset_fingerprint": reset}
+        if name == "five_hour" and reset is None and used == 0:
+            window, precision, fingerprint = "five_hour:idle", "idle", "idle"
+        elif reset is None:
+            raise ClaudeQuotaError(f"quota pool {name} reset is missing")
+        else:
+            window, precision = (
+                _five_hour_window_id(reset, observed)
+                if name == "five_hour"
+                else _week_window_id(name, reset, observed)
+            )
+            fingerprint = reset
+        pools[name] = {"displayed_used_percent": used, "remaining_lower_bound": max(0, 99 - used), "window_id": window, "reset_precision": precision, "reset_fingerprint": fingerprint}
     return pools
 
 
 def _validated_pools(raw: object) -> dict[str, dict[str, Any]]:
-    if not isinstance(raw, Mapping) or set(raw) != set(POOL_NAMES):
+    if not isinstance(raw, Mapping):
         raise ClaudeQuotaError("Claude quota producer must contain all three pools")
+    model_pools = set(raw).intersection(MODEL_POOL_LABELS.values())
+    if set(raw) != set(BASE_POOL_NAMES).union(model_pools) or len(model_pools) != 1:
+        raise ClaudeQuotaError("Claude quota producer must contain all three pools")
+    names = (*BASE_POOL_NAMES, *sorted(model_pools))
     pools: dict[str, dict[str, Any]] = {}
-    for name in POOL_NAMES:
+    for name in names:
         value = raw[name]
         if not isinstance(value, Mapping):
             raise ClaudeQuotaError(f"quota pool {name} is invalid")
@@ -286,16 +361,18 @@ def _validated_pools(raw: object) -> dict[str, dict[str, Any]]:
         if not isinstance(used, int) or not 0 <= used <= 100 or remaining != max(0, 99 - used):
             raise ClaudeQuotaError(f"quota pool {name} bounds are invalid")
         expected_prefix = "five_hour:" if name == "five_hour" else "weekly:"
-        if not isinstance(window, str) or not window.startswith(expected_prefix) or precision not in {"precise", "date-only-compatible"}:
+        allowed_precision = {"precise", "idle"} if name == "five_hour" else {"precise", "date-only-compatible"}
+        if not isinstance(window, str) or not window.startswith(expected_prefix) or precision not in allowed_precision:
             raise ClaudeQuotaError(f"quota pool {name} reset metadata is invalid")
         if not isinstance(fingerprint, str) or not fingerprint:
             raise ClaudeQuotaError(f"quota pool {name} reset fingerprint is invalid")
         pools[name] = {"displayed_used_percent": used, "remaining_lower_bound": remaining, "window_id": window, "reset_precision": precision, "reset_fingerprint": fingerprint}
-    if pools["five_hour"]["reset_precision"] != "precise":
-        raise ClaudeQuotaError("five-hour reset must be precise")
-    if pools["seven_day"]["window_id"] != pools["seven_day_sonnet"]["window_id"]:
+    if pools["five_hour"]["reset_precision"] not in {"precise", "idle"}:
+        raise ClaudeQuotaError("five-hour reset must be precise or explicitly idle")
+    model_pool = next(iter(model_pools))
+    if pools["seven_day"]["window_id"] != pools[model_pool]["window_id"]:
         raise ClaudeQuotaError("weekly quota pools must share one reset window")
-    if pools["seven_day"]["reset_fingerprint"] != pools["seven_day_sonnet"]["reset_fingerprint"]:
+    if pools["seven_day"]["reset_fingerprint"] != pools[model_pool]["reset_fingerprint"]:
         raise ClaudeQuotaError("weekly quota pools must share one reset fingerprint")
     return pools
 
@@ -345,6 +422,36 @@ def _week_window_id(name: str, value: str, observed: datetime) -> tuple[str, str
             hour = 0
         candidate, _local_observed, zone = _clock_reset_datetime(hour, minute, clock.group("zone"), observed)
         return f"weekly:{candidate.date().isoformat()}@{zone.key}", "date-only-compatible"
+    dated_clock = _DATE_TIME_RESET.fullmatch(value)
+    if dated_clock is not None:
+        zone = _zone(dated_clock.group("zone"))
+        local_observed = observed.astimezone(zone)
+        hour = int(dated_clock.group("hour"))
+        minute = int(dated_clock.group("minute") or 0)
+        if not 1 <= hour <= 12 or minute > 59:
+            raise ClaudeQuotaError("weekly reset clock is invalid")
+        if dated_clock.group("ampm").lower() == "pm" and hour != 12:
+            hour += 12
+        if dated_clock.group("ampm").lower() == "am" and hour == 12:
+            hour = 0
+        try:
+            month = datetime.strptime(dated_clock.group("month"), "%b").month
+            year = int(dated_clock.group("year")) if dated_clock.group("year") else local_observed.year
+            candidate = datetime(
+                year,
+                month,
+                int(dated_clock.group("day")),
+                hour,
+                minute,
+                tzinfo=zone,
+            )
+            if dated_clock.group("year") is None and candidate <= local_observed:
+                candidate = candidate.replace(year=year + 1)
+        except ValueError as error:
+            raise ClaudeQuotaError("weekly reset date is invalid") from error
+        if candidate - local_observed <= timedelta(hours=24):
+            raise ClaudeQuotaError("weekly reset must be more than 24 hours away")
+        return f"weekly:{candidate.date().isoformat()}@{zone.key}", "precise"
     match = _DATE_RESET.fullmatch(value)
     if match is None:
         raise ClaudeQuotaError("weekly reset is not a supported date")

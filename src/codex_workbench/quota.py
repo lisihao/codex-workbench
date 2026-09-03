@@ -53,11 +53,15 @@ class JsonFileQuotaAdapter:
     def _read_producer_snapshot(self, raw: object) -> QuotaSnapshot:
         producer = validate_producer_snapshot(raw)
         pools = producer.get("pools", {})
-        if producer["auth_ok"] is False:
+        if producer["auth_ok"] is False or producer.get("quota_ok") is False:
             snapshot = QuotaSnapshot(
                 observed_at=str(producer["observed_at"]),
-                auth_ok=False,
-                auth_method="none",
+                auth_ok=producer["auth_ok"] is True,
+                auth_method=(
+                    "native-subscription"
+                    if producer["auth_ok"] is True
+                    else "none"
+                ),
                 five_hour_remaining=None,
                 weekly_all_remaining=None,
                 weekly_sonnet_remaining=None,
@@ -73,15 +77,24 @@ class JsonFileQuotaAdapter:
             return snapshot
         five_hour = pools["five_hour"]
         seven_day = pools["seven_day"]
-        sonnet = pools["seven_day_sonnet"]
+        sonnet = pools.get("seven_day_sonnet")
+        fable = pools.get("seven_day_fable")
         snapshot = QuotaSnapshot(
             observed_at=str(producer["observed_at"]),
             auth_ok=True,
             auth_method="native-subscription",
             five_hour_remaining=float(five_hour["remaining_lower_bound"]),
             weekly_all_remaining=float(seven_day["remaining_lower_bound"]),
-            weekly_sonnet_remaining=float(sonnet["remaining_lower_bound"]),
-            weekly_fable_remaining=None,
+            weekly_sonnet_remaining=(
+                float(sonnet["remaining_lower_bound"])
+                if sonnet is not None
+                else None
+            ),
+            weekly_fable_remaining=(
+                float(fable["remaining_lower_bound"])
+                if fable is not None
+                else None
+            ),
             source=COMPATIBLE_SOURCE,
             five_hour_window_id=str(five_hour["window_id"]),
             weekly_window_id=str(seven_day["window_id"]),

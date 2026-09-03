@@ -32,6 +32,24 @@ codex plugin add codex-workbench@codex-workbench
 Codex asks you to review and approve the `UserPromptSubmit` hook.  Do that in
 `/hooks` before activating a session.
 
+## What the v1.7.0 authority adds
+
+The plugin remains a thin session-binding entry point; scheduling and evidence
+stay on the configured Mac mini authority. The authority now provides:
+
+- a benchmark-backed, domain-specific cold-start prior plus a long-lived
+  SQLite runtime ledger and pinned performance snapshots;
+- quality-gated routing that uses conservative benchmark/runtime posterior
+  lower bounds only after role, tool, evidence, quota, and capacity gates;
+- a dedicated logical Spark lane with planner-side decomposition checks and
+  observable queue/utilization metrics.
+
+Public benchmark results are transfer priors, not a unified leaderboard or a
+claim about local success rates. The current calibration interface is
+advisory-only and reports `cold-start` or `ok`; it does not yet implement a
+`baseline`/`shadow`/`calibrated` promotion lifecycle. Codex/Spark remaining
+quota is `N/A` when no provider balance is observable.
+
 ## Use
 
 Type `wb` in a Codex conversation to activate the Workbench. You may continue

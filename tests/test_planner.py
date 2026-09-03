@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from codex_workbench.model import NodeSpec, TaskContract
-from codex_workbench.planner import CodexPlanner, PlannerError
+from codex_workbench.planner import PLAN_SCHEMA, CodexPlanner, PlannerError
 
 
 def make_contract(**changes: object) -> TaskContract:
@@ -35,7 +35,7 @@ def node(
         "executor": executor,
         "model": model,
         "prompt": f"work on {node_id}",
-        "command": [],
+        "command": ["true"],
         "depends_on": list(depends_on),
         "read_scopes": [write_scope] if write_scope else ["src"],
         "write_scopes": [write_scope] if write_scope else [],
@@ -164,6 +164,41 @@ class PlannerRoutingTests(unittest.TestCase):
             [(worker.model_profile, worker.model_reasoning_effort) for worker in workers],
             [("spark_worker", "xhigh"), ("spark_worker", "xhigh")],
         )
+        self.assertEqual(
+            [(worker.execution_lane, worker.quota_pool_id) for worker in workers],
+            [("spark", "codex-spark"), ("spark", "codex-spark")],
+        )
+
+    def test_ready_spark_node_with_multiple_completed_dependencies_is_preserved(self) -> None:
+        raw = {
+            "summary": "mechanical node after independent preparation",
+            "nodes": [
+                node("prepare-a", write_scope="src/a"),
+                node("prepare-b", write_scope="src/b"),
+                node("mechanical", write_scope="tests/output", depends_on=("prepare-a", "prepare-b")),
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("prepare-a", "prepare-b", "mechanical"),
+                    verifier=True,
+                ),
+            ],
+        }
+
+        planned = CodexPlanner.normalize_and_validate_plan(
+            make_contract(),
+            raw,
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+        )
+
+        mechanical = next(item for item in planned if item.node_id == "mechanical")
+        self.assertEqual(mechanical.model, "gpt-5.3-codex-spark")
+        self.assertEqual(mechanical.execution_lane, "spark")
+        self.assertEqual(mechanical.depends_on, ("prepare-a", "prepare-b"))
 
     def test_mixed_dag_routes_each_node_from_its_typed_metadata(self) -> None:
         contract = make_contract(complexity="standard")
@@ -294,6 +329,104 @@ class PlannerRoutingTests(unittest.TestCase):
                 self.assertEqual(item.agent_name, "codex-cli")
                 self.assertEqual(item.agent_version, "0.149.1")
                 self.assertEqual(item.routing_policy_version, "model-routing-v3")
+
+    def test_performance_binding_and_receipt_are_inherited_from_contract(self) -> None:
+        active = catalog()
+        performance_id = "performance-" + "a" * 16
+        performance_digest = "b" * 64
+        contract = make_contract(
+            complexity="standard",
+            capability_snapshot_id=active["catalog_id"],
+            capability_digest=active["digest"],
+            performance_snapshot_id=performance_id,
+            performance_digest=performance_digest,
+            performance_policy="quality-first-v1",
+            performance_status="cold-start",
+        )
+        raw = {
+            "summary": "performance binding",
+            "nodes": [
+                node("worker", write_scope="src/worker", executor="codex", model="gpt-5.6-luna"),
+                node("verify", write_scope="", executor="codex", model="gpt-5.6-sol", verifier=True),
+            ],
+        }
+
+        planned = CodexPlanner.normalize_and_validate_plan(
+            contract,
+            raw,
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+            capability_snapshot=active,
+            provider_capacity={"codex": {"capacity": 4}},
+        )
+        for item in planned:
+            with self.subTest(node=item.node_id):
+                self.assertEqual(item.performance_snapshot_id, performance_id)
+                self.assertEqual(item.performance_digest, performance_digest)
+                self.assertEqual(item.performance_policy, "quality-first-v1")
+                self.assertEqual(item.performance_status, "cold-start")
+                self.assertEqual(item.performance_quality_source, "declared")
+                self.assertIsNone(item.performance_lower_bound_95)
+
+    def test_planner_rejects_forged_performance_receipt(self) -> None:
+        active = catalog()
+        performance_id = "performance-" + "a" * 16
+        performance_digest = "b" * 64
+        contract = make_contract(
+            capability_snapshot_id=active["catalog_id"],
+            capability_digest=active["digest"],
+            performance_snapshot_id=performance_id,
+            performance_digest=performance_digest,
+        )
+        raw_worker = node("worker", write_scope="src/worker", executor="codex", model="gpt-5.6-luna")
+        raw_worker["performance_snapshot_id"] = "performance-" + "c" * 16
+        raw_worker["performance_digest"] = performance_digest
+        raw = {
+            "summary": "forged performance receipt",
+            "nodes": [
+                raw_worker,
+                node("verify", write_scope="", executor="codex", model="gpt-5.6-sol", verifier=True),
+            ],
+        }
+        with self.assertRaisesRegex(PlannerError, "performance_snapshot_id is derived"):
+            CodexPlanner.normalize_and_validate_plan(
+                contract,
+                raw,
+                claude_models_available=(),
+                default_executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+                capability_snapshot=active,
+                provider_capacity={"codex": {"capacity": 4}},
+            )
+
+    def test_planner_cannot_supply_execution_lane_or_quota_pool(self) -> None:
+        raw = {
+            "summary": "forged lane",
+            "nodes": [
+                {
+                    **node("worker", write_scope="src/worker"),
+                    "execution_lane": "control",
+                    "quota_pool_id": "codex-control",
+                },
+                node("verify", write_scope="", executor="codex", model="gpt-5.6-sol", verifier=True),
+            ],
+        }
+
+        with self.assertRaisesRegex(PlannerError, "execution_lane is derived"):
+            CodexPlanner.normalize_and_validate_plan(
+                make_contract(),
+                raw,
+                claude_models_available=(),
+                default_executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+            )
+
+    def test_plan_schema_excludes_derived_execution_metadata(self) -> None:
+        properties = PLAN_SCHEMA["properties"]["nodes"]["items"]["properties"]
+        self.assertNotIn("execution_lane", properties)
+        self.assertNotIn("quota_pool_id", properties)
+        self.assertTrue({"execution_lane", "quota_pool_id"}.isdisjoint(properties))
 
 
 if __name__ == "__main__":

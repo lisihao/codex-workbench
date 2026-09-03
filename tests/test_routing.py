@@ -172,9 +172,30 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(contract.strategy.complexity, "standard")
         self.assertTrue(contract.strategy.parallelizable)
 
+    def test_legacy_route_receipt_preserves_pinned_performance_identity(self) -> None:
+        contract = make_contract(
+            performance_snapshot_id="performance-" + "a" * 16,
+            performance_digest="b" * 64,
+            performance_status="cold-start",
+        )
+        decision = route_task(
+            contract,
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+        )
+        self.assertEqual(decision.performance_snapshot_id, contract.performance_snapshot_id)
+        self.assertEqual(decision.performance_digest, contract.performance_digest)
+        self.assertEqual(decision.performance_status, "cold-start")
+        self.assertEqual(decision.quality_source, "declared")
+        self.assertIsNone(decision.performance_lower_bound_95)
+
     def test_low_risk_split_implementation_uses_the_independent_codex_spark_pool(self) -> None:
         decision = route_task(
-            make_contract(complexity="low", parallelizable=True),
+            make_contract(
+                complexity="low",
+                parallelizable=True,
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
             claude_models_available=("opus", "sonnet"),
             quota_snapshot=healthy_quota(),
         )
@@ -210,7 +231,10 @@ class RoutingTests(unittest.TestCase):
         ):
             with self.subTest(complexity=complexity):
                 decision = route_task(
-                    make_contract(complexity=complexity),
+                    make_contract(
+                        complexity=complexity,
+                        acceptance_commands=("scripts/python-runtime -m unittest",),
+                    ),
                     claude_models_available=(),
                     quota_snapshot=healthy_quota(auth_ok=False),
                 )
@@ -237,6 +261,7 @@ class RoutingTests(unittest.TestCase):
                     complexity=complexity,
                     parallelizable=parallelizable,
                     task_type="implementation",
+                    command=("true",) if complexity == "low" else (),
                 )
                 decision = route_node(
                     contract,
@@ -342,7 +367,11 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(first.to_dict(), second.to_dict())
 
     def test_codex_fallback_escalates_without_downgrading_high_complexity_work(self) -> None:
-        low = make_contract(task_type="tests", complexity="low")
+        low = make_contract(
+            task_type="tests",
+            complexity="low",
+            acceptance_commands=("scripts/python-runtime -m unittest",),
+        )
         self.assertEqual(codex_fallback_model(low, attempt=1), "gpt-5.3-codex-spark")
         self.assertEqual(codex_fallback_model(low, attempt=2), "gpt-5.6-luna")
         self.assertEqual(codex_fallback_model(low, attempt=3), "gpt-5.6-terra")
@@ -356,6 +385,71 @@ class RoutingTests(unittest.TestCase):
         high = make_contract(task_type="architecture", complexity="high")
         self.assertEqual(codex_fallback_model(high, attempt=1), "gpt-5.6-terra")
         self.assertEqual(codex_fallback_model(high, attempt=2), "gpt-5.6-sol")
+
+    def test_spark_requires_mechanical_acceptance_and_ignores_dependency_count(self) -> None:
+        no_command = route_task(
+            make_contract(complexity="low"),
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+        )
+        self.assertEqual((no_command.executor, no_command.model), ("codex", "gpt-5.6-luna"))
+
+        many_dependencies = route_task(
+            make_contract(complexity="low"),
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+            node_context={
+                "command": ("scripts/python-runtime -m unittest",),
+                "depends_on": ("a", "b", "c"),
+                "write_scopes": ("tests/one",),
+            },
+        )
+        self.assertEqual((many_dependencies.executor, many_dependencies.model), ("codex", "gpt-5.3-codex-spark"))
+
+    def test_spark_rejects_multiple_writes_and_control_or_architecture_roles(self) -> None:
+        multiple_writes = route_task(
+            make_contract(
+                complexity="low",
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+            node_context={"write_scopes": ("src/a", "src/b")},
+        )
+        self.assertEqual((multiple_writes.executor, multiple_writes.model), ("codex", "gpt-5.6-luna"))
+
+        architecture = route_task(
+            make_contract(
+                task_type="architecture",
+                complexity="low",
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+        )
+        self.assertEqual((architecture.executor, architecture.model), ("codex", "gpt-5.6-terra"))
+
+        security = route_task(
+            make_contract(
+                objective="security patch across the authentication boundary",
+                complexity="low",
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+        )
+        self.assertEqual((security.executor, security.model), ("codex", "gpt-5.6-luna"))
+
+        verifier = route_task(
+            make_contract(
+                complexity="low",
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
+            role="verifier",
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(auth_ok=False),
+        )
+        self.assertEqual((verifier.executor, verifier.model), ("codex", "gpt-5.6-sol"))
 
     def test_public_worker_route_fails_closed_without_a_quota_snapshot(self) -> None:
         decision = route_task(

@@ -21,6 +21,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 | “Worker 跑完了”被误当作完成 | Worker 结果不是验收。只有独立 verifier 收齐约定的 diff、检查日志和 verdict 后，任务才可 `accepted`。 |
 | 强模型被实现细节占满 | Sol 负责需求编译、跨模块判断和最终验收；边界明确的实现优先交给 Spark、Luna、Terra 或受配额约束的 Claude Worker。 |
 | Claude Code 订阅被后台任务耗尽 | Claude Worker 只在认证和新鲜配额快照可证明时启用；未知状态会 fail closed 并转交 Codex。系统保留至少 20% 的目标配额空间，并设有更早的调度门槛。 |
+| 不知道哪个模型在当前工作里更合适 | Workbench 使用按领域的公开 benchmark 冷启动先验，再用长期运行账本校准；它不把不同 benchmark 拼成一个排行榜，也不把公开分数冒充本机成功率。 |
 | 验证反复运行、成本高且结论不清 | `code-as-harness/v1` 将 L0–L3 验证层级和 Evidence fingerprint 写入任务契约；相同输入闭包的已通过证据可复用。 |
 
 ## 运行模型
@@ -36,9 +37,11 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 │                                                                    │
 │  SQLite task ledger ──► Sol planner ──► scope-aware parallel DAG   │
 │         │                       │                                  │
-│         │                       ├── Codex Spark / Luna / Terra     │
+│         │                       ├── Spark P0 lane / Luna / Terra   │
 │         │                       ├── optional Claude Code workers   │
 │         │                       └── deterministic build/test tools │
+│         │                                                          │
+│         ├── performance baseline + runtime ledger ──► score policy │
 │         │                                                          │
 │         └──► independent Sol verifier ──► Evidence ──► accepted   │
 └────────────────────────────────────────────────────────────────────┘
@@ -56,6 +59,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 - **手机 Codex Remote**：手机端 Codex 的 Remote 页连接 Mac mini 上的 Codex app-server；同一 Workbench 插件与 MCP 让远程会话查看进度、发送新指令并继续既有任务。首次短效配对必须由用户在 Mac mini 终端完成。
 - **`wb` Codex 入口**：一个薄插件，将新会话或已有会话绑定到同一份持久任务。它同步经脱敏的会话摘要与受控 Git 上下文，而不持有第二份任务状态。
 - **Claude Code Worker**：可选的订阅型执行器，不承担规划或最终验收。认证、CLI 兼容性或配额状态不明确时不会猜测余额，也不会使用 API-key fallback。
+- **Claude 登录与配额采集**：Claude Code 原生订阅 OAuth 的凭据由官方 macOS CLI 保存在系统 Keychain；Workbench 不复制、导出或持久化 token，只调用 `auth status` 与受限的 `/usage` 观察。当前受支持的 collector 兼容锁定的 Claude CLI `2.1.239`，既接受对象也接受其真实数组 envelope；认证或解析失败会 fail closed，不循环重新登录。
 - **离线回落**：如果 Authority 不可达，已绑定会话继续在 MacBook 当前 checkout 上工作；系统不会在离线端静默创建第二个 Authority，下一次可用连接再重试同步。
 
 ## 核心能力与边界
@@ -65,6 +69,28 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 任务首先由 Sol 规划器编译为持久 TaskContract 和 DAG。只有依赖已完成且读写 scope 不冲突的节点才会并行；父子路径互斥，纯读节点可以并行。每个执行节点在独立 worktree/branch 中运行，因此并行提升吞吐量而不会把共享工作树变成竞态源。
 
 路由不是固定“弱模型干活”的盲目规则：低风险、短且可机械验收的工作可进入独立 Spark 池；边界明确的常规实现优先 Luna；较大的独立切片可以升级 Terra；需求拆解、跨模块判断和最终验收留给 Sol。Claude Code 的 Sonnet、Opus 或 Fable 只在其订阅资格和受保护配额可证明时作为 Worker 使用。
+
+Spark 是一个独立的逻辑队列，不是另一套协调器。它和普通 Worker 共享全局执行器上限，但拥有自己的容量、等待、启动和 busy-slot 计数；默认上限为 `min(4, max_workers)`，可用 `serve --spark-workers N` 调整，`0` 表示关闭 Spark 优先 lane。规划器会主动寻找互不冲突、可单独验收的短切片；无法安全拆分时保留 Luna/Terra 的较大切片。routing-v3 的 Spark 失败不会被当成成功，也不会在 claim 时绕过已固定能力目录静默换模型；需要换档时由后续 planner repair 重新路由，最终仍由 Sol 验收。
+
+### Benchmark 基线、长期校准与快照绑定
+
+Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam) 等公开资料建立按领域的冷启动先验。Terminal、SWE 和 HLE 衡量的事情不同，因此不会被合并成一个“总分”；每条先验都保留来源、模型/Agent 配对和迁移折扣，不能替代本机验收。
+
+长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 仍保留为运行证据，但只记作 unresolved，不进入模型质量成功/失败分母。当前尚无更细的 `failure_origin` 分类器，不能进一步区分网络、主机、harness 或模型自身原因。Beta 后验的保守排名信号与声明质量门禁分开记录，只在硬门禁之后参与 advisory 排序；当前校准接口仅报告 `cold-start`（无活动快照）或 `ok`（有活动快照），尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值。
+
+创建任务时，当前 performance snapshot、能力目录 digest 和 policy version 会固定进 TaskContract/NodeSpec；刷新或升级不会重路由已运行任务。快照是可重建的派生缓存，不是第二份状态真相；所有刷新都是本地、被动、无模型调用和无登录操作。
+
+常用观测入口：
+
+```bash
+codex-workbench performance status
+codex-workbench performance show
+codex-workbench performance refresh       # 只重放本地账本，不调用模型
+curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/performance
+curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/scheduler
+```
+
+`/api/scheduler` 展示每个 lane 的依赖就绪 `queue_depth`、`dependency_blocked`、`inflight`、`started`、`accepted`、`failed`、`blocked`、`indeterminate`、`retry`、`rework`、`busy_seconds`、`utilization` 和 `accepted_per_hour`，以及 quota pool 状态；分母为零时返回 `N/A`。历史事件的 lane/pool 以持久 NodeSpec 为准，事件载荷只兼容没有 NodeSpec 的旧记录。first-pass/final acceptance 和 duration 由 performance ledger 单独记录，不是 scheduler API 的字段。Codex/Spark 的订阅剩余配额在上游没有可证明接口时保持 `N/A`，不会由 Workbench 编造余额。
 
 ### 版本化能力目录与质量优先路由
 
@@ -244,6 +270,12 @@ codex-workbench capabilities status
 codex-workbench capabilities diff
 codex-workbench capabilities refresh --activate-safe
 codex-workbench capabilities rollback
+codex-workbench performance status
+codex-workbench performance show
+codex-workbench performance refresh
+
+# Tune the logical Spark lane inside the shared executor
+codex-workbench serve --max-workers 8 --spark-workers 4
 
 # Native Codex mobile Remote Control
 codex-workbench mobile status
@@ -269,7 +301,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.6.2`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
+当前源码版本为 `1.7.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.7.0 新增 benchmark-backed 性能基线、长期运行校准、性能快照绑定和 Spark P0 逻辑队列；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

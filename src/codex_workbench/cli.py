@@ -29,6 +29,7 @@ from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .mobile import MobileRemote, MobileRemoteError
+from .performance import PerformanceRegistry, PerformanceRegistryError
 from .planner import PlannerError
 from .research import managed_research_skill_status
 from .restart_readiness import assess_restart_readiness
@@ -61,6 +62,7 @@ def command_init(args: argparse.Namespace) -> int:
             host=config.host,
             port=config.port,
             max_workers=config.max_workers,
+            spark_workers=config.spark_workers,
             deployment_role="authority",
             authority_host=socket.gethostname(),
             authority_machine_id=authority_machine_id(),
@@ -75,12 +77,19 @@ def command_init(args: argparse.Namespace) -> int:
 
 def command_serve(args: argparse.Namespace) -> int:
     config = _config(args)
-    if args.host or args.port or args.max_workers:
+    if args.host or args.port or args.max_workers is not None or args.spark_workers is not None:
         config = WorkbenchConfig(
             state_root=config.state_root,
             host=args.host or config.host,
             port=args.port or config.port,
-            max_workers=args.max_workers or config.max_workers,
+            max_workers=(
+                args.max_workers if args.max_workers is not None else config.max_workers
+            ),
+            spark_workers=(
+                args.spark_workers
+                if args.spark_workers is not None
+                else config.spark_workers
+            ),
             deployment_role=config.deployment_role,
             authority_host=config.authority_host,
             authority_machine_id=config.authority_machine_id,
@@ -96,6 +105,7 @@ def command_serve(args: argparse.Namespace) -> int:
             config.state_root,
             coordinator_epoch=coordinator_epoch,
             max_workers=config.max_workers,
+            spark_workers=config.effective_spark_workers,
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
         )
@@ -561,10 +571,61 @@ def _capability_registry(config: WorkbenchConfig) -> CapabilityRegistry:
     )
 
 
+def _refresh_performance_after_capabilities(
+    config: WorkbenchConfig,
+    refresh: dict[str, object],
+) -> dict[str, object]:
+    """Materialize the matching calibration after a safe catalog activation.
+
+    The capability watcher runs on the Mac mini authority.  A client may
+    inspect or refresh its own catalog, but it must never write the authority
+    SQLite-backed performance ledger.  The registry is refreshed only when
+    the returned catalog is the active generation, so a staged/unsafe catalog
+    cannot silently influence new-task calibration.
+    """
+
+    catalog = refresh.get("catalog")
+    active_generation_id = refresh.get("active_generation_id")
+    if not isinstance(catalog, dict):
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "reason": "capability refresh did not return a catalog generation",
+        }
+    if catalog.get("catalog_id") != active_generation_id:
+        return {
+            "ok": False,
+            "status": "deferred",
+            "reason": "catalog is not the active safe generation",
+            "catalog_id": catalog.get("catalog_id"),
+            "active_generation_id": active_generation_id,
+        }
+    if config.deployment_role != "authority":
+        return {
+            "ok": False,
+            "status": "deferred",
+            "reason": "client installation cannot write the authority performance ledger",
+            "catalog_id": catalog.get("catalog_id"),
+        }
+    try:
+        result = PerformanceRegistry(config.state_root).refresh(_store(config), catalog)
+    except PerformanceRegistryError as error:
+        return {"ok": False, "status": "unavailable", "reason": str(error)}
+    return {
+        "ok": True,
+        "status": "active",
+        "snapshot_id": result["active_generation_id"],
+        "activated": result["activated"],
+        "unchanged": result["unchanged"],
+        "model_calls": 0,
+    }
+
+
 def command_capabilities(args: argparse.Namespace) -> int:
     """Inspect and manage the passive, versioned capability catalog."""
 
-    registry = _capability_registry(_config(args))
+    config = _config(args)
+    registry = _capability_registry(config)
     action = args.capabilities_action
     try:
         if action == "status":
@@ -586,6 +647,11 @@ def command_capabilities(args: argparse.Namespace) -> int:
                 bundled=bool(args.bundled),
                 activate_safe=bool(args.activate_safe),
             )
+            if result.get("ok") is True:
+                result["performance"] = _refresh_performance_after_capabilities(
+                    config,
+                    result,
+                )
         elif action == "diff":
             result = registry.diff(args.from_generation, args.to_generation)
         elif action == "activate":
@@ -595,6 +661,80 @@ def command_capabilities(args: argparse.Namespace) -> int:
         else:
             raise ValueError(f"unsupported capabilities action: {action}")
     except CapabilityCatalogError as error:
+        result = {"ok": False, "error": str(error)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def _performance_catalog(config: WorkbenchConfig) -> tuple[dict[str, object], dict[str, object]]:
+    """Read, but never probe or refresh, the capability catalog for a ledger run."""
+
+    try:
+        active = _capability_registry(config).active()
+    except CapabilityCatalogError as error:
+        active = None
+        reason = str(error)
+    else:
+        reason = None
+    if isinstance(active, dict):
+        return active, {
+            "status": "active",
+            "catalog_id": active.get("catalog_id"),
+            "capability_digest": active.get("digest"),
+            "refreshed": False,
+        }
+    # A performance generation can still safely describe the historical
+    # ledger before the passive capability catalog has been established.  It
+    # carries an explicit anonymous catalog identity rather than inventing a
+    # model/version claim.
+    return {
+        "catalog_id": None,
+        "digest": None,
+        "models": [],
+        "agents": {},
+    }, {
+        "status": "unavailable",
+        "catalog_id": None,
+        "capability_digest": None,
+        "refreshed": False,
+        "reason": reason or "no active capability catalog",
+    }
+
+
+def command_performance(args: argparse.Namespace) -> int:
+    """Inspect or materialize the advisory performance calibration ledger.
+
+    All actions are local: ``refresh`` replays SQLite task/event evidence and
+    writes a content-addressed snapshot.  It does not authenticate, prompt, or
+    invoke either provider's model.
+    """
+
+    config = _config(args)
+    store = _store(config)
+    registry = PerformanceRegistry(config.state_root)
+    try:
+        if args.performance_action == "status":
+            result = registry.status()
+        elif args.performance_action == "show":
+            snapshot = (
+                registry.load_generation(args.snapshot_id)
+                if args.snapshot_id
+                else registry.active()
+            )
+            result = {
+                "ok": snapshot is not None,
+                "snapshot_id": snapshot.get("snapshot_id") if snapshot else None,
+                "snapshot": snapshot,
+                **({} if snapshot is not None else {"error": "no active performance snapshot"}),
+            }
+        elif args.performance_action == "refresh":
+            catalog, catalog_status = _performance_catalog(config)
+            result = registry.refresh(store, catalog)
+            result["catalog"] = catalog_status
+            result["model_calls"] = 0
+        else:
+            raise ValueError(f"unsupported performance action: {args.performance_action}")
+    except PerformanceRegistryError as error:
         result = {"ok": False, "error": str(error)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
@@ -768,6 +908,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.add_argument("--max-workers", type=int)
+    serve.add_argument(
+        "--spark-workers",
+        type=int,
+        help="logical Spark lane cap inside the shared executor; zero disables its priority lane",
+    )
     serve.set_defaults(func=command_serve)
 
     mcp = sub.add_parser("mcp", help="serve the Codex-native Workbench tools over stdio")
@@ -956,6 +1101,20 @@ def build_parser() -> argparse.ArgumentParser:
     capabilities_activate.add_argument("catalog_id")
     capabilities_sub.add_parser("rollback")
     capabilities.set_defaults(func=command_capabilities)
+
+    performance = sub.add_parser(
+        "performance",
+        help="inspect or calibrate the local benchmark-prior and runtime performance ledger",
+    )
+    performance_sub = performance.add_subparsers(dest="performance_action", required=True)
+    performance_sub.add_parser("status")
+    performance_show = performance_sub.add_parser("show")
+    performance_show.add_argument("snapshot_id", nargs="?")
+    performance_sub.add_parser(
+        "refresh",
+        help="replay local SQLite events/tasks into a content-addressed snapshot; never calls a model",
+    )
+    performance.set_defaults(func=command_performance)
 
     mobile = sub.add_parser(
         "mobile",

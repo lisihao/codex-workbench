@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import get_args
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +14,13 @@ from codex_workbench.claude_quota import (
     PRODUCER_SCHEMA_VERSION,
     SUPPORTED_USAGE_VERSION,
 )
-from codex_workbench.model import NodeSpec, QuotaSnapshot, now_iso
+from codex_workbench.model import (
+    NodeSpec,
+    QuotaSnapshot,
+    RoutingComplexity,
+    RoutingTaskType,
+    now_iso,
+)
 from codex_workbench.store import WorkbenchStore
 from codex_workbench.submission import submit_natural_language_request
 
@@ -285,7 +292,95 @@ class SubmissionTests(unittest.TestCase):
             self.assertEqual(contract["capability_digest"], "c" * 64)
             self.assertEqual(result["routing_policy"]["version"], "model-routing-v3")
             self.assertEqual(result["capability_registry"]["status"], "active")
-            self.assertEqual(compile_plan.call_args.kwargs["capability_snapshot"], active_catalog())
+            routing_catalog = compile_plan.call_args.kwargs["capability_snapshot"]
+            self.assertEqual(routing_catalog["catalog_id"], active_catalog()["catalog_id"])
+            self.assertIn("performance_calibration", routing_catalog)
+
+    def test_active_catalog_pins_the_performance_snapshot_and_passes_advisory_calibration_to_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            config = WorkbenchConfig(root / "state")
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            planned = [
+                NodeSpec(
+                    "verify",
+                    "task-performance",
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    verifier=True,
+                )
+            ]
+            registry = MagicMock()
+            registry.active.return_value = active_catalog()
+            with (
+                patch("codex_workbench.submission.CapabilityRegistry", return_value=registry),
+                patch("codex_workbench.submission.CodexPlanner.compile", return_value=planned) as compile_plan,
+            ):
+                result = submit_natural_language_request(
+                    config,
+                    store,
+                    objective="bounded work",
+                    repository=str(repository),
+                    allowed_scope=("README.md",),
+                    task_id="task-performance",
+                    queue=False,
+                )
+
+            contract = store.get_task("task-performance")["contract"]
+            self.assertTrue(contract["performance_snapshot_id"].startswith("performance-"))
+            self.assertEqual(len(contract["performance_digest"]), 64)
+            self.assertEqual(contract["performance_policy"], "benchmark-prior-plus-runtime-ledger-v1")
+            self.assertEqual(contract["performance_status"], "ok")
+            self.assertEqual(
+                result["routing_policy"]["performance_snapshot_id"],
+                contract["performance_snapshot_id"],
+            )
+            self.assertTrue(result["performance"]["advisory_only"])
+            self.assertEqual(
+                result["performance"]["calibration"]["matrix_context_count"],
+                len(get_args(RoutingTaskType)) * len(get_args(RoutingComplexity)),
+            )
+            self.assertNotIn("contexts", result["performance"]["calibration"])
+            routing_catalog = compile_plan.call_args.kwargs["capability_snapshot"]
+            self.assertEqual(routing_catalog["catalog_id"], "catalog-submission-v3")
+            calibration = routing_catalog["performance_calibration"]
+            self.assertEqual(calibration["task_type"], "implementation")
+            self.assertEqual(calibration["complexity"], "standard")
+            self.assertEqual(calibration["snapshot_id"], contract["performance_snapshot_id"])
+            self.assertEqual(calibration["digest"], contract["performance_digest"])
+            expected_contexts = {
+                (task_type, complexity)
+                for task_type in get_args(RoutingTaskType)
+                for complexity in get_args(RoutingComplexity)
+            }
+            contexts = calibration["contexts"]
+            self.assertEqual(
+                {(context["task_type"], context["complexity"]) for context in contexts},
+                expected_contexts,
+            )
+            self.assertTrue(
+                all(
+                    context["snapshot_id"] == contract["performance_snapshot_id"]
+                    and context["digest"] == contract["performance_digest"]
+                    for context in contexts
+                )
+            )
+            self.assertEqual(
+                compile_plan.call_args.kwargs["performance_calibration"],
+                calibration,
+            )
 
     def test_failed_first_capability_refresh_reports_legacy_v2_without_pinning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -133,6 +133,72 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(module.authority_max_workers({"max_workers": 4}), 8)
         self.assertEqual(module.authority_max_workers({"max_workers": 12}), 12)
 
+    def test_authority_installer_persists_a_valid_spark_lane_and_performance_refresh_contract(self) -> None:
+        module = self._macos_installer_module()
+        self.assertEqual(module.authority_spark_workers({}, max_workers=8), 4)
+        self.assertEqual(module.authority_spark_workers({"spark_workers": 0}, max_workers=8), 0)
+        self.assertEqual(module.authority_spark_workers({"spark_workers": 3}, max_workers=8), 3)
+        with self.assertRaisesRegex(SystemExit, "spark_workers must be between"):
+            module.authority_spark_workers({"spark_workers": 9}, max_workers=8)
+
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            state_root = root / "state"
+            app_root = state_root / "app"
+            existing = {
+                "user_setting": "preserve",
+                "performance": {"operator_note": "preserve"},
+            }
+            performance = module.performance_installation_config(
+                existing,
+                app_root=app_root,
+                state_root=state_root,
+                refresh_seconds=1234,
+            )
+
+        self.assertEqual(performance["operator_note"], "preserve")
+        self.assertEqual(performance["state_root"], str(state_root / "performance"))
+        self.assertEqual(
+            performance["baseline_resource"],
+            module.PERFORMANCE_BASELINE_RESOURCE,
+        )
+        self.assertEqual(performance["refresh_interval_seconds"], 1234)
+        self.assertEqual(
+            performance["refresh_command"],
+            [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "capabilities",
+                "refresh",
+                "--activate-safe",
+            ],
+        )
+
+    def test_authority_service_render_uses_real_home_and_explicit_claude_path(self) -> None:
+        module = self._macos_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / f"{module.LABEL}.plist.in").read_text()
+        with mock.patch.object(module.Path, "home", return_value=Path("/Users/example")):
+            rendered = module.render_authority_service_plist(
+                template,
+                app_root=Path("/tmp/app"),
+                state_root=Path("/tmp/state"),
+                codex_binary=Path("/tmp/runtime/codex"),
+                codex_home=Path("/tmp/state/codex-home"),
+                process_home=Path("/tmp/state/process-home"),
+                quota_snapshot_file=Path("/tmp/state/claude-quota.json"),
+                claude_binary=Path("/tmp/claude-2.1.239"),
+            )
+
+        payload = plistlib.loads(rendered.encode())
+        environment = payload["EnvironmentVariables"]
+        self.assertEqual(environment["HOME"], "/Users/example")
+        self.assertEqual(environment["CODEX_WORKBENCH_CLAUDE"], "/tmp/claude-2.1.239")
+        self.assertEqual(environment["CODEX_WORKBENCH_CODEX"], "/tmp/runtime/codex")
+
     def test_harness_installer_is_idempotent_and_preserves_existing_policy(self) -> None:
         module = self._harness_installer_module()
         source = Path(__file__).resolve().parents[1]
@@ -1553,6 +1619,26 @@ class InstallerTests(unittest.TestCase):
             config = json.loads((state_root / "config.json").read_text())
             self.assertEqual(config["user_setting"], "preserve")
             self.assertEqual(config["capability_refresh_seconds"], 1234)
+            self.assertEqual(config["max_workers"], 8)
+            self.assertEqual(config["spark_workers"], 4)
+            self.assertEqual(
+                config["performance"],
+                {
+                    "state_root": str(state_root / "performance"),
+                    "baseline_resource": module.PERFORMANCE_BASELINE_RESOURCE,
+                    "refresh_interval_seconds": 1234,
+                    "refresh_command": [
+                        str(state_root / "app" / "scripts" / "python-runtime"),
+                        "-m",
+                        "codex_workbench",
+                        "--home",
+                        str(state_root),
+                        "capabilities",
+                        "refresh",
+                        "--activate-safe",
+                    ],
+                },
+            )
             manifest = json.loads((state_root / "app" / "install-manifest.json").read_text())
             self.assertEqual(
                 manifest["capabilities"],
@@ -1566,11 +1652,16 @@ class InstallerTests(unittest.TestCase):
                 },
             )
             self.assertNotIn("catalog", manifest["capabilities"])
+            self.assertEqual(
+                manifest["performance"],
+                config["performance"],
+            )
             capability_plist = home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist"
             payload = plistlib.loads(capability_plist.read_bytes())
             self.assertEqual(payload["StartInterval"], 1234)
             self.assertEqual(payload["EnvironmentVariables"]["CODEX_HOME"], str(state_root / "codex-home"))
             self.assertEqual(payload["EnvironmentVariables"]["CODEX_WORKBENCH_CODEX"], str(state_root / "runtime" / "codex"))
+            self.assertEqual(payload["EnvironmentVariables"]["HOME"], str(home))
             launchctl_commands = [command for command in calls if command and command[0] == "launchctl"]
             sidecar_service = f"gui/501/{module.CAPABILITY_LABEL}"
             self.assertTrue(

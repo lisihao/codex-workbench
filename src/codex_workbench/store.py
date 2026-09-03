@@ -25,6 +25,11 @@ from .model import (
 from .artifacts import ArtifactStore, presentation_format
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
+from .scheduler_metrics import (
+    EXECUTION_LANES,
+    execution_lane_for_spec,
+    quota_pool_id_for_spec,
+)
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
@@ -51,6 +56,29 @@ class CommandConflictError(RuntimeError):
 
 class StateConflictError(RuntimeError):
     pass
+
+
+def _normalize_execution_lanes(lanes: tuple[str, ...] | None) -> frozenset[str] | None:
+    if lanes is None:
+        return None
+    normalized = frozenset(lanes)
+    invalid = normalized - set(EXECUTION_LANES)
+    if invalid:
+        raise ValueError(f"unsupported execution lanes: {sorted(invalid)}")
+    return normalized
+
+
+def _normalize_lane_capacities(capacities: dict[str, int] | None) -> dict[str, int]:
+    if capacities is None:
+        return {}
+    normalized: dict[str, int] = {}
+    for lane, capacity in capacities.items():
+        if lane not in EXECUTION_LANES:
+            raise ValueError(f"unsupported execution lane capacity: {lane!r}")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
+            raise ValueError("lane capacity must be a non-negative integer")
+        normalized[lane] = capacity
+    return normalized
 
 
 class WorkbenchStore:
@@ -1999,9 +2027,14 @@ class WorkbenchStore:
         worker_id: str,
         coordinator_epoch: int,
         admissible: Callable[[dict[str, Any]], bool] | None = None,
+        *,
+        execution_lanes: tuple[str, ...] | None = None,
+        lane_capacities: dict[str, int] | None = None,
     ) -> dict[str, Any] | None:
         if coordinator_epoch <= 0:
             raise ValueError("coordinator_epoch must be positive")
+        allowed_lanes = _normalize_execution_lanes(execution_lanes)
+        capacities = _normalize_lane_capacities(lane_capacities)
         timestamp = now_iso()
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
@@ -2016,14 +2049,21 @@ class WorkbenchStore:
             ).fetchall()
             running_accesses: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
             running_task_parallelism: dict[str, bool] = {}
+            running_lane_active = {lane: 0 for lane in EXECUTION_LANES}
             for running in connection.execute(
                 """
-                SELECT n.task_id, n.spec_json, t.contract_json
+                SELECT n.task_id, n.spec_json, n.effective_executor, n.effective_model,
+                       t.contract_json
                 FROM nodes n JOIN tasks t USING(task_id)
                 WHERE n.state = 'running'
                 """
             ).fetchall():
-                running_spec = json.loads(running["spec_json"])
+                persisted_spec = json.loads(running["spec_json"])
+                running_spec = {
+                    **persisted_spec,
+                    "executor": running["effective_executor"] or persisted_spec["executor"],
+                    "model": running["effective_model"] or persisted_spec["model"],
+                }
                 running_contract = json.loads(running["contract_json"])
                 task_id = str(running["task_id"])
                 running_task_parallelism[task_id] = running_task_parallelism.get(task_id, False) or (
@@ -2036,11 +2076,36 @@ class WorkbenchStore:
                         tuple(running_spec.get("write_scopes", [])),
                     )
                 )
+                running_lane_active[execution_lane_for_spec(running_spec)] += 1
 
             selected: sqlite3.Row | None = None
             selected_spec: dict[str, Any] | None = None
+            selected_effective_executor: str | None = None
+            selected_effective_model: str | None = None
+            selected_lane: str | None = None
+            selected_pool: str | None = None
             for candidate in candidates:
                 spec = json.loads(candidate["spec_json"])
+                candidate_attempt = int(candidate["attempt"]) + 1
+                effective_executor = str(candidate["effective_executor"] or spec["executor"])
+                effective_model = retry_model(
+                    str(candidate["effective_model"] or spec["model"]),
+                    candidate_attempt,
+                    verifier=bool(spec.get("verifier")),
+                    routing_policy_version=spec.get("routing_policy_version"),
+                )
+                effective_spec = {
+                    **spec,
+                    "executor": effective_executor,
+                    "model": effective_model,
+                    "model_profile": codex_model_profile(effective_model),
+                    "model_reasoning_effort": codex_model_reasoning_effort(effective_model),
+                }
+                lane = execution_lane_for_spec(effective_spec)
+                if allowed_lanes is not None and lane not in allowed_lanes:
+                    continue
+                if lane in capacities and running_lane_active[lane] >= capacities[lane]:
+                    continue
                 dependencies = spec.get("depends_on", [])
                 if dependencies:
                     placeholders = ",".join("?" for _ in dependencies)
@@ -2070,20 +2135,26 @@ class WorkbenchStore:
                     continue
                 selected = candidate
                 selected_spec = spec
+                selected_effective_executor = effective_executor
+                selected_effective_model = effective_model
+                selected_lane = lane
+                selected_pool = quota_pool_id_for_spec(effective_spec)
                 break
 
-            if selected is None or selected_spec is None:
+            if (
+                selected is None
+                or selected_spec is None
+                or selected_effective_executor is None
+                or selected_effective_model is None
+                or selected_lane is None
+                or selected_pool is None
+            ):
                 return None
 
             attempt = int(selected["attempt"]) + 1
             lease_epoch = self._next_lease_epoch(connection)
-            effective_executor = str(selected["effective_executor"] or selected_spec["executor"])
-            effective_model = retry_model(
-                str(selected["effective_model"] or selected_spec["model"]),
-                attempt,
-                verifier=bool(selected_spec.get("verifier")),
-                routing_policy_version=selected_spec.get("routing_policy_version"),
-            )
+            effective_executor = selected_effective_executor
+            effective_model = selected_effective_model
             connection.execute(
                 """
                 UPDATE nodes SET state = 'running', attempt = ?, worker_id = ?,
@@ -2135,6 +2206,11 @@ class WorkbenchStore:
                     "model_reasoning_effort": codex_model_reasoning_effort(effective_model),
                     "coordinator_epoch": coordinator_epoch,
                     "lease_epoch": lease_epoch,
+                    "execution_lane": selected_lane,
+                    "quota_pool_id": selected_pool,
+                    "lane_capacity": capacities.get(selected_lane),
+                    "lane_active_units": running_lane_active[selected_lane] + 1,
+                    "claimed_at": timestamp,
                 },
             )
             steering = tuple(
@@ -2159,6 +2235,8 @@ class WorkbenchStore:
                     "model": effective_model,
                     "model_profile": codex_model_profile(effective_model),
                     "model_reasoning_effort": codex_model_reasoning_effort(effective_model),
+                    "execution_lane": selected_lane,
+                    "quota_pool_id": selected_pool,
                 },
                 "contract": json.loads(selected["contract_json"]),
                 "steering": steering,

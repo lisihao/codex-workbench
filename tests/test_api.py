@@ -20,10 +20,60 @@ from codex_workbench.claude_quota import (
 )
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
+from codex_workbench.performance import PerformanceRegistry
 from codex_workbench.store import WorkbenchStore
 
 
 class APITests(unittest.TestCase):
+    def test_performance_and_scheduler_endpoints_are_read_only_and_expose_spark_na_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(
+                root,
+                host="127.0.0.1",
+                port=0,
+                max_workers=3,
+                spark_workers=2,
+            )
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            refreshed = PerformanceRegistry(config.state_root).refresh(
+                store,
+                {
+                    "catalog_id": "catalog-api-performance",
+                    "digest": "a" * 64,
+                    "models": [],
+                    "agents": {},
+                },
+            )
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                with urlopen(f"http://127.0.0.1:{port}/api/performance", timeout=2) as response:
+                    performance = json.load(response)
+                with urlopen(f"http://127.0.0.1:{port}/api/scheduler", timeout=2) as response:
+                    scheduler = json.load(response)
+                with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
+                    snapshot = json.load(response)
+
+                self.assertTrue(performance["ok"])
+                self.assertEqual(
+                    performance["active"]["snapshot_id"],
+                    refreshed["active_generation_id"],
+                )
+                self.assertEqual(performance["active"]["pools"]["spark"]["remaining_display"], "N/A")
+                self.assertEqual(scheduler["lanes"]["spark"]["capacity"], 2)
+                self.assertEqual(scheduler["quota_pools"]["codex-spark"]["status"], "N/A")
+                self.assertEqual(snapshot["performance"]["active_generation_id"], refreshed["active_generation_id"])
+                self.assertEqual(snapshot["scheduler"]["lanes"]["spark"]["capacity"], 2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_events_rejects_invalid_after_as_json_400(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

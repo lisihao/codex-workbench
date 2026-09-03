@@ -15,7 +15,9 @@ from .capabilities import CapabilityRegistry
 from .config import WorkbenchConfig
 from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
+from .performance import PerformanceRegistry
 from .quota_productivity import build_quota_productivity
+from .scheduler_metrics import build_scheduler_metrics
 from .store import StateConflictError, WorkbenchStore
 
 
@@ -71,6 +73,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "governance": governance_status(),
                     "harness": code_as_harness_health(self.server.config),
                     "capability_registry": self._capability_registry_summary(),
+                    "performance": self._performance_registry_summary(),
+                    "scheduler": self._scheduler_metrics(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "approvals": self.server.store.list_approvals(),
@@ -85,6 +89,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "authenticated": self._authenticated(),
                 }
             )
+        if parsed.path == "/api/performance":
+            return self._json(self._performance_registry_summary())
+        if parsed.path == "/api/scheduler":
+            return self._json(self._scheduler_metrics())
         if parsed.path == "/api/capabilities":
             status = self._capability_registry().status()
             return self._json(
@@ -320,6 +328,64 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "error": status.get("error"),
             "active": active_summary,
         }
+
+    def _performance_registry(self) -> PerformanceRegistry:
+        """Read the local, materialized performance ledger without probing models."""
+
+        return PerformanceRegistry(self.server.config.state_root)
+
+    def _performance_registry_summary(self) -> dict[str, object]:
+        """Return the active calibrated snapshot, if one has been materialized.
+
+        This endpoint deliberately never refreshes the registry.  Refreshing is
+        a separate, explicit CLI/submission action so observing the cockpit
+        remains read-only and cannot run a model or mutate the task ledger.
+        """
+
+        status = self._performance_registry().status()
+        active = status.get("active")
+        if not isinstance(active, dict):
+            return {
+                "ok": bool(status.get("ok")),
+                "active_generation_id": status.get("active_generation_id"),
+                "generation_count": status.get("generation_count", 0),
+                "error": status.get("error"),
+                "active": None,
+            }
+        baseline = active.get("baseline")
+        ledger = active.get("ledger")
+        return {
+            "ok": bool(status.get("ok")),
+            "active_generation_id": status.get("active_generation_id"),
+            "generation_count": status.get("generation_count", 0),
+            "error": status.get("error"),
+            "active": {
+                "snapshot_id": active.get("snapshot_id"),
+                "digest": active.get("digest"),
+                "event_cursor": active.get("event_cursor"),
+                "catalog": active.get("catalog"),
+                "baseline": {
+                    "baseline_id": baseline.get("baseline_id"),
+                    "digest": baseline.get("digest"),
+                    "record_count": len(baseline.get("records", ())),
+                }
+                if isinstance(baseline, dict)
+                else None,
+                "ledger": ledger if isinstance(ledger, dict) else None,
+                "pools": active.get("pools"),
+                "metrics": active.get("metrics") if isinstance(active.get("metrics"), list) else [],
+                "advisory_policy": active.get("advisory_policy"),
+            },
+        }
+
+    def _scheduler_metrics(self) -> dict[str, object]:
+        """Replay scheduler evidence into lane metrics without asserting provider quota."""
+
+        return build_scheduler_metrics(
+            self.server.store,
+            max_workers=self.server.config.max_workers,
+            spark_workers=self.server.config.effective_spark_workers,
+        )
 
     def _build_manifest(self) -> dict | None:
         path = self.server.config.install_manifest

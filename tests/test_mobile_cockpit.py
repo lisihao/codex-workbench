@@ -38,6 +38,28 @@ class MobileCockpitStaticTests(unittest.TestCase):
         ):
             self.assertIn(contract, javascript)
 
+    def test_mobile_cockpit_shows_spark_queue_and_local_performance_calibration(self) -> None:
+        html = (STATIC / "index.html").read_text()
+        javascript = (STATIC / "app.js").read_text()
+        css = (STATIC / "app.css").read_text()
+
+        for contract in (
+            'id="performance-section"',
+            'id="performance-summary"',
+            'id="spark-summary"',
+            'id="scheduler"',
+            "function renderPerformance(performance)",
+            "function renderScheduler(scheduler)",
+            "Spark 配额池",
+            "供应商余额",
+            "remaining_display || \"N/A\"",
+            "spark.accepted_per_hour",
+            "spark.utilization",
+        ):
+            self.assertIn(contract, html if contract.startswith('id=') else javascript)
+        self.assertIn(".performance-grid, .scheduler-grid", css)
+        self.assertIn(".performance-grid, .scheduler-grid { grid-template-columns: repeat(2", css)
+
     def test_phone_observation_requires_a_visible_rendered_task_summary(self) -> None:
         javascript = (STATIC / "app.js").read_text()
 

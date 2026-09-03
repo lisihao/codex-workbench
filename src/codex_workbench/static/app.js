@@ -107,6 +107,37 @@ function renderCapabilities(registry) {
   return `<div class="capability-meta"><span>catalog ${escapeHtml(active.catalog_id || registry.active_generation_id || "N/A")}</span><span>routable ${routable}/${models.length}</span></div><div class="capability-agents">${agents || '<span class="muted">Agent 版本 N/A</span>'}</div><div class="capability-models">${models.length ? models.map(renderCapabilityModel).join("") : '<p class="muted">没有模型观测</p>'}</div>`;
 }
 
+function formatRatio(value) {
+  return typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "N/A";
+}
+
+function formatThroughput(value) {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(2)}/h` : "N/A";
+}
+
+function renderPerformance(performance) {
+  const active = performance?.active;
+  if (!active) {
+    return `<p class="muted">${escapeHtml(performance?.error || "尚未生成性能快照")}；运行 performance refresh 只会重放本地 SQLite 账本，不会调用模型。</p>`;
+  }
+  const ledger = active.ledger || {};
+  const baseline = active.baseline || {};
+  const pools = active.pools || {};
+  const spark = pools.spark || {};
+  const metrics = Array.isArray(active.metrics) ? active.metrics : [];
+  return `<div class="performance-grid"><article class="performance-card"><span>快照</span><strong>${escapeHtml(active.snapshot_id || "N/A")}</strong><p>catalog ${escapeHtml(active.catalog?.catalog_id || "N/A")} · event cursor ${escapeHtml(active.event_cursor ?? "N/A")}</p></article><article class="performance-card"><span>冷启动先验</span><strong>${escapeHtml(baseline.baseline_id || "N/A")}</strong><p>${escapeHtml(baseline.record_count ?? 0)} 条公开基线 · 仅作保守建议</p></article><article class="performance-card"><span>本地运行校准</span><strong>${escapeHtml(ledger.eligible_terminal_attempts ?? 0)} 次合格 attempt</strong><p>模型/版本/任务类型隔离 · ${escapeHtml(metrics.length)} 个观测桶</p></article><article class="performance-card"><span>Spark 配额池</span><strong>${escapeHtml(spark.remaining_display || "N/A")}</strong><p>${escapeHtml(spark.reason || "供应商未公开可用余额")}</p></article></div>`;
+}
+
+function renderScheduler(scheduler) {
+  const spark = scheduler?.lanes?.spark;
+  if (!spark) return '<p class="muted">暂无 Spark 队列观测。</p>';
+  const quota = scheduler?.quota_pools?.["codex-spark"] || {};
+  const capacity = spark.capacity ?? "N/A";
+  const running = spark.inflight ?? "N/A";
+  const queued = spark.queue_depth ?? "N/A";
+  return `<div class="scheduler-grid"><article class="scheduler-card"><span>排队</span><strong>${escapeHtml(queued)}</strong><p>只计已就绪的 Spark 机械化节点</p></article><article class="scheduler-card"><span>运行 / 容量</span><strong>${escapeHtml(running)} / ${escapeHtml(capacity)}</strong><p>${escapeHtml(spark.capacity_kind || "N/A")} lane capacity</p></article><article class="scheduler-card"><span>通道利用率</span><strong>${escapeHtml(formatRatio(spark.utilization))}</strong><p>${escapeHtml(spark.busy_seconds ?? "N/A")} busy seconds / 当前窗口</p></article><article class="scheduler-card"><span>已验收吞吐</span><strong>${escapeHtml(formatThroughput(spark.accepted_per_hour))}</strong><p>${escapeHtml(spark.accepted ?? 0)} accepted · ${escapeHtml(spark.failed ?? 0)} failed</p></article><article class="scheduler-card"><span>供应商余额</span><strong>${escapeHtml(quota.remaining_display || "N/A")}</strong><p>${escapeHtml(quota.reason || "未观测")}</p></article></div>`;
+}
+
 function renderApproval(approval) {
   const request = approval.request || {};
   const buttons = authenticated
@@ -146,6 +177,8 @@ async function refreshSnapshot() {
   const quotaPolicy = data.quota_policy;
   const quotaProductivity = data.quota_productivity;
   const capabilityRegistry = data.capability_registry || {};
+  const performance = data.performance || {};
+  const scheduler = data.scheduler || {};
   const latestFiveHourProductivity = [...(quotaProductivity?.windows || [])]
     .reverse()
     .find((window) => window.kind === "five-hour" && window.status === "ok");
@@ -185,6 +218,16 @@ async function refreshSnapshot() {
     ? `${capabilityRoutable}/${capabilityModels.length} routable · ${capabilityActive.catalog_id || "N/A"}`
     : (capabilityRegistry.error || "未激活");
   document.querySelector("#capabilities").innerHTML = renderCapabilities(capabilityRegistry);
+  const performanceActive = performance.active;
+  document.querySelector("#performance-summary").textContent = performanceActive
+    ? `${performanceActive.snapshot_id || performance.active_generation_id || "N/A"} · ${performanceActive.ledger?.eligible_terminal_attempts ?? 0} samples`
+    : (performance.error || "尚未校准");
+  document.querySelector("#performance").innerHTML = renderPerformance(performance);
+  const sparkMetrics = scheduler?.lanes?.spark;
+  document.querySelector("#spark-summary").textContent = sparkMetrics
+    ? `queued ${sparkMetrics.queue_depth ?? "N/A"} · running ${sparkMetrics.inflight ?? "N/A"}/${sparkMetrics.capacity ?? "N/A"}`
+    : "N/A";
+  document.querySelector("#scheduler").innerHTML = renderScheduler(scheduler);
   document.querySelector("#approval-summary").textContent = approvals.length ? `${approvals.length} pending` : "0 pending";
   document.querySelector("#approvals").innerHTML = approvals.length ? approvals.map(renderApproval).join("") : '<p class="muted">当前没有待处理审批</p>';
   document.querySelector("#alerts").innerHTML = alerts.length ? alerts.slice(-8).reverse().map(renderAlert).join("") : '<p class="muted">当前没有重要提醒</p>';

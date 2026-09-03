@@ -89,7 +89,11 @@ class RankedCandidate:
     model: str
     capability_id: str
     capability_digest: str
+    # Declared quality is the hard-gate contract.  Calibrated quality is a
+    # separate conservative ranking signal so a weak prior cannot appear to
+    # violate a floor that the capability already passed.
     quality_score: float
+    ranking_quality_score: float
     quality_floor: float
     acceptance_risk: str
     estimated_cost_units: float
@@ -99,6 +103,32 @@ class RankedCandidate:
     preference_rank: int
     score: tuple[float | str, ...]
     reasons: tuple[str, ...]
+    # Performance calibration is advisory metadata.  It is copied from the
+    # immutable performance generation (when an exact model/agent/task bucket
+    # exists) so a route receipt can explain both its quality input and its
+    # absence.  ``None`` is intentional for unmeasured models such as Spark.
+    performance_snapshot_id: str | None = None
+    performance_digest: str | None = None
+    quality_source: str = "declared"
+    performance_lower_bound_95: float | None = None
+    runtime_sample_count: int = 0
+    performance_first_pass_rate: float | None = None
+    performance_rework_rate: float | None = None
+    performance_latency_ms: float | None = None
+
+    @property
+    def lower_bound_95(self) -> float | None:
+        """Compatibility spelling for the calibrated posterior lower bound."""
+
+        return self.performance_lower_bound_95
+
+    @property
+    def performance_quality_source(self) -> str:
+        return self.quality_source
+
+    @property
+    def performance_runtime_sample_count(self) -> int:
+        return self.runtime_sample_count
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +138,7 @@ class RankedCandidate:
             "capability_id": self.capability_id,
             "capability_digest": self.capability_digest,
             "quality_score": self.quality_score,
+            "ranking_quality_score": self.ranking_quality_score,
             "quality_floor": self.quality_floor,
             "acceptance_risk": self.acceptance_risk,
             "estimated_cost_units": self.estimated_cost_units,
@@ -117,6 +148,17 @@ class RankedCandidate:
             "preference_rank": self.preference_rank,
             "score": list(self.score),
             "reasons": list(self.reasons),
+            "performance_snapshot_id": self.performance_snapshot_id,
+            "performance_digest": self.performance_digest,
+            "quality_source": self.quality_source,
+            "performance_lower_bound_95": self.performance_lower_bound_95,
+            # Keep the short posterior spelling in receipts for consumers that
+            # read PerformanceRegistry.calibrate directly.
+            "lower_bound_95": self.performance_lower_bound_95,
+            "runtime_sample_count": self.runtime_sample_count,
+            "performance_first_pass_rate": self.performance_first_pass_rate,
+            "performance_rework_rate": self.performance_rework_rate,
+            "performance_latency_ms": self.performance_latency_ms,
         }
 
 
@@ -133,6 +175,15 @@ class RoutingV3Decision:
     ranked_candidates: tuple[RankedCandidate, ...]
     parallel_candidates: tuple[RankedCandidate, ...]
     rejected_candidates: tuple[RejectedCandidate, ...]
+    performance_snapshot_id: str | None = None
+    performance_digest: str | None = None
+    performance_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.performance_snapshot_id is None) != (self.performance_digest is None):
+            raise ValueError(
+                "routing-v3 performance_snapshot_id and performance_digest must be supplied together"
+            )
 
     @property
     def model(self) -> str | None:
@@ -153,6 +204,9 @@ class RoutingV3Decision:
             "ranked_candidates": [candidate.to_dict() for candidate in self.ranked_candidates],
             "parallel_candidates": [candidate.to_dict() for candidate in self.parallel_candidates],
             "rejected_candidates": [candidate.to_dict() for candidate in self.rejected_candidates],
+            "performance_snapshot_id": self.performance_snapshot_id,
+            "performance_digest": self.performance_digest,
+            "performance_status": self.performance_status,
         }
 
 
@@ -167,6 +221,7 @@ def route_capability_snapshot(
     *,
     active_model_ids: Iterable[str] = (),
     policy_version: str = ROUTING_V3_POLICY_VERSION,
+    performance_calibration: Mapping[str, Any] | None = None,
 ) -> RoutingV3Decision:
     """Route ``request`` against an immutable capability ``snapshot``.
 
@@ -182,9 +237,22 @@ def route_capability_snapshot(
 
     catalog = _as_mapping(snapshot, label="capability snapshot")
     requested = _as_mapping(request, label="routing request")
+    if performance_calibration is not None:
+        if (
+            requested.get("performance_calibration") is not None
+            and requested.get("performance_calibration") != performance_calibration
+        ):
+            raise ValueError("conflicting performance calibrations were supplied")
+        requested["performance_calibration"] = dict(performance_calibration)
     role = _request_role(requested)
     task_type = _text(requested.get("task_type"), default="implementation")
     complexity = _text(requested.get("complexity"), default="standard")
+    performance = _performance_context(
+        catalog,
+        requested,
+        task_type=task_type,
+        complexity=complexity,
+    )
     quality_floor = _quality_number(requested.get("quality_floor"), default=0.0)
     required_features = _string_set(requested.get("required_features", ()))
     reasoning_effort = _optional_text(requested.get("reasoning_effort"))
@@ -233,6 +301,9 @@ def route_capability_snapshot(
                 snapshot=catalog,
                 request=requested,
                 active_model_ids=active,
+                task_type=task_type,
+                complexity=complexity,
+                performance=performance,
             )
         )
 
@@ -255,7 +326,7 @@ def route_capability_snapshot(
     else:
         reason = (
             f"selected {selected.provider}:{selected.model}; acceptance quality "
-            f"{selected.quality_score:g} is ranked before cost and latency"
+            f"rank {selected.ranking_quality_score:g} is ranked before cost and latency"
         )
     return RoutingV3Decision(
         accepted=selected is not None,
@@ -267,6 +338,9 @@ def route_capability_snapshot(
         ranked_candidates=ranked,
         parallel_candidates=parallel,
         rejected_candidates=rejected,
+        performance_snapshot_id=performance[1],
+        performance_digest=performance[2],
+        performance_status=performance[3],
     )
 
 
@@ -675,6 +749,369 @@ def _concurrency_reasons(
         )
 
 
+def _performance_context(
+    snapshot: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    task_type: str,
+    complexity: str,
+) -> tuple[Mapping[str, Any] | None, str | None, str | None, str | None]:
+    """Return the immutable performance calibration and its route binding.
+
+    ``PerformanceRegistry.calibrate`` is intentionally passed as a nested
+    advisory object.  The routing catalog remains the capability authority;
+    this helper only validates the optional generation binding and prepares an
+    exact lookup context for each candidate.
+    """
+
+    raw = request.get("performance_calibration")
+    if raw is None:
+        raw = snapshot.get("performance_calibration")
+    calibration: Mapping[str, Any] | None = None
+    if raw is not None:
+        calibration = _as_mapping(raw, label="performance calibration")
+
+    requested_id = _optional_text(
+        _first(request, "performance_snapshot_id", "performance_generation_id")
+    )
+    requested_digest = _optional_text(
+        _first(request, "performance_digest", "performance_snapshot_digest")
+    )
+    calibration_id = (
+        _optional_text(
+            _first(
+                calibration or {},
+                "performance_snapshot_id",
+                "snapshot_id",
+                "generation",
+            )
+        )
+        if calibration is not None
+        else None
+    )
+    calibration_digest = (
+        _optional_text(
+            _first(
+                calibration or {},
+                "performance_digest",
+                "digest",
+                "snapshot_digest",
+            )
+        )
+        if calibration is not None
+        else None
+    )
+    contexts_present = calibration is not None and "contexts" in calibration
+    selected_context: Mapping[str, Any] | None = None
+    if contexts_present:
+        raw_contexts = calibration.get("contexts")
+        if not isinstance(raw_contexts, Iterable) or isinstance(raw_contexts, (str, bytes, Mapping)):
+            raise TypeError("performance calibration contexts must be a sequence")
+        for raw_context in raw_contexts:
+            context = _as_mapping(raw_context, label="performance calibration context")
+            context_task_type = _optional_text(context.get("task_type"))
+            context_complexity = _optional_text(context.get("complexity"))
+            if context_task_type == task_type and context_complexity == complexity:
+                if selected_context is not None:
+                    raise ValueError(
+                        "performance calibration has duplicate task_type and complexity context"
+                    )
+                selected_context = context
+
+    selected_id = (
+        _optional_text(
+            _first(
+                selected_context or {},
+                "performance_snapshot_id",
+                "snapshot_id",
+                "generation",
+            )
+        )
+        if selected_context is not None
+        else None
+    )
+    selected_digest = (
+        _optional_text(
+            _first(
+                selected_context or {},
+                "performance_digest",
+                "digest",
+                "snapshot_digest",
+            )
+        )
+        if selected_context is not None
+        else None
+    )
+    if calibration_id is not None and selected_id is not None and calibration_id != selected_id:
+        raise ValueError("performance calibration context snapshot does not match calibration")
+    if (
+        calibration_digest is not None
+        and selected_digest is not None
+        and calibration_digest != selected_digest
+    ):
+        raise ValueError("performance calibration context digest does not match calibration")
+    # A context may omit the immutable identity because it inherits the
+    # task-level generation.  Conversely, a context-only payload can carry the
+    # identity itself.  Resolve both sides before validating the pair so that
+    # either shape remains compatible while an explicitly conflicting value is
+    # rejected above.
+    calibration_id = calibration_id or selected_id
+    calibration_digest = calibration_digest or selected_digest
+    # Older PerformanceRegistry.calibrate payloads carry the active generation
+    # ID but not its digest.  A submission contract pins both values, so it is
+    # safe to complete the advisory payload from that immutable request pin;
+    # without the request digest we still fail closed rather than emit an
+    # unverifiable performance receipt.
+    if calibration_id is not None and calibration_digest is None and requested_digest is not None:
+        calibration_digest = requested_digest
+    _validate_performance_binding(
+        requested_id,
+        requested_digest,
+        "routing request",
+    )
+    _validate_performance_binding(
+        calibration_id,
+        calibration_digest,
+        "performance calibration",
+    )
+    if requested_id is not None and calibration_id is not None and requested_id != calibration_id:
+        raise ValueError("routing request performance snapshot does not match calibration")
+    if (
+        requested_digest is not None
+        and calibration_digest is not None
+        and requested_digest != calibration_digest
+    ):
+        raise ValueError("routing request performance digest does not match calibration")
+
+    performance_id = calibration_id or requested_id
+    performance_digest = calibration_digest or requested_digest
+    status = (
+        _optional_text(_first(calibration or {}, "status", "performance_status"))
+        if calibration is not None
+        else None
+    )
+    if status is None and selected_context is not None:
+        status = _optional_text(_first(selected_context, "status", "performance_status"))
+    if status is None:
+        status = _optional_text(request.get("performance_status"))
+    # The status is descriptive only.  A cold-start generation may still carry
+    # benchmark priors, while a missing generation must never be fabricated.
+    if status is None and performance_id is not None:
+        status = "unknown"
+    if calibration is not None and contexts_present:
+        # A task-level calibration can contain several exact DAG buckets.  The
+        # top-level task_type/complexity describes the calibration call, not a
+        # neighboring node; only the selected context may contribute scores.
+        calibration = selected_context
+    elif calibration is not None:
+        cal_task_type = _optional_text(calibration.get("task_type"))
+        cal_complexity = _optional_text(calibration.get("complexity"))
+        if (
+            (cal_task_type is not None and cal_task_type != task_type)
+            or (cal_complexity is not None and cal_complexity != complexity)
+        ):
+            # One task-level calibration is commonly reused while the planner
+            # specializes a DAG node.  Keep the immutable generation receipt,
+            # but discard its quality candidates for this non-exact bucket;
+            # never transfer a neighboring task/complexity score.
+            calibration = None
+    return calibration, performance_id, performance_digest, status
+
+
+def _validate_performance_binding(
+    snapshot_id: str | None,
+    digest: str | None,
+    owner: str,
+) -> None:
+    if (snapshot_id is None) != (digest is None):
+        raise ValueError(
+            f"{owner} performance_snapshot_id and performance_digest must be supplied together"
+        )
+    if snapshot_id is not None and (
+        not isinstance(snapshot_id, str)
+        or not snapshot_id.strip()
+        or any(character.isspace() for character in snapshot_id)
+    ):
+        raise ValueError(f"{owner} performance_snapshot_id must be non-empty and safe")
+    if digest is not None:
+        normalized = digest.removeprefix("sha256:")
+        if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized.lower()):
+            raise ValueError(f"{owner} performance_digest must be a SHA-256 digest")
+
+
+def _record_agent_version(
+    snapshot: Mapping[str, Any],
+    record: Mapping[str, Any],
+    provider: str,
+) -> str:
+    direct = _first(record, "agent_version", "agent_cli_version", "cli_version")
+    if direct is not None:
+        return _text(direct, default="unattested")
+    nested = record.get("agent")
+    if isinstance(nested, Mapping):
+        value = _first(nested, "version", "cli_version", "agent_version")
+        if value is not None:
+            return _text(value, default="unattested")
+    agents = snapshot.get("agents")
+    if isinstance(agents, Mapping):
+        agent = agents.get(provider)
+        if agent is None and provider in _CLAUDE_PROVIDERS:
+            agent = agents.get("claude") or agents.get("anthropic")
+        if isinstance(agent, Mapping):
+            value = _first(agent, "cli_version", "version", "agent_version")
+            if value is not None:
+                return _text(value, default="unattested")
+    return "unattested"
+
+
+def _performance_candidate(
+    calibration: Mapping[str, Any] | None,
+    *,
+    provider: str,
+    model: str,
+    agent_version: str,
+    task_type: str,
+    complexity: str,
+) -> dict[str, Any] | None:
+    """Find one exact PerformanceRegistry bucket; family transfer is forbidden."""
+
+    if calibration is None:
+        return None
+    calibration_task = _optional_text(calibration.get("task_type"))
+    calibration_complexity = _optional_text(calibration.get("complexity"))
+    if calibration_task not in {None, task_type} or calibration_complexity not in {
+        None,
+        complexity,
+    }:
+        return None
+    candidates = calibration.get("candidates")
+    if not isinstance(candidates, Iterable) or isinstance(candidates, (str, bytes, Mapping)):
+        return None
+    for raw in candidates:
+        if not isinstance(raw, Mapping):
+            continue
+        candidate_provider = _text(raw.get("provider"), default="")
+        candidate_model = _text(
+            _first(raw, "model_id", "model", "model_name"),
+            default="",
+        )
+        candidate_agent = _text(
+            _first(raw, "agent_version", "agent_cli_version", "cli_version"),
+            default="unattested",
+        )
+        candidate_task = _optional_text(raw.get("task_type"))
+        candidate_complexity = _optional_text(raw.get("complexity"))
+        if (
+            candidate_provider != provider
+            or candidate_model != model
+            or candidate_agent != agent_version
+            or candidate_task not in {None, task_type}
+            or candidate_complexity not in {None, complexity}
+        ):
+            continue
+        return dict(raw)
+    return None
+
+
+def _performance_inputs(
+    candidate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Extract only measured/prior-backed values, never a synthetic Spark score."""
+
+    empty = {
+        "quality_source": "declared",
+        "lower_bound_95": None,
+        "runtime_sample_count": 0,
+        "first_pass_rate": None,
+        "rework_rate": None,
+        "latency_ms": None,
+    }
+    if candidate is None:
+        return empty
+    quality = candidate.get("quality")
+    quality_mapping = quality if isinstance(quality, Mapping) else {}
+    posterior = quality_mapping.get("posterior")
+    if not isinstance(posterior, Mapping):
+        posterior = candidate.get("posterior")
+    posterior = posterior if isinstance(posterior, Mapping) else {}
+    prior = quality_mapping.get("prior")
+    prior = prior if isinstance(prior, Mapping) else {}
+    lower = _number(_first(posterior, "lower_bound_95", "lower_bound", "quality_lower_bound_95"))
+    samples = _nonnegative_int(
+        _first(posterior, "runtime_sample_count", "sample_count", "runtime_samples")
+    )
+    prior_available = _text(prior.get("evidence_status"), default="") == "available"
+    # A generic-conservative prior is not evidence and must not masquerade as a
+    # Spark quality estimate.  Runtime observations remain valid even for a
+    # model with no public benchmark score.
+    usable = lower is not None and 0 <= lower <= 1 and (samples > 0 or prior_available)
+    runtime = candidate.get("runtime")
+    runtime = runtime if isinstance(runtime, Mapping) else {}
+    first_pass = _rate_value(
+        _first(candidate, "first_pass", "first_pass_rate")
+        if _first(candidate, "first_pass", "first_pass_rate") is not None
+        else runtime.get("first_pass")
+    )
+    rework = _rate_value(
+        _first(candidate, "rework_rate", "rework")
+        if _first(candidate, "rework_rate", "rework") is not None
+        else runtime.get("rework_rate")
+    )
+    if rework is None:
+        rework_count = _number(
+            _first(runtime, "quality_rework_count", "rework_count")
+        )
+        denominator = _number(runtime.get("attempt_count"))
+        if rework_count is not None and denominator is not None and denominator > 0:
+            rework = max(0.0, rework_count / denominator)
+    latency = _runtime_latency_ms(candidate, runtime)
+    return {
+        "quality_source": "calibrated" if usable else "declared",
+        "lower_bound_95": lower if usable else None,
+        "runtime_sample_count": samples if usable else 0,
+        "first_pass_rate": first_pass,
+        "rework_rate": rework,
+        "latency_ms": latency,
+    }
+
+
+def _nonnegative_int(value: Any) -> int:
+    number = _number(value)
+    if number is None or number < 0 or not number.is_integer():
+        return 0
+    return int(number)
+
+
+def _rate_value(value: Any) -> float | None:
+    if isinstance(value, Mapping):
+        accepted = _number(value.get("accepted"))
+        total = _number(value.get("total"))
+        if accepted is not None and total is not None and total > 0:
+            return max(0.0, min(1.0, accepted / total))
+        value = _first(value, "rate", "value", "score")
+    number = _number(value)
+    if number is None:
+        return None
+    # Runtime rates are fractions; tolerate percentage receipts at the
+    # boundary, but never allow an out-of-range value into the sort key.
+    if number > 1 and number <= 100:
+        number /= 100
+    return number if 0 <= number <= 1 else None
+
+
+def _runtime_latency_ms(candidate: Mapping[str, Any], runtime: Mapping[str, Any]) -> float | None:
+    value = _first(candidate, "performance_latency_ms", "latency_ms", "runtime_latency_ms")
+    if value is None:
+        duration = runtime.get("duration_seconds")
+        if isinstance(duration, Mapping):
+            value = _first(duration, "p50", "median", "mean")
+            number = _number(value)
+            return number * 1000 if number is not None and number >= 0 else None
+        value = _first(runtime, "latency_ms", "duration_ms")
+    number = _number(value)
+    return number if number is not None and number >= 0 else None
+
+
 def _candidate_inputs(
     record: Mapping[str, Any],
     *,
@@ -686,6 +1123,9 @@ def _candidate_inputs(
     snapshot: Mapping[str, Any],
     request: Mapping[str, Any],
     active_model_ids: frozenset[str],
+    task_type: str,
+    complexity: str,
+    performance: tuple[Mapping[str, Any] | None, str | None, str | None, str | None],
 ) -> dict[str, Any]:
     quality = _record_quality(record)
     assert quality is not None  # guarded by _hard_gate_reasons
@@ -717,6 +1157,24 @@ def _candidate_inputs(
     capacity, active, weight = _concurrency_values(snapshot, request, record, model, active_model_ids)
     utilization = (active + weight) / capacity if capacity > 0 else 1.0
     capability_digest = _text(record.get("digest"), default=_digest_mapping(record))
+    agent_version = _record_agent_version(snapshot, record, provider)
+    performance_calibration, performance_snapshot_id, performance_digest, _ = performance
+    performance_candidate = _performance_candidate(
+        performance_calibration,
+        provider=provider,
+        model=model,
+        agent_version=agent_version,
+        task_type=task_type,
+        complexity=complexity,
+    )
+    performance_values = _performance_inputs(performance_candidate)
+    quality_source = performance_values["quality_source"]
+    performance_lower_bound = performance_values["lower_bound_95"]
+    quality_for_ranking = (
+        performance_lower_bound * 100
+        if performance_lower_bound is not None
+        else quality
+    )
     preferred_families = tuple(_ordered_strings(request.get("preferred_families", ())))
     family = _model_tier(model) or model
     preference_rank = (
@@ -725,7 +1183,12 @@ def _candidate_inputs(
         else len(preferred_families)
     )
     score = (
-        -quality,
+        -quality_for_ranking,
+        # A measured first-pass signal breaks otherwise equal conservative
+        # bounds.  Missing observations sort after observed values.
+        -(performance_values["first_pass_rate"] if performance_values["first_pass_rate"] is not None else -1.0),
+        performance_values["rework_rate"] if performance_values["rework_rate"] is not None else 1_000_000.0,
+        performance_values["latency_ms"] if performance_values["latency_ms"] is not None else 1_000_000.0,
         preference_rank,
         cost,
         latency,
@@ -741,6 +1204,7 @@ def _candidate_inputs(
         "capability_id": capability_id,
         "capability_digest": capability_digest,
         "quality_score": quality,
+        "ranking_quality_score": quality_for_ranking,
         "quality_floor": quality_floor,
         "acceptance_risk": acceptance_risk,
         "estimated_cost_units": cost,
@@ -751,8 +1215,22 @@ def _candidate_inputs(
         "score": score,
         "reasons": (
             f"quality {quality:g} meets floor {quality_floor:g}",
-            "quality is the primary routing-v3 rank; declared role fit, cost, and latency are tie-breakers",
+            (
+                f"ranking quality source {quality_source}; posterior lower_bound_95="
+                f"{performance_lower_bound:g}"
+                if performance_lower_bound is not None
+                else "quality source declared; no exact calibrated posterior was available"
+            ),
+            "quality is the primary routing-v3 rank; first-pass, rework, latency, cost, and throughput are tie-breakers",
         ),
+        "performance_snapshot_id": performance_snapshot_id,
+        "performance_digest": performance_digest,
+        "quality_source": quality_source,
+        "performance_lower_bound_95": performance_lower_bound,
+        "runtime_sample_count": performance_values["runtime_sample_count"],
+        "performance_first_pass_rate": performance_values["first_pass_rate"],
+        "performance_rework_rate": performance_values["rework_rate"],
+        "performance_latency_ms": performance_values["latency_ms"],
     }
 
 

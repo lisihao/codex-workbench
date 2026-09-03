@@ -16,11 +16,29 @@ class WorkbenchConfig:
     host: str = "127.0.0.1"
     port: int = 8766
     max_workers: int = 4
+    # Spark is a logical worker lane inside the one global executor.  ``None``
+    # deliberately means "use the portable default", rather than reserving
+    # idle threads for Spark.
+    spark_workers: int | None = None
     deployment_role: str = "client"
     authority_host: str | None = None
     authority_machine_id: str | None = None
     quota_snapshot_file: Path | None = None
     quota_refresh_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        if self.spark_workers is not None and not (
+            0 <= self.spark_workers <= self.max_workers
+        ):
+            raise ValueError("spark_workers must be between 0 and max_workers")
+
+    @property
+    def effective_spark_workers(self) -> int:
+        """Return the dedicated Spark lane cap without reserving executor slots."""
+
+        return min(4, self.max_workers) if self.spark_workers is None else self.spark_workers
 
     @property
     def effective_quota_snapshot_file(self) -> Path:
@@ -56,6 +74,7 @@ class WorkbenchConfig:
             "host": self.host,
             "port": self.port,
             "max_workers": self.max_workers,
+            "spark_workers": self.spark_workers,
             "deployment_role": self.deployment_role,
             "authority_host": self.authority_host,
             "authority_machine_id": self.authority_machine_id,
@@ -110,6 +129,11 @@ class WorkbenchConfig:
                 host=raw.get("host", "127.0.0.1"),
                 port=int(raw.get("port", 8766)),
                 max_workers=int(raw.get("max_workers", 4)),
+                spark_workers=(
+                    int(raw["spark_workers"])
+                    if raw.get("spark_workers") is not None
+                    else None
+                ),
                 deployment_role=str(role),
                 authority_host=authority_host,
                 authority_machine_id=raw.get("authority_machine_id"),

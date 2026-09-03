@@ -80,6 +80,15 @@ RoutingProfile = Literal[
     "sol_control_plane",
 ]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
+ExecutionLane = Literal["spark", "general", "control", "deterministic", "fixture"]
+
+EXECUTION_LANES = frozenset({
+    "spark",
+    "general",
+    "control",
+    "deterministic",
+    "fixture",
+})
 
 # These are deliberately derived from the selected model, rather than trusted
 # from planner prose.  The values are persisted on normalized NodeSpec rows
@@ -101,21 +110,74 @@ CODEX_MODEL_REASONING_EFFORTS: dict[str, ReasoningEffort] = {
 def codex_model_profile(model: object) -> str | None:
     """Return the canonical execution profile for a known Codex model."""
 
-    value = str(model).lower()
-    for model_name, profile in CODEX_MODEL_PROFILES.items():
-        if model_name in value:
-            return profile
-    return None
+    value = str(model).strip().lower()
+    return CODEX_MODEL_PROFILES.get(value)
 
 
 def codex_model_reasoning_effort(model: object) -> str | None:
     """Return the explicit reasoning effort required for a known Codex model."""
 
-    value = str(model).lower()
-    for model_name, effort in CODEX_MODEL_REASONING_EFFORTS.items():
-        if model_name in value:
-            return effort
-    return None
+    value = str(model).strip().lower()
+    return CODEX_MODEL_REASONING_EFFORTS.get(value)
+
+
+def derive_execution_lane(
+    executor: object,
+    model: object,
+    *,
+    verifier: bool = False,
+    role: str | None = None,
+) -> ExecutionLane:
+    """Derive the durable execution lane from trusted execution metadata.
+
+    Planner text and planner-supplied lane labels are never inputs to this
+    function.  ``role`` is supplied only by the deterministic routing
+    decision; direct/legacy ``NodeSpec`` values use ``verifier`` and the
+    exact Codex model to preserve the same fail-closed result.
+    """
+
+    normalized_executor = str(executor).strip().lower()
+    normalized_model = str(model).strip().lower()
+    if normalized_executor == "fixture":
+        return "fixture"
+    if normalized_executor == "deterministic":
+        return "deterministic"
+    if verifier or role in {"planner", "verifier", "control"}:
+        return "control"
+    if normalized_executor == "codex":
+        if codex_model_profile(normalized_model) == "spark_worker":
+            return "spark"
+        if codex_model_profile(normalized_model) == "sol_control_plane":
+            return "control"
+    return "general"
+
+
+def derive_quota_pool_id(
+    executor: object,
+    model: object,
+    *,
+    verifier: bool = False,
+    role: str | None = None,
+) -> str:
+    """Return the stable pool identifier paired with ``derive_execution_lane``."""
+
+    lane = derive_execution_lane(
+        executor,
+        model,
+        verifier=verifier,
+        role=role,
+    )
+    if lane == "spark":
+        return "codex-spark"
+    if lane == "control":
+        return "codex-control"
+    if lane == "deterministic":
+        return "deterministic"
+    if lane == "fixture":
+        return "fixture"
+    if str(executor).strip().lower() in {"claude", "anthropic"}:
+        return "claude-shared"
+    return "codex-general"
 
 
 def now_iso() -> str:
@@ -156,6 +218,45 @@ def _validate_capability_snapshot_binding(
         raise ValueError(
             f"{owner} capability_digest must be a raw SHA-256 hex digest or sha256:<64 hex>"
         )
+
+
+def _validate_performance_snapshot_binding(
+    snapshot_id: str | None,
+    digest: str | None,
+    owner: str,
+) -> None:
+    """Validate the optional performance-calibration pin as an atomic pair.
+
+    Performance generations are content addressed by the registry.  The model
+    layer intentionally does not require a particular generation prefix so
+    imported/legacy contracts can retain their opaque identifiers, but it
+    always requires the digest when an identifier is present.
+    """
+
+    if (snapshot_id is None) != (digest is None):
+        raise ValueError(
+            f"{owner} performance_snapshot_id and performance_digest must be supplied together"
+        )
+    if snapshot_id is None:
+        return
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        raise ValueError(f"{owner} performance_snapshot_id must be non-empty")
+    if any(character.isspace() for character in snapshot_id):
+        raise ValueError(f"{owner} performance_snapshot_id must not contain whitespace")
+    if not isinstance(digest, str) or not _CAPABILITY_DIGEST_RE.fullmatch(digest):
+        raise ValueError(
+            f"{owner} performance_digest must be a raw SHA-256 hex digest or sha256:<64 hex>"
+        )
+
+
+def _validate_performance_metadata(
+    policy: str | None,
+    status: str | None,
+    owner: str,
+) -> None:
+    for name, value in (("performance_policy", policy), ("performance_status", status)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"{owner} {name} must be a non-empty string when supplied")
 
 
 @dataclass(frozen=True)
@@ -307,6 +408,14 @@ class TaskContract:
     # absent values preserve pre-capability-registry contracts.
     capability_snapshot_id: str | None = None
     capability_digest: str | None = None
+    # Optional content-addressed performance-calibration binding.  A contract
+    # may be created before a calibration generation exists; ``None`` keeps
+    # legacy contracts valid and makes the binding fail closed when supplied
+    # incompletely.
+    performance_snapshot_id: str | None = None
+    performance_digest: str | None = None
+    performance_policy: str | None = None
+    performance_status: str | None = None
 
     def __post_init__(self) -> None:
         # Sol is a role invariant.  ``fixture`` remains available for the
@@ -364,6 +473,16 @@ class TaskContract:
         _validate_capability_snapshot_binding(
             self.capability_snapshot_id,
             self.capability_digest,
+            "task contract",
+        )
+        _validate_performance_snapshot_binding(
+            self.performance_snapshot_id,
+            self.performance_digest,
+            "task contract",
+        )
+        _validate_performance_metadata(
+            self.performance_policy,
+            self.performance_status,
             "task contract",
         )
         if self.timeout_seconds <= 0:
@@ -495,13 +614,51 @@ class NodeSpec:
     # fields; legacy plans omit them and retain their existing routing.
     capability_snapshot_id: str | None = None
     capability_digest: str | None = None
+    # Performance calibration is pinned alongside the capability catalog.  It
+    # is derived by the normalizer from the task contract and final routing
+    # receipt; model-generated plan values cannot widen or replace it.
+    performance_snapshot_id: str | None = None
+    performance_digest: str | None = None
+    performance_policy: str | None = None
+    performance_status: str | None = None
+    performance_quality_source: str | None = None
+    performance_lower_bound_95: float | None = None
+    performance_runtime_sample_count: int = 0
+    performance_first_pass_rate: float | None = None
+    performance_rework_rate: float | None = None
+    performance_latency_ms: float | None = None
     model_capability_id: str | None = None
     agent_capability_id: str | None = None
     agent_name: str | None = None
     agent_version: str | None = None
     routing_policy_version: str | None = None
+    # Durable scheduler metadata.  These fields are derived from the final
+    # executor/model/role by the planner and are never a planner control
+    # channel.  ``None`` remains accepted at the constructor boundary for
+    # legacy persisted nodes; __post_init__ fills both values deterministically.
+    execution_lane: ExecutionLane | None = None
+    quota_pool_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.execution_lane is None and self.quota_pool_id is None:
+            object.__setattr__(
+                self,
+                "execution_lane",
+                derive_execution_lane(
+                    self.executor,
+                    self.model,
+                    verifier=self.verifier,
+                ),
+            )
+            object.__setattr__(
+                self,
+                "quota_pool_id",
+                derive_quota_pool_id(
+                    self.executor,
+                    self.model,
+                    verifier=self.verifier,
+                ),
+            )
         if self.executor != "codex":
             return
         profile = codex_model_profile(self.model)
@@ -535,6 +692,78 @@ class NodeSpec:
             self.capability_digest,
             "node",
         )
+        _validate_performance_snapshot_binding(
+            self.performance_snapshot_id,
+            self.performance_digest,
+            "node",
+        )
+        _validate_performance_metadata(
+            self.performance_policy,
+            self.performance_status,
+            "node",
+        )
+        if self.performance_quality_source is not None and (
+            not isinstance(self.performance_quality_source, str)
+            or not self.performance_quality_source.strip()
+        ):
+            raise ValueError(
+                "node performance_quality_source must be a non-empty string when supplied"
+            )
+        if (
+            not isinstance(self.performance_runtime_sample_count, int)
+            or isinstance(self.performance_runtime_sample_count, bool)
+            or self.performance_runtime_sample_count < 0
+        ):
+            raise ValueError("node performance_runtime_sample_count must be non-negative")
+        for field_name in (
+            "performance_lower_bound_95",
+            "performance_first_pass_rate",
+            "performance_rework_rate",
+            "performance_latency_ms",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"node {field_name} must be a finite non-negative number")
+        if self.performance_lower_bound_95 is not None and self.performance_lower_bound_95 > 1:
+            raise ValueError("node performance_lower_bound_95 must be between 0 and 1")
+        for field_name in ("performance_first_pass_rate", "performance_rework_rate"):
+            value = getattr(self, field_name)
+            if value is not None and value > 1:
+                raise ValueError(f"node {field_name} must be between 0 and 1")
+        if (self.execution_lane is None) != (self.quota_pool_id is None):
+            raise ValueError(
+                "node execution_lane and quota_pool_id must be supplied together"
+            )
+        if self.execution_lane is not None:
+            if self.execution_lane not in EXECUTION_LANES:
+                raise ValueError(
+                    f"node execution_lane {self.execution_lane!r} is unsupported"
+                )
+            expected_lane = derive_execution_lane(
+                self.executor,
+                self.model,
+                verifier=self.verifier,
+            )
+            if self.execution_lane != expected_lane:
+                raise ValueError(
+                    f"node execution_lane {self.execution_lane!r} does not match "
+                    f"executor/model/role (expected {expected_lane!r})"
+                )
+            expected_pool = derive_quota_pool_id(
+                self.executor,
+                self.model,
+                verifier=self.verifier,
+            )
+            if self.quota_pool_id != expected_pool:
+                raise ValueError(
+                    f"node quota_pool_id {self.quota_pool_id!r} does not match "
+                    f"execution lane (expected {expected_pool!r})"
+                )
         for field_name in (
             "model_capability_id",
             "agent_capability_id",
@@ -661,16 +890,16 @@ def retry_model(
         return model
     if routing_policy_version == "model-routing-v3":
         return model
-    lower = model.lower()
-    if "codex-spark" in lower:
+    lower = model.strip().lower()
+    if lower == "gpt-5.3-codex-spark":
         if attempt == 2:
             return "gpt-5.6-luna"
         if attempt == 3:
             return "gpt-5.6-terra"
         return "gpt-5.6-sol"
-    if "luna" in lower:
+    if lower == "gpt-5.6-luna":
         return "gpt-5.6-terra" if attempt == 2 else "gpt-5.6-sol"
-    if "terra" in lower:
+    if lower == "gpt-5.6-terra":
         return "gpt-5.6-sol"
     return model
 
@@ -727,10 +956,9 @@ class QuotaSnapshot:
         lower = model.lower()
         if "sonnet" in lower:
             values.append(self.weekly_sonnet_remaining)
-        # Claude /usage currently exposes an all-model weekly pool and a
-        # Sonnet-only pool, but no Fable-only pool.  Fable is therefore gated
-        # by the shared all-model pool unless a future producer supplies an
-        # additional Fable-specific ceiling.
+        # Claude /usage exposes the all-model pool plus one model-specific
+        # pool depending on the subscription. Missing model-specific pools
+        # fall back to the shared all-model ceiling.
         if "fable" in lower and self.weekly_fable_remaining is not None:
             values.append(self.weekly_fable_remaining)
         return tuple(values)

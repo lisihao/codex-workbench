@@ -19,9 +19,12 @@ CAPABILITY_LABEL = "com.lisihao.codex-workbench-capabilities"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_AUTHORITY_MAX_WORKERS = 8
+DEFAULT_AUTHORITY_SPARK_WORKERS = 4
 DEFAULT_CAPABILITY_REFRESH_SECONDS = 6 * 60 * 60
 CAPABILITY_REGISTRY_SCHEMA_VERSION = 1
 CAPABILITY_REGISTRY_POLICY = "model-routing-v3"
+PERFORMANCE_BASELINE_RESOURCE = "codex_workbench.data/model-performance-baseline-v1.json"
+PERFORMANCE_STATE_DIRECTORY = "performance"
 RESEARCH_SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "UrlVerificationProtocol.md",
@@ -386,16 +389,16 @@ def preflight_authority_plists(
     capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
 ) -> None:
     template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
-    rendered = (
-        template.replace("__APP_ROOT__", str(app_root))
-        .replace("__STATE_ROOT__", str(state_root))
-        .replace("__CODEX_BINARY__", str(codex_binary))
-        .replace("__CODEX_HOME__", str(codex_home))
-        .replace("__PROCESS_HOME__", str(process_home))
-        .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
-        .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
+    render_authority_service_plist(
+        template,
+        app_root=app_root,
+        state_root=state_root,
+        codex_binary=codex_binary,
+        codex_home=codex_home,
+        process_home=process_home,
+        quota_snapshot_file=quota_snapshot_file,
+        claude_binary=claude_binary,
     )
-    plistlib.loads(rendered.encode())
     if claude_binary is not None:
         quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
         quota_rendered = (
@@ -405,7 +408,12 @@ def preflight_authority_plists(
             .replace("__CLAUDE_BINARY__", str(claude_binary))
             .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
         )
-        plistlib.loads(quota_rendered.encode())
+        quota_payload = plistlib.loads(quota_rendered.encode())
+        _validate_quota_runtime_environment(
+            quota_payload,
+            claude_binary=claude_binary,
+            user_home=Path.home(),
+        )
     capability_template = (source / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
     capability_rendered = render_capability_plist(
         capability_template,
@@ -418,11 +426,151 @@ def preflight_authority_plists(
         claude_binary=claude_binary,
         refresh_seconds=capability_refresh_seconds,
     )
-    plistlib.loads(capability_rendered.encode())
 
 
 def authority_max_workers(config: dict[str, object]) -> int:
     return max(DEFAULT_AUTHORITY_MAX_WORKERS, int(config.get("max_workers", 4)))
+
+
+def authority_spark_workers(config: dict[str, object], *, max_workers: int | None = None) -> int:
+    """Resolve the persisted Spark lane cap without silently overcommitting workers."""
+
+    capacity = authority_max_workers(config) if max_workers is None else max_workers
+    raw = config.get("spark_workers")
+    if raw is None:
+        return min(DEFAULT_AUTHORITY_SPARK_WORKERS, capacity)
+    if isinstance(raw, bool):
+        raise SystemExit("spark_workers must be an integer between 0 and max_workers")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as error:
+        raise SystemExit("spark_workers must be an integer between 0 and max_workers") from error
+    if value < 0 or value > capacity:
+        raise SystemExit(
+            f"spark_workers must be between 0 and max_workers ({capacity}); got {value}"
+        )
+    return value
+
+
+def performance_installation_config(
+    config: dict[str, object],
+    *,
+    app_root: Path,
+    state_root: Path,
+    refresh_seconds: int,
+) -> dict[str, object]:
+    """Persist the benchmark source and sidecar contract beside user settings."""
+
+    existing = config.get("performance", {})
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise SystemExit("performance config must be a JSON object")
+    performance = dict(existing)
+    performance.update(
+        {
+            "state_root": str(state_root / PERFORMANCE_STATE_DIRECTORY),
+            "baseline_resource": PERFORMANCE_BASELINE_RESOURCE,
+            "refresh_interval_seconds": refresh_seconds,
+            "refresh_command": [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "capabilities",
+                "refresh",
+                "--activate-safe",
+            ],
+        }
+    )
+    return performance
+
+
+def _set_authority_runtime_environment(
+    payload: dict[str, object],
+    *,
+    claude_binary: Path | None,
+) -> None:
+    environment = payload.setdefault("EnvironmentVariables", {})
+    if not isinstance(environment, dict):
+        raise SystemExit("authority LaunchAgent EnvironmentVariables is invalid")
+    # Claude's subscription OAuth is held in the real user's macOS Keychain;
+    # only the explicit CLI path is persisted, never a credential or token.
+    environment["HOME"] = str(Path.home())
+    environment["CODEX_WORKBENCH_CLAUDE"] = str(claude_binary) if claude_binary else ""
+
+
+def _validate_authority_runtime_environment(
+    payload: dict[str, object],
+    *,
+    codex_binary: Path,
+    claude_binary: Path | None,
+) -> None:
+    environment = payload.get("EnvironmentVariables")
+    if not isinstance(environment, dict):
+        raise SystemExit("authority LaunchAgent EnvironmentVariables is invalid")
+    if environment.get("HOME") != str(Path.home()):
+        raise SystemExit("authority LaunchAgent must use the real user's HOME")
+    if environment.get("CODEX_WORKBENCH_CODEX") != str(codex_binary):
+        raise SystemExit("authority LaunchAgent Codex binary is not explicit")
+    expected_claude = str(claude_binary) if claude_binary else ""
+    if environment.get("CODEX_WORKBENCH_CLAUDE") != expected_claude:
+        raise SystemExit("authority LaunchAgent Claude binary is not explicit")
+
+
+def _validate_quota_runtime_environment(
+    payload: dict[str, object],
+    *,
+    claude_binary: Path,
+    user_home: Path,
+) -> None:
+    environment = payload.get("EnvironmentVariables")
+    if not isinstance(environment, dict) or environment.get("HOME") != str(user_home):
+        raise SystemExit("quota LaunchAgent must use the real user's HOME")
+    arguments = payload.get("ProgramArguments")
+    if not isinstance(arguments, list):
+        raise SystemExit("quota LaunchAgent ProgramArguments is invalid")
+    try:
+        index = arguments.index("--claude-binary")
+    except ValueError as error:
+        raise SystemExit("quota LaunchAgent must use an explicit --claude-binary") from error
+    if index + 1 >= len(arguments) or arguments[index + 1] != str(claude_binary):
+        raise SystemExit("quota LaunchAgent Claude binary is not explicit")
+
+
+def render_authority_service_plist(
+    template: str,
+    *,
+    app_root: Path,
+    state_root: Path,
+    codex_binary: Path,
+    codex_home: Path,
+    process_home: Path,
+    quota_snapshot_file: Path,
+    claude_binary: Path | None,
+) -> str:
+    """Render the main service with an explicit user HOME and binary paths."""
+
+    rendered = (
+        template.replace("__APP_ROOT__", str(app_root))
+        .replace("__STATE_ROOT__", str(state_root))
+        .replace("__CODEX_BINARY__", str(codex_binary))
+        .replace("__CODEX_HOME__", str(codex_home))
+        .replace("__PROCESS_HOME__", str(process_home))
+        .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+        .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
+    )
+    payload = plistlib.loads(rendered.encode())
+    if not isinstance(payload, dict):
+        raise SystemExit("authority service LaunchAgent plist is invalid")
+    _set_authority_runtime_environment(payload, claude_binary=claude_binary)
+    _validate_authority_runtime_environment(
+        payload,
+        codex_binary=codex_binary,
+        claude_binary=claude_binary,
+    )
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
 
 
 def capability_refresh_interval(config: dict[str, object]) -> int:
@@ -444,7 +592,7 @@ def render_capability_plist(
     claude_binary: Path | None,
     refresh_seconds: int,
 ) -> str:
-    return (
+    rendered = (
         template.replace("__APP_ROOT__", str(app_root))
         .replace("__STATE_ROOT__", str(state_root))
         .replace("__USER_HOME__", str(Path.home()))
@@ -455,6 +603,16 @@ def render_capability_plist(
         .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
         .replace("__CAPABILITY_REFRESH_SECONDS__", str(refresh_seconds))
     )
+    payload = plistlib.loads(rendered.encode())
+    if not isinstance(payload, dict):
+        raise SystemExit("capability LaunchAgent plist is invalid")
+    _set_authority_runtime_environment(payload, claude_binary=claude_binary)
+    _validate_authority_runtime_environment(
+        payload,
+        codex_binary=codex_binary,
+        claude_binary=claude_binary,
+    )
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
 
 
 def capability_refresh_environment(
@@ -595,6 +753,7 @@ def main() -> int:
     codex_home = state_root / "codex-home"
     process_home = state_root / "codex-process-home"
     capability_registry_root = state_root / "capabilities"
+    performance_state_root = state_root / PERFORMANCE_STATE_DIRECTORY
     quota_snapshot_file = (
         absolute_path(Path(args.quota_snapshot_file))
         if args.quota_snapshot_file
@@ -606,6 +765,7 @@ def main() -> int:
     assert_directory_target(codex_home, "Codex home")
     assert_directory_target(process_home, "process home")
     assert_directory_target(capability_registry_root, "capability registry")
+    assert_directory_target(performance_state_root, "performance state")
     assert_directory_target(launch_agents, "LaunchAgents root")
     assert_file_target(config_file := state_root / "config.json", "config file")
     assert_file_target(plist_path, "service LaunchAgent")
@@ -638,6 +798,14 @@ def main() -> int:
     if not isinstance(config_raw, dict):
         raise SystemExit(f"config file must contain a JSON object: {config_file}")
     capability_refresh_seconds = capability_refresh_interval(config_raw)
+    max_workers = authority_max_workers(config_raw)
+    spark_workers = authority_spark_workers(config_raw, max_workers=max_workers)
+    performance_config = performance_installation_config(
+        config_raw,
+        app_root=app_root,
+        state_root=state_root,
+        refresh_seconds=capability_refresh_seconds,
+    )
     authority_machine_id = macos_machine_id()
     research_source = validate_research_skill_source(Path(args.research_skill_source))
     research_destination = process_home / ".agents" / "skills" / "research"
@@ -656,7 +824,6 @@ def main() -> int:
     auth_source = Path.home() / ".codex" / "auth.json"
     if not auth_source.is_file():
         raise SystemExit("Codex subscription auth is missing at ~/.codex/auth.json")
-    authority_max_workers(config_raw)
     int(config_raw.get("quota_refresh_seconds", 60))
     selected_claude = args.claude_binary if args.claude_binary is not None else shutil.which("claude")
     if selected_claude and "/" not in selected_claude:
@@ -723,6 +890,14 @@ def main() -> int:
         print(f"plan: state_root={state_root}")
         print(f"plan: application={app_root}")
         print(f"plan: Codex runtime={runtime_root}")
+        print(f"plan: workers={max_workers} (Spark lane={spark_workers})")
+        print(f"plan: performance state={performance_state_root}")
+        print(f"plan: performance baseline={PERFORMANCE_BASELINE_RESOURCE}")
+        print(
+            "plan: performance refresh="
+            + " ".join(performance_config["refresh_command"])
+            + f" (every {capability_refresh_seconds}s via {CAPABILITY_LABEL})"
+        )
         print(f"plan: Research skill={research_destination}")
         print(f"plan: service={plist_path}")
         print(f"plan: quota={quota_plist_path} ({'enabled' if claude_binary else 'skipped: Claude CLI unavailable'})")
@@ -748,6 +923,7 @@ def main() -> int:
         (runtime_root, "runtime root"),
         (process_home / ".agents" / "skills" / "research", "Research skill"),
         (capability_registry_root, "capability registry"),
+        (performance_state_root, "performance state"),
         (auth_link, "Codex auth link"),
         (plist_path, "service LaunchAgent"),
         (quota_plist_path, "quota LaunchAgent"),
@@ -777,13 +953,15 @@ def main() -> int:
                 "deployment_role": "authority",
                 "authority_host": __import__("socket").gethostname(),
                 "authority_machine_id": authority_machine_id,
-                "max_workers": authority_max_workers(config_raw),
+                "max_workers": max_workers,
+                "spark_workers": spark_workers,
                 "quota_snapshot_file": str(quota_snapshot_file),
                 "quota_refresh_seconds": min(
                     int(config_raw.get("quota_refresh_seconds", 60)),
                     60,
                 ),
                 "capability_refresh_seconds": capability_refresh_seconds,
+                "performance": performance_config,
             }
         )
         config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
@@ -817,6 +995,12 @@ def main() -> int:
                         "sidecar_label": CAPABILITY_LABEL,
                         "activation": "safe-only",
                         "initial_refresh": "bundled-safe",
+                    },
+                    "performance": {
+                        "state_root": str(state_root / PERFORMANCE_STATE_DIRECTORY),
+                        "baseline_resource": PERFORMANCE_BASELINE_RESOURCE,
+                        "refresh_interval_seconds": capability_refresh_seconds,
+                        "refresh_command": performance_config["refresh_command"],
                     },
                     "research_skill": {
                         "name": "Research",
@@ -863,6 +1047,7 @@ def main() -> int:
         wrapper.write_text(
             (
             "#!/bin/zsh\n"
+            f"export HOME={str(Path.home())!r}\n"
             f"export PYTHONPATH={str(app_root / 'src')!r}\n"
             f"export CODEX_HOME={str(codex_home)!r}\n"
             f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
@@ -875,16 +1060,16 @@ def main() -> int:
         wrapper.chmod(0o755)
 
         template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
-        rendered = (
-            template.replace("__APP_ROOT__", str(app_root))
-            .replace("__STATE_ROOT__", str(state_root))
-            .replace("__CODEX_BINARY__", str(codex_binary))
-            .replace("__CODEX_HOME__", str(codex_home))
-            .replace("__PROCESS_HOME__", str(process_home))
-            .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
-            .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
+        rendered = render_authority_service_plist(
+            template,
+            app_root=app_root,
+            state_root=state_root,
+            codex_binary=codex_binary,
+            codex_home=codex_home,
+            process_home=process_home,
+            quota_snapshot_file=quota_snapshot_file,
+            claude_binary=claude_binary,
         )
-        plistlib.loads(rendered.encode())
         launch_agents.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(rendered)
         plist_path.chmod(0o600)

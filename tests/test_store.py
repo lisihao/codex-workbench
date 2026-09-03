@@ -38,6 +38,31 @@ class StoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def _set_node_execution_metadata(
+        self,
+        task_id: str,
+        node_id: str,
+        **metadata: object,
+    ) -> None:
+        """Persist forward-compatible lane fields without changing NodeSpec tests.
+
+        The scheduler must also correctly classify already-persisted plans
+        produced before the NodeSpec schema grows these optional fields.
+        """
+
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            assert row is not None
+            spec = json.loads(row["spec_json"])
+            spec.update(metadata)
+            connection.execute(
+                "UPDATE nodes SET spec_json = ? WHERE task_id = ? AND node_id = ?",
+                (json.dumps(spec), task_id, node_id),
+            )
+
     def test_idempotent_submit_and_command_conflict(self) -> None:
         nodes = verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1")
         self.assertEqual(self.store.create_task(self.contract, nodes, "cmd-1"), "task-1")
@@ -403,6 +428,179 @@ class StoreTests(unittest.TestCase):
         self.store.settle_claimed(first, NodeResult("succeeded", "ok"))
         third = self.store.claim_ready_node("worker-3", self.epoch)
         self.assertEqual(third["node_id"], "b")
+
+    def test_spark_lane_claim_is_capped_and_records_its_capacity_receipt(self) -> None:
+        nodes = [
+            NodeSpec("a", "task-1", "A", "codex", "gpt-5.3-codex-spark", "bounded work", write_scopes=("src/a",)),
+            NodeSpec("b", "task-1", "B", "codex", "gpt-5.3-codex-spark", "bounded work", write_scopes=("src/b",)),
+        ]
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-spark-cap")
+        self.store.queue_task("task-1")
+
+        first = self.store.claim_ready_node(
+            "spark-1",
+            self.epoch,
+            execution_lanes=("spark",),
+            lane_capacities={"spark": 1},
+        )
+        assert first is not None
+        self.assertEqual(first["node_id"], "a")
+        self.assertEqual(first["spec"]["execution_lane"], "spark")
+        self.assertEqual(first["spec"]["quota_pool_id"], "codex-spark")
+        self.assertIsNone(
+            self.store.claim_ready_node(
+                "spark-2",
+                self.epoch,
+                execution_lanes=("spark",),
+                lane_capacities={"spark": 1},
+            )
+        )
+        started = [
+            event
+            for event in self.store.read_events(task_id="task-1")
+            if event["event_type"] == "node.started"
+        ][-1]
+        self.assertEqual(started["payload"]["execution_lane"], "spark")
+        self.assertEqual(started["payload"]["quota_pool_id"], "codex-spark")
+        self.assertEqual(started["payload"]["lane_capacity"], 1)
+        self.assertEqual(started["payload"]["lane_active_units"], 1)
+        self.assertEqual(started["payload"]["claimed_at"], started["created_at"])
+
+        self.store.settle_claimed(
+            first,
+            NodeResult(
+                "succeeded",
+                "ok",
+                actual_model="gpt-5.3-codex-spark",
+                result_kind="worker",
+                checks=("fixture-check",),
+            ),
+        )
+        second = self.store.claim_ready_node(
+            "spark-2",
+            self.epoch,
+            execution_lanes=("spark",),
+            lane_capacities={"spark": 1},
+        )
+        assert second is not None
+        self.assertEqual(second["node_id"], "b")
+
+    def test_non_spark_model_is_not_admitted_to_spark_lane(self) -> None:
+        worker = NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")
+        self.store.create_task(self.contract, verified([worker], "task-1"), "cmd-not-spark")
+        self._set_node_execution_metadata("task-1", "work", execution_lane="spark")
+        self.store.queue_task("task-1")
+
+        self.assertIsNone(
+            self.store.claim_ready_node(
+                "spark-worker",
+                self.epoch,
+                execution_lanes=("spark",),
+                lane_capacities={"spark": 1},
+            )
+        )
+        general = self.store.claim_ready_node(
+            "general-worker",
+            self.epoch,
+            execution_lanes=("general",),
+            lane_capacities={"spark": 1},
+        )
+        assert general is not None
+        self.assertEqual(general["node_id"], "work")
+        self.assertEqual(general["spec"]["execution_lane"], "general")
+
+    def test_spark_retry_that_escalates_to_luna_moves_to_general_lane(self) -> None:
+        contract = TaskContract(
+            task_id="spark-retry",
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="retry bounded work",
+            allowed_scope=("src",),
+            retry_limit=1,
+        )
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "worker",
+            "codex",
+            "gpt-5.3-codex-spark",
+            "bounded work",
+        )
+        self.store.create_task(contract, verified([worker], contract.task_id), "cmd-spark-retry")
+        self.store.queue_task(contract.task_id)
+        first = self.store.claim_ready_node(
+            "spark-1",
+            self.epoch,
+            execution_lanes=("spark",),
+            lane_capacities={"spark": 1},
+        )
+        assert first is not None
+        self.store.settle_claimed(
+            first,
+            NodeResult(
+                "failed",
+                "retryable Spark failure",
+                actual_model="gpt-5.3-codex-spark",
+                retryable=True,
+                result_kind="worker",
+            ),
+        )
+
+        self.assertIsNone(
+            self.store.claim_ready_node(
+                "spark-2",
+                self.epoch,
+                execution_lanes=("spark",),
+                lane_capacities={"spark": 1},
+            )
+        )
+        retried = self.store.claim_ready_node(
+            "general-1",
+            self.epoch,
+            execution_lanes=("general",),
+            lane_capacities={"spark": 1},
+        )
+        assert retried is not None
+        self.assertEqual(retried["spec"]["model"], "gpt-5.6-luna")
+        self.assertEqual(retried["spec"]["execution_lane"], "general")
+
+    def test_spark_lane_keeps_dependency_and_scope_gates(self) -> None:
+        nodes = [
+            NodeSpec("base", "task-1", "base", "codex", "gpt-5.3-codex-spark", "bounded work", write_scopes=("src/shared",), ordinal=1),
+            NodeSpec(
+                "child",
+                "task-1",
+                "child",
+                "codex",
+                "gpt-5.3-codex-spark",
+                "bounded work",
+                depends_on=("base",),
+                write_scopes=("src/child",),
+                ordinal=0,
+            ),
+            NodeSpec("conflict", "task-1", "conflict", "codex", "gpt-5.3-codex-spark", "bounded work", write_scopes=("src/shared",), ordinal=2),
+        ]
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-spark-gates")
+        self.store.queue_task("task-1")
+
+        base = self.store.claim_ready_node(
+            "spark-1",
+            self.epoch,
+            execution_lanes=("spark",),
+            lane_capacities={"spark": 2},
+        )
+        assert base is not None
+        self.assertEqual(base["node_id"], "base")
+        # child still waits for an accepted dependency; conflict still waits
+        # for the running writer.  Spark admission does not bypass either gate.
+        self.assertIsNone(
+            self.store.claim_ready_node(
+                "spark-2",
+                self.epoch,
+                execution_lanes=("spark",),
+                lane_capacities={"spark": 2},
+            )
+        )
 
     def test_nonparallel_node_serializes_only_its_own_task(self) -> None:
         nodes = [

@@ -29,6 +29,8 @@ from .model import (
     TaskContract,
     codex_model_profile,
     codex_model_reasoning_effort,
+    derive_execution_lane,
+    derive_quota_pool_id,
 )
 from .routing import route_node, strategy_for_node
 from .research import research_planner_directive
@@ -129,11 +131,23 @@ _NODE_KEYS = {
     "model_reasoning_effort",
     "capability_snapshot_id",
     "capability_digest",
+    "performance_snapshot_id",
+    "performance_digest",
+    "performance_policy",
+    "performance_status",
+    "performance_quality_source",
+    "performance_lower_bound_95",
+    "performance_runtime_sample_count",
+    "performance_first_pass_rate",
+    "performance_rework_rate",
+    "performance_latency_ms",
     "model_capability_id",
     "agent_capability_id",
     "agent_name",
     "agent_version",
     "routing_policy_version",
+    "execution_lane",
+    "quota_pool_id",
 }
 _REQUIRED_NODE_KEYS = _NODE_KEYS - {
     "task_id",
@@ -150,11 +164,23 @@ _REQUIRED_NODE_KEYS = _NODE_KEYS - {
     "model_reasoning_effort",
     "capability_snapshot_id",
     "capability_digest",
+    "performance_snapshot_id",
+    "performance_digest",
+    "performance_policy",
+    "performance_status",
+    "performance_quality_source",
+    "performance_lower_bound_95",
+    "performance_runtime_sample_count",
+    "performance_first_pass_rate",
+    "performance_rework_rate",
+    "performance_latency_ms",
     "model_capability_id",
     "agent_capability_id",
     "agent_name",
     "agent_version",
     "routing_policy_version",
+    "execution_lane",
+    "quota_pool_id",
 }
 
 
@@ -422,6 +448,7 @@ def normalize_and_validate_plan(
     strategy: RoutingStrategy | dict[str, Any] | None = None,
     capability_snapshot: Mapping[str, Any] | None = None,
     provider_capacity: Mapping[str, Any] | None = None,
+    performance_calibration: Mapping[str, Any] | None = None,
 ) -> list[NodeSpec]:
     """Normalize a Sol-generated DAG and enforce the routing contract.
 
@@ -528,6 +555,7 @@ def normalize_and_validate_plan(
                 strategy=strategy,
                 capability_snapshot=capability_snapshot,
                 provider_capacity=provider_capacity,
+                performance_calibration=performance_calibration,
             )
         except (TypeError, ValueError) as error:
             raise PlannerError(f"invalid routing metadata for node {node_id}: {error}") from error
@@ -542,11 +570,87 @@ def normalize_and_validate_plan(
         source["model_reasoning_effort"] = decision.model_reasoning_effort
         source["capability_snapshot_id"] = decision.capability_snapshot_id
         source["capability_digest"] = decision.capability_digest
+        expected_performance_snapshot_id = (
+            contract.performance_snapshot_id or decision.performance_snapshot_id
+        )
+        expected_performance_digest = (
+            contract.performance_digest or decision.performance_digest
+        )
+        expected_performance_status = (
+            contract.performance_status or decision.performance_status
+        )
+        for field_name, expected in (
+            ("performance_snapshot_id", expected_performance_snapshot_id),
+            ("performance_digest", expected_performance_digest),
+        ):
+            supplied = raw.get(field_name)
+            if supplied is not None and supplied != expected:
+                raise PlannerError(
+                    f"plan node {node_id} {field_name} is derived and does not "
+                    f"match the final routing decision (expected {expected!r})"
+                )
+            source[field_name] = expected
+        supplied_policy = raw.get("performance_policy")
+        if supplied_policy is not None and supplied_policy != contract.performance_policy:
+            raise PlannerError(
+                f"plan node {node_id} performance_policy is derived and cannot be overridden"
+            )
+        supplied_status = raw.get("performance_status")
+        if supplied_status is not None and supplied_status != expected_performance_status:
+            raise PlannerError(
+                f"plan node {node_id} performance_status is derived and does not "
+                f"match the final routing decision (expected {expected_performance_status!r})"
+            )
+        source["performance_policy"] = contract.performance_policy
+        source["performance_status"] = expected_performance_status
+        source["performance_quality_source"] = decision.quality_source
+        source["performance_lower_bound_95"] = decision.performance_lower_bound_95
+        source["performance_runtime_sample_count"] = decision.runtime_sample_count
+        source["performance_first_pass_rate"] = decision.performance_first_pass_rate
+        source["performance_rework_rate"] = decision.performance_rework_rate
+        source["performance_latency_ms"] = decision.performance_latency_ms
+        for field_name, expected in (
+            ("performance_quality_source", decision.quality_source),
+            ("performance_lower_bound_95", decision.performance_lower_bound_95),
+            ("performance_runtime_sample_count", decision.runtime_sample_count),
+            ("performance_first_pass_rate", decision.performance_first_pass_rate),
+            ("performance_rework_rate", decision.performance_rework_rate),
+            ("performance_latency_ms", decision.performance_latency_ms),
+        ):
+            supplied = raw.get(field_name)
+            if supplied is not None and supplied != expected:
+                raise PlannerError(
+                    f"plan node {node_id} {field_name} is derived and does not "
+                    f"match the final routing decision (expected {expected!r})"
+                )
         source["model_capability_id"] = decision.model_capability_id
         source["agent_capability_id"] = decision.agent_capability_id
         source["agent_name"] = decision.agent_name
         source["agent_version"] = decision.agent_version
         source["routing_policy_version"] = decision.routing_policy_version
+        derived_lane = derive_execution_lane(
+            decision.executor,
+            decision.model,
+            verifier=verifier,
+            role=decision.role,
+        )
+        derived_pool = derive_quota_pool_id(
+            decision.executor,
+            decision.model,
+            verifier=verifier,
+            role=decision.role,
+        )
+        for field_name, expected in (
+            ("execution_lane", derived_lane),
+            ("quota_pool_id", derived_pool),
+        ):
+            supplied = raw.get(field_name)
+            if supplied is not None and supplied != expected:
+                raise PlannerError(
+                    f"plan node {node_id} {field_name} is derived and does not "
+                    f"match the final routing decision (expected {expected!r})"
+                )
+            source[field_name] = expected
         if node_role is not None:
             source["archify"] = archify_internal_directive(
                 node_role,
@@ -653,6 +757,30 @@ def normalize_and_validate_plan(
         model_reasoning_effort=codex_model_reasoning_effort(
             "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL
         ),
+        execution_lane=derive_execution_lane(
+            "fixture" if contract.verifier_model == "fixture" else "codex",
+            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL,
+            verifier=True,
+            role="verifier",
+        ),
+        quota_pool_id=derive_quota_pool_id(
+            "fixture" if contract.verifier_model == "fixture" else "codex",
+            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL,
+            verifier=True,
+            role="verifier",
+        ),
+        performance_snapshot_id=(
+            contract.performance_snapshot_id or verifier.performance_snapshot_id
+        ),
+        performance_digest=(contract.performance_digest or verifier.performance_digest),
+        performance_policy=contract.performance_policy,
+        performance_status=(contract.performance_status or verifier.performance_status),
+        performance_quality_source=verifier.performance_quality_source,
+        performance_lower_bound_95=verifier.performance_lower_bound_95,
+        performance_runtime_sample_count=verifier.performance_runtime_sample_count,
+        performance_first_pass_rate=verifier.performance_first_pass_rate,
+        performance_rework_rate=verifier.performance_rework_rate,
+        performance_latency_ms=verifier.performance_latency_ms,
     )
     return [*workers, normalized_verifier]
 
@@ -680,6 +808,7 @@ class CodexPlanner:
         strategy: RoutingStrategy | dict[str, Any] | None = None,
         capability_snapshot: Mapping[str, Any] | None = None,
         provider_capacity: Mapping[str, Any] | None = None,
+        performance_calibration: Mapping[str, Any] | None = None,
     ) -> list[NodeSpec]:
         return normalize_and_validate_plan(
             contract,
@@ -691,6 +820,7 @@ class CodexPlanner:
             strategy=strategy,
             capability_snapshot=capability_snapshot,
             provider_capacity=provider_capacity,
+            performance_calibration=performance_calibration,
         )
 
     validate_and_normalize_plan = normalize_and_validate_plan
@@ -707,6 +837,7 @@ class CodexPlanner:
         context_excerpt: str | None = None,
         capability_snapshot: Mapping[str, Any] | None = None,
         provider_capacity: Mapping[str, Any] | None = None,
+        performance_calibration: Mapping[str, Any] | None = None,
     ) -> list[NodeSpec]:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary or not Path(binary).exists():
@@ -781,6 +912,7 @@ class CodexPlanner:
             strategy=strategy,
             capability_snapshot=capability_snapshot,
             provider_capacity=provider_capacity,
+            performance_calibration=performance_calibration,
         )
 
     @staticmethod
@@ -841,8 +973,11 @@ Context bundle ref: {contract.context_bundle_ref or "N/A"}{context_block}
 Rules:
 - Apply the research routing policy before model routing or DAG decomposition.
 {archify_rule}- Prefer independent parallel nodes when their write scopes do not overlap.
+- Actively decompose the request into the smallest useful independent DAG nodes: identify low-risk, short, mechanically verifiable actions (for example one focused test, formatter, notice generation, or bounded file check) that can run independently and expose their exact command and scope.
+- Do not split a coupled change, hide shared state, or create artificial nodes merely to use Spark. Preserve semantic and write-scope dependencies; every worker, including a Spark worker, must remain in the final verifier dependency closure.
+- A Spark candidate is only a low-complexity, parallelizable node with at most one write scope and either a node-level command or the task acceptance commands as its mechanical acceptance condition. Architecture, review, security, migration, release, verifier/control-plane, and ambiguous cross-module work must never be assigned to Spark.
 - Every node must declare routing_strategy, task_type, complexity, parallelizable, and claude_allowed. These typed fields are execution metadata, not prose suggestions; the Workbench normalizer may only inherit missing fields from the task contract.
-- The structured routing policy is authoritative. For model-routing-v2, bounded low work uses the independent Codex Spark pool; standard parallelizable implementation, debugging, tests, docs, and exploration prefer admitted Claude Sonnet; high-complexity, architecture, and review prefer Opus then Fable then Sonnet; creative work prefers Fable then Opus then Sonnet. When no eligible Claude family is admitted, the post-compile policy chooses Codex Spark, Luna, or Terra by complexity.
+- The structured routing policy is authoritative. For model-routing-v2, only bounded low, mechanically verifiable work uses the independent Codex Spark pool; standard parallelizable implementation, debugging, tests, docs, and exploration prefer admitted Claude Sonnet; high-complexity, architecture, and review prefer Opus then Fable then Sonnet; creative work prefers Fable then Opus then Sonnet. When no eligible Claude family is admitted, the post-compile policy chooses Codex Spark, Luna, or Terra by complexity and the explicit mechanical-lane gate.
 - When a pinned capability catalog is present, the normalizer applies model-routing-v3 after this JSON is returned. Do not treat model text in this plan as a capability override; the catalog, current quota receipt, role boundaries, and service concurrency gate decide the final provider/model.
 - When a Codex worker is selected, its normalized node stores a model profile and explicit reasoning effort. Luna workers must be `luna_worker` with `model_reasoning_effort=max`; do not treat `--model` alone as proof of the requested tier.
 - model-routing-v1 retains its legacy Claude eligibility and fallback behavior. Do not infer a newer policy from a task's wording.
