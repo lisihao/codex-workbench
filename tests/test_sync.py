@@ -112,15 +112,19 @@ class RepositorySyncTests(unittest.TestCase):
             response = json.dumps({"ok": True, "commit": head}).encode()
             return subprocess.CompletedProcess(command, 0, response, b"")
 
-        result = self.sync.send_increment(
-            str(self.source),
-            base,
-            "HEAD",
-            host="macmini",
-            remote_repository="/Users/example/Projects/example repo",
-            ref_name="macbook/task-2",
-            runner=runner,
-        )
+        # Isolate this fallback-path test from a real MacBook client profile in
+        # the developer's home directory.  Location-aware routing has its own
+        # explicit test below.
+        with patch("pathlib.Path.home", return_value=self.root / "empty-home"):
+            result = self.sync.send_increment(
+                str(self.source),
+                base,
+                "HEAD",
+                host="macmini",
+                remote_repository="/Users/example/Projects/example repo",
+                ref_name="macbook/task-2",
+                runner=runner,
+            )
         self.assertEqual(result["imported"]["commit"], head)
         self.assertEqual(result["transport_profile"], "ssh-config")
         self.assertEqual(observed["command"][0], "ssh")

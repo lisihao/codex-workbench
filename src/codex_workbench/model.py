@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 from .governance import (
@@ -127,6 +128,34 @@ def canonical_json(value: Any) -> str:
 
 def canonical_hash(value: Any) -> str:
     return sha256(canonical_json(value).encode()).hexdigest()
+
+
+# Capability snapshots are content-addressed records.  Accept the same raw
+# hexadecimal form returned by ``canonical_hash`` and the explicit form used
+# by artifact/evidence references, while rejecting ambiguous or unsafe values
+# before they become part of a durable contract.
+_CAPABILITY_DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
+
+
+def _validate_capability_snapshot_binding(
+    snapshot_id: str | None,
+    digest: str | None,
+    owner: str,
+) -> None:
+    if (snapshot_id is None) != (digest is None):
+        raise ValueError(
+            f"{owner} capability_snapshot_id and capability_digest must be supplied together"
+        )
+    if snapshot_id is None:
+        return
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        raise ValueError(f"{owner} capability_snapshot_id must be non-empty")
+    if any(character.isspace() for character in snapshot_id):
+        raise ValueError(f"{owner} capability_snapshot_id must not contain whitespace")
+    if not isinstance(digest, str) or not _CAPABILITY_DIGEST_RE.fullmatch(digest):
+        raise ValueError(
+            f"{owner} capability_digest must be a raw SHA-256 hex digest or sha256:<64 hex>"
+        )
 
 
 @dataclass(frozen=True)
@@ -273,6 +302,11 @@ class TaskContract:
     verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
     source_thread_id: str | None = None
     context_bundle_ref: str | None = None
+    # Optional content-addressed capability catalog binding.  Both values are
+    # persisted in the contract so routing/evidence can remain reproducible;
+    # absent values preserve pre-capability-registry contracts.
+    capability_snapshot_id: str | None = None
+    capability_digest: str | None = None
 
     def __post_init__(self) -> None:
         # Sol is a role invariant.  ``fixture`` remains available for the
@@ -327,6 +361,11 @@ class TaskContract:
             raise ValueError("source_thread_id must contain no whitespace")
         if self.context_bundle_ref and not self.context_bundle_ref.startswith("sha256:"):
             raise ValueError("context_bundle_ref must be a content-addressed artifact ref")
+        _validate_capability_snapshot_binding(
+            self.capability_snapshot_id,
+            self.capability_digest,
+            "task contract",
+        )
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if not 0 <= self.retry_limit <= 3:
@@ -452,6 +491,15 @@ class NodeSpec:
     # selected model and make Luna's max-effort/profile semantics inspectable.
     model_profile: str | None = None
     model_reasoning_effort: str | None = None
+    # Optional pinned capability metadata.  New planners may populate these
+    # fields; legacy plans omit them and retain their existing routing.
+    capability_snapshot_id: str | None = None
+    capability_digest: str | None = None
+    model_capability_id: str | None = None
+    agent_capability_id: str | None = None
+    agent_name: str | None = None
+    agent_version: str | None = None
+    routing_policy_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.executor != "codex":
@@ -482,6 +530,25 @@ class NodeSpec:
             raise ValueError("node parallelizable must be a boolean")
         if self.claude_allowed is not None and not isinstance(self.claude_allowed, bool):
             raise ValueError("node claude_allowed must be a boolean")
+        _validate_capability_snapshot_binding(
+            self.capability_snapshot_id,
+            self.capability_digest,
+            "node",
+        )
+        for field_name in (
+            "model_capability_id",
+            "agent_capability_id",
+            "agent_name",
+            "agent_version",
+            "routing_policy_version",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"node {field_name} must be a non-empty string when supplied"
+                )
         expected_profile = codex_model_profile(self.model)
         if expected_profile is not None and self.model_profile not in {None, expected_profile}:
             raise ValueError(
@@ -550,6 +617,16 @@ class NodeResult:
     verdict: Literal["accepted", "needs_fix", "blocked"] | None = None
     governance_profile: str = CODE_AS_HARNESS_PROFILE
     verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
+    # Execution provenance is optional for legacy receipts.  Executors can
+    # populate it when a capability catalog is active without changing the
+    # existing result contract or SQLite schema.
+    requested_model: str | None = None
+    provider: str | None = None
+    agent_name: str | None = None
+    agent_version: str | None = None
+    capability_snapshot_id: str | None = None
+    model_capability_id: str | None = None
+    agent_capability_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -564,9 +641,25 @@ class NodeResult:
         return cls(**normalized)
 
 
-def retry_model(model: str, attempt: int, *, verifier: bool = False) -> str:
-    """Escalate bounded Codex repair attempts without changing provider families."""
+def retry_model(
+    model: str,
+    attempt: int,
+    *,
+    verifier: bool = False,
+    routing_policy_version: str | None = None,
+) -> str:
+    """Escalate legacy repairs while keeping pinned v3 capabilities immutable.
+
+    A routing-v3 node has already passed the capability, quota, role, and
+    quality gates against one immutable catalog snapshot.  Silently replacing
+    its model at claim time would bypass those gates and could promote an
+    ordinary worker to the Sol control plane.  Such nodes therefore retry the
+    same selected capability; a later planner repair may create a newly routed
+    node when a different capability is genuinely required.
+    """
     if verifier or attempt <= 1:
+        return model
+    if routing_policy_version == "model-routing-v3":
         return model
     lower = model.lower()
     if "codex-spark" in lower:

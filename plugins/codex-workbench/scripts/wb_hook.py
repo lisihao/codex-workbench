@@ -320,15 +320,31 @@ def _mcp_ssh_command(command_id: str) -> list[str]:
     arguments = values.get("args")
     if not isinstance(command, str) or not isinstance(arguments, list) or not arguments:
         raise RuntimeError("codex-workbench MCP transport is incomplete")
-    remote = arguments[-1]
-    if not isinstance(remote, str) or not remote.endswith(" mcp"):
-        raise RuntimeError("codex-workbench MCP remote command is unsupported")
-    arguments[-1] = (
-        remote[:-4]
-        + " context import --archive - --command-id "
-        + shlex.quote(command_id)
-    )
-    return [command] + arguments
+    # The MacBook client normally uses SSH to reach the Mac mini.  A native
+    # Codex Remote Control session on the authority host may instead register
+    # the Workbench MCP command directly.  Keep the former shell command
+    # shape intact while replacing the final ``mcp`` argument in the latter
+    # with the context-import subcommand.
+    if Path(command).name == "ssh":
+        remote = arguments[-1]
+        if not isinstance(remote, str) or not remote.endswith(" mcp"):
+            raise RuntimeError("codex-workbench MCP remote command is unsupported")
+        arguments[-1] = (
+            remote[:-4]
+            + " context import --archive - --command-id "
+            + shlex.quote(command_id)
+        )
+        return [command] + arguments
+    if arguments[-1] != "mcp":
+        raise RuntimeError("codex-workbench MCP local command is unsupported")
+    return [command] + arguments[:-1] + [
+        "context",
+        "import",
+        "--archive",
+        "-",
+        "--command-id",
+        command_id,
+    ]
 
 
 def _send(bundle: bytes, command_id: str) -> dict:

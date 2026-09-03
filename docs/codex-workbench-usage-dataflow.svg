@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
   <title id="title">Codex Workbench 使用方式与数据流</title>
-  <desc id="desc">从 MacBook 的任意 Codex 会话输入 wb，经受控上下文同步到 Mac mini Authority，由 Sol 规划并调度 Spark、Luna、Terra 与受配额保护的 Claude Worker，在隔离 worktree 中执行，经过 Evidence 验收后将状态和结果回传原会话。网络中断时回落到 MacBook 当前 checkout 并写入待重试 outbox。</desc>
+  <desc id="desc">从 MacBook 或手机 Remote 的任意 Codex 会话输入 wb，经受控上下文同步到 Mac mini Authority；版本化能力目录驱动 Sol、Spark、Luna、Terra 与受配额保护的 Claude Worker 路由，在隔离 worktree 中执行，经过 Evidence 验收后将状态和结果回传原会话。网络中断时回落到 MacBook 当前 checkout 并写入待重试 outbox。</desc>
 
   <defs>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
@@ -46,7 +46,7 @@
   <g transform="translate(58 58)">
     <text class="eyebrow" x="0" y="0">CODEX WORKBENCH</text>
     <text class="title" x="0" y="52">怎么使用，以及数据怎样流动</text>
-    <text class="subtitle" x="0" y="89">MacBook 是入口 · Mac mini 是唯一 Authority · Evidence 是完成条件</text>
+    <text class="subtitle" x="0" y="89">MacBook 是完整入口 · 手机可随时遥控 · Mac mini 是唯一 Authority · Evidence 是完成条件</text>
   </g>
 
   <g transform="translate(1150 48)">
@@ -66,8 +66,8 @@
   <!-- Lane headers -->
   <g transform="translate(78 204)">
     <rect width="338" height="48" rx="14" fill="#eaf3ff"/>
-    <text class="lane-title" x="18" y="23">MacBook · Codex 驾驶舱</text>
-    <text class="lane-subtitle mono" x="18" y="40">USER ENTRY / LOCAL FALLBACK</text>
+    <text class="lane-title" x="18" y="23">MacBook / 手机 · Codex 入口</text>
+    <text class="lane-subtitle mono" x="18" y="40">COCKPIT / REMOTE / LOCAL FALLBACK</text>
   </g>
   <g transform="translate(452 204)">
     <rect width="244" height="48" rx="14" fill="#edf4fb"/>
@@ -86,7 +86,7 @@
     <rect x="18" y="18" width="36" height="26" rx="8" fill="#2367c9"/>
     <text class="step mono" x="28" y="36" fill="#ffffff">01</text>
     <text class="card-title" x="68" y="38">打开任意 Codex 会话</text>
-    <text class="card-copy" x="18" y="68">新会话或已有会话都可以</text>
+    <text class="card-copy" x="18" y="68">MacBook 或手机 Remote，新旧会话都可以</text>
     <rect x="18" y="82" width="90" height="22" rx="11" fill="#dceaff"/>
     <text class="pill mono" x="33" y="97" fill="#1e5bad">输入 wb</text>
   </g>
@@ -141,8 +141,8 @@
     <rect class="amber-node" width="724" height="82" rx="17"/>
     <rect x="18" y="18" width="36" height="26" rx="8" fill="#b67b12"/>
     <text class="step mono" x="28" y="36" fill="#ffffff">05</text>
-    <text class="card-title" x="68" y="37">Sol 规划器：恢复目标与验收边界</text>
-    <text class="card-copy" x="68" y="62">导入会话与仓库状态 → TaskContract → scope-aware DAG</text>
+    <text class="card-title" x="68" y="37">能力目录 + Sol：恢复目标与验收边界</text>
+    <text class="card-copy" x="68" y="62">固定 catalog → TaskContract → 质量优先路由 → scope-aware DAG</text>
   </g>
 
   <path d="M696 461H716V337H752" fill="none" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>
@@ -176,7 +176,7 @@
       <rect x="14" y="13" width="60" height="20" rx="10" fill="#b66b43"/>
       <text class="pill mono" x="44" y="27" text-anchor="middle" fill="#ffffff">CLAUDE</text>
       <text class="card-title" x="14" y="55" font-size="17">可选订阅 Worker</text>
-      <text class="small" x="14" y="75">登录新鲜 · 保护 ≥20%</text>
+      <text class="small" x="14" y="75">Sonnet / Fable / Opus · 保护 ≥20%</text>
     </g>
   </g>
 

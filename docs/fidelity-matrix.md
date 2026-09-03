@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.5.1 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.6.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.5.1 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.6.0 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -17,9 +17,10 @@
 | WB 新旧会话接管 | implemented | UserPromptSubmit Hook 生成经脱敏的 Context Bundle；同步对话、Git patch、untracked/显式关联文件；Mac mini ArtifactStore + SQLite receipt + 隔离 worktree 导入后才返回 active；断网明确回退 MacBook 并保留 outbox | Codex 首次安装/Hook 内容变化后必须由用户在 `/hooks` 完成官方信任流程 |
 | Sol 需求编译与 DAG | implemented | Sol planner 生成 DAG；图验证、依赖闭包、scope 冲突门禁 | 真实 Sol 质量由具体订阅回合决定 |
 | 多场景必经 Research Skill | compatible-subset | Authority 安装器将一份完整 Research Skill 复制到隔离 planner HOME；`research-skill/v2` 先用可测试路由判定架构/探索、高复杂度、论文/上游、选型/迁移、性能/基准、最佳实践、兼容性/安全、竞品/可行性等场景，再向 Sol planner 注入强制 `$Research` directive | 默认由单一 Sol planner 执行 Standard 方法，只有用户明确要求深度、广泛或并行研究时才扩展多研究节点；当前可证明 Skill 安装与 prompt wiring，尚无 host-side runtime research receipt |
-| Sol 规划、分层执行、Sol 验收 | implemented | Sol 固定 planner/verifier；routing-v2 以独立 Codex Spark 池处理低复杂度微任务，在配额安全时以 Sonnet 承担标准生产，以 Opus/Fable 承担架构挑战，Luna/Terra 接管回退 | routing-v1 仅为旧合同兼容，不作为新任务默认 |
+| Sol 规划、分层执行、Sol 验收 | implemented | routing-v3 固定 Sol planner/verifier/control；低风险机械任务进入独立 Spark 池，标准生产按任务角色选择 Luna/Sonnet，较大独立切片选择 Terra，Opus/Fable 承担架构/审核/研究挑战 | routing-v1/v2 仅为无能力目录的旧合同兼容；质量/成本/时延是政策等级，不是经验基准分数 |
+| 版本化模型与 Agent 能力目录 | implemented | 安装时 bundled safe refresh；LaunchAgent 每 6 小时被动读取 Codex/Claude Code 版本、帮助和模型元数据；无变化 generation 去重；新任务固定 catalog ID/digest；支持 status/show/diff/activate/rollback | Claude alias 背后的精确服务端模型只能在正常任务返回的 actual model receipt 中观察；未知和新 Sol 默认不获路由权限 |
 | Claude Opus/Sonnet/Fable Worker | implemented | 原生订阅资格、结构化 JSON Schema、工具/权限映射、实际模型证明 | A4 真实 Sonnet 工件仍需一次最小真实回合 |
-| Codex Worker | implemented | 原生订阅 CLI、结构化 worker/verifier 结果；低复杂度使用独立 `gpt-5.3-codex-spark` 池并按 Spark→Luna→Terra→Sol 有界升级；A4 已有 Luna + Sol 真实 Evidence | 无 |
+| Codex Worker | implemented | 原生订阅 CLI、结构化 worker/verifier 结果；低复杂度使用独立 `gpt-5.3-codex-spark` 池；routing-v3 重试保持已固定 capability，不允许普通 Worker 在 claim 时静默升级为 Sol；A4 已有 Luna + Sol 真实 Evidence | 旧 routing-v1/v2 合同保留原有有界升级行为 |
 | 确定性执行器 | implemented | 构建、测试、lint 等 argv 执行，不消耗模型 | 无 |
 | 一个 Worker 一个 worktree/branch | implemented | base SHA、规范化仓库、独立 worktree、作用域验证 | 无 |
 | DAG 并行与冲突消除 | implemented | 无依赖且 scope 不冲突才并行；read/read 可并行；父子 scope 互斥 | Planner 产生冲突时 fail loud，不猜测自动串行化 |
@@ -33,14 +34,15 @@
 | 单位配额产出指标 | implemented | 每具名窗口的 accepted 加权任务点 / Claude 消耗；排除 fixture/test | 长周期趋势需真实窗口积累 |
 | 配额触线自动转 Codex | implemented | 同一 attempt 记录 node.routed，不调用 Claude 后再重启 | A8 真实配额窗口证据 external-pending |
 | MacBook 完整驾驶舱 | implemented | 任务/DAG/契约/Evidence/配额/告警、暂停恢复、优先级、steering、approval | 原文“接管异常 Agent”当前是控制与下一 attempt 指令，不是交互式终端 attach |
-| 手机精简驾驶舱 | deferred | 响应式 UI 与 A2 receipt 代码保留 | 用户已将手机接入移至回加拿大后的 backlog；当前不部署、不作为门禁 |
-| 手机后台通知 | deferred | 页面打开时的浏览器 Notification 代码保留 | 与手机接入一并转 backlog |
+| 手机 Codex App Remote | external-pending | `mobile status/enable/pair/disable` 管理 Codex 原生 app-server Remote Control；复用同一 WB plugin/MCP/Authority；pair 只返回有人值守原生命令，不保存短效码 | 尚需用户在 Mac mini 终端与真实手机 Codex App 完成配对、查看和发任务旅程 |
+| 手机精简 Web 驾驶舱 | external-pending | 响应式 UI、认证、任务状态/控制与 A2 `client.observed` receipt 已实现并列入当前验收 | 尚需手机真机渲染真实 Authority 快照并写入服务端回执 |
+| 手机后台通知 | deferred | 页面打开时的浏览器 Notification 代码保留 | 页面关闭后的 Web Push 仍在 backlog |
 | 位置感知传输路由（家庭 LAN / Tailscale） | implemented | `workbench-location-proxy.py` 每次连接按显式 home CIDR 和有界 LAN probe 选路；MCP、Hook、tunnel、heartbeat 与 Git 增量同步共享同一 `ProxyCommand` profile；失败沿用 `degraded` + outbox | 尚未使用操作者的真实家庭 CIDR、LAN endpoint 与 Tailnet endpoint 完成双地点链路回放 |
 | GitHub 主同步与增量传输 | implemented | clean fast-forward；显式刷新目标 remote-tracking ref，不依赖本地 `remote.*.fetch`；SSH/Tailscale Git bundle 导入独立 refs；MacBook 自动以 `tailscale nc` 绕过错误 CGNAT 系统路由 | 无 |
 | 授权后 PR/CI/merge/release | implemented | accepted + external-write contract + durable delivery receipt；不确定时 indeterminate | 真实仓库权限仍由调用任务决定 |
 | 认证与费用保护 | implemented | Codex/Claude native-subscription；API key 不转发；认证失败不循环重登；A9 已记录 Claude 失效后单次接管并由 Luna 执行、Sol 验收 | 无 |
 | 无人值守 readiness | implemented | doctor 检查 FileVault、authrestart、launchd、Tailscale、自动开机和睡眠 | UPS/现场断电能力属于外部基础设施 |
-| 当前验收账本 | implemented | A1、A3–A12 由持久真实 Evidence 计算；A2 显式列入 backlog；fixture/test 不能冒充；A5/A9/A10/A11 已有真实持久证据 | A1/A3/A4/A6/A7/A8/A12 仍需对应真实旅程或时间窗口 |
+| 当前验收账本 | implemented | A1–A12 由持久真实 Evidence 计算；A2 已恢复为当前手机真机门禁；fixture/test 不能冒充；A5/A9/A10/A11 已有真实持久证据 | A1/A2/A3/A4/A6/A7/A8/A12 仍需对应真实旅程或时间窗口 |
 | 旧 A10 Evidence 追加补证 | implemented | manifest 存 ArtifactStore；command receipt 幂等；只追加 remediation event；重新绑定 source task/base/hash/cursor/attempt 与原 artifact refs | deterministic 或缺少原生结构化 verdict/checks/evidence 的历史 verifier 必须绑定另一个独立 accepted review task；该任务的 deterministic/Codex worker 实际物化并检查 source patch，依赖它的真实 Codex Sol 节点产生事件链和原生结果工件；自写 transcript/receipt 不算 Evidence |
 | Claude Web PPT 保留池证明 | external-pending | 工件签名、内容地址、export receipt、session、配额窗口和 ≥20% 联合校验 | 需用户完成一次真实 Claude Web 导出 |
 | 与 DSH 解耦 | implemented | 独立仓库、包、SQLite、进程、发布节奏；无 DSH 运行时依赖 | 无 |
@@ -48,6 +50,6 @@
 ## 当前忠实度结论
 
 1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现。
-2. 后续用户要求的 quota-productive routing-v2 是有意调整：Sol 仍负责规划/验收；低复杂度使用独立 Codex Spark 池，标准生产在安全配额时优先 Sonnet，高复杂度/架构审核优先 Opus/Fable，容量或配额不足由 Spark/Luna/Terra 填充。
-3. 1.5.1 在完成当前 A1、A3–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota sidecar 的夹具验证描述为登录态生产验证。
-4. 手机接入与页面关闭后的 Web Push 是用户明确后置的 backlog；交互式终端式 Agent attach 仍未实现，三者均不冒充当前交付。
+2. 1.6.0 的 routing-v3 以版本化能力目录作为新任务路由输入：硬门禁先于质量、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
+3. 1.6.0 在完成当前 A1–A12 外部旅程前应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
+4. 手机原生 Remote 与响应式 cockpit 已有实现，但真实配对、查看、发任务和 A2 receipt 仍是 external-pending；只有页面关闭后的 Web Push 留在 backlog。

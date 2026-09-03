@@ -281,7 +281,10 @@ class LegacyEvidenceTests(unittest.TestCase):
         self.assertEqual(self.store.read_events(task_id=task["task_id"], limit=1000)[:-1], before_events)
         with patch.object(self.store, "read_events", return_value=[]):
             self.assertEqual(len(self.store.legacy_evidence_remediations()), 1)
-        self.assertEqual(build_acceptance_report(self.store)["checks"][8]["status"], "ok")
+        check = next(
+            item for item in build_acceptance_report(self.store)["checks"] if item["id"] == "A10"
+        )
+        self.assertEqual(check["status"], "ok")
 
     def test_unstructured_source_sol_result_requires_an_independent_review_task(self) -> None:
         task = self._source_task("legacy-sol-without-native-verdict")
@@ -330,7 +333,10 @@ class LegacyEvidenceTests(unittest.TestCase):
         ref = self.store.artifacts.put_text(json.dumps(manifest), "json")
         self.store.record_system_event("acceptance.evidence_remediated", {"manifest_ref": ref, "task_id": task["task_id"]})
         self.assertEqual(self.store.legacy_evidence_remediations(), [])
-        self.assertEqual(build_acceptance_report(self.store)["checks"][8]["status"], "error")
+        check = next(
+            item for item in build_acceptance_report(self.store)["checks"] if item["id"] == "A10"
+        )
+        self.assertEqual(check["status"], "error")
 
     def test_deterministic_verifier_needs_bound_supplemental_sol_review(self) -> None:
         task = self._source_task("acceptance-v0.4.0-fallback", verifier_model="local-deterministic")
@@ -346,7 +352,10 @@ class LegacyEvidenceTests(unittest.TestCase):
             self._apply(missing_sol, "fallback-no-sol")
         receipt = self._apply(self._manifest(task["task_id"], supplemental=True), "fallback-sol")
         self.assertFalse(receipt["idempotent"])
-        self.assertEqual(build_acceptance_report(self.store)["checks"][8]["status"], "ok")
+        check = next(
+            item for item in build_acceptance_report(self.store)["checks"] if item["id"] == "A10"
+        )
+        self.assertEqual(check["status"], "ok")
 
     def test_manifest_written_static_supplemental_review_is_rejected(self) -> None:
         task = self._source_task("supplemental-binding", verifier_model="local-deterministic")

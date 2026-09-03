@@ -26,7 +26,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 ## 运行模型
 
 ```text
-                           Codex conversation on MacBook
+                  Codex on MacBook / Codex Remote on phone
                                       │
                         `wb` plugin / Codex MCP binding
                                       │
@@ -53,6 +53,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 
 - **Mac mini Authority**：唯一的 SQLite 写入者、任务账本、协调器、ArtifactStore 和后台执行位置。它可通过 `launchd` 常驻运行；其他设备不会创建第二个协调器或复制第二份账本。
 - **MacBook cockpit**：Codex 的 MCP 入口、状态面板和控制端。它读取 Authority 的 snapshot + cursor events，可调整优先级、追加 steering、查看 Evidence 和做受契约约束的控制操作。
+- **手机 Codex Remote**：手机端 Codex 的 Remote 页连接 Mac mini 上的 Codex app-server；同一 Workbench 插件与 MCP 让远程会话查看进度、发送新指令并继续既有任务。首次短效配对必须由用户在 Mac mini 终端完成。
 - **`wb` Codex 入口**：一个薄插件，将新会话或已有会话绑定到同一份持久任务。它同步经脱敏的会话摘要与受控 Git 上下文，而不持有第二份任务状态。
 - **Claude Code Worker**：可选的订阅型执行器，不承担规划或最终验收。认证、CLI 兼容性或配额状态不明确时不会猜测余额，也不会使用 API-key fallback。
 - **离线回落**：如果 Authority 不可达，已绑定会话继续在 MacBook 当前 checkout 上工作；系统不会在离线端静默创建第二个 Authority，下一次可用连接再重试同步。
@@ -64,6 +65,12 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 任务首先由 Sol 规划器编译为持久 TaskContract 和 DAG。只有依赖已完成且读写 scope 不冲突的节点才会并行；父子路径互斥，纯读节点可以并行。每个执行节点在独立 worktree/branch 中运行，因此并行提升吞吐量而不会把共享工作树变成竞态源。
 
 路由不是固定“弱模型干活”的盲目规则：低风险、短且可机械验收的工作可进入独立 Spark 池；边界明确的常规实现优先 Luna；较大的独立切片可以升级 Terra；需求拆解、跨模块判断和最终验收留给 Sol。Claude Code 的 Sonnet、Opus 或 Fable 只在其订阅资格和受保护配额可证明时作为 Worker 使用。
+
+### 版本化能力目录与质量优先路由
+
+Authority 会在安装时建立第一份能力目录，并由独立 LaunchAgent 每 6 小时执行一次无模型、无登录的被动刷新。目录记录 Codex/Claude Code CLI 版本、模型选择 ID、角色、任务类型、推理档位、工具特性以及质量/成本/时延/并发策略。功能未变化的刷新复用现有 generation；只有真实能力或 Agent 版本变化才产生新 generation。
+
+新任务将当前 `catalog_id` 与 digest 固定进 TaskContract 和每个节点。硬门禁先检查角色、工具、版本、Claude 配额与并发，再按“验收质量优先、角色适配其次、成本和时延随后”的确定性顺序选路。未知或弃用模型只展示、不调度；新的 Luna/Terra/Spark 家族可继承受限 Worker 策略，新的 Sol 版本不会自动取得规划与最终验收权限。旧任务始终按其已固定的目录运行，目录可查看 diff、显式激活或回滚。
 
 ### Code-as-Harness：把开发规则变成可验证契约
 
@@ -144,6 +151,7 @@ export WB_STATE_ROOT="$HOME/Library/Application Support/Codex Workbench"
 export WB_AUTHORITY_BIN="$WB_STATE_ROOT/app/bin/codex-workbench"
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" doctor
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" harness health
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" capabilities status
 codex mcp get codex-workbench
 ```
 
@@ -158,6 +166,19 @@ wb
 插件会请求将当前会话与受控代码上下文绑定到 Mac mini Authority。安装或 Hook 内容变更后，Codex 需要用户在 `/hooks` 中审核该 Hook；这是 Codex 的显式信任步骤，不会被 Workbench 绕过。
 
 `wb` 插件随仓库内的 [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) 与 [`plugins/codex-workbench/`](plugins/codex-workbench/) 发行，可通过 Codex Marketplace 安装。首次使用仍需显式添加该 Marketplace source、安装插件并审核 Hook；这不是无需确认的一键启用。完整的安装、升级与回退方式以 [AI 安装与配置指南](docs/AI_INSTALL.md) 为准。部分 Codex 版本不接受自定义顶层 `/WB`，因此默认入口是小写的 `wb`；`$WB` 和从 `/skills` 选择 `WB` 也可作为替代入口。
+
+### 从手机 Codex App 进入
+
+在 Mac mini 上先检查并启用原生 Remote Control：
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile enable --dry-run
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile enable
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile pair
+```
+
+最后一条只显示需要在有人值守终端执行的原生 `codex remote-control pair --json` 命令，不生成或保存配对码。用户在 Mac mini 终端运行该命令，并在手机 Codex App 的 Remote 页完成配对。之后手机发出的任务由 Mac mini 上的 Codex 会话执行；在会话中输入 `wb` 即进入同一 Workbench Authority。自动化测试只能证明命令接线与状态读取，真机可见、可发任务仍须一次真实手机旅程验收。
 
 如果在家网段且 MCP 链路可达，客户端会优先走家庭 LAN；否则回落到 Tailscale 原生 SSH TCP Serve（默认端口 10022）。判断失败后会产生 `degraded` receipt 并走 outbox，下一次同一会话重试 `wb` 时继续同步。该策略不是按国家/区域判断，不会修改系统网络与 Tailscale 配置，也不会自动发起登录。
 
@@ -219,6 +240,15 @@ codex-workbench task priority <task-id> <priority> --expected-revision <n>
 # Acceptance, routing and quota observation
 codex-workbench acceptance
 codex-workbench quota show
+codex-workbench capabilities status
+codex-workbench capabilities diff
+codex-workbench capabilities refresh --activate-safe
+codex-workbench capabilities rollback
+
+# Native Codex mobile Remote Control
+codex-workbench mobile status
+codex-workbench mobile enable --dry-run
+codex-workbench mobile pair
 
 # Source synchronization and explicitly authorized GitHub delivery
 codex-workbench sync github --repository <repository-path> --branch <branch>
@@ -235,11 +265,11 @@ codex-workbench deliver <task-id> --base-branch <branch>
 - 受控执行器使用既有的 Codex/Claude 原生订阅登录态；不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，也不以 API key 作为订阅失败的回退。
 - Authority 默认只监听本机回环地址。远程 cockpit 通过你配置的 SSH/Tailscale 通道访问，而不是把 SQLite 服务公开到互联网。
 - MacBook 和离线端不创建第二个 Authority；它们只能读取、控制或准备后续同步。
-- 该项目仅支持 macOS；手机真机接入和页面关闭后的 Push 目前在 [backlog](docs/backlog.md) 中，不应被视为已交付能力。
+- 该项目仅支持 macOS；手机 Remote Control 的接线已经实现，但未完成真实手机配对就不能声称手机旅程通过。页面关闭后的 Web Push 仍在 [backlog](docs/backlog.md)。
 
 ## 状态与文档
 
-当前源码版本为 `1.5.1`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
+当前源码版本为 `1.6.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

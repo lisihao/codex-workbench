@@ -99,8 +99,8 @@ class APITests(unittest.TestCase):
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
                 self.assertIsNone(snapshot["quota_policy"])
-                self.assertEqual(len(snapshot["acceptance"]["checks"]), 11)
-                self.assertEqual(snapshot["acceptance"]["backlog"][0]["id"], "A2")
+                self.assertEqual(len(snapshot["acceptance"]["checks"]), 12)
+                self.assertEqual(snapshot["acceptance"]["backlog"], [])
                 with mock.patch(
                     "codex_workbench.api.code_as_harness_health",
                     return_value={"ok": True, "archify": {"ok": True}},
@@ -162,8 +162,8 @@ class APITests(unittest.TestCase):
                     acceptance = json.load(response)
                 checks = {check["id"]: check for check in acceptance["checks"]}
                 backlog = {check["id"]: check for check in acceptance["backlog"]}
-                self.assertNotIn("A2", checks)
-                self.assertEqual(backlog["A2"]["status"], "deferred")
+                self.assertEqual(checks["A2"]["status"], "ok")
+                self.assertNotIn("A2", backlog)
 
                 contract = TaskContract(
                     task_id="phone-approval",
@@ -259,6 +259,87 @@ class APITests(unittest.TestCase):
                 with urlopen(artifact_request, timeout=2) as response:
                     artifact_body = response.read().decode()
                 self.assertEqual(artifact_body, "phone-visible evidence")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_capability_endpoints_are_read_only_and_expose_active_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            empty_status = {
+                "ok": False,
+                "active_generation_id": None,
+                "active": None,
+                "generation_count": 0,
+                "generations": [],
+                "last_refresh": None,
+                "error": None,
+            }
+            active = {
+                "catalog_id": "catalog-0123456789abcdef",
+                "observed_at": "2026-09-02T00:00:00+00:00",
+                "agents": {
+                    "codex": {"status": "available", "cli_version": "0.149.1"},
+                    "claude": {"status": "available", "cli_version": "2.1.239"},
+                },
+                "models": [
+                    {
+                        "provider": "codex",
+                        "model_id": "gpt-5.6-luna",
+                        "model_family": "luna",
+                        "status": "available",
+                        "routable": True,
+                        "roles": ["worker"],
+                        "agent_cli_version": "0.149.1",
+                    },
+                    {
+                        "provider": "codex",
+                        "model_id": "gpt-9.9-unknown",
+                        "model_family": "unknown",
+                        "status": "observed",
+                        "routable": False,
+                        "roles": [],
+                        "agent_cli_version": "0.149.1",
+                    },
+                ],
+            }
+            active_status = {**empty_status, "ok": True, "active_generation_id": active["catalog_id"], "active": active, "generation_count": 1, "generations": [active["catalog_id"]]}
+            try:
+                with mock.patch("codex_workbench.api.CapabilityRegistry") as registry_class:
+                    registry = registry_class.return_value
+                    registry.status.return_value = empty_status
+                    with urlopen(f"http://127.0.0.1:{port}/api/capabilities", timeout=2) as response:
+                        empty_payload = json.load(response)
+                    self.assertFalse(empty_payload["ok"])
+                    self.assertIsNone(empty_payload["active"])
+                    self.assertFalse(empty_payload["status"]["ok"])
+                    with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
+                        empty_snapshot = json.load(response)
+                    self.assertFalse(empty_snapshot["capability_registry"]["ok"])
+                    registry.refresh.assert_not_called()
+
+                    registry.status.return_value = active_status
+                    with urlopen(f"http://127.0.0.1:{port}/api/capabilities", timeout=2) as response:
+                        active_payload = json.load(response)
+                    self.assertTrue(active_payload["ok"])
+                    self.assertEqual(active_payload["active"]["catalog_id"], active["catalog_id"])
+                    with urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                        health = json.load(response)
+                    self.assertEqual(health["capability_registry"]["active_generation_id"], active["catalog_id"])
+                    self.assertEqual(
+                        health["capability_registry"]["active"]["models"][0]["model_id"],
+                        "gpt-5.6-luna",
+                    )
+                    self.assertFalse(health["capability_registry"]["active"]["models"][1]["routable"])
             finally:
                 server.shutdown()
                 server.server_close()

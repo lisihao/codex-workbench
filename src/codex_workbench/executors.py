@@ -212,6 +212,73 @@ def codex_subscription_environment() -> dict[str, str]:
     return environment
 
 
+def _execution_receipt_metadata(
+    request: ExecutionRequest,
+    *,
+    provider: str,
+    agent_version: str | None = None,
+) -> dict[str, str | None]:
+    """Collect pinned execution metadata without probing either model.
+
+    Capability fields are copied from the normalized node first and then the
+    task contract.  Older plans do not contain these optional fields; their
+    result remains valid and simply carries the model/provider fields that
+    can be established from the executor boundary.  ``agent_version`` is
+    only accepted from already-attested request metadata (or an explicit
+    caller value); this helper never logs in or starts a model turn to obtain
+    it.
+    """
+
+    spec = request.spec if isinstance(request.spec, Mapping) else {}
+    contract = request.contract if isinstance(request.contract, Mapping) else {}
+
+    def first_string(*containers: Mapping[str, Any], keys: tuple[str, ...]) -> str | None:
+        for container in containers:
+            for key in keys:
+                value = container.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    requested_model = first_string(spec, contract, keys=("requested_model", "model"))
+    if requested_model is None:
+        requested_model = first_string(
+            contract,
+            keys=("verifier_model",) if spec.get("verifier") else ("executor_model",),
+        )
+    selected_provider = first_string(
+        spec,
+        contract,
+        keys=("provider", "model_provider", "executor_provider"),
+    ) or provider
+    version = agent_version or first_string(
+        spec,
+        contract,
+        keys=("agent_version", "agent_cli_version", "cli_version"),
+    )
+    return {
+        "requested_model": requested_model,
+        "provider": selected_provider,
+        "agent_name": first_string(spec, contract, keys=("agent_name",)),
+        "agent_version": version,
+        "capability_snapshot_id": first_string(
+            spec,
+            contract,
+            keys=("capability_snapshot_id",),
+        ),
+        "model_capability_id": first_string(
+            spec,
+            contract,
+            keys=("model_capability_id", "capability_id"),
+        ),
+        "agent_capability_id": first_string(
+            spec,
+            contract,
+            keys=("agent_capability_id",),
+        ),
+    }
+
+
 class ProcessExecutor:
     def __init__(self, artifacts: ArtifactStore):
         self.artifacts = artifacts
@@ -1402,6 +1469,7 @@ class CodexExecutor(ProcessExecutor):
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
+        metadata = _execution_receipt_metadata(request, provider="codex")
         qualified, reason = self.qualification()
         verifier = bool(request.spec.get("verifier"))
         if not qualified:
@@ -1409,6 +1477,7 @@ class CodexExecutor(ProcessExecutor):
                 status="blocked", summary=reason,
                 result_kind="verifier" if verifier else "worker",
                 verdict="blocked" if verifier else None,
+                **metadata,
                 **governance_receipt_fields(request.contract),
             )
         prompt = self._prompt(request)
@@ -1442,6 +1511,7 @@ class CodexExecutor(ProcessExecutor):
                     summary="Codex turn timed out; terminal state is unknown",
                     actual_model=request.spec["model"],
                     result_kind="verifier" if verifier else "worker",
+                    **metadata,
                     **governance_receipt_fields(request.contract),
                 )
             structured = None
@@ -1520,6 +1590,7 @@ class CodexExecutor(ProcessExecutor):
             checks=tuple(structured.get("checks", ())) if isinstance(structured, dict) else (),
             evidence=verifier_evidence,
             verdict=verifier_verdict,
+            **metadata,
             **governance_receipt_fields(request.contract),
         )
 
@@ -1736,11 +1807,13 @@ class ClaudeExecutor(ProcessExecutor):
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
+        metadata = _execution_receipt_metadata(request, provider="claude")
         if request.spec.get("verifier"):
             return NodeResult(
                 status="blocked",
                 summary="Claude executor is worker-only; verifier must be a Codex Sol node",
                 result_kind="worker",
+                **metadata,
                 **governance_receipt_fields(request.contract),
             )
         archify_role, archify_required, _ = _archify_context(request)
@@ -1750,6 +1823,7 @@ class ClaudeExecutor(ProcessExecutor):
                 status="blocked",
                 summary=reason,
                 result_kind="worker",
+                **metadata,
                 **governance_receipt_fields(request.contract),
             )
         schema = self._worker_schema(archify_required=archify_required)
@@ -1774,6 +1848,7 @@ class ClaudeExecutor(ProcessExecutor):
                 status="indeterminate",
                 summary="Claude turn timed out; terminal state is unknown",
                 result_kind="worker",
+                **metadata,
                 **governance_receipt_fields(request.contract),
             )
         if result.stdout.strip():
@@ -1800,6 +1875,7 @@ class ClaudeExecutor(ProcessExecutor):
                 exit_code=result.returncode,
                 retryable=False,
                 result_kind="worker",
+                **metadata,
                 **governance_receipt_fields(request.contract),
             )
         assert worker_result is not None
@@ -1840,6 +1916,7 @@ class ClaudeExecutor(ProcessExecutor):
             result_kind="worker",
             changed_paths=tuple(worker_result["changed_paths"]),
             checks=tuple(worker_result["checks"]),
+            **metadata,
             **governance_receipt_fields(request.contract),
         )
 

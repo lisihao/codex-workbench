@@ -3,7 +3,7 @@
   "diagram_type": "dataflow",
   "meta": {
     "title": "Codex Workbench 使用方式与数据流",
-    "subtitle": "MacBook 是入口，Mac mini 是唯一 Authority，Evidence 是完成条件",
+    "subtitle": "MacBook 是完整入口，手机可随时遥控，Mac mini 是唯一 Authority，Evidence 是完成条件",
     "output": "docs/codex-workbench-usage-dataflow.html",
     "locale": "zh-CN",
     "viewBox": [1000, 900],
@@ -15,7 +15,7 @@
         "id": "how_to_use",
         "label": "怎么使用",
         "focus": ["codex_session", "wb_plugin", "context_bundle", "secure_transport", "authority_planner"],
-        "note": "在任意新会话或已有会话输入 wb，Workbench 会打包受控上下文并连接 Mac mini。"
+        "note": "在 MacBook 或手机 Remote 的任意新会话或已有会话输入 wb，Workbench 会打包受控上下文并连接 Mac mini。"
       },
       {
         "id": "execution_loop",
@@ -42,7 +42,7 @@
     }
   },
   "stages": [
-    { "label": "MacBook · 使用入口" },
+    { "label": "MacBook / 手机 · Codex 入口" },
     { "label": "受控传输" },
     { "label": "Mac mini · 唯一 Authority" },
     { "label": "验收回传" }
@@ -51,8 +51,8 @@
     {
       "id": "codex_session",
       "type": "frontend",
-      "label": "Codex 会话",
-      "sublabel": "新会话或已有会话",
+      "label": "Codex 会话 / Remote",
+      "sublabel": "MacBook 或手机，新会话或已有会话",
       "stage": 0,
       "row": 0,
       "tag": "输入 wb"
@@ -88,8 +88,8 @@
     {
       "id": "authority_planner",
       "type": "backend",
-      "label": "Authority + Sol 规划器",
-      "sublabel": "导入上下文，生成 TaskContract + DAG",
+      "label": "能力目录 + Sol 规划器",
+      "sublabel": "固定 catalog，生成 TaskContract + 质量优先 DAG",
       "stage": 2,
       "row": 0,
       "width": 206,
@@ -99,7 +99,7 @@
       "id": "worker_pool",
       "type": "messagebus",
       "label": "并行 Worker 池",
-      "sublabel": "Spark · Luna max · Terra · Claude",
+      "sublabel": "Spark · Luna max · Terra · Sonnet/Fable/Opus",
       "stage": 2,
       "row": 1,
       "width": 176,
@@ -138,7 +138,7 @@
     {
       "id": "cockpit_return",
       "type": "frontend",
-      "label": "Codex 驾驶舱回显",
+      "label": "Codex 驾驶舱 / 手机回显",
       "sublabel": "进度、结果、Evidence",
       "stage": 3,
       "row": 2,

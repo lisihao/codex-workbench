@@ -46,3 +46,9 @@ retries synchronization.
 
 Some Codex versions reject custom top-level slash commands before hooks run, so
 `wb` is the portable shortcut; `/WB` is not required.
+
+The same activation works in a Codex conversation reached through the native
+mobile Remote page when Remote Control is enabled on the Mac mini. Run
+`codex-workbench mobile status`, inspect `mobile enable --dry-run`, then use
+`mobile pair` to obtain the attended native pairing command. The plugin never
+captures or stores the short-lived pairing code.

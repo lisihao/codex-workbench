@@ -586,6 +586,57 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(manually_retried["spec"]["executor"], "codex")
         self.assertEqual(manually_retried["spec"]["model"], "gpt-5.6-sol")
 
+    def test_routing_v3_retry_keeps_the_pinned_worker_model(self) -> None:
+        contract = TaskContract(
+            task_id="v3-pinned-retry",
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="preserve the admitted v3 capability across retries",
+            allowed_scope=("src",),
+            retry_limit=1,
+            capability_snapshot_id="catalog-20260902-001",
+            capability_digest="a" * 64,
+        )
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "worker",
+            "codex",
+            "gpt-5.6-luna",
+            "bounded work",
+            read_scopes=("src",),
+            capability_snapshot_id=contract.capability_snapshot_id,
+            capability_digest=contract.capability_digest,
+            model_capability_id="codex:gpt-5.6-luna",
+            agent_capability_id="codex:0.149.1",
+            routing_policy_version="model-routing-v3",
+        )
+        self.store.create_task(
+            contract,
+            verified([worker], contract.task_id),
+            "v3-pinned-retry-create",
+        )
+        self.store.queue_task(contract.task_id)
+        first = self.store.claim_ready_node("worker-1", self.epoch)
+        self.assertEqual(first["spec"]["model"], "gpt-5.6-luna")
+        self.store.settle_claimed(
+            first,
+            NodeResult(
+                "failed",
+                "transient failure",
+                actual_model="gpt-5.6-luna",
+                retryable=True,
+                result_kind="worker",
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+
+        second = self.store.claim_ready_node("worker-2", self.epoch)
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["spec"]["model"], "gpt-5.6-luna")
+        self.assertEqual(second["spec"]["model_capability_id"], "codex:gpt-5.6-luna")
+
     def test_archify_validate_and_migrate_persist_host_command_validation_evidence(self) -> None:
         for command in ("validate", "migrate"):
             with self.subTest(command=command):

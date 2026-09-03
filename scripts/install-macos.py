@@ -15,9 +15,13 @@ import uuid
 
 LABEL = "com.lisihao.codex-workbench"
 QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
+CAPABILITY_LABEL = "com.lisihao.codex-workbench-capabilities"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_AUTHORITY_MAX_WORKERS = 8
+DEFAULT_CAPABILITY_REFRESH_SECONDS = 6 * 60 * 60
+CAPABILITY_REGISTRY_SCHEMA_VERSION = 1
+CAPABILITY_REGISTRY_POLICY = "model-routing-v3"
 RESEARCH_SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "UrlVerificationProtocol.md",
@@ -379,6 +383,7 @@ def preflight_authority_plists(
     process_home: Path,
     quota_snapshot_file: Path,
     claude_binary: Path | None,
+    capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
 ) -> None:
     template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
     rendered = (
@@ -401,10 +406,143 @@ def preflight_authority_plists(
             .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
         )
         plistlib.loads(quota_rendered.encode())
+    capability_template = (source / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
+    capability_rendered = render_capability_plist(
+        capability_template,
+        app_root=app_root,
+        state_root=state_root,
+        codex_binary=codex_binary,
+        codex_home=codex_home,
+        process_home=process_home,
+        quota_snapshot_file=quota_snapshot_file,
+        claude_binary=claude_binary,
+        refresh_seconds=capability_refresh_seconds,
+    )
+    plistlib.loads(capability_rendered.encode())
 
 
 def authority_max_workers(config: dict[str, object]) -> int:
     return max(DEFAULT_AUTHORITY_MAX_WORKERS, int(config.get("max_workers", 4)))
+
+
+def capability_refresh_interval(config: dict[str, object]) -> int:
+    value = int(config.get("capability_refresh_seconds", DEFAULT_CAPABILITY_REFRESH_SECONDS))
+    if value <= 0:
+        raise SystemExit("capability_refresh_seconds must be greater than zero")
+    return value
+
+
+def render_capability_plist(
+    template: str,
+    *,
+    app_root: Path,
+    state_root: Path,
+    codex_binary: Path,
+    codex_home: Path,
+    process_home: Path,
+    quota_snapshot_file: Path,
+    claude_binary: Path | None,
+    refresh_seconds: int,
+) -> str:
+    return (
+        template.replace("__APP_ROOT__", str(app_root))
+        .replace("__STATE_ROOT__", str(state_root))
+        .replace("__USER_HOME__", str(Path.home()))
+        .replace("__CODEX_BINARY__", str(codex_binary))
+        .replace("__CODEX_HOME__", str(codex_home))
+        .replace("__PROCESS_HOME__", str(process_home))
+        .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+        .replace("__CLAUDE_BINARY__", str(claude_binary) if claude_binary else "")
+        .replace("__CAPABILITY_REFRESH_SECONDS__", str(refresh_seconds))
+    )
+
+
+def capability_refresh_environment(
+    *,
+    app_root: Path,
+    state_root: Path,
+    codex_binary: Path,
+    codex_home: Path,
+    process_home: Path,
+    quota_snapshot_file: Path,
+    claude_binary: Path | None,
+) -> dict[str, str]:
+    """Build the sidecar's small, credential-free process environment."""
+
+    environment = {
+        "HOME": str(Path.home()),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONPATH": str(app_root / "src"),
+        "PYTHONUNBUFFERED": "1",
+        "CODEX_WORKBENCH_HOME": str(state_root),
+        "CODEX_WORKBENCH_CODEX": str(codex_binary),
+        "CODEX_HOME": str(codex_home),
+        "CODEX_WORKBENCH_PROCESS_HOME": str(process_home),
+        "CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE": str(quota_snapshot_file),
+    }
+    if claude_binary is not None:
+        environment["CODEX_WORKBENCH_CLAUDE"] = str(claude_binary)
+    return environment
+
+
+def initial_capability_refresh(
+    *,
+    app_root: Path,
+    state_root: Path,
+    codex_binary: Path,
+    codex_home: Path,
+    process_home: Path,
+    quota_snapshot_file: Path,
+    claude_binary: Path | None,
+) -> None:
+    """Create the first safe catalog before any Authority service is started."""
+
+    runtime = app_root / "scripts" / "python-runtime"
+    command = (
+        str(runtime),
+        "-m",
+        "codex_workbench",
+        "--home",
+        str(state_root),
+        "capabilities",
+        "refresh",
+        "--bundled",
+        "--activate-safe",
+    )
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=capability_refresh_environment(
+                app_root=app_root,
+                state_root=state_root,
+                codex_binary=codex_binary,
+                codex_home=codex_home,
+                process_home=process_home,
+                quota_snapshot_file=quota_snapshot_file,
+                claude_binary=claude_binary,
+            ),
+        )
+    except OSError as error:
+        raise SystemExit(f"initial capability catalog refresh could not start: {error}") from error
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+    raise SystemExit(f"initial capability catalog refresh failed: {detail}")
+
+
+def restart_launch_agent(domain: str, label: str, plist_path: Path) -> None:
+    """Replace, start, and confirm one declared LaunchAgent is loaded."""
+
+    run("launchctl", "bootout", domain, str(plist_path), check=False)
+    run("launchctl", "bootstrap", domain, str(plist_path))
+    run("launchctl", "enable", f"{domain}/{label}")
+    run("launchctl", "kickstart", "-k", f"{domain}/{label}")
+    health = run("launchctl", "print", f"{domain}/{label}", check=False)
+    if health.returncode != 0:
+        raise SystemExit(f"LaunchAgent health check failed: {label}")
 
 
 def main() -> int:
@@ -451,10 +589,12 @@ def main() -> int:
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / f"{LABEL}.plist"
     quota_plist_path = launch_agents / f"{QUOTA_LABEL}.plist"
+    capability_plist_path = launch_agents / f"{CAPABILITY_LABEL}.plist"
     logs = state_root / "logs"
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
     process_home = state_root / "codex-process-home"
+    capability_registry_root = state_root / "capabilities"
     quota_snapshot_file = (
         absolute_path(Path(args.quota_snapshot_file))
         if args.quota_snapshot_file
@@ -465,10 +605,12 @@ def main() -> int:
     assert_directory_target(runtime_root, "runtime root")
     assert_directory_target(codex_home, "Codex home")
     assert_directory_target(process_home, "process home")
+    assert_directory_target(capability_registry_root, "capability registry")
     assert_directory_target(launch_agents, "LaunchAgents root")
     assert_file_target(config_file := state_root / "config.json", "config file")
     assert_file_target(plist_path, "service LaunchAgent")
     assert_file_target(quota_plist_path, "quota LaunchAgent")
+    assert_file_target(capability_plist_path, "capability LaunchAgent")
     assert_file_target(quota_snapshot_file, "quota snapshot")
     backup_root = state_root / "previous-app"
     if app_root.is_symlink():
@@ -495,6 +637,7 @@ def main() -> int:
     config_raw = json.loads(config_file.read_text()) if config_file.exists() else {}
     if not isinstance(config_raw, dict):
         raise SystemExit(f"config file must contain a JSON object: {config_file}")
+    capability_refresh_seconds = capability_refresh_interval(config_raw)
     authority_machine_id = macos_machine_id()
     research_source = validate_research_skill_source(Path(args.research_skill_source))
     research_destination = process_home / ".agents" / "skills" / "research"
@@ -567,6 +710,7 @@ def main() -> int:
         process_home,
         quota_snapshot_file,
         claude_binary,
+        capability_refresh_seconds,
     )
     preflight_global_agent_targets(Path.home())
     preflight_managed_agent_skills(source)
@@ -582,11 +726,15 @@ def main() -> int:
         print(f"plan: Research skill={research_destination}")
         print(f"plan: service={plist_path}")
         print(f"plan: quota={quota_plist_path} ({'enabled' if claude_binary else 'skipped: Claude CLI unavailable'})")
+        print(
+            f"plan: capabilities={capability_plist_path} "
+            f"(RunAtLoad + every {capability_refresh_seconds}s; passive bundled refresh before services)"
+        )
         print("plan: managed Code-as-Harness and Archify projections for Codex and Claude Code")
         return 0
 
     domain = f"gui/{run('id', '-u').stdout.strip()}"
-    service_labels = (LABEL, QUOTA_LABEL)
+    service_labels = (LABEL, QUOTA_LABEL, CAPABILITY_LABEL)
     service_was_loaded = {
         label: run("launchctl", "print", f"{domain}/{label}", check=False).returncode == 0
         for label in service_labels
@@ -599,9 +747,11 @@ def main() -> int:
         (config_file, "config file"),
         (runtime_root, "runtime root"),
         (process_home / ".agents" / "skills" / "research", "Research skill"),
+        (capability_registry_root, "capability registry"),
         (auth_link, "Codex auth link"),
         (plist_path, "service LaunchAgent"),
         (quota_plist_path, "quota LaunchAgent"),
+        (capability_plist_path, "capability LaunchAgent"),
         (quota_snapshot_file, "quota snapshot"),
         (Path.home() / ".codex" / "skills" / "code-as-harness", "Codex Code-as-Harness skill"),
         (Path.home() / ".codex" / "AGENTS.md", "Codex policy"),
@@ -633,6 +783,7 @@ def main() -> int:
                     int(config_raw.get("quota_refresh_seconds", 60)),
                     60,
                 ),
+                "capability_refresh_seconds": capability_refresh_seconds,
             }
         )
         config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
@@ -659,6 +810,14 @@ def main() -> int:
                     "tag": tag,
                     "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "codex_version": codex_version,
+                    "capabilities": {
+                        "schema_version": CAPABILITY_REGISTRY_SCHEMA_VERSION,
+                        "policy": CAPABILITY_REGISTRY_POLICY,
+                        "refresh_interval_seconds": capability_refresh_seconds,
+                        "sidecar_label": CAPABILITY_LABEL,
+                        "activation": "safe-only",
+                        "initial_refresh": "bundled-safe",
+                    },
                     "research_skill": {
                         "name": "Research",
                         "policy": "research-skill/v2",
@@ -743,20 +902,41 @@ def main() -> int:
             quota_plist_path.write_text(quota_rendered)
             quota_plist_path.chmod(0o600)
 
+        capability_template = (source / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
+        capability_rendered = render_capability_plist(
+            capability_template,
+            app_root=app_root,
+            state_root=state_root,
+            codex_binary=codex_binary,
+            codex_home=codex_home,
+            process_home=process_home,
+            quota_snapshot_file=quota_snapshot_file,
+            claude_binary=claude_binary,
+            refresh_seconds=capability_refresh_seconds,
+        )
+        plistlib.loads(capability_rendered.encode())
+        capability_plist_path.write_text(capability_rendered)
+        capability_plist_path.chmod(0o600)
+
+        initial_capability_refresh(
+            app_root=app_root,
+            state_root=state_root,
+            codex_binary=codex_binary,
+            codex_home=codex_home,
+            process_home=process_home,
+            quota_snapshot_file=quota_snapshot_file,
+            claude_binary=claude_binary,
+        )
+
         services_touched = True
-        run("launchctl", "bootout", domain, str(plist_path), check=False)
-        run("launchctl", "bootstrap", domain, str(plist_path))
-        run("launchctl", "enable", f"{domain}/{LABEL}")
-        run("launchctl", "kickstart", "-k", f"{domain}/{LABEL}")
+        restart_launch_agent(domain, LABEL, plist_path)
         if claude_binary is not None and quota_rendered is not None:
-            run("launchctl", "bootout", domain, str(quota_plist_path), check=False)
-            run("launchctl", "bootstrap", domain, str(quota_plist_path))
-            run("launchctl", "enable", f"{domain}/{QUOTA_LABEL}")
-            run("launchctl", "kickstart", "-k", f"{domain}/{QUOTA_LABEL}")
+            restart_launch_agent(domain, QUOTA_LABEL, quota_plist_path)
         else:
             run("launchctl", "bootout", domain, str(quota_plist_path), check=False)
             if quota_plist_path.exists() or quota_plist_path.is_symlink():
                 remove_path(quota_plist_path)
+        restart_launch_agent(domain, CAPABILITY_LABEL, capability_plist_path)
         if tailscale_socket:
             configure_tailscale_serve(
                 tailscale,
@@ -767,7 +947,11 @@ def main() -> int:
     except BaseException as error:
         rollback_errors: list[str] = []
         if services_touched:
-            for label, path in ((LABEL, plist_path), (QUOTA_LABEL, quota_plist_path)):
+            for label, path in (
+                (LABEL, plist_path),
+                (QUOTA_LABEL, quota_plist_path),
+                (CAPABILITY_LABEL, capability_plist_path),
+            ):
                 try:
                     run("launchctl", "bootout", domain, str(path), check=False)
                 except BaseException as rollback_error:
@@ -777,7 +961,11 @@ def main() -> int:
         except BaseException as rollback_error:
             rollback_errors.append(str(rollback_error))
         if services_touched:
-            for label, path in ((LABEL, plist_path), (QUOTA_LABEL, quota_plist_path)):
+            for label, path in (
+                (LABEL, plist_path),
+                (QUOTA_LABEL, quota_plist_path),
+                (CAPABILITY_LABEL, capability_plist_path),
+            ):
                 if not service_was_loaded[label] or not path.is_file():
                     continue
                 try:

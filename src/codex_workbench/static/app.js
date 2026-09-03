@@ -81,6 +81,32 @@ function renderAcceptance(check) {
   return `<article class="acceptance-check"><span class="pill ${escapeHtml(check.status)}">${escapeHtml(check.id)} · ${escapeHtml(check.status)}</span><div><strong>${escapeHtml(check.requirement)}</strong><p>${escapeHtml(check.evidence)}</p></div></article>`;
 }
 
+function renderCapabilityModel(model) {
+  const available = model?.status === "available";
+  const routable = available && model?.routable === true;
+  const tone = routable ? "ok" : model?.status === "observed" ? "pending" : "deferred";
+  const state = routable ? "available · routable" : model?.status === "observed" ? "observed only" : (model?.status || "N/A");
+  const roles = Array.isArray(model?.roles) && model.roles.length ? model.roles.join(" · ") : "N/A";
+  const tasks = Array.isArray(model?.task_types) && model.task_types.length ? model.task_types.join(" · ") : "N/A";
+  const quality = model?.quality?.floor || "unknown";
+  const cost = model?.cost?.relative || "unknown";
+  const latency = model?.latency?.class || "unknown";
+  const effort = model?.reasoning?.preferred_effort || "N/A";
+  return `<article class="capability-model"><div class="capability-model-head"><span class="pill ${tone}">${escapeHtml(state)}</span><strong>${escapeHtml(model?.provider || "N/A")} / ${escapeHtml(model?.model_id || "N/A")}</strong></div><p>family ${escapeHtml(model?.model_family || "N/A")} · CLI ${escapeHtml(model?.agent_cli_version || "N/A")}</p><p>角色：${escapeHtml(roles)}</p><p>任务：${escapeHtml(tasks)}</p><p>策略：quality ${escapeHtml(quality)} · cost ${escapeHtml(cost)} · latency ${escapeHtml(latency)} · effort ${escapeHtml(effort)}</p><p>来源：${escapeHtml(model?.policy_origin || "observed-only")}</p></article>`;
+}
+
+function renderCapabilities(registry) {
+  const active = registry?.active;
+  if (!active) {
+    const detail = registry?.error || "尚未激活能力目录";
+    return `<p class="muted">${escapeHtml(detail)}；请运行 capabilities refresh。</p>`;
+  }
+  const agents = Object.entries(active.agents || {}).map(([provider, agent]) => `<span class="capability-agent"><strong>${escapeHtml(provider)}</strong> · ${escapeHtml(agent?.status || "N/A")} · CLI ${escapeHtml(agent?.cli_version || "N/A")}</span>`).join("");
+  const models = Array.isArray(active.models) ? active.models : [];
+  const routable = models.filter((model) => model?.status === "available" && model?.routable === true).length;
+  return `<div class="capability-meta"><span>catalog ${escapeHtml(active.catalog_id || registry.active_generation_id || "N/A")}</span><span>routable ${routable}/${models.length}</span></div><div class="capability-agents">${agents || '<span class="muted">Agent 版本 N/A</span>'}</div><div class="capability-models">${models.length ? models.map(renderCapabilityModel).join("") : '<p class="muted">没有模型观测</p>'}</div>`;
+}
+
 function renderApproval(approval) {
   const request = approval.request || {};
   const buttons = authenticated
@@ -119,6 +145,7 @@ async function refreshSnapshot() {
   const quota = data.quota;
   const quotaPolicy = data.quota_policy;
   const quotaProductivity = data.quota_productivity;
+  const capabilityRegistry = data.capability_registry || {};
   const latestFiveHourProductivity = [...(quotaProductivity?.windows || [])]
     .reverse()
     .find((window) => window.kind === "five-hour" && window.status === "ok");
@@ -151,6 +178,13 @@ async function refreshSnapshot() {
     metric("待处理审批", approvals.length, approvals.length ? "error" : "ok"),
     metric("事件游标", data.health.cursor),
   ].join("");
+  const capabilityActive = capabilityRegistry.active;
+  const capabilityModels = Array.isArray(capabilityActive?.models) ? capabilityActive.models : [];
+  const capabilityRoutable = capabilityModels.filter((model) => model?.status === "available" && model?.routable === true).length;
+  document.querySelector("#capability-summary").textContent = capabilityActive
+    ? `${capabilityRoutable}/${capabilityModels.length} routable · ${capabilityActive.catalog_id || "N/A"}`
+    : (capabilityRegistry.error || "未激活");
+  document.querySelector("#capabilities").innerHTML = renderCapabilities(capabilityRegistry);
   document.querySelector("#approval-summary").textContent = approvals.length ? `${approvals.length} pending` : "0 pending";
   document.querySelector("#approvals").innerHTML = approvals.length ? approvals.map(renderApproval).join("") : '<p class="muted">当前没有待处理审批</p>';
   document.querySelector("#alerts").innerHTML = alerts.length ? alerts.slice(-8).reverse().map(renderAlert).join("") : '<p class="muted">当前没有重要提醒</p>';

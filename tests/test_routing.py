@@ -71,6 +71,98 @@ def yellow_quota() -> QuotaSnapshot:
     )
 
 
+def v3_catalog() -> dict[str, object]:
+    def record(
+        provider: str,
+        model_id: str,
+        *,
+        roles: tuple[str, ...],
+        task_types: tuple[str, ...],
+        quality: str,
+        cost: str,
+        latency: str,
+        weight: int,
+    ) -> dict[str, object]:
+        return {
+            "provider": provider,
+            "model_id": model_id,
+            "capability_id": f"{provider}:{model_id}",
+            "status": "available",
+            "routable": True,
+            "roles": list(roles),
+            "task_types": list(task_types),
+            "quality": {"floor": quality},
+            "cost": {"relative": cost},
+            "latency": {"class": latency},
+            "concurrency": {"weight": weight, "class": "high"},
+            "reasoning": {"preferred_effort": "xhigh" if "spark" in model_id else "max"},
+            "features": {"structured_output": True},
+        }
+
+    return {
+        "catalog_id": "catalog-routing-v3",
+        "digest": "a" * 64,
+        "agents": {
+            "codex": {"status": "available", "cli_version": "0.149.1"},
+            "claude": {"status": "available", "cli_version": "2.1.239"},
+        },
+        "models": [
+            record(
+                "codex", "gpt-5.6-sol",
+                roles=("planner", "verifier", "architecture", "research"),
+                task_types=("architecture", "review", "exploration"),
+                quality="frontier", cost="highest", latency="deliberate", weight=3,
+            ),
+            record(
+                "codex", "gpt-5.3-codex-spark",
+                roles=("worker",),
+                task_types=("implementation", "debugging", "tests", "docs", "exploration"),
+                quality="focused-mechanical", cost="lowest", latency="fastest", weight=1,
+            ),
+            record(
+                "codex", "gpt-5.6-luna",
+                roles=("worker",),
+                task_types=("implementation", "debugging", "tests", "docs", "exploration"),
+                quality="production", cost="efficient", latency="fast", weight=1,
+            ),
+            record(
+                "codex", "gpt-5.6-terra",
+                roles=("worker",),
+                task_types=("implementation", "debugging", "tests", "docs", "exploration"),
+                quality="production", cost="balanced", latency="balanced", weight=2,
+            ),
+            record(
+                "claude", "sonnet",
+                roles=("worker", "reviewer"),
+                task_types=("implementation", "debugging", "tests", "docs", "exploration", "review"),
+                quality="production", cost="balanced", latency="fast", weight=1,
+            ),
+            record(
+                "claude", "opus",
+                roles=("architecture_challenge", "reviewer", "research"),
+                task_types=("architecture", "review", "exploration"),
+                quality="frontier", cost="high", latency="deliberate", weight=2,
+            ),
+            record(
+                "claude", "fable",
+                roles=("architecture_challenge", "reviewer", "research", "creative"),
+                task_types=("architecture", "review", "creative", "exploration"),
+                quality="frontier", cost="high", latency="deliberate", weight=2,
+            ),
+        ],
+    }
+
+
+def v3_contract(**changes: object) -> TaskContract:
+    catalog = v3_catalog()
+    values: dict[str, object] = {
+        "capability_snapshot_id": catalog["catalog_id"],
+        "capability_digest": catalog["digest"],
+    }
+    values.update(changes)
+    return make_contract(**values)
+
+
 class RoutingTests(unittest.TestCase):
     def test_old_contract_input_gets_versioned_default_strategy(self) -> None:
         contract = make_contract()
@@ -286,6 +378,123 @@ class RoutingTests(unittest.TestCase):
             active_models=("opus",),
         )
         self.assertEqual((decision.executor, decision.model), ("claude", "sonnet"))
+
+    def test_v3_pinned_catalog_keeps_sol_for_planner_and_verifier(self) -> None:
+        catalog = v3_catalog()
+        contract = v3_contract()
+
+        for role in ("planner", "verifier"):
+            with self.subTest(role=role):
+                decision = route_task(
+                    contract,
+                    role=role,
+                    capability_snapshot=catalog,
+                )
+                self.assertEqual((decision.executor, decision.model), ("codex", "gpt-5.6-sol"))
+                self.assertEqual(decision.capability_snapshot_id, catalog["catalog_id"])
+                self.assertEqual(decision.capability_digest, catalog["digest"])
+                self.assertEqual(decision.model_capability_id, "codex:gpt-5.6-sol")
+                self.assertEqual(decision.agent_capability_id, "codex-cli:0.149.1")
+                self.assertEqual(decision.routing_policy_version, "model-routing-v3")
+
+    def test_v3_standard_worker_prefers_sonnet_then_luna_fallback(self) -> None:
+        catalog = v3_catalog()
+        standard = v3_contract(task_type="implementation", complexity="standard")
+        sonnet = route_task(
+            standard,
+            claude_models_available=("sonnet",),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((sonnet.executor, sonnet.model), ("claude", "sonnet"))
+
+        tests = v3_contract(task_type="tests", complexity="standard")
+        luna = route_task(
+            tests,
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((luna.executor, luna.model), ("codex", "gpt-5.6-luna"))
+        self.assertEqual(luna.model_profile, "luna_worker")
+        self.assertEqual(luna.model_reasoning_effort, "max")
+
+    def test_v3_uses_terra_for_high_independent_slice_and_spark_only_for_mechanical_lane(self) -> None:
+        catalog = v3_catalog()
+        terra = route_task(
+            v3_contract(task_type="implementation", complexity="high"),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((terra.executor, terra.model), ("codex", "gpt-5.6-terra"))
+
+        spark = route_task(
+            v3_contract(
+                task_type="tests",
+                complexity="low",
+                acceptance_commands=("scripts/python-runtime -m unittest",),
+            ),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((spark.executor, spark.model), ("codex", "gpt-5.3-codex-spark"))
+        self.assertEqual(spark.model_profile, "spark_worker")
+
+    def test_v3_challenge_prefers_fable_or_opus_and_quota_gate_uses_sol_control(self) -> None:
+        catalog = v3_catalog()
+        architecture = route_task(
+            v3_contract(task_type="architecture", complexity="high"),
+            claude_models_available=("fable", "opus"),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((architecture.role, architecture.executor, architecture.model), ("challenge", "claude", "fable"))
+
+        review = route_task(
+            v3_contract(task_type="review", complexity="high"),
+            claude_models_available=("fable", "opus", "sonnet"),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((review.role, review.executor, review.model), ("challenge", "claude", "opus"))
+
+        protected = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=20,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            weekly_fable_remaining=80,
+            **compatible_provenance(),
+        )
+        control = route_task(
+            v3_contract(task_type="architecture", complexity="high"),
+            claude_models_available=("fable", "opus"),
+            quota_snapshot=protected,
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((control.role, control.executor, control.model), ("control", "codex", "gpt-5.6-sol"))
+        self.assertIn("quota admission", control.reason)
+
+        codex_only = route_task(
+            v3_contract(
+                task_type="review",
+                complexity="high",
+                claude_allowed=False,
+            ),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual((codex_only.role, codex_only.executor, codex_only.model), ("control", "codex", "gpt-5.6-sol"))
+        self.assertIn("disabled by the immutable task contract", codex_only.reason)
+
+    def test_v3_fails_loud_when_no_legal_worker_exists(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no legal worker"):
+            route_task(
+                v3_contract(task_type="creative", complexity="high"),
+                quota_snapshot=healthy_quota(),
+                capability_snapshot=v3_catalog(),
+            )
 
 
 if __name__ == "__main__":

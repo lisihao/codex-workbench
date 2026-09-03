@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
+from typing import Any, Mapping
 
 from .artifacts import ArtifactStore
+from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .config import WorkbenchConfig
 from .executors import ClaudeExecutor
 from .governance import VerificationTier, governance_status
@@ -19,6 +21,76 @@ from .model import (
 from .planner import CodexPlanner
 from .research import route_research
 from .store import WorkbenchStore
+
+
+def _catalog_claude_families(catalog: Mapping[str, Any] | None) -> frozenset[str]:
+    if catalog is None:
+        return frozenset(("opus", "sonnet", "fable"))
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return frozenset()
+    families: set[str] = set()
+    for raw in models:
+        if not isinstance(raw, Mapping) or str(raw.get("provider", "")).lower() != "claude":
+            continue
+        if raw.get("status") != "available" or raw.get("routable") is not True:
+            continue
+        model = str(raw.get("model_id", raw.get("model", ""))).lower()
+        for family in ("opus", "sonnet", "fable"):
+            if family in model:
+                families.add(family)
+    return frozenset(families)
+
+
+def _capability_catalog_for_submission(
+    config: WorkbenchConfig,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Load the active catalog or passively establish it for a new task.
+
+    This is deliberately before planning and deliberately metadata-only.  The
+    registry probes only ``--version``/``--help``/Codex model metadata; it does
+    not log in, send a prompt, or consume model quota.  A failed first probe is
+    visible in the submission receipt and keeps the pre-existing v2 path.
+    """
+
+    registry = CapabilityRegistry(
+        config.state_root,
+        codex_binary=os.environ.get("CODEX_WORKBENCH_CODEX") or "codex",
+        claude_binary=os.environ.get("CODEX_WORKBENCH_CLAUDE") or "claude",
+    )
+    active: dict[str, Any] | None = None
+    active_error: str | None = None
+    refresh: dict[str, Any] | None = None
+    try:
+        active = registry.active()
+    except CapabilityCatalogError as error:
+        active_error = str(error)
+    if active is None and active_error is None:
+        refresh = registry.refresh(activate_safe=True)
+        candidate = refresh.get("catalog") if isinstance(refresh, Mapping) else None
+        if refresh.get("ok") is True and isinstance(candidate, Mapping):
+            active = dict(candidate)
+        else:
+            active_error = str(refresh.get("error", "passive capability refresh did not produce an active catalog"))
+    if active is None:
+        return None, {
+            "mode": "legacy-v2",
+            "status": "unavailable",
+            "active_catalog_id": None,
+            "capability_digest": None,
+            "refresh_attempted": refresh is not None,
+            "refresh_ok": bool(refresh and refresh.get("ok") is True),
+            "reason": active_error or "no active capability catalog",
+        }
+    return active, {
+        "mode": "model-routing-v3",
+        "status": "active",
+        "active_catalog_id": active.get("catalog_id"),
+        "capability_digest": active.get("digest"),
+        "refresh_attempted": refresh is not None,
+        "refresh_ok": bool(refresh is None or refresh.get("ok") is True),
+        "probe_errors": list(active.get("probe_errors", ())),
+    }
 
 
 def submit_natural_language_request(
@@ -75,6 +147,7 @@ def submit_natural_language_request(
         complexity = selected_strategy.complexity
         parallelizable = selected_strategy.parallelizable
         claude_allowed = selected_strategy.claude_allowed
+    capability_catalog, capability_registry = _capability_catalog_for_submission(config)
     contract = TaskContract(
         task_id=resolved_task_id,
         repository=str(resolved_repository),
@@ -99,13 +172,25 @@ def submit_natural_language_request(
         verification_tier=verification_tier,
         source_thread_id=source_thread_id,
         context_bundle_ref=context_bundle_ref,
+        capability_snapshot_id=(
+            str(capability_catalog["catalog_id"])
+            if capability_catalog is not None
+            else None
+        ),
+        capability_digest=(
+            str(capability_catalog["digest"])
+            if capability_catalog is not None
+            else None
+        ),
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
     quota = store.latest_quota()
+    catalog_claude_families = _catalog_claude_families(capability_catalog)
     quota_admitted_models = tuple(
         model
         for model in ("opus", "sonnet", "fable")
+        if model in catalog_claude_families
         if quota is not None
         and quota.dispatch_decision(
             model,
@@ -133,6 +218,8 @@ def submit_natural_language_request(
         quota_snapshot=quota,
         strategy=contract.strategy,
         context_excerpt=context_excerpt,
+        capability_snapshot=capability_catalog,
+        provider_capacity={"codex": {"capacity": config.max_workers, "active": 0}},
     )
     resolved_command_id = command_id or f"request-{uuid.uuid4()}"
     store.create_task(contract, nodes, resolved_command_id)
@@ -148,6 +235,12 @@ def submit_natural_language_request(
         "claude_dispatch_available": bool(claude_models_available),
         "claude_models_available": claude_models_available,
         "routing_strategy": contract.strategy.to_dict(),
+        "routing_policy": {
+            "version": "model-routing-v3" if capability_catalog is not None else contract.strategy.version,
+            "catalog_id": contract.capability_snapshot_id,
+            "capability_digest": contract.capability_digest,
+        },
+        "capability_registry": capability_registry,
         "research": route_research(contract).to_dict(),
         "governance": {
             **governance_status(),

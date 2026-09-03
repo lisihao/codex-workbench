@@ -124,6 +124,29 @@ class WBHookTests(unittest.TestCase):
             self.assertEqual(command[1], "authority-fixture")
             self.assertTrue(command[-1].endswith("context import --archive - --command-id command-1"))
 
+    def test_local_mcp_transport_replaces_final_mcp_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.toml").write_text(
+                "[mcp_servers.codex-workbench]\n"
+                'command = "/Applications/Codex Workbench.app/bin/codex-workbench"\n'
+                'args = ["mcp"]\n'
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": str(root)}):
+                command = wb_hook._mcp_ssh_command("command-local")
+            self.assertEqual(
+                command,
+                [
+                    "/Applications/Codex Workbench.app/bin/codex-workbench",
+                    "context",
+                    "import",
+                    "--archive",
+                    "-",
+                    "--command-id",
+                    "command-local",
+                ],
+            )
+
     def test_active_binding_is_reused_without_a_new_sync(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

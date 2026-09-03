@@ -117,8 +117,8 @@ class MCPTests(unittest.TestCase):
 
         report = json.loads(self.call("workbench_acceptance_report", {})["content"][0]["text"])
         self.assertFalse(report["complete"])
-        self.assertEqual(len(report["checks"]), 11)
-        self.assertEqual(report["backlog"][0]["id"], "A2")
+        self.assertEqual(len(report["checks"]), 12)
+        self.assertEqual(report["backlog"], [])
 
     def test_continue_session_appends_steering_without_terminating_active_task(self) -> None:
         context_ref = "sha256:" + "e" * 64 + ":tar.gz"

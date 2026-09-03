@@ -59,6 +59,8 @@ command -v codex
 codex --version
 codex plugin --help
 codex mcp --help
+codex app-server daemon --help
+codex remote-control --help
 ```
 
 如果 `codex plugin marketplace add`、`codex plugin add` 或 `codex mcp` 不在本机 CLI 帮助中，停止并升级或更换到兼容的 Codex CLI；不要手工编辑 Codex 配置来模拟这些能力。
@@ -180,8 +182,11 @@ export WB_AUTHORITY_BIN="$WB_STATE_ROOT/app/bin/codex-workbench"
 test -x "$WB_AUTHORITY_BIN"
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" doctor
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" harness health
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" capabilities status
 curl --ipv4 --fail --silent --show-error http://localhost:8766/health
 ```
+
+Authority 安装器会在主服务启动前，以已安装的 Codex runtime 生成一份 bundled capability catalog；只有存在明确的 Sol planner/verifier 和至少一个 Codex Worker 时才激活。随后 `com.lisihao.codex-workbench-capabilities` LaunchAgent 默认每 6 小时执行一次 live metadata refresh。刷新只调用 CLI 版本、帮助与模型目录命令，不登录、不发模型提示；未变化结果不会制造新 generation，失败会继续使用上一份完整目录。
 
 如果接入了 Claude，也只能查看被动快照；`unknown`、`unavailable` 或未登录都是正确的 fail-closed 结果，而不是让 AI 重试登录的理由。
 
@@ -312,6 +317,24 @@ codex plugin list --json
 
 完成信任后，在任意位于 Git 仓库中的新会话或已有会话输入小写 `wb`。只有看到 `WB_SYNC_RECEIPT` 且其状态为 `active`，才可声称该会话已由 Mac mini Workbench 接管。`$WB` 和从 `/skills` 选择 `WB` 是备选入口；不要依赖自定义顶层 slash command。
 
+### 3.5 可选：让手机 Codex App 连接 Authority
+
+手机接入使用 Codex 自带的 Remote Control，不建立第二套 Workbench 总账。先在 Mac mini 的有人值守终端执行只读状态与 dry-run：
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile enable --dry-run
+```
+
+确认计划只包含当前 Workbench marketplace、插件、MCP 与 Codex app-server 后，再启用：
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile enable
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile pair
+```
+
+`mobile pair` 不会捕获配对码，而会返回一条 `pairing_command`。由用户在同一 Mac mini 终端运行该原生命令，并在手机 Codex App 的 Remote 页输入短效码。不要把配对码复制进工单、聊天、日志或仓库。手机配对后新建/打开远程 Codex 会话并输入 `wb`；只有远端会话收到 `WB_SYNC_RECEIPT=active`，且手机真实完成一次查看和发送，才可把手机旅程标为通过。
+
 ## 4. 验证矩阵
 
 按下表逐项保留输出。任何 `error` 都应停止在对应层，不应通过启动模型、修改认证或重复安装来“试试”。
@@ -321,9 +344,11 @@ codex plugin list --json
 | 固定来源 | `git -C "$WB_ROOT" rev-parse HEAD`、`git status --porcelain` | 实际来源提交及工作树状态 | GitHub 权限、发布质量 |
 | Authority 预检 | `install-macos.py ... --dry-run` | 目标、Research Skill、Codex runtime、Tailscale socket 可被安装器接受 | 模型登录、Claude 余额、客户端连通性 |
 | Authority 健康 | `doctor`、`harness health`、`curl ...:8766/health` | 本地服务、治理投影、回环健康端点 | 任一真实模型回合或任务已验收 |
+| 能力目录 | `capabilities status/show/diff` | 当前激活 generation、模型/Agent 版本与静态策略 | 某模型在真实任务上的质量优于另一模型 |
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
 | 会话接管 | `WB_SYNC_RECEIPT` 的 `active` 状态 | Context Bundle 已被 Authority 持久绑定 | 任务已 accepted 或模型已调用 |
+| 手机 Remote | `mobile status`、用户执行 `pairing_command`、手机真机查看/发送 | 原生 Remote 配置与真实手机旅程 | 仅凭 dry-run 或 daemon running 不能声称已配对 |
 | Claude 可选项 | `quota show` | 当前被动快照是否被识别，或是否 fail-closed | 真实剩余百分比、一次回合的最终消耗 |
 
 ## 5. 日常使用与离线回退
@@ -338,7 +363,7 @@ MCP、Hook、tunnel 与 Git 同步共享同一传输 profile。Git 的 `sync` �
 
 升级前应先确保没有需要人工决定的活跃任务，并在两台机器使用同一个候选 ref。不要在运行中的交互式 Codex 回合中升级。
 
-1. Authority 上先执行 `doctor`、`harness health` 和 `git status --porcelain`；若工作树不干净，停止。
+1. Authority 上先执行 `doctor`、`harness health`、`capabilities status` 和 `git status --porcelain`；若工作树不干净，停止。
 2. 将 `$WB_STATE_ROOT` 复制到一个操作者指定、受访问控制的本地备份目录。备份仅用于恢复，不得上传或提交：
 
 ```bash
@@ -362,6 +387,8 @@ codex plugin list --marketplace "$WB_MARKETPLACE" --available --json
 ```
 
 当前 Codex CLI 没有单独的 `plugin upgrade` 子命令。若 marketplace 刷新后显示插件版本仍旧，先停止新任务、由操作者确认，再执行一次 `codex plugin remove` 后重新 `codex plugin add`，并重新审核 `/hooks`。不要在 Hook 未获重新信任时运行 `wb`。
+
+Authority 安装器会先建立并安全激活与新 runtime 配套的能力目录，再启动主服务和刷新 sidecar。旧任务仍使用 TaskContract 固定的旧 `catalog_id`；新目录不安全时安装会回滚。安装后应比较 `capabilities status` 与 `capabilities diff`，未知/弃用模型保持 observed-only 是正确结果，不应手工把它们改成 routable。
 
 升级失败时，两个安装器会对本次触及的文件执行事务回滚。已完成升级的应用回退应通过一个已知兼容的旧 ref 重跑相同安装器完成；如果 release notes 没有声明账本 schema 可逆或兼容，停止并从升级前的状态备份恢复，而不是只替换应用目录。
 
@@ -415,6 +442,7 @@ launchctl bootout "gui/$(id -u)" "$WB_APPROVED_PLIST"
 - 不在 macOS、Codex CLI 不包含 marketplace/MCP 命令，或仓库 ref 无法固定。
 - 目标版本缺少 `.agents/plugins/marketplace.json` 或 `plugins/codex-workbench/.codex-plugin/plugin.json`。
 - Codex runtime、其 companion host、Research Skill、Tailscale socket、SSH key 或 Authority MCP 预检任一失败。
+- Codex CLI 不支持 `app-server daemon` / `remote-control` 时，不启用手机功能；不要用开放端口或自制中继冒充原生 Remote Control。
 - 安装器报告已有非 Workbench 管理的同名 Skill、策略块、文件或 symlink。
 - Hook 未经人工信任、Hook 内容与预期插件不一致，或 `wb` 没有产生 `active` 回执。
 - Claude CLI 缺失、认证/配额未知、版本或使用量显示不兼容。此时可以继续 Codex-only Workbench，但不得强行启用 Claude。

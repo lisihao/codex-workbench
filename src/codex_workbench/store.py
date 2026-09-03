@@ -2082,6 +2082,7 @@ class WorkbenchStore:
                 str(selected["effective_model"] or selected_spec["model"]),
                 attempt,
                 verifier=bool(selected_spec.get("verifier")),
+                routing_policy_version=selected_spec.get("routing_policy_version"),
             )
             connection.execute(
                 """

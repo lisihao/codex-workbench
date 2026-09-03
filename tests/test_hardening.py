@@ -196,6 +196,10 @@ class WorkbenchHardeningTests(unittest.TestCase):
         with patch.object(codex, "qualification", return_value=(False, "not qualified")):
             result = codex.execute(request)
         self.assertEqual((result.status, result.result_kind), ("blocked", "worker"))
+        self.assertEqual(result.requested_model, "gpt-5.6-luna")
+        self.assertEqual(result.provider, "codex")
+        self.assertIsNone(result.agent_name)
+        self.assertIsNone(result.capability_snapshot_id)
 
         verifier_request = ExecutionRequest(
             task_id="task", node_id="verify", attempt=1,
@@ -209,6 +213,8 @@ class WorkbenchHardeningTests(unittest.TestCase):
             (verifier_result.status, verifier_result.result_kind, verifier_result.verdict),
             ("blocked", "verifier", "blocked"),
         )
+        self.assertEqual(verifier_result.requested_model, "gpt-5.6-sol")
+        self.assertEqual(verifier_result.provider, "codex")
 
         claude = ClaudeExecutor(self.artifacts, quota=None)
         with patch.object(claude, "qualification", return_value=(False, "not qualified")):
@@ -219,8 +225,108 @@ class WorkbenchHardeningTests(unittest.TestCase):
                     spec={"model": "sonnet", "verifier": False},
                     worktree=self.root,
                 )
-            )
+        )
         self.assertEqual((claude_result.status, claude_result.result_kind), ("blocked", "worker"))
+        self.assertEqual(claude_result.requested_model, "sonnet")
+        self.assertEqual(claude_result.provider, "claude")
+        self.assertIsNone(claude_result.agent_name)
+        self.assertIsNone(claude_result.capability_snapshot_id)
+
+    def test_codex_success_and_failure_results_include_pinned_capability_metadata(self) -> None:
+        executor = CodexExecutor(self.artifacts)
+        common = {
+            "title": "bounded worker",
+            "prompt": "implement the bounded change",
+            "model": "gpt-5.6-luna",
+            "verifier": False,
+            "provider": "codex",
+            "agent_name": "codex.exec",
+            "agent_version": "0.149.1",
+            "capability_snapshot_id": "catalog-20260902-001",
+            "model_capability_id": "codex.gpt-5.6-luna",
+            "agent_capability_id": "codex.exec",
+        }
+        request = ExecutionRequest(
+            task_id="task",
+            node_id="codex",
+            attempt=1,
+            contract={
+                "objective": "implement the bounded change",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 30,
+            },
+            spec=common,
+            worktree=self.root,
+        )
+        response = {
+            "status": "succeeded",
+            "summary": "bounded change complete",
+            "changed_paths": ["src/worker.py"],
+            "checks": ["python -m unittest"],
+        }
+
+        def fake_run(command: list[str], **_: object):
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(response))
+            return subprocess.CompletedProcess(command, 0, "", ""), {}
+
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(executor, "_run", side_effect=fake_run),
+        ):
+            result = executor.execute(request)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.actual_model, "gpt-5.6-luna")
+        self.assertEqual(
+            (
+                result.requested_model,
+                result.provider,
+                result.agent_name,
+                result.agent_version,
+                result.capability_snapshot_id,
+                result.model_capability_id,
+                result.agent_capability_id,
+            ),
+            (
+                "gpt-5.6-luna",
+                "codex",
+                "codex.exec",
+                "0.149.1",
+                "catalog-20260902-001",
+                "codex.gpt-5.6-luna",
+                "codex.exec",
+            ),
+        )
+
+        failed_request = ExecutionRequest(
+            task_id="task",
+            node_id="codex-failed",
+            attempt=1,
+            contract={
+                "objective": "implement the bounded change",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "timeout_seconds": 30,
+            },
+            spec={**common, "agent_version": "0.149.1"},
+            worktree=self.root,
+        )
+        with (
+            patch.object(executor, "qualification", return_value=(True, "native-subscription")),
+            patch.object(
+                executor,
+                "_run",
+                return_value=(subprocess.CompletedProcess([], 2, "", "worker failed"), {}),
+            ),
+        ):
+            failed = executor.execute(failed_request)
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.provider, "codex")
+        self.assertEqual(failed.capability_snapshot_id, "catalog-20260902-001")
+        self.assertEqual(failed.agent_version, "0.149.1")
 
     def test_claude_worker_uses_native_structured_scope_and_model_evidence(self) -> None:
         executor = ClaudeExecutor(self.artifacts, quota=None)
@@ -240,6 +346,12 @@ class WorkbenchHardeningTests(unittest.TestCase):
                 "prompt": "implement the parser",
                 "model": "sonnet",
                 "verifier": False,
+                "provider": "claude",
+                "agent_name": "claude-code",
+                "agent_version": "2.1.239",
+                "capability_snapshot_id": "catalog-20260902-001",
+                "model_capability_id": "claude.sonnet",
+                "agent_capability_id": "claude-code",
                 "read_scopes": ["src"],
                 "write_scopes": ["src/parser.py"],
             },
@@ -277,6 +389,13 @@ class WorkbenchHardeningTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.summary, "parser updated")
         self.assertEqual(result.actual_model, "claude-sonnet-4-5-20250929")
+        self.assertEqual(result.requested_model, "sonnet")
+        self.assertEqual(result.provider, "claude")
+        self.assertEqual(result.agent_name, "claude-code")
+        self.assertEqual(result.agent_version, "2.1.239")
+        self.assertEqual(result.capability_snapshot_id, "catalog-20260902-001")
+        self.assertEqual(result.model_capability_id, "claude.sonnet")
+        self.assertEqual(result.agent_capability_id, "claude-code")
         self.assertEqual(result.changed_paths, ("src/parser.py",))
         self.assertEqual(result.checks, ("python -m unittest tests/test_parser.py",))
         self.assertEqual(result.governance_profile, "code-as-harness/v1")
@@ -322,6 +441,12 @@ class WorkbenchHardeningTests(unittest.TestCase):
                 "prompt": "inspect the source",
                 "model": "sonnet",
                 "verifier": False,
+                "provider": "claude",
+                "agent_name": "claude-code",
+                "agent_version": "2.1.239",
+                "capability_snapshot_id": "catalog-20260902-001",
+                "model_capability_id": "claude.sonnet",
+                "agent_capability_id": "claude-code",
                 "write_scopes": [],
             },
             worktree=self.root,
@@ -348,6 +473,13 @@ class WorkbenchHardeningTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("structured", result.summary.lower())
         self.assertIsNone(result.actual_model)
+        self.assertEqual(result.requested_model, "sonnet")
+        self.assertEqual(result.provider, "claude")
+        self.assertEqual(result.agent_name, "claude-code")
+        self.assertEqual(result.agent_version, "2.1.239")
+        self.assertEqual(result.capability_snapshot_id, "catalog-20260902-001")
+        self.assertEqual(result.model_capability_id, "claude.sonnet")
+        self.assertEqual(result.agent_capability_id, "claude-code")
         self.assertEqual(result.changed_paths, ())
         self.assertEqual(result.checks, ())
 
@@ -433,6 +565,8 @@ class WorkbenchHardeningTests(unittest.TestCase):
 
         self.assertEqual(result.status, "indeterminate")
         self.assertIsNone(result.actual_model)
+        self.assertEqual(result.requested_model, "sonnet")
+        self.assertEqual(result.provider, "claude")
 
     def test_claude_executor_is_worker_only(self) -> None:
         executor = ClaudeExecutor(self.artifacts, quota=None)

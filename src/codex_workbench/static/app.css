@@ -26,6 +26,15 @@ section { background: color-mix(in srgb, var(--panel) 92%, transparent); border:
 .muted, .metric span, #updated, #cursor { color: var(--muted); font-size: 12px; }
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .tasks { display: grid; gap: 12px; }
+.capabilities { display: grid; gap: 12px; }
+.capability-meta, .capability-agents { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font: 11px ui-monospace, monospace; }
+.capability-meta span, .capability-agent { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: var(--panel-2); }
+.capability-agent strong { color: var(--text); }
+.capability-models { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 9px; }
+.capability-model { border: 1px solid var(--line); border-radius: 11px; padding: 11px; background: var(--panel-2); }
+.capability-model-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.capability-model-head strong { font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.capability-model p { color: var(--muted); font: 11px ui-monospace, monospace; line-height: 1.45; margin-top: 7px; }
 .approvals { display: grid; gap: 10px; }
 .alerts { display: grid; gap: 8px; }
 .alert { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; border-bottom: 1px solid var(--line); padding: 8px 0; }

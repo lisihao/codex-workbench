@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,12 +22,14 @@ from .acceptance import build_acceptance_report
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
+from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_quota
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
+from .mobile import MobileRemote, MobileRemoteError
 from .planner import PlannerError
 from .research import managed_research_skill_status
 from .restart_readiness import assess_restart_readiness
@@ -549,6 +552,100 @@ def command_harness(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _capability_registry(config: WorkbenchConfig) -> CapabilityRegistry:
+    """Build a registry against the binaries used by this Workbench process."""
+
+    return CapabilityRegistry(
+        config.state_root,
+        codex_binary=os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
+        claude_binary=os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+    )
+
+
+def command_capabilities(args: argparse.Namespace) -> int:
+    """Inspect and manage the passive, versioned capability catalog."""
+
+    registry = _capability_registry(_config(args))
+    action = args.capabilities_action
+    try:
+        if action == "status":
+            result = registry.status()
+        elif action == "show":
+            catalog = (
+                registry.load_generation(args.catalog_id)
+                if args.catalog_id
+                else registry.active()
+            )
+            result = {
+                "ok": catalog is not None,
+                "catalog": catalog,
+                "catalog_id": catalog["catalog_id"] if catalog is not None else None,
+                **({} if catalog is not None else {"error": "no active capability catalog"}),
+            }
+        elif action == "refresh":
+            result = registry.refresh(
+                bundled=bool(args.bundled),
+                activate_safe=bool(args.activate_safe),
+            )
+        elif action == "diff":
+            result = registry.diff(args.from_generation, args.to_generation)
+        elif action == "activate":
+            result = registry.activate(args.catalog_id, safe=True)
+        elif action == "rollback":
+            result = registry.rollback()
+        else:
+            raise ValueError(f"unsupported capabilities action: {action}")
+    except CapabilityCatalogError as error:
+        result = {"ok": False, "error": str(error)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def command_mobile(args: argparse.Namespace) -> int:
+    """Manage native Codex Remote Control without login or model execution."""
+
+    try:
+        remote = MobileRemote(
+            codex_binary=args.codex_binary or os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
+            user_codex_home=args.user_codex_home,
+            marketplace_source=args.marketplace_source,
+            workbench_binary=args.workbench_binary,
+            dry_run=bool(args.dry_run),
+        )
+        action = args.mobile_action
+        if action == "status":
+            result = remote.status()
+        elif action == "enable":
+            result = remote.enable()
+        elif action == "pair":
+            result = remote.pair()
+            # Pairing is deliberately a human action.  The native CLI may emit a
+            # short-lived code, but the Workbench never captures or persists it.
+            pair_command = [
+                args.codex_binary or os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
+                "remote-control",
+                "pair",
+                "--json",
+            ]
+            result = {
+                **result,
+                "pairing_state": "not_confirmed",
+                "pairing_command": shlex.join(pair_command),
+                "next_step": (
+                    "若尚未完成配对，请在同一终端执行 pairing_command；"
+                    "配对码只在终端短时显示，不会写入文件或返回 Workbench。"
+                ),
+            }
+        elif action == "disable":
+            result = remote.disable()
+        else:
+            raise ValueError(f"unsupported mobile action: {action}")
+    except MobileRemoteError as error:
+        result = {"ok": False, "action": args.mobile_action, "error": str(error)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
 def _run(command: list[str], timeout: int = 15) -> tuple[int, str]:
     try:
         result = subprocess.run(
@@ -848,6 +945,50 @@ def build_parser() -> argparse.ArgumentParser:
     harness_sub = harness.add_subparsers(dest="harness_action", required=True)
     harness_sub.add_parser("health")
     harness.set_defaults(func=command_harness)
+
+    capabilities = sub.add_parser(
+        "capabilities",
+        help="inspect or refresh the passive model and Agent capability catalog",
+    )
+    capabilities_sub = capabilities.add_subparsers(
+        dest="capabilities_action", required=True
+    )
+    capabilities_sub.add_parser("status")
+    capabilities_show = capabilities_sub.add_parser("show")
+    capabilities_show.add_argument("catalog_id", nargs="?")
+    capabilities_refresh = capabilities_sub.add_parser("refresh")
+    capabilities_refresh.add_argument(
+        "--bundled",
+        action="store_true",
+        help="read Codex's bundled model catalog instead of its live catalog",
+    )
+    capabilities_refresh.add_argument(
+        "--activate-safe",
+        action="store_true",
+        help="activate the new generation only when its control-plane and worker gates pass",
+    )
+    capabilities_diff = capabilities_sub.add_parser("diff")
+    capabilities_diff.add_argument("--from", dest="from_generation")
+    capabilities_diff.add_argument("--to", dest="to_generation")
+    capabilities_activate = capabilities_sub.add_parser("activate")
+    capabilities_activate.add_argument("catalog_id")
+    capabilities_sub.add_parser("rollback")
+    capabilities.set_defaults(func=command_capabilities)
+
+    mobile = sub.add_parser(
+        "mobile",
+        help="manage native Codex Remote Control for mobile observation and task control",
+    )
+    mobile_sub = mobile.add_subparsers(dest="mobile_action", required=True)
+    for mobile_action in ("status", "enable", "pair", "disable"):
+        mobile_sub.add_parser(mobile_action)
+    for mobile_parser in mobile_sub.choices.values():
+        mobile_parser.add_argument("--codex-binary")
+        mobile_parser.add_argument("--user-codex-home")
+        mobile_parser.add_argument("--marketplace-source")
+        mobile_parser.add_argument("--workbench-binary")
+        mobile_parser.add_argument("--dry-run", action="store_true")
+    mobile.set_defaults(func=command_mobile)
 
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--require-restart-ready", action="store_true")

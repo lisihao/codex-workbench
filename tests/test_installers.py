@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import os
 import importlib.util
 import json
@@ -473,6 +475,129 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("/tmp/claude", payload["ProgramArguments"])
         self.assertEqual(payload["EnvironmentVariables"]["HOME"], "/Users/example")
         self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/quota.log")
+
+    def test_capability_launch_agent_uses_the_installed_runtime_and_passive_refresh(self) -> None:
+        module = self._macos_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / f"{module.CAPABILITY_LABEL}.plist.in").read_text()
+        rendered = module.render_capability_plist(
+            template,
+            app_root=Path("/tmp/app"),
+            state_root=Path("/tmp/state"),
+            codex_binary=Path("/tmp/runtime/codex"),
+            codex_home=Path("/tmp/state/codex-home"),
+            process_home=Path("/tmp/state/codex-process-home"),
+            quota_snapshot_file=Path("/tmp/state/claude-quota.json"),
+            claude_binary=Path("/tmp/claude"),
+            refresh_seconds=module.DEFAULT_CAPABILITY_REFRESH_SECONDS,
+        )
+
+        payload = plistlib.loads(rendered.encode())
+        arguments = payload["ProgramArguments"]
+        environment = payload["EnvironmentVariables"]
+        self.assertEqual(payload["Label"], module.CAPABILITY_LABEL)
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertEqual(payload["StartInterval"], 6 * 60 * 60)
+        self.assertNotIn("KeepAlive", payload)
+        self.assertEqual(
+            arguments,
+            [
+                "/tmp/app/scripts/python-runtime",
+                "-m",
+                "codex_workbench",
+                "--home",
+                "/tmp/state",
+                "capabilities",
+                "refresh",
+                "--activate-safe",
+            ],
+        )
+        self.assertEqual(environment["CODEX_HOME"], "/tmp/state/codex-home")
+        self.assertEqual(environment["CODEX_WORKBENCH_CODEX"], "/tmp/runtime/codex")
+        self.assertEqual(environment["CODEX_WORKBENCH_CLAUDE"], "/tmp/claude")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+        self.assertNotIn("login", arguments)
+        self.assertNotIn("exec", arguments)
+
+    def test_initial_capability_refresh_uses_fixture_runtime_without_api_keys_or_model_prompt(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            app_root = root / "app"
+            runtime = app_root / "scripts" / "python-runtime"
+            arguments_path = root / "arguments.txt"
+            environment_path = root / "environment.txt"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > {shlex.quote(str(arguments_path))}\n"
+                f"env | /usr/bin/sort > {shlex.quote(str(environment_path))}\n"
+                "exit 0\n"
+            )
+            runtime.chmod(0o755)
+            codex = root / "runtime-codex"
+            claude = root / "fixture-claude"
+            codex.write_text("#!/bin/sh\nexit 99\n")
+            claude.write_text("#!/bin/sh\nexit 99\n")
+            codex.chmod(0o755)
+            claude.chmod(0o755)
+
+            with mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "must-not-forward", "ANTHROPIC_API_KEY": "must-not-forward"},
+                clear=False,
+            ):
+                module.initial_capability_refresh(
+                    app_root=app_root,
+                    state_root=root / "state",
+                    codex_binary=codex,
+                    codex_home=root / "state" / "codex-home",
+                    process_home=root / "state" / "codex-process-home",
+                    quota_snapshot_file=root / "state" / "claude-quota.json",
+                    claude_binary=claude,
+                )
+
+            arguments = arguments_path.read_text().splitlines()
+            environment = environment_path.read_text()
+            self.assertEqual(
+                arguments,
+                [
+                    "-m",
+                    "codex_workbench",
+                    "--home",
+                    str(root / "state"),
+                    "capabilities",
+                    "refresh",
+                    "--bundled",
+                    "--activate-safe",
+                ],
+            )
+            self.assertNotIn("must-not-forward", environment)
+            self.assertNotIn("OPENAI_API_KEY=", environment)
+            self.assertNotIn("ANTHROPIC_API_KEY=", environment)
+            self.assertNotIn("login", arguments)
+            self.assertNotIn("exec", arguments)
+
+    def test_initial_capability_refresh_fails_loudly_on_fixture_failure(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            runtime = root / "app" / "scripts" / "python-runtime"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text("#!/bin/sh\nprintf 'bundled fixture failed' >&2\nexit 23\n")
+            runtime.chmod(0o755)
+
+            with self.assertRaisesRegex(SystemExit, "initial capability catalog refresh failed: bundled fixture failed"):
+                module.initial_capability_refresh(
+                    app_root=root / "app",
+                    state_root=root / "state",
+                    codex_binary=root / "runtime-codex",
+                    codex_home=root / "state" / "codex-home",
+                    process_home=root / "state" / "codex-process-home",
+                    quota_snapshot_file=root / "state" / "claude-quota.json",
+                    claude_binary=None,
+                )
 
     def test_macbook_tunnel_reconnect_is_bounded(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1147,6 +1272,7 @@ class InstallerTests(unittest.TestCase):
                 calls.append(command)
                 return subprocess.CompletedProcess(command, 0, stdout="fixture\n", stderr="")
 
+            output = io.StringIO()
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
                 module, "run", side_effect=fake_run
             ), mock.patch.object(module, "macos_machine_id", return_value="fixture-machine"), mock.patch.object(
@@ -1168,7 +1294,7 @@ class InstallerTests(unittest.TestCase):
                     str(research),
                     "--dry-run",
                 ],
-            ):
+            ), redirect_stdout(output):
                 result = module.main()
 
             self.assertEqual(result, 0)
@@ -1176,6 +1302,8 @@ class InstallerTests(unittest.TestCase):
             install_archify.assert_not_called()
             self.assertFalse((root / "state").exists())
             self.assertTrue(all(command[0] == "git" for command in calls))
+            self.assertIn("plan: capabilities=", output.getvalue())
+            self.assertIn("passive bundled refresh before services", output.getvalue())
 
     def test_macbook_dry_run_skips_ssh_launchctl_and_mcp_mutations(self) -> None:
         module = self._macbook_installer_module()
@@ -1340,6 +1468,201 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse((home / ".codex" / "AGENTS.md").exists())
             self.assertFalse((home / ".claude" / "skills" / "archify").exists())
             self.assertFalse(state_root.exists())
+
+    def test_authority_installer_writes_capability_sidecar_manifest_and_health_checks_it(self) -> None:
+        module = self._macos_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            home = root / "home"
+            auth_source = home / ".codex" / "auth.json"
+            auth_source.parent.mkdir(parents=True)
+            auth_source.write_text("{}\n")
+            research = root / "research"
+            for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
+                path = research / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            codex = root / "fixture-codex"
+            codex_host = root / "codex-code-mode-host"
+            for fixture in (codex, codex_host):
+                fixture.write_text("#!/bin/sh\nexit 0\n")
+                fixture.chmod(0o755)
+            state_root = root / "state"
+            state_root.mkdir()
+            (state_root / "config.json").write_text(
+                json.dumps({"user_setting": "preserve", "capability_refresh_seconds": 1234})
+            )
+            calls: list[tuple[str, ...]] = []
+            refreshes: list[dict[str, object]] = []
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[0] == "git":
+                    if len(command) > 3 and command[3] == "rev-parse":
+                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if command[0] == "launchctl":
+                    return subprocess.CompletedProcess(command, 0, stdout="fixture-loaded\n", stderr="")
+                if command[0].endswith("/runtime/codex"):
+                    return subprocess.CompletedProcess(command, 0, stdout="codex-cli 0.149.1\n", stderr="")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            def fixture_refresh(**kwargs: object) -> None:
+                self.assertFalse(any(command[:2] == ("launchctl", "bootstrap") for command in calls))
+                refreshes.append(kwargs)
+                state = kwargs["state_root"]
+                assert isinstance(state, Path)
+                catalog = state / "capabilities" / "generations"
+                catalog.mkdir(parents=True)
+                (catalog / "fixture.json").write_text("{}\n")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module.shutil, "which", return_value=None
+            ), mock.patch.object(module, "run", side_effect=fake_run), mock.patch.object(
+                module, "macos_machine_id", return_value="fixture-machine"
+            ), mock.patch.object(module, "preflight_global_agent_targets"), mock.patch.object(
+                module, "preflight_managed_agent_skills"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(module, "initial_capability_refresh", side_effect=fixture_refresh), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macos.py",
+                    "--source",
+                    str(source),
+                    "--state-root",
+                    str(state_root),
+                    "--codex-binary",
+                    str(codex),
+                    "--research-skill-source",
+                    str(research),
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertEqual(len(refreshes), 1)
+            refresh = refreshes[0]
+            self.assertEqual(refresh["app_root"], state_root / "app")
+            self.assertEqual(refresh["codex_home"], state_root / "codex-home")
+            self.assertEqual(refresh["codex_binary"], state_root / "runtime" / "codex")
+            self.assertIsNone(refresh["claude_binary"])
+            config = json.loads((state_root / "config.json").read_text())
+            self.assertEqual(config["user_setting"], "preserve")
+            self.assertEqual(config["capability_refresh_seconds"], 1234)
+            manifest = json.loads((state_root / "app" / "install-manifest.json").read_text())
+            self.assertEqual(
+                manifest["capabilities"],
+                {
+                    "schema_version": module.CAPABILITY_REGISTRY_SCHEMA_VERSION,
+                    "policy": module.CAPABILITY_REGISTRY_POLICY,
+                    "refresh_interval_seconds": 1234,
+                    "sidecar_label": module.CAPABILITY_LABEL,
+                    "activation": "safe-only",
+                    "initial_refresh": "bundled-safe",
+                },
+            )
+            self.assertNotIn("catalog", manifest["capabilities"])
+            capability_plist = home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist"
+            payload = plistlib.loads(capability_plist.read_bytes())
+            self.assertEqual(payload["StartInterval"], 1234)
+            self.assertEqual(payload["EnvironmentVariables"]["CODEX_HOME"], str(state_root / "codex-home"))
+            self.assertEqual(payload["EnvironmentVariables"]["CODEX_WORKBENCH_CODEX"], str(state_root / "runtime" / "codex"))
+            launchctl_commands = [command for command in calls if command and command[0] == "launchctl"]
+            sidecar_service = f"gui/501/{module.CAPABILITY_LABEL}"
+            self.assertTrue(
+                any(command[1] == "bootstrap" and str(capability_plist) in command for command in launchctl_commands)
+            )
+            self.assertTrue(
+                any(command[1] == "kickstart" and command[-1] == sidecar_service for command in launchctl_commands)
+            )
+            self.assertTrue(
+                any(command[1] == "print" and command[-1] == sidecar_service for command in launchctl_commands)
+            )
+
+    def test_authority_installer_rolls_back_catalog_when_initial_bundled_refresh_fails(self) -> None:
+        module = self._macos_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            home = root / "home"
+            auth_source = home / ".codex" / "auth.json"
+            auth_source.parent.mkdir(parents=True)
+            auth_source.write_text("{}\n")
+            research = root / "research"
+            for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
+                path = research / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            codex = root / "fixture-codex"
+            codex_host = root / "codex-code-mode-host"
+            for fixture in (codex, codex_host):
+                fixture.write_text("#!/bin/sh\nexit 0\n")
+                fixture.chmod(0o755)
+            state_root = root / "state"
+            previous_catalog = state_root / "capabilities" / "generations" / "previous.json"
+            previous_catalog.parent.mkdir(parents=True)
+            previous_catalog.write_text('{"previous":true}\n')
+            original_config = '{"unrelated":"keep"}\n'
+            (state_root / "config.json").write_text(original_config)
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[0] == "git":
+                    if len(command) > 3 and command[3] == "rev-parse":
+                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if command[0] == "launchctl":
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if command[0].endswith("/runtime/codex"):
+                    return subprocess.CompletedProcess(command, 0, stdout="codex-cli 0.149.1\n", stderr="")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            def fail_refresh(**kwargs: object) -> None:
+                state = kwargs["state_root"]
+                assert isinstance(state, Path)
+                generated = state / "capabilities" / "generations" / "failed.json"
+                generated.write_text("{}\n")
+                raise SystemExit("initial capability catalog refresh failed: fixture bundled failure")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module.shutil, "which", return_value=None
+            ), mock.patch.object(module, "run", side_effect=fake_run), mock.patch.object(
+                module, "macos_machine_id", return_value="fixture-machine"
+            ), mock.patch.object(module, "preflight_global_agent_targets"), mock.patch.object(
+                module, "preflight_managed_agent_skills"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(module, "initial_capability_refresh", side_effect=fail_refresh), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macos.py",
+                    "--source",
+                    str(source),
+                    "--state-root",
+                    str(state_root),
+                    "--codex-binary",
+                    str(codex),
+                    "--research-skill-source",
+                    str(research),
+                ],
+            ):
+                with self.assertRaisesRegex(SystemExit, "fixture bundled failure"):
+                    module.main()
+
+            self.assertEqual(previous_catalog.read_text(), '{"previous":true}\n')
+            self.assertFalse((state_root / "capabilities" / "generations" / "failed.json").exists())
+            self.assertEqual((state_root / "config.json").read_text(), original_config)
+            self.assertFalse((state_root / "app").exists())
+            self.assertFalse((home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist").exists())
+            self.assertFalse(any(command[:2] == ("launchctl", "bootstrap") for command in calls))
 
 
 if __name__ == "__main__":

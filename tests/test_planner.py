@@ -43,6 +43,50 @@ def node(
     }
 
 
+def catalog() -> dict:
+    def record(model_id: str, roles: list[str], task_types: list[str], quality: str, weight: int) -> dict:
+        return {
+            "provider": "codex",
+            "model_id": model_id,
+            "capability_id": f"codex:{model_id}",
+            "status": "available",
+            "routable": True,
+            "roles": roles,
+            "task_types": task_types,
+            "quality": {"floor": quality},
+            "cost": {"relative": "balanced"},
+            "latency": {"class": "balanced"},
+            "concurrency": {"weight": weight, "class": "high"},
+            "reasoning": {"preferred_effort": "max"},
+            "features": {"structured_output": True},
+        }
+
+    return {
+        "catalog_id": "catalog-planner-v3",
+        "digest": "b" * 64,
+        "agents": {
+            "codex": {"status": "available", "cli_version": "0.149.1"},
+            "claude": {"status": "unavailable", "cli_version": "unavailable"},
+        },
+        "models": [
+            record(
+                "gpt-5.6-sol",
+                ["planner", "verifier", "architecture", "research"],
+                ["architecture", "review", "exploration"],
+                "frontier",
+                3,
+            ),
+            record(
+                "gpt-5.6-luna",
+                ["worker"],
+                ["implementation", "debugging", "tests", "docs", "exploration"],
+                "production",
+                1,
+            ),
+        ],
+    }
+
+
 class PlannerRoutingTests(unittest.TestCase):
     def test_normalization_accepts_nodes_serialized_with_archify_metadata(self) -> None:
         contract = make_contract()
@@ -209,6 +253,47 @@ class PlannerRoutingTests(unittest.TestCase):
                 default_executor_model="gpt-5.6-luna",
                 verifier_model="gpt-5.6-sol",
             )
+
+    def test_pinned_catalog_routes_and_persists_capability_metadata(self) -> None:
+        active = catalog()
+        contract = make_contract(
+            complexity="standard",
+            capability_snapshot_id=active["catalog_id"],
+            capability_digest=active["digest"],
+        )
+        raw = {
+            "summary": "catalog routing",
+            "nodes": [
+                node("worker", write_scope="src/worker", executor="codex", model="gpt-5.6-luna"),
+                node("verify", write_scope="", executor="codex", model="gpt-5.6-sol", verifier=True),
+            ],
+        }
+
+        planned = CodexPlanner.normalize_and_validate_plan(
+            contract,
+            raw,
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+            capability_snapshot=active,
+            provider_capacity={"codex": {"capacity": 4}},
+        )
+
+        worker, verifier = planned
+        self.assertEqual((worker.executor, worker.model), ("codex", "gpt-5.6-luna"))
+        self.assertEqual((verifier.executor, verifier.model), ("codex", "gpt-5.6-sol"))
+        for item, expected_capability in (
+            (worker, "codex:gpt-5.6-luna"),
+            (verifier, "codex:gpt-5.6-sol"),
+        ):
+            with self.subTest(node=item.node_id):
+                self.assertEqual(item.capability_snapshot_id, active["catalog_id"])
+                self.assertEqual(item.capability_digest, active["digest"])
+                self.assertEqual(item.model_capability_id, expected_capability)
+                self.assertEqual(item.agent_capability_id, "codex-cli:0.149.1")
+                self.assertEqual(item.agent_name, "codex-cli")
+                self.assertEqual(item.agent_version, "0.149.1")
+                self.assertEqual(item.routing_policy_version, "model-routing-v3")
 
 
 if __name__ == "__main__":

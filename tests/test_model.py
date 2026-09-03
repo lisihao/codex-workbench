@@ -20,7 +20,14 @@ from codex_workbench.claude_quota import (
     PRODUCER_SCHEMA_VERSION,
     SUPPORTED_USAGE_VERSION,
 )
-from codex_workbench.model import NodeSpec, QuotaSnapshot, TaskContract, now_iso
+from codex_workbench.model import (
+    NodeResult,
+    NodeSpec,
+    QuotaSnapshot,
+    TaskContract,
+    now_iso,
+    retry_model,
+)
 from codex_workbench.planner import PLAN_SCHEMA, CodexPlanner
 
 
@@ -34,6 +41,175 @@ def compatible_provenance() -> dict[str, object]:
 
 
 class ModelTests(unittest.TestCase):
+    def test_routing_v3_retry_preserves_the_pinned_worker_capability(self) -> None:
+        self.assertEqual(
+            retry_model(
+                "gpt-5.6-luna",
+                3,
+                routing_policy_version="model-routing-v3",
+            ),
+            "gpt-5.6-luna",
+        )
+        self.assertEqual(
+            retry_model(
+                "gpt-5.3-codex-spark",
+                4,
+                routing_policy_version="model-routing-v3",
+            ),
+            "gpt-5.3-codex-spark",
+        )
+
+    def test_capability_snapshot_roundtrips_on_contract_and_node(self) -> None:
+        digest = "sha256:" + "a" * 64
+        contract = TaskContract(
+            task_id="capability-contract",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-20260902-001",
+            capability_digest=digest,
+        )
+        contract.validate()
+        restored_contract = TaskContract.from_dict(contract.to_dict())
+        self.assertEqual(restored_contract, contract)
+        self.assertEqual(restored_contract.capability_digest, digest)
+
+        node = NodeSpec(
+            node_id="worker",
+            task_id=contract.task_id,
+            title="worker",
+            executor="codex",
+            model="gpt-5.6-luna",
+            prompt="bounded implementation",
+            capability_snapshot_id=contract.capability_snapshot_id,
+            capability_digest=contract.capability_digest,
+            model_capability_id="codex.gpt-5.6-luna",
+            agent_capability_id="codex.exec",
+            agent_name="codex",
+            agent_version="0.149.1",
+            routing_policy_version="model-routing-v3",
+        )
+        node.validate()
+        restored_node = NodeSpec.from_dict(node.to_dict())
+        self.assertEqual(restored_node, node)
+
+    def test_capability_snapshot_changes_contract_digest(self) -> None:
+        values = {
+            "task_id": "capability-digest",
+            "repository": "/tmp/example",
+            "base_sha": "abc123",
+            "objective": "bounded work",
+            "allowed_scope": ("src",),
+        }
+        without_snapshot = TaskContract(**values)
+        with_snapshot = TaskContract(
+            **values,
+            capability_snapshot_id="catalog-1",
+            capability_digest="b" * 64,
+        )
+        self.assertNotEqual(without_snapshot.digest, with_snapshot.digest)
+
+    def test_capability_snapshot_requires_a_complete_pair(self) -> None:
+        contract = TaskContract(
+            task_id="half-contract",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-1",
+        )
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            contract.validate()
+
+        node = NodeSpec(
+            node_id="half-node",
+            task_id="half-contract",
+            title="worker",
+            executor="fixture",
+            model="fixture",
+            prompt="ok",
+            capability_digest="c" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            node.validate()
+
+    def test_capability_snapshot_rejects_empty_or_unsafe_digest(self) -> None:
+        empty_id = TaskContract(
+            task_id="empty-id",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            capability_snapshot_id=" ",
+            capability_digest="d" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "snapshot_id"):
+            empty_id.validate()
+
+        unsafe_digest = TaskContract(
+            task_id="unsafe-digest",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded work",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-1",
+            capability_digest="not-a-digest",
+        )
+        with self.assertRaisesRegex(ValueError, "capability_digest"):
+            unsafe_digest.validate()
+
+        invalid_agent_version = NodeSpec(
+            node_id="invalid-agent-version",
+            task_id="unsafe-digest",
+            title="worker",
+            executor="fixture",
+            model="fixture",
+            agent_version=149,  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(ValueError, "agent_version"):
+            invalid_agent_version.validate()
+
+    def test_legacy_contract_and_node_input_remain_valid(self) -> None:
+        legacy_contract = {
+            "task_id": "legacy-contract",
+            "repository": "/tmp/example",
+            "base_sha": "abc123",
+            "objective": "bounded work",
+            "allowed_scope": ["src"],
+        }
+        restored_contract = TaskContract.from_dict(legacy_contract)
+        self.assertIsNone(restored_contract.capability_snapshot_id)
+        self.assertIsNone(restored_contract.capability_digest)
+
+        legacy_node = {
+            "node_id": "legacy-node",
+            "task_id": "legacy-contract",
+            "title": "worker",
+            "executor": "fixture",
+            "model": "fixture",
+            "prompt": "ok",
+        }
+        restored_node = NodeSpec.from_dict(legacy_node)
+        self.assertIsNone(restored_node.capability_snapshot_id)
+        self.assertIsNone(restored_node.capability_digest)
+
+    def test_node_result_capability_provenance_roundtrips(self) -> None:
+        result = NodeResult(
+            status="succeeded",
+            summary="bounded work complete",
+            actual_model="gpt-5.6-luna",
+            requested_model="gpt-5.6-luna",
+            provider="codex",
+            agent_name="codex.exec",
+            agent_version="0.149.1",
+            capability_snapshot_id="catalog-20260902-001",
+            model_capability_id="codex.gpt-5.6-luna",
+            agent_capability_id="codex.exec",
+        )
+        restored = NodeResult.from_dict(result.to_dict())
+        self.assertEqual(restored, result)
+
     def test_context_reference_and_source_thread_are_a_paired_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             contract = TaskContract(

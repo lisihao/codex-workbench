@@ -4,12 +4,14 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
 from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
+from .capabilities import CapabilityRegistry
 from .config import WorkbenchConfig
 from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
@@ -46,6 +48,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             store_health = self.server.store.health()
             harness_health = code_as_harness_health(self.server.config)
+            capability_registry = self._capability_registry_summary()
             overall_ok = bool(store_health["ok"]) and bool(harness_health["ok"])
             return self._json(
                 {
@@ -54,6 +57,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "governance": governance_status(),
                     **store_health,
                     "harness": harness_health,
+                    "capability_registry": capability_registry,
                     "ok": overall_ok,
                 },
                 HTTPStatus.OK if overall_ok else HTTPStatus.SERVICE_UNAVAILABLE,
@@ -66,6 +70,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "build": self._build_manifest(),
                     "governance": governance_status(),
                     "harness": code_as_harness_health(self.server.config),
+                    "capability_registry": self._capability_registry_summary(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
                     "approvals": self.server.store.list_approvals(),
@@ -78,6 +83,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "acceptance": build_acceptance_report(self.server.store),
                     "diagnostics": {"stale_tasks": self.server.store.stale_tasks()},
                     "authenticated": self._authenticated(),
+                }
+            )
+        if parsed.path == "/api/capabilities":
+            status = self._capability_registry().status()
+            return self._json(
+                {
+                    "ok": bool(status.get("ok")),
+                    "status": status,
+                    "active": status.get("active"),
                 }
             )
         if parsed.path == "/api/acceptance":
@@ -239,6 +253,73 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _static(self, name: str) -> str:
         return (Path(__file__).parent / "static" / name).read_text()
+
+    def _capability_registry(self) -> CapabilityRegistry:
+        """Use the configured local binaries without probing them on GET."""
+
+        return CapabilityRegistry(
+            self.server.config.state_root,
+            codex_binary=os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
+            claude_binary=os.environ.get("CODEX_WORKBENCH_CLAUDE", "claude"),
+        )
+
+    def _capability_registry_summary(self) -> dict[str, object]:
+        """Return a small, read-only status suitable for health and snapshots."""
+
+        status = self._capability_registry().status()
+        active = status.get("active")
+        active_summary: dict[str, object] | None = None
+        if isinstance(active, dict):
+            agents = active.get("agents")
+            agent_summary = {
+                provider: {
+                    "status": agent.get("status"),
+                    "cli_version": agent.get("cli_version"),
+                }
+                for provider, agent in (agents.items() if isinstance(agents, dict) else ())
+                if isinstance(agent, dict)
+            }
+            models = active.get("models")
+            model_summary = [
+                {
+                    "provider": model.get("provider"),
+                    "model_id": model.get("model_id"),
+                    "model_family": model.get("model_family"),
+                    "status": model.get("status"),
+                    "routable": model.get("routable") is True
+                    and model.get("status") == "available",
+                    "roles": list(model.get("roles", ()))
+                    if isinstance(model.get("roles"), list)
+                    else [],
+                    "task_types": list(model.get("task_types", ()))
+                    if isinstance(model.get("task_types"), list)
+                    else [],
+                    "quality": model.get("quality"),
+                    "cost": model.get("cost"),
+                    "latency": model.get("latency"),
+                    "concurrency": model.get("concurrency"),
+                    "reasoning": model.get("reasoning"),
+                    "features": model.get("features"),
+                    "policy_origin": model.get("policy_origin"),
+                    "agent_cli_version": model.get("agent_cli_version"),
+                }
+                for model in (models if isinstance(models, list) else ())
+                if isinstance(model, dict)
+            ]
+            active_summary = {
+                "catalog_id": active.get("catalog_id"),
+                "observed_at": active.get("observed_at"),
+                "agents": agent_summary,
+                "models": model_summary,
+            }
+        return {
+            "ok": bool(status.get("ok")),
+            "active_generation_id": status.get("active_generation_id"),
+            "generation_count": status.get("generation_count", 0),
+            "last_refresh": status.get("last_refresh"),
+            "error": status.get("error"),
+            "active": active_summary,
+        }
 
     def _build_manifest(self) -> dict | None:
         path = self.server.config.install_manifest

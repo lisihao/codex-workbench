@@ -51,6 +51,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     authority = store.authority_status()
     checks = [
         _macbook_offline_check(tasks, events),
+        _phone_observation_check(events),
         _restart_check(tasks, events),
         _model_worker_check(tasks, store.artifacts),
         _sol_verifier_check(events),
@@ -62,14 +63,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         _authority_check(authority),
         _ppt_reserve_check(events, quota, store.artifacts),
     ]
-    backlog = [
-        AcceptanceCheck(
-            "A2",
-            "deferred",
-            REQUIREMENTS["A2"],
-            "用户已将手机接入移出当前交付范围；回加拿大后再恢复 tailnet 真机验收",
-        )
-    ]
+    backlog: list[AcceptanceCheck] = []
     counts = {status: sum(check.status == status for check in checks) for status in ("ok", "warn", "error", "pending")}
     return {
         "complete": counts["ok"] == len(checks),

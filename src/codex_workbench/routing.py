@@ -7,6 +7,7 @@ the routing policy merely by returning a different JSON value.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Literal
 
@@ -22,13 +23,14 @@ from .model import (
     codex_model_reasoning_effort,
     retry_model,
 )
+from .routing_v3 import ROUTING_V3_POLICY_VERSION, RoutingV3Decision, route_capability_snapshot
 
 
 CODEX_LUNA_MODEL = "gpt-5.6-luna"
 CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
 CODEX_TERRA_MODEL = "gpt-5.6-terra"
 CLAUDE_FAMILIES = ("opus", "sonnet", "fable")
-RoutingRole = Literal["planner", "worker", "verifier", "challenge"]
+RoutingRole = Literal["planner", "worker", "verifier", "challenge", "control"]
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,16 @@ class RoutingDecision:
     claude_eligible: bool = False
     model_profile: str | None = None
     model_reasoning_effort: str | None = None
+    # Capability routing is optional so persisted routing-v1/v2 decisions and
+    # fixtures retain their original shape/semantics.  A v3 result carries the
+    # exact immutable catalog identity used to choose it.
+    capability_snapshot_id: str | None = None
+    capability_digest: str | None = None
+    model_capability_id: str | None = None
+    agent_capability_id: str | None = None
+    agent_name: str | None = None
+    agent_version: str | None = None
+    routing_policy_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.executor != "codex":
@@ -70,7 +82,7 @@ class RoutingDecision:
 
     @property
     def policy_version(self) -> str:
-        return self.strategy_version
+        return self.routing_policy_version or self.strategy_version
 
     @property
     def selected_model(self) -> str:
@@ -253,6 +265,557 @@ def codex_fallback_model(
     return retry_model(base_model, attempt)
 
 
+def _snapshot_text(snapshot: Mapping[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = snapshot.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _catalog_identity(snapshot: Mapping[str, Any]) -> tuple[str, str]:
+    snapshot_id = _snapshot_text(snapshot, "catalog_id", "snapshot_id", "generation", "id")
+    digest = _snapshot_text(snapshot, "digest", "catalog_digest", "capability_digest")
+    if snapshot_id is None or digest is None:
+        raise ValueError("capability catalog must declare catalog_id and digest")
+    return snapshot_id, digest
+
+
+def _catalog_records(snapshot: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    for name in ("models", "capabilities", "records"):
+        value = snapshot.get(name)
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)):
+            return tuple(dict(item) for item in value if isinstance(item, Mapping))
+    return ()
+
+
+def _model_family(model: object) -> str | None:
+    value = str(model).lower()
+    for family in ("spark", "luna", "terra", "sol", "fable", "opus", "sonnet"):
+        if family in value:
+            return family
+    return None
+
+
+def _snapshot_has_routable_family(
+    snapshot: Mapping[str, Any], families: Iterable[str]
+) -> bool:
+    requested = frozenset(families)
+    for record in _catalog_records(snapshot):
+        if str(record.get("provider", "")).lower() not in {"claude", "anthropic"}:
+            continue
+        model = record.get("model_id", record.get("model", record.get("id", "")))
+        if _model_family(model) not in requested:
+            continue
+        if record.get("status") == "available" and record.get("routable") is True:
+            return True
+    return False
+
+
+def _snapshot_has_routable_model_family(
+    snapshot: Mapping[str, Any], family: str, *, provider: str | None = None
+) -> bool:
+    for record in _catalog_records(snapshot):
+        if provider is not None and str(record.get("provider", "")).lower() != provider:
+            continue
+        model = record.get("model_id", record.get("model", record.get("id", "")))
+        if _model_family(model) != family:
+            continue
+        if record.get("status") == "available" and record.get("routable") is True:
+            return True
+    return False
+
+
+def _restricted_catalog_families(
+    snapshot: Mapping[str, Any], families: frozenset[str]
+) -> dict[str, Any]:
+    """Narrow one explicit lane without altering the immutable catalog."""
+
+    result = dict(snapshot)
+    for name in ("models", "capabilities", "records"):
+        value = snapshot.get(name)
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
+            continue
+        records: list[dict[str, Any]] = []
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                continue
+            record = dict(raw)
+            model = record.get("model_id", record.get("model", record.get("id", "")))
+            if _model_family(model) not in families:
+                record["routable"] = False
+            records.append(record)
+        result[name] = records
+        break
+    return result
+
+
+def _is_explicit_spark_lane(
+    contract: TaskContract,
+    strategy: RoutingStrategy,
+    node_context: Mapping[str, Any] | None,
+) -> bool:
+    raw = dict(node_context or {})
+    writes = raw.get("write_scopes")
+    write_count = len(writes) if isinstance(writes, (tuple, list)) else 0
+    dependencies = raw.get("depends_on")
+    dependency_count = len(dependencies) if isinstance(dependencies, (tuple, list)) else 0
+    return (
+        strategy.complexity == "low"
+        and strategy.parallelizable
+        and bool(contract.acceptance_commands or raw.get("command"))
+        and write_count <= 1
+        and dependency_count <= 1
+    )
+
+
+def _filtered_catalog_for_admission(
+    snapshot: Mapping[str, Any],
+    *,
+    claude_allowed: bool,
+    claude_models_available: Iterable[str],
+) -> dict[str, Any]:
+    """Return a routing view without mutating the pinned catalog.
+
+    The immutable catalog says which models are safe *in principle*.  Current
+    Claude authentication/quota admission is a separate, short-lived input;
+    only the transient routing view is narrowed by it.
+    """
+
+    admitted = frozenset(
+        family
+        for model in claude_models_available
+        if (family := _family(str(model))) is not None
+    )
+    result = dict(snapshot)
+    for name in ("models", "capabilities", "records"):
+        value = snapshot.get(name)
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
+            continue
+        records: list[dict[str, Any]] = []
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                continue
+            record = dict(raw)
+            provider = str(record.get("provider", "")).lower()
+            if provider in {"claude", "anthropic"}:
+                model = record.get("model_id", record.get("model", record.get("id", "")))
+                if not claude_allowed or _model_family(model) not in admitted:
+                    record["routable"] = False
+            records.append(record)
+        result[name] = records
+        break
+    return result
+
+
+def _quota_payload(
+    snapshot: QuotaSnapshot | None,
+    *,
+    max_age_seconds: int | None,
+) -> dict[str, Any]:
+    """Translate the durable quota receipt into routing-v3's neutral shape."""
+
+    if snapshot is None:
+        return {
+            "auth_ok": False,
+            "authenticated": False,
+            "native_subscription": False,
+            "zone": "unknown",
+        }
+    fresh = max_age_seconds is None or snapshot.is_fresh(max_age_seconds=max_age_seconds)
+    compatible = snapshot.has_compatible_subscription_provenance()
+    values = [
+        value
+        for value in (
+            snapshot.five_hour_remaining,
+            snapshot.weekly_all_remaining,
+            snapshot.weekly_sonnet_remaining,
+            snapshot.weekly_fable_remaining,
+        )
+        if value is not None
+    ]
+    minimum = min(values) if values else None
+    if not fresh or not compatible or not snapshot.auth_ok or snapshot.auth_method != "native-subscription":
+        zone = "unknown"
+    elif minimum is None:
+        zone = "unknown"
+    elif minimum <= 25:
+        zone = "protected"
+    elif minimum < 30:
+        zone = "red"
+    elif minimum <= 40:
+        zone = "yellow"
+    else:
+        zone = "green"
+    return {
+        "auth_ok": snapshot.auth_ok and fresh and compatible,
+        "authenticated": snapshot.auth_ok and fresh and compatible,
+        "native_subscription": snapshot.auth_method == "native-subscription",
+        "zone": zone,
+        "five_hour_remaining": snapshot.five_hour_remaining,
+        "weekly_all_remaining": snapshot.weekly_all_remaining,
+        "weekly_sonnet_remaining": snapshot.weekly_sonnet_remaining,
+        "weekly_fable_remaining": snapshot.weekly_fable_remaining,
+        "observed_at": snapshot.observed_at,
+    }
+
+
+def _provider_capacity(
+    quota_snapshot: QuotaSnapshot | None,
+    *,
+    active_models: tuple[str, ...],
+    supplied: Mapping[str, Any] | None,
+    max_age_seconds: int | None,
+) -> dict[str, dict[str, float]]:
+    """Supply conservative planning capacity; service remains the final gate."""
+
+    result: dict[str, dict[str, float]] = {
+        # The catalog's weights describe provider pressure, not coordinator
+        # worker slots.  Four keeps every known Codex tier individually legal;
+        # the service claim path still owns actual concurrency.
+        "codex": {"capacity": 4.0, "active": 0.0},
+        "claude": {"capacity": 2.0, "active": 0.0},
+    }
+    if isinstance(supplied, Mapping):
+        for provider, raw in supplied.items():
+            if not isinstance(raw, Mapping):
+                continue
+            capacity = raw.get("capacity", raw.get("max_concurrency"))
+            active = raw.get("active", raw.get("active_count", raw.get("active_units")))
+            try:
+                parsed_capacity = float(capacity) if capacity is not None else None
+            except (TypeError, ValueError):
+                parsed_capacity = None
+            try:
+                parsed_active = float(active) if active is not None else None
+            except (TypeError, ValueError):
+                parsed_active = None
+            target = result.setdefault(str(provider).lower(), {"capacity": 1.0, "active": 0.0})
+            if parsed_capacity is not None:
+                target["capacity"] = max(parsed_capacity, 0.0)
+            if parsed_active is not None:
+                target["active"] = max(parsed_active, 0.0)
+    result["codex"]["capacity"] = max(result["codex"]["capacity"], 4.0)
+    if quota_snapshot is not None:
+        quota_decision = quota_snapshot.dispatch_decision(
+            "sonnet",
+            active_models,
+            max_age_seconds=max_age_seconds,
+        )
+        if quota_decision.capacity_units:
+            result["claude"]["capacity"] = min(
+                result["claude"]["capacity"], float(quota_decision.capacity_units)
+            )
+        result["claude"]["active"] = float(quota_decision.active_units)
+    return result
+
+
+def _v3_preferred_families(strategy: RoutingStrategy, *, role: RoutingRole) -> tuple[str, ...]:
+    task_type = strategy.task_type
+    complexity = strategy.complexity
+    if role == "challenge":
+        if task_type == "review":
+            return ("opus", "fable", "sonnet")
+        if task_type in {"architecture", "creative"} or (
+            task_type == "exploration" and complexity == "high"
+        ):
+            return ("fable", "opus", "terra")
+    if complexity == "low":
+        return ("spark", "luna")
+    if task_type in {"tests", "docs"}:
+        return ("luna", "sonnet", "terra")
+    if task_type in {"implementation", "debugging"} and complexity == "standard":
+        return ("sonnet", "luna", "terra")
+    if task_type == "exploration" and complexity == "standard":
+        return ("sonnet", "luna", "terra")
+    return ("terra", "luna", "sonnet")
+
+
+def _v3_role_for(strategy: RoutingStrategy, *, requested_role: RoutingRole) -> RoutingRole:
+    if requested_role != "worker":
+        return requested_role
+    if strategy.task_type in {"architecture", "review", "creative"}:
+        return "challenge"
+    if strategy.task_type == "exploration" and strategy.complexity == "high":
+        return "challenge"
+    return "worker"
+
+
+def _v3_request(
+    contract: TaskContract,
+    strategy: RoutingStrategy,
+    *,
+    role: RoutingRole,
+    node_context: Mapping[str, Any] | None,
+    quota_snapshot: QuotaSnapshot | None,
+    active_models: tuple[str, ...],
+    max_age_seconds: int | None,
+    provider_capacity: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    raw = dict(node_context or {})
+    writes = raw.get("write_scopes")
+    write_count = len(writes) if isinstance(writes, (tuple, list)) else 0
+    dependencies = raw.get("depends_on")
+    dependency_count = len(dependencies) if isinstance(dependencies, (tuple, list)) else 0
+    mechanical = bool(contract.acceptance_commands) or bool(raw.get("command"))
+    is_control_plane = role in {"planner", "verifier", "control"}
+    # Current passive Sol metadata intentionally advertises architecture and
+    # exploration control work rather than every worker task type.  Planning
+    # and verification therefore use its control-plane contract, not the
+    # worker's task type.
+    task_type = "architecture" if role in {"planner", "verifier"} else strategy.task_type
+    low = strategy.complexity == "low"
+    bounded = bool(contract.allowed_scope) and strategy.complexity in {"low", "standard"}
+    independent = strategy.parallelizable and bool(contract.allowed_scope)
+    return {
+        "role": role,
+        "task_type": task_type,
+        "complexity": strategy.complexity,
+        "quality_floor": 60 if low and mechanical else 80,
+        "acceptance_risk": strategy.complexity,
+        "low_risk": low,
+        "short_task": low and strategy.parallelizable and write_count <= 1 and dependency_count <= 1,
+        "mechanically_verifiable": mechanical,
+        "bounded": bounded,
+        "independent_slice": independent,
+        "allow_parallel_providers": strategy.parallelizable and not is_control_plane,
+        "preferred_families": _v3_preferred_families(strategy, role=role),
+        "claude_quota": _quota_payload(quota_snapshot, max_age_seconds=max_age_seconds),
+        "provider_capacity": _provider_capacity(
+            quota_snapshot,
+            active_models=active_models,
+            supplied=provider_capacity,
+            max_age_seconds=max_age_seconds,
+        ),
+    }
+
+
+def _preferred_effort(snapshot: Mapping[str, Any], provider: str, model: str) -> str | None:
+    for record in _catalog_records(snapshot):
+        record_provider = str(record.get("provider", "")).lower()
+        record_model = str(record.get("model_id", record.get("model", record.get("id", ""))))
+        if record_provider != provider or record_model != model:
+            continue
+        reasoning = record.get("reasoning")
+        if isinstance(reasoning, Mapping):
+            value = reasoning.get("preferred_effort")
+            return str(value) if isinstance(value, str) and value else None
+    return None
+
+
+def _agent_capability_id(snapshot: Mapping[str, Any], provider: str) -> str:
+    agents = snapshot.get("agents")
+    if isinstance(agents, Mapping):
+        agent = agents.get(provider)
+        if isinstance(agent, Mapping):
+            declared = agent.get("capability_id")
+            if isinstance(declared, str) and declared.strip():
+                return declared.strip()
+            version = agent.get("cli_version")
+            if isinstance(version, str) and version.strip():
+                return f"{provider}-cli:{version.strip()}"
+    return f"{provider}-cli:observed"
+
+
+def _agent_identity(snapshot: Mapping[str, Any], provider: str) -> tuple[str, str | None]:
+    agents = snapshot.get("agents")
+    if isinstance(agents, Mapping):
+        agent = agents.get(provider)
+        if isinstance(agent, Mapping):
+            name = agent.get("name", agent.get("agent_name", f"{provider}-cli"))
+            version = agent.get("cli_version", agent.get("version"))
+            return (
+                str(name) if isinstance(name, str) and name else f"{provider}-cli",
+                str(version) if isinstance(version, str) and version else None,
+            )
+    return f"{provider}-cli", None
+
+
+def _decision_from_v3(
+    decision: RoutingV3Decision,
+    *,
+    role: RoutingRole,
+    strategy: RoutingStrategy,
+    snapshot: Mapping[str, Any],
+    reason_prefix: str = "",
+) -> RoutingDecision:
+    if not decision.accepted or decision.selected is None:
+        raise ValueError(
+            "routing-v3 has no legal worker in pinned catalog "
+            f"{decision.catalog_snapshot_id}: {decision.reason}"
+        )
+    selected = decision.selected
+    provider = "claude" if selected.provider in {"claude", "anthropic"} else selected.provider
+    if provider not in {"codex", "claude"}:
+        raise ValueError(f"routing-v3 selected unsupported executor provider {selected.provider!r}")
+    agent_name, agent_version = _agent_identity(snapshot, provider)
+    return RoutingDecision(
+        role=role,
+        executor=provider,
+        model=selected.model,
+        strategy_version=strategy.version,
+        reason=f"{reason_prefix}{decision.reason}",
+        claude_eligible=any(candidate.provider in {"claude", "anthropic"} for candidate in decision.ranked_candidates),
+        model_reasoning_effort=_preferred_effort(snapshot, selected.provider, selected.model),
+        capability_snapshot_id=decision.catalog_snapshot_id,
+        capability_digest=decision.catalog_digest,
+        model_capability_id=selected.capability_id,
+        agent_capability_id=_agent_capability_id(snapshot, provider),
+        agent_name=agent_name,
+        agent_version=agent_version,
+        routing_policy_version=decision.policy_version,
+    )
+
+
+def _quota_blocks_challenge(
+    quota_snapshot: QuotaSnapshot | None,
+    *,
+    families: tuple[str, ...],
+    active_models: tuple[str, ...],
+    max_age_seconds: int | None,
+) -> bool:
+    if quota_snapshot is None:
+        return True
+    decisions = [
+        quota_snapshot.dispatch_decision(
+            family,
+            active_models,
+            max_age_seconds=max_age_seconds,
+        )
+        for family in families
+    ]
+    # A full shared pool is a scheduling wait, not a reason to turn a worker
+    # into Sol.  Authentication, freshness, reserve, and quota-zone refusal
+    # are the explicit control-plane fallback condition.
+    return bool(decisions) and all(
+        decision.action != "claude" and decision.zone in {"unknown", "auth-unavailable", "protected", "red", "yellow"}
+        for decision in decisions
+    )
+
+
+def _route_catalog_task(
+    contract: TaskContract,
+    *,
+    strategy: RoutingStrategy,
+    role: RoutingRole,
+    capability_snapshot: Mapping[str, Any],
+    claude_models_available: tuple[str, ...],
+    quota_snapshot: QuotaSnapshot | None,
+    active_models: tuple[str, ...],
+    max_age_seconds: int | None,
+    node_context: Mapping[str, Any] | None,
+    provider_capacity: Mapping[str, Any] | None,
+) -> RoutingDecision:
+    snapshot_id, digest = _catalog_identity(capability_snapshot)
+    if contract.capability_snapshot_id is not None and contract.capability_snapshot_id != snapshot_id:
+        raise ValueError("pinned task capability catalog does not match the routing catalog")
+    if contract.capability_digest is not None and contract.capability_digest != digest:
+        raise ValueError("pinned task capability digest does not match the routing catalog")
+
+    selected_role = _v3_role_for(strategy, requested_role=role)
+    routing_view = _filtered_catalog_for_admission(
+        capability_snapshot,
+        claude_allowed=strategy.claude_allowed,
+        claude_models_available=claude_models_available,
+    )
+    # Spark is an explicit short/mechanical lane, not a cheap replacement for
+    # work with ambiguous acceptance.  Once a node has passed that strict
+    # classification and the independent pool is observed, route only within
+    # that lane; otherwise the normal quality-first candidate set remains.
+    if (
+        selected_role == "worker"
+        and _is_explicit_spark_lane(contract, strategy, node_context)
+        and _snapshot_has_routable_model_family(
+            capability_snapshot, "spark", provider="codex"
+        )
+    ):
+        routing_view = _restricted_catalog_families(routing_view, frozenset({"spark"}))
+    request = _v3_request(
+        contract,
+        strategy,
+        role=selected_role,
+        node_context=node_context,
+        quota_snapshot=quota_snapshot,
+        active_models=active_models,
+        max_age_seconds=max_age_seconds,
+        provider_capacity=provider_capacity,
+    )
+    decision = route_capability_snapshot(
+        routing_view,
+        request,
+        active_model_ids=active_models,
+        policy_version=ROUTING_V3_POLICY_VERSION,
+    )
+    if decision.accepted:
+        return _decision_from_v3(
+            decision,
+            role=selected_role,
+            strategy=strategy,
+            snapshot=capability_snapshot,
+        )
+
+    # Claude challenge capacity is deliberately optional.  For cross-module
+    # architecture/review/research work, a genuine Claude auth/quota refusal
+    # may fall back to the exact, catalog-proven Sol control plane.  This is
+    # not an ordinary worker retry and never routes an unknown model.
+    control_types = {"architecture", "review"}
+    if strategy.task_type == "exploration" and strategy.complexity == "high":
+        control_types.add("exploration")
+    if selected_role == "challenge" and strategy.task_type in control_types:
+        challenge_families = _v3_preferred_families(strategy, role="challenge")
+        claude_families = tuple(
+            family for family in challenge_families if family in CLAUDE_FAMILIES
+        )
+        control_reason: str | None = None
+        if not strategy.claude_allowed:
+            control_reason = (
+                "Claude is disabled by the immutable task contract; "
+                "using the exact Sol cross-module control plane: "
+            )
+        elif (
+            _snapshot_has_routable_family(capability_snapshot, claude_families)
+            and _quota_blocks_challenge(
+                quota_snapshot,
+                families=claude_families,
+                active_models=active_models,
+                max_age_seconds=max_age_seconds,
+            )
+        ):
+            control_reason = (
+                "Claude challenge was unavailable due to authenticated quota admission; "
+                "using the exact Sol cross-module control plane: "
+            )
+        if control_reason is not None:
+            control_request = _v3_request(
+                contract,
+                strategy,
+                role="control",
+                node_context=node_context,
+                quota_snapshot=quota_snapshot,
+                active_models=active_models,
+                max_age_seconds=max_age_seconds,
+                provider_capacity=provider_capacity,
+            )
+            control_decision = route_capability_snapshot(
+                routing_view,
+                control_request,
+                active_model_ids=active_models,
+                policy_version=ROUTING_V3_POLICY_VERSION,
+            )
+            if control_decision.accepted:
+                return _decision_from_v3(
+                    control_decision,
+                    role="control",
+                    strategy=strategy,
+                    snapshot=capability_snapshot,
+                    reason_prefix=control_reason,
+                )
+    raise ValueError(
+        "routing-v3 has no legal worker in the pinned catalog; "
+        f"{decision.reason}"
+    )
+
+
 def route_task(
     contract: TaskContract,
     claude_models_available: tuple[str, ...] = (),
@@ -263,6 +826,9 @@ def route_task(
     max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
     strategy: RoutingStrategy | dict[str, Any] | None = None,
     available_claude_models: tuple[str, ...] | None = None,
+    capability_snapshot: Mapping[str, Any] | None = None,
+    node_context: Mapping[str, Any] | None = None,
+    provider_capacity: Mapping[str, Any] | None = None,
 ) -> RoutingDecision:
     """Select a model from immutable contract inputs.
 
@@ -277,6 +843,20 @@ def route_task(
         claude_models_available = tuple(available_claude_models)
     version = selected_strategy.version
 
+    if capability_snapshot is not None:
+        return _route_catalog_task(
+            contract,
+            strategy=selected_strategy,
+            role=role,
+            capability_snapshot=capability_snapshot,
+            claude_models_available=claude_models_available,
+            quota_snapshot=quota_snapshot,
+            active_models=active_models,
+            max_age_seconds=max_age_seconds,
+            node_context=node_context,
+            provider_capacity=provider_capacity,
+        )
+
     if role in {"planner", "verifier"}:
         return RoutingDecision(
             role=role,
@@ -284,6 +864,15 @@ def route_task(
             model=CODEX_SOL_MODEL,
             strategy_version=version,
             reason=f"{role} role is fixed to the independent Codex Sol control plane",
+        )
+
+    if role == "control":
+        return RoutingDecision(
+            role=role,
+            executor="codex",
+            model=CODEX_SOL_MODEL,
+            strategy_version=version,
+            reason="control role is fixed to the Codex Sol cross-module control plane",
         )
 
     if role not in {"worker", "challenge"}:
@@ -386,6 +975,8 @@ def route_node(
     active_models: tuple[str, ...] = (),
     max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
     strategy: RoutingStrategy | dict[str, Any] | None = None,
+    capability_snapshot: Mapping[str, Any] | None = None,
+    provider_capacity: Mapping[str, Any] | None = None,
 ) -> RoutingDecision:
     """Route one planner node while preserving deterministic executors."""
 
@@ -400,6 +991,9 @@ def route_node(
             active_models=active_models,
             max_age_seconds=max_age_seconds,
             strategy=node_strategy,
+            capability_snapshot=capability_snapshot,
+            node_context=raw,
+            provider_capacity=provider_capacity,
         )
     executor = raw.get("executor")
     if executor in {"deterministic", "fixture"}:
@@ -418,6 +1012,9 @@ def route_node(
         active_models=active_models,
         max_age_seconds=max_age_seconds,
         strategy=node_strategy,
+        capability_snapshot=capability_snapshot,
+        node_context=raw,
+        provider_capacity=provider_capacity,
     )
 
 
@@ -431,11 +1028,15 @@ class ModelRoutingPolicy:
         quota_snapshot: QuotaSnapshot | None = None,
         active_models: tuple[str, ...] = (),
         max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
+        capability_snapshot: Mapping[str, Any] | None = None,
+        provider_capacity: Mapping[str, Any] | None = None,
     ) -> None:
         self.claude_models_available = tuple(claude_models_available)
         self.quota_snapshot = quota_snapshot
         self.active_models = tuple(active_models)
         self.max_age_seconds = max_age_seconds
+        self.capability_snapshot = capability_snapshot
+        self.provider_capacity = provider_capacity
 
     def route(
         self,
@@ -452,6 +1053,8 @@ class ModelRoutingPolicy:
             active_models=self.active_models,
             max_age_seconds=self.max_age_seconds,
             strategy=strategy,
+            capability_snapshot=self.capability_snapshot,
+            provider_capacity=self.provider_capacity,
         )
 
 

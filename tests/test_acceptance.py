@@ -137,8 +137,8 @@ class AcceptanceTests(unittest.TestCase):
             checks = {check["id"]: check for check in report["checks"]}
             backlog = {check["id"]: check for check in report["backlog"]}
             self.assertEqual(checks["A1"]["status"], "ok")
-            self.assertNotIn("A2", checks)
-            self.assertEqual(backlog["A2"]["status"], "deferred")
+            self.assertEqual(checks["A2"]["status"], "ok")
+            self.assertNotIn("A2", backlog)
             self.assertEqual(checks["A12"]["status"], "pending")
 
     def test_a12_cli_imports_a_content_addressed_artifact(self) -> None:
