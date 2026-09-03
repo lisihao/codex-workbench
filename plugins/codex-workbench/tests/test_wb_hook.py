@@ -82,7 +82,15 @@ class WBHookTests(unittest.TestCase):
             self.assertTrue(binding["existing_conversation"])
 
     def test_supported_one_token_invocations_activate(self) -> None:
-        prompts = ("wb", "wb continue", "$WB", "$wb continue", "启动工作台")
+        prompts = (
+            "wb",
+            "wb continue",
+            "wb，只读检查",
+            "wb,read-only check",
+            "$WB：状态",
+            "/wb，继续",
+            "启动工作台",
+        )
         for prompt in prompts:
             with self.subTest(prompt=prompt), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -109,6 +117,28 @@ class WBHookTests(unittest.TestCase):
                 send.assert_called_once()
                 context = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
                 self.assertIn('"state":"active"', context)
+
+    def test_wb_prefix_inside_a_word_is_inert(self) -> None:
+        for prompt in ("wbackup", "$wblegacy", "/wbench"):
+            with self.subTest(prompt=prompt), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                event = {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-inert-prefix",
+                    "cwd": "/tmp",
+                    "prompt": prompt,
+                    "transcript_path": None,
+                }
+                output = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"PLUGIN_DATA": str(root / "plugin-data")}),
+                    patch.object(wb_hook, "_send") as send,
+                    patch.object(sys, "stdin", io.StringIO(json.dumps(event))),
+                    contextlib.redirect_stdout(output),
+                ):
+                    self.assertEqual(wb_hook.main(), 0)
+                send.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
 
     def test_transport_is_derived_from_existing_mcp_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

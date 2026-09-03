@@ -34,8 +34,10 @@ Codex asks you to review and approve the `UserPromptSubmit` hook.  Do that in
 
 ## Use
 
-Type `wb` in a Codex conversation to activate the Workbench.  `$WB` and the
-`WB` entry in `/skills` are also supported.  Existing conversations import their
+Type `wb` in a Codex conversation to activate the Workbench. You may continue
+the request after whitespace or common punctuation, for example `wb, status`
+or `wb，检查状态`. `$WB` and the `WB` entry in `/skills` are also supported.
+Existing conversations import their
 normalized history, current Git patch, untracked files, and explicitly mentioned
 files once before planning begins.
 

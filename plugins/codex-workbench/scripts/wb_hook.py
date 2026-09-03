@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 
 ACTIVATION_MARKER = "WB_ACTIVATE_V1"
+WB_ACTIVATION = re.compile(r"^(?:[$/]?wb)(?:$|[^\w])", re.IGNORECASE)
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_FILE_BYTES = 128 * 1024 * 1024
 SECRET_NAME = re.compile(
@@ -379,13 +380,10 @@ def main() -> int:
     ).expanduser()
     binding_file = data_root / "bindings" / "{}.json".format(session_id)
     prompt = event.get("prompt") or ""
-    normalized_prompt = prompt.strip().lower()
+    normalized_prompt = prompt.strip()
     activating = (
         ACTIVATION_MARKER in prompt
-        or normalized_prompt == "wb"
-        or normalized_prompt.startswith("wb ")
-        or normalized_prompt.startswith("$wb")
-        or normalized_prompt.startswith("/wb")
+        or WB_ACTIVATION.match(normalized_prompt) is not None
         or normalized_prompt.startswith("启动工作台")
     )
     if not activating and not binding_file.is_file():
