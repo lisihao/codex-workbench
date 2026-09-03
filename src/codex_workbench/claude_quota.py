@@ -404,16 +404,47 @@ def _zone(value: str) -> ZoneInfo:
 
 def _five_hour_window_id(value: str, observed: datetime) -> tuple[str, str]:
     match = _TIME_RESET.fullmatch(value)
-    if match is None:
+    dated_clock = _DATE_TIME_RESET.fullmatch(value)
+    if match is None and dated_clock is None:
         raise ClaudeQuotaError("five-hour reset is not a supported clock time")
-    hour, minute = int(match.group("hour")), int(match.group("minute") or 0)
+    active = match or dated_clock
+    assert active is not None
+    hour, minute = int(active.group("hour")), int(active.group("minute") or 0)
     if not 1 <= hour <= 12 or minute > 59:
         raise ClaudeQuotaError("five-hour reset clock is invalid")
-    if match.group("ampm").lower() == "pm" and hour != 12:
+    if active.group("ampm").lower() == "pm" and hour != 12:
         hour += 12
-    if match.group("ampm").lower() == "am" and hour == 12:
+    if active.group("ampm").lower() == "am" and hour == 12:
         hour = 0
-    candidate, local_observed, zone = _clock_reset_datetime(hour, minute, match.group("zone"), observed)
+    if dated_clock is None:
+        candidate, local_observed, _zone_info = _clock_reset_datetime(
+            hour,
+            minute,
+            active.group("zone"),
+            observed,
+        )
+    else:
+        zone = _zone(dated_clock.group("zone"))
+        local_observed = observed.astimezone(zone)
+        try:
+            month = datetime.strptime(dated_clock.group("month"), "%b").month
+            year = (
+                int(dated_clock.group("year"))
+                if dated_clock.group("year")
+                else local_observed.year
+            )
+            candidate = datetime(
+                year,
+                month,
+                int(dated_clock.group("day")),
+                hour,
+                minute,
+                tzinfo=zone,
+            )
+        except ValueError as error:
+            raise ClaudeQuotaError("five-hour reset date is invalid") from error
+        if candidate <= local_observed:
+            raise ClaudeQuotaError("five-hour reset must be in the future")
     if candidate - local_observed > timedelta(hours=24):
         raise ClaudeQuotaError("five-hour reset is not within the next 24 hours")
     return f"five_hour:{candidate.astimezone(UTC).isoformat(timespec='seconds').replace('+00:00', 'Z')}", "precise"

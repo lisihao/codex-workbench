@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from codex_workbench.claude_quota import (
     ClaudeQuotaCollector,
     ClaudeQuotaError,
     COMPATIBLE_SOURCE,
+    _five_hour_window_id,
     scrubbed_environment,
     watch_claude_quota,
 )
@@ -24,6 +26,15 @@ def _completed(arguments: list[str], stdout: str, returncode: int = 0) -> subpro
 
 
 class ClaudeQuotaCollectorTests(unittest.TestCase):
+    def test_five_hour_window_accepts_claude_dated_clock_format(self) -> None:
+        window, precision = _five_hour_window_id(
+            "Sep 3 at 1:19pm (America/Toronto)",
+            datetime(2026, 9, 3, 12, 30, tzinfo=UTC),
+        )
+
+        self.assertEqual(window, "five_hour:2026-09-03T17:19:00Z")
+        self.assertEqual(precision, "precise")
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
