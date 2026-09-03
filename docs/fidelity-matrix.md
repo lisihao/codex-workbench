@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.8.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.8.1 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.8.0 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.8.1 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -52,8 +52,8 @@
 
 ## 当前忠实度结论
 
-1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.8.0 另加入性能基线、长期账本、Spark P0 调度闭环和可恢复的 NAS 归档生命周期。
-2. 1.8.0 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
+1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.8.1 另加入性能基线、长期账本、Spark P0 调度闭环和可恢复的 NAS 归档生命周期。
+2. 1.8.1 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
 3. 公开 benchmark 只提供按领域、带迁移折扣的冷启动先验，不是统一排行榜，也不是本机成功率；当前 performance calibrate 只报告 advisory `cold-start` 或 `ok`，尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态和阈值，不能称为动态校准完成。
-4. 1.8.0 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
+4. 1.8.1 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
 5. 手机原生 Remote 与响应式 cockpit 已有实现，但真实配对、查看、发任务和 A2 receipt 仍是 external-pending；只有页面关闭后的 Web Push 留在 backlog。

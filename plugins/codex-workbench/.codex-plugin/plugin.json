@@ -1,6 +1,6 @@
 {
   "name": "codex-workbench",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Explicitly bind a Codex conversation to a configured persistent Codex Workbench.",
   "author": {
     "name": "Codex Workbench contributors"

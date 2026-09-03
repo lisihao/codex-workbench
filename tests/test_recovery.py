@@ -218,6 +218,30 @@ class WorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual((restored_path / "untracked.txt").read_text(), "recover me\n")
         self.assertEqual(git(restored_path, "rev-parse", "HEAD"), self.base_sha)
 
+    def test_smb_validation_targets_the_mount_point_not_the_archive_subdirectory(self) -> None:
+        mount_point = self.root / "mounted-nas"
+        mount_point.mkdir()
+        resolved_mount_point = mount_point.resolve()
+        archive_root = mount_point / "Codex-Workbench" / "worktree-archives"
+        base = self.policy(archive_root=archive_root)
+        manager = WorktreeRecoveryManager(
+            self.store,
+            RecoveryPolicy(**{**base.__dict__, "require_smb": True}),
+        )
+        completed = subprocess.CompletedProcess([], 0, "", "")
+
+        with (
+            patch(
+                "codex_workbench.recovery.os.path.ismount",
+                side_effect=lambda path: Path(path) == resolved_mount_point,
+            ),
+            patch("codex_workbench.recovery.subprocess.run", return_value=completed) as run,
+        ):
+            resolved = manager._assert_archive_root()
+
+        self.assertEqual(resolved, archive_root.resolve())
+        self.assertEqual(run.call_args.args[0][-1], str(resolved_mount_point))
+
     def test_special_files_are_omitted_without_blocking_recovery(self) -> None:
         allocation_id, _ = self.accepted_allocation()
         manager = WorktreeRecoveryManager(self.store, self.policy())

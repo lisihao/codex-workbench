@@ -337,7 +337,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.8.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.8.0 包含 benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证和强制 Tailscale 远程归档；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
+当前源码版本为 `1.8.1`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.8.1 包含 benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证和强制 Tailscale 远程归档；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

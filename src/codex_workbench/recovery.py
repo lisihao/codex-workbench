@@ -487,9 +487,12 @@ class WorktreeRecoveryManager:
         if not ancestor.is_dir() or not os.access(ancestor, os.W_OK):
             raise WorktreeRecoveryError(f"NAS archive parent is not writable: {ancestor}")
         if self.policy.require_smb:
+            mount_point = ancestor.resolve(strict=True)
+            while mount_point.parent != mount_point and not os.path.ismount(mount_point):
+                mount_point = mount_point.parent
             smbutil = shutil.which("smbutil") or "/usr/bin/smbutil"
             result = subprocess.run(
-                [smbutil, "statshares", "-m", str(ancestor)],
+                [smbutil, "statshares", "-m", str(mount_point)],
                 text=True,
                 capture_output=True,
                 timeout=30,

@@ -32,7 +32,7 @@ codex plugin add codex-workbench@codex-workbench
 Codex asks you to review and approve the `UserPromptSubmit` hook.  Do that in
 `/hooks` before activating a session.
 
-## What the v1.8.0 authority adds
+## What the v1.8.1 authority adds
 
 The plugin remains a thin session-binding entry point; scheduling and evidence
 stay on the configured Mac mini authority. The authority now provides:
