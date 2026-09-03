@@ -319,7 +319,7 @@ codex plugin list --json
 
 ### 3.5 可选：让手机 Codex App 连接 Authority
 
-手机接入使用 Codex 自带的 Remote Control，不建立第二套 Workbench 总账。先在 Mac mini 的有人值守终端执行只读状态与 dry-run：
+手机接入使用 Codex 自带的 Remote，不建立第二套 Workbench 总账。Workbench 只配置 plugin/MCP；原生 Remote host 和二维码由 Mac mini 的 ChatGPT/Codex 桌面 App 独占管理。先执行只读状态与 dry-run：
 
 ```bash
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile status
@@ -333,7 +333,7 @@ codex plugin list --json
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile pair
 ```
 
-`mobile pair` 不会捕获配对码，而会返回一条 `pairing_command`。由用户在同一 Mac mini 终端运行该原生命令，并在手机 Codex App 的 Remote 页输入短效码。不要把配对码复制进工单、聊天、日志或仓库。手机配对后新建/打开远程 Codex 会话并输入 `wb`；只有远端会话收到 `WB_SYNC_RECEIPT=active`，且手机真实完成一次查看和发送，才可把手机旅程标为通过。
+`mobile enable` 不会启动 `codex app-server daemon`，避免与桌面 App 的单实例 Remote host 冲突。`mobile pair` 返回桌面设置路径：在 Mac mini 打开 `Settings > Connections > Control this Mac or PC > Set up or Add`，显示二维码后用手机扫描并批准。手机配对后新建/打开远程 Codex 会话并输入 `wb`；只有远端会话收到 `WB_SYNC_RECEIPT=active`，且手机真实完成一次查看和发送，才可把手机旅程标为通过。
 
 ## 4. 验证矩阵
 
@@ -348,7 +348,7 @@ codex plugin list --json
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
 | 会话接管 | `WB_SYNC_RECEIPT` 的 `active` 状态 | Context Bundle 已被 Authority 持久绑定 | 任务已 accepted 或模型已调用 |
-| 手机 Remote | `mobile status`、用户执行 `pairing_command`、手机真机查看/发送 | 原生 Remote 配置与真实手机旅程 | 仅凭 dry-run 或 daemon running 不能声称已配对 |
+| 手机 Remote | `mobile status`、桌面 App 生成二维码、手机真机查看/发送 | 原生 Remote 配置与真实手机旅程 | 仅凭 plugin/MCP 就绪不能声称已配对 |
 | Claude 可选项 | `quota show` | 当前被动快照是否被识别，或是否 fail-closed | 真实剩余百分比、一次回合的最终消耗 |
 
 ## 5. 日常使用与离线回退
@@ -442,7 +442,7 @@ launchctl bootout "gui/$(id -u)" "$WB_APPROVED_PLIST"
 - 不在 macOS、Codex CLI 不包含 marketplace/MCP 命令，或仓库 ref 无法固定。
 - 目标版本缺少 `.agents/plugins/marketplace.json` 或 `plugins/codex-workbench/.codex-plugin/plugin.json`。
 - Codex runtime、其 companion host、Research Skill、Tailscale socket、SSH key 或 Authority MCP 预检任一失败。
-- Codex CLI 不支持 `app-server daemon` / `remote-control` 时，不启用手机功能；不要用开放端口或自制中继冒充原生 Remote Control。
+- 桌面 App 不提供 `Connections > Control this Mac or PC` 时，不启动 CLI app-server、开放端口或自制中继冒充原生 Remote；先核对桌面/手机版本、同一账号与 workspace，以及管理员是否允许 Remote。
 - 安装器报告已有非 Workbench 管理的同名 Skill、策略块、文件或 symlink。
 - Hook 未经人工信任、Hook 内容与预期插件不一致，或 `wb` 没有产生 `active` 回执。
 - Claude CLI 缺失、认证/配额未知、版本或使用量显示不兼容。此时可以继续 Codex-only Workbench，但不得强行启用 Claude。

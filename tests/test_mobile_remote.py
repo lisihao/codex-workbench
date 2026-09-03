@@ -46,7 +46,7 @@ class MobileRemoteTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertTrue(result["idempotent"])
-            self.assertEqual(len(calls), 6)
+            self.assertEqual(len(calls), 5)
             self.assertEqual(
                 calls[1][0],
                 [
@@ -81,15 +81,11 @@ class MobileRemoteTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(
-                calls[5][0],
-                [
-                    "/usr/local/bin/codex",
-                    "app-server",
-                    "daemon",
-                    "bootstrap",
-                    "--remote-control",
-                ],
+                result["remote_control"]["owner"],
+                "desktop_app",
             )
+            self.assertEqual(result["pairing_state"], "not_attested")
+            self.assertFalse(any("app-server" in command for command, _environment in calls))
             for _command, environment in calls:
                 self.assertEqual(environment["CODEX_HOME"], str(user_home.resolve()))
                 self.assertNotEqual(environment["CODEX_HOME"], str(isolated_home))
@@ -111,7 +107,8 @@ class MobileRemoteTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["dry_run"])
         self.assertEqual(calls, [])
-        self.assertEqual(result["commands"][-1][-1], "--remote-control")
+        self.assertEqual(result["commands"][-1][1:3], ["mcp", "add"])
+        self.assertFalse(any("app-server" in command for command in result["commands"]))
 
     def test_enable_failure_stops_without_claiming_success(self) -> None:
         calls: list[list[str]] = []
@@ -158,8 +155,8 @@ class MobileRemoteTests(unittest.TestCase):
         ).enable()
 
         self.assertTrue(result["ok"])
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[-1][-1], "--remote-control")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any("app-server" in command for command in calls))
         self.assertEqual(
             result["skipped"],
             [
@@ -207,7 +204,7 @@ class MobileRemoteTests(unittest.TestCase):
                 with self.assertRaisesRegex(MobileRemoteError, "isolated CODEX_HOME"):
                     MobileRemote(user_codex_home=isolated_home)
 
-    def test_pair_returns_an_attended_command_without_generating_a_code(self) -> None:
+    def test_pair_points_to_desktop_app_without_generating_a_code(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mobile-remote-") as directory:
             home = Path(directory) / ".codex"
 
@@ -223,7 +220,9 @@ class MobileRemoteTests(unittest.TestCase):
             self.assertTrue(result["manual_pairing_required"])
             self.assertFalse(result["pairing_code_available"])
             self.assertFalse(result["persisted"])
-            self.assertEqual(result["commands"][0][-2:], ["pair", "--json"])
+            self.assertEqual(result["commands"], [])
+            self.assertEqual(result["pairing_surface"], "desktop_app")
+            self.assertIn("Control this Mac or PC", result["desktop_setup_path"])
             self.assertEqual(calls, [])
             self.assertNotIn("short-lived-secret", json.dumps(result))
             self.assertFalse(home.exists())
@@ -231,19 +230,13 @@ class MobileRemoteTests(unittest.TestCase):
     def test_status_reports_only_reduced_state(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mobile-remote-") as directory:
             home = Path(directory) / ".codex"
-            settings = home / "app-server-daemon"
-            settings.mkdir(parents=True)
-            (settings / "settings.json").write_text('{"remoteControlEnabled": true}\n')
             outputs = {
-                "version": '{"status":"running","cliVersion":"0.149.1","socketPath":"private"}',
                 "mcp": '{"name":"codex-workbench","enabled":true,"transport":'
                 '{"type":"stdio","command":"/opt/workbench","args":["mcp"]}}',
                 "plugin": '{"installed":[{"pluginId":"codex-workbench@codex-workbench","installed":true}],"available":[]}',
             }
 
             def runner(command: list[str], _environment: dict[str, str]) -> CommandResult:
-                if command[1:4] == ["app-server", "daemon", "version"]:
-                    return CommandResult(0, outputs["version"])
                 if command[1:3] == ["mcp", "get"]:
                     return CommandResult(0, outputs["mcp"])
                 return CommandResult(0, outputs["plugin"])
@@ -255,8 +248,9 @@ class MobileRemoteTests(unittest.TestCase):
             ).status()
 
             self.assertTrue(result["ok"])
-            self.assertEqual(result["remote_control_enabled"], True)
-            self.assertTrue(result["daemon"]["running"])
+            self.assertTrue(result["integration_ready"])
+            self.assertEqual(result["pairing_state"], "not_attested")
+            self.assertEqual(result["remote_control"]["owner"], "desktop_app")
             self.assertTrue(result["mcp"]["configured"])
             self.assertTrue(result["plugin"]["installed"])
             self.assertNotIn("socketPath", json.dumps(result))
@@ -264,13 +258,7 @@ class MobileRemoteTests(unittest.TestCase):
     def test_status_rejects_a_different_mcp_transport(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mobile-remote-") as directory:
             home = Path(directory) / ".codex"
-            settings = home / "app-server-daemon"
-            settings.mkdir(parents=True)
-            (settings / "settings.json").write_text('{"remoteControlEnabled": true}\n')
-
             def runner(command: list[str], _environment: dict[str, str]) -> CommandResult:
-                if command[1:4] == ["app-server", "daemon", "version"]:
-                    return CommandResult(0, '{"status":"running"}')
                 if command[1:3] == ["mcp", "get"]:
                     return CommandResult(
                         0,
@@ -292,7 +280,7 @@ class MobileRemoteTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertFalse(result["mcp"]["configured"])
 
-    def test_disable_only_toggles_remote_control_and_preserves_files(self) -> None:
+    def test_disable_defers_to_desktop_app_and_preserves_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mobile-remote-") as directory:
             home = Path(directory) / ".codex"
             home.mkdir(parents=True)
@@ -307,8 +295,9 @@ class MobileRemoteTests(unittest.TestCase):
             result = MobileRemote(user_codex_home=home, runner=runner).disable()
 
             self.assertTrue(result["ok"])
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][-1], "disable-remote-control")
+            self.assertEqual(calls, [])
+            self.assertTrue(result["manual_action_required"])
+            self.assertEqual(result["remote_control"]["owner"], "desktop_app")
             self.assertEqual(config.read_text(), "model = \"keep-me\"\n")
             self.assertTrue(result["preserved"]["mcp"])
             self.assertTrue(result["preserved"]["plugin"])

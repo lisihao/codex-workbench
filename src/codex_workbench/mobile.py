@@ -1,9 +1,9 @@
-"""Codex native Remote Control integration for the Workbench.
+"""Codex native Remote integration for the Workbench.
 
-The Workbench remains the durable authority.  This module only manages the
-local Codex CLI's app-server remote-control switch and the user-facing Codex
-configuration that lets the native Remote tab reach the Workbench MCP server.
-It deliberately does not talk to a model, Claude, or a phone relay directly.
+The Workbench remains the durable authority.  This module configures the
+Workbench plugin and MCP server used by Codex Remote.  The native desktop app
+is the sole owner of Remote Control and QR pairing; starting a second CLI
+app-server would conflict with the desktop host.
 
 All mutating operations accept an injectable runner and support ``dry_run`` so
 the installer/CLI can show an exact plan without touching the user's Codex
@@ -26,6 +26,10 @@ MCP_SERVER_NAME = "codex-workbench"
 PLUGIN_NAME = "codex-workbench"
 MARKETPLACE_NAME = "codex-workbench"
 PLUGIN_SELECTOR = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
+DESKTOP_REMOTE_SETUP_PATH = (
+    "Settings > Connections > Control this Mac or PC > Set up or Add"
+)
+REMOTE_DOCUMENTATION_URL = "https://learn.chatgpt.com/docs/remote"
 
 
 class MobileRemoteError(RuntimeError):
@@ -159,16 +163,6 @@ def _default_workbench_command() -> list[str]:
     return ["codex-workbench"]
 
 
-def _settings_remote_enabled(user_codex_home: Path) -> bool | None:
-    path = user_codex_home / "app-server-daemon" / "settings.json"
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    value = raw.get("remoteControlEnabled")
-    return value if isinstance(value, bool) else None
-
-
 def _plugin_registration(raw_output: str) -> dict[str, object]:
     """Reduce plugin-list JSON to non-sensitive installation state."""
 
@@ -218,19 +212,8 @@ def _mcp_matches(raw_output: str, expected_command: Sequence[str]) -> bool:
     return actual == list(expected_command)
 
 
-def _daemon_summary(result: CommandResult) -> dict[str, object]:
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    allowed = ("status", "cliVersion", "appServerVersion", "managedCodexVersion")
-    return {key: payload[key] for key in allowed if isinstance(payload.get(key), (str, int, float))}
-
-
 class MobileRemote:
-    """Manage Codex's native Remote Control without running a model."""
+    """Configure Workbench integration for desktop-owned Codex Remote."""
 
     def __init__(
         self,
@@ -295,21 +278,8 @@ class MobileRemote:
     def _plugin_command(self) -> list[str]:
         return [self.codex_binary, "plugin", "add", PLUGIN_SELECTOR, "--json"]
 
-    def _bootstrap_command(self) -> list[str]:
-        return [self.codex_binary, "app-server", "daemon", "bootstrap", "--remote-control"]
-
-    def _version_command(self) -> list[str]:
-        return [self.codex_binary, "app-server", "daemon", "version"]
-
-    def _pair_command(self) -> list[str]:
-        return [self.codex_binary, "remote-control", "pair", "--json"]
-
-    def _disable_command(self) -> list[str]:
-        return [self.codex_binary, "app-server", "daemon", "disable-remote-control"]
-
     def status(self) -> dict[str, object]:
         commands = [
-            self._version_command(),
             [self.codex_binary, "mcp", "get", MCP_SERVER_NAME, "--json"],
             [self.codex_binary, "plugin", "list", "--available", "--json"],
         ]
@@ -322,29 +292,30 @@ class MobileRemote:
                 "commands": commands,
             }
 
-        version = self._run(commands[0])
-        mcp = self._run(commands[1])
-        plugins = self._run(commands[2])
-        daemon = _daemon_summary(version)
-        daemon_running = daemon.get("status") == "running" if daemon else version.returncode == 0
+        mcp = self._run(commands[0])
+        plugins = self._run(commands[1])
         expected_mcp = [*self.workbench_command, "mcp"]
         mcp_ok = mcp.returncode == 0 and _mcp_matches(mcp.stdout, expected_mcp)
         plugin = _plugin_registration(plugins.stdout) if plugins.returncode == 0 else {"installed": False, "available": False, "selector": None}
-        remote_enabled = _settings_remote_enabled(self.user_codex_home)
-        ready = bool(daemon_running and remote_enabled is True and mcp_ok and plugin["installed"])
+        integration_ready = bool(mcp_ok and plugin["installed"])
         return {
-            "ok": ready,
+            "ok": integration_ready,
             "action": "status",
             "dry_run": False,
             "user_codex_home": str(self.user_codex_home),
-            "remote_control_enabled": remote_enabled,
-            "daemon": {**daemon, "running": daemon_running},
+            "integration_ready": integration_ready,
+            "pairing_state": "not_attested",
+            "remote_control": {
+                "owner": "desktop_app",
+                "setup_path": DESKTOP_REMOTE_SETUP_PATH,
+                "documentation": REMOTE_DOCUMENTATION_URL,
+            },
             "mcp": {"configured": mcp_ok},
             "plugin": plugin,
         }
 
     def enable(self) -> dict[str, object]:
-        commands = [self._marketplace_command(), self._plugin_command(), self._mcp_command(), self._bootstrap_command()]
+        commands = [self._marketplace_command(), self._plugin_command(), self._mcp_command()]
         if self.dry_run:
             return {
                 "ok": True,
@@ -407,56 +378,60 @@ class MobileRemote:
                 }
             )
 
-        for label, command in (
-            ("Codex app-server remote-control bootstrap", commands[3]),
-        ):
-            result = self._require_success(command, label)
-            executed.append({"action": label, "returncode": result.returncode})
         return {
             "ok": True,
             "action": "enable",
             "dry_run": False,
             "idempotent": True,
             "user_codex_home": str(self.user_codex_home),
-            "remote_control": "enabled_by_daemon_bootstrap",
+            "integration_ready": True,
+            "pairing_state": "not_attested",
+            "remote_control": {
+                "owner": "desktop_app",
+                "setup_path": DESKTOP_REMOTE_SETUP_PATH,
+                "documentation": REMOTE_DOCUMENTATION_URL,
+            },
             "executed": executed,
             "skipped": skipped,
             "preserved": {"other_codex_config": True},
         }
 
     def pair(self) -> dict[str, object]:
-        command = self._pair_command()
-        # Pairing is intentionally not proxied: capturing the CLI output here
-        # would either expose a short-lived secret in Workbench logs or create
-        # and discard a code the user can no longer see.  The caller receives
-        # the exact native command and executes it in an attended terminal.
+        # Pairing is intentionally desktop-owned.  The ChatGPT/Codex desktop
+        # app presents the QR code and performs account/workspace approval.
         return {
             "ok": True,
             "action": "pair",
             "dry_run": self.dry_run,
             "manual_pairing_required": True,
-            "commands": [command],
+            "pairing_state": "not_confirmed",
+            "pairing_surface": "desktop_app",
+            "desktop_setup_path": DESKTOP_REMOTE_SETUP_PATH,
+            "documentation": REMOTE_DOCUMENTATION_URL,
+            "commands": [],
             "pairing_code_available": False,
             "persisted": False,
+            "next_step": (
+                "在 Mac mini 的 ChatGPT/Codex 桌面 App 打开 "
+                f"{DESKTOP_REMOTE_SETUP_PATH}，显示二维码后用手机扫描并批准。"
+            ),
         }
 
     def disable(self) -> dict[str, object]:
-        command = self._disable_command()
-        if self.dry_run:
-            return {
-                "ok": True,
-                "action": "disable",
-                "dry_run": True,
-                "commands": [command],
-                "preserved": {"mcp": True, "plugin": True, "other_codex_config": True},
-            }
-        result = self._require_success(command, "Codex app-server remote-control disable")
         return {
             "ok": True,
             "action": "disable",
-            "dry_run": False,
-            "remote_control": "disabled",
-            "returncode": result.returncode,
+            "dry_run": self.dry_run,
+            "manual_action_required": True,
+            "remote_control": {
+                "owner": "desktop_app",
+                "setup_path": DESKTOP_REMOTE_SETUP_PATH,
+            },
+            "commands": [],
+            "next_step": (
+                "请在 ChatGPT/Codex 桌面 App 的 Connections 设置中关闭 Remote；"
+                "Workbench 不会启动或停止原生 Remote host。"
+            ),
             "preserved": {"mcp": True, "plugin": True, "other_codex_config": True},
         }
 

@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 import signal
 import socket
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -619,23 +618,6 @@ def command_mobile(args: argparse.Namespace) -> int:
             result = remote.enable()
         elif action == "pair":
             result = remote.pair()
-            # Pairing is deliberately a human action.  The native CLI may emit a
-            # short-lived code, but the Workbench never captures or persists it.
-            pair_command = [
-                args.codex_binary or os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
-                "remote-control",
-                "pair",
-                "--json",
-            ]
-            result = {
-                **result,
-                "pairing_state": "not_confirmed",
-                "pairing_command": shlex.join(pair_command),
-                "next_step": (
-                    "若尚未完成配对，请在同一终端执行 pairing_command；"
-                    "配对码只在终端短时显示，不会写入文件或返回 Workbench。"
-                ),
-            }
         elif action == "disable":
             result = remote.disable()
         else:

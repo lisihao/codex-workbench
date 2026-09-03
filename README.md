@@ -178,7 +178,7 @@ wb
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" mobile pair
 ```
 
-最后一条只显示需要在有人值守终端执行的原生 `codex remote-control pair --json` 命令，不生成或保存配对码。用户在 Mac mini 终端运行该命令，并在手机 Codex App 的 Remote 页完成配对。之后手机发出的任务由 Mac mini 上的 Codex 会话执行；在会话中输入 `wb` 即进入同一 Workbench Authority。自动化测试只能证明命令接线与状态读取，真机可见、可发任务仍须一次真实手机旅程验收。
+`mobile enable` 只安装 Workbench plugin/MCP，不启动第二个 CLI app-server。原生 Remote host 和二维码必须由 Mac mini 的 ChatGPT/Codex 桌面 App 独占管理：打开 `Settings > Connections > Control this Mac or PC > Set up or Add`，显示二维码后用手机扫描并批准。`mobile pair` 只返回这条桌面操作路径，不生成或保存配对码。之后手机发出的任务由 Mac mini 上的 Codex 会话执行；在会话中输入 `wb` 即进入同一 Workbench Authority。自动化测试只能证明接线状态，真机可见、可发任务仍须一次真实手机旅程验收。
 
 如果在家网段且 MCP 链路可达，客户端会优先走家庭 LAN；否则回落到 Tailscale 原生 SSH TCP Serve（默认端口 10022）。判断失败后会产生 `degraded` receipt 并走 outbox，下一次同一会话重试 `wb` 时继续同步。该策略不是按国家/区域判断，不会修改系统网络与 Tailscale 配置，也不会自动发起登录。
 
@@ -269,7 +269,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.6.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
+当前源码版本为 `1.6.1`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

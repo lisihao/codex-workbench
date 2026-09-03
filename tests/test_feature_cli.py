@@ -93,7 +93,10 @@ class FeatureCLITests(unittest.TestCase):
         fake_remote.pair.return_value = {
             "ok": True,
             "manual_pairing_required": True,
-            "pairing_code_available": True,
+            "pairing_code_available": False,
+            "pairing_state": "not_confirmed",
+            "desktop_setup_path": "Settings > Connections > Control this Mac or PC > Set up or Add",
+            "next_step": "在桌面 App 中显示二维码后用手机扫描。",
         }
         with mock.patch("codex_workbench.cli.MobileRemote", return_value=fake_remote) as remote:
             code, payload = self._run(command_mobile, args)
@@ -102,8 +105,9 @@ class FeatureCLITests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["pairing_state"], "not_confirmed")
         self.assertNotIn("paired", payload)
-        self.assertIn("remote-control pair --json", payload["pairing_command"])
-        self.assertIn("同一终端", payload["next_step"])
+        self.assertNotIn("pairing_command", payload)
+        self.assertIn("Control this Mac or PC", payload["desktop_setup_path"])
+        self.assertIn("桌面 App", payload["next_step"])
         self.assertNotIn("pairing_code", payload)
         remote.assert_called_once_with(
             codex_binary="/opt/codex",
