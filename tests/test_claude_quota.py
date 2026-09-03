@@ -140,6 +140,13 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
             "Current week (Fable): 1% used · resets Sep 9 at 1am (America/Toronto)",
         ))
         result = json.loads(self._usage(text))
+        result["subagent_stats"] = {
+            "spawned": 0,
+            "requested": {"background": 0, "foreground": 0, "unset": 0},
+            "completed": 0,
+            "failed": 0,
+            "by_type": {},
+        }
         responses = {
             ("auth", "status", "--json"): _completed([], self._logged_in()),
             ("--version",): _completed([], "2.1.239 (Claude Code)\n"),
@@ -164,6 +171,21 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         self.assertEqual(derived.weekly_fable_remaining, 98.0)
         self.assertIsNone(derived.weekly_sonnet_remaining)
         self.assertEqual(derived.dispatch_decision("fable").action, "claude")
+
+    def test_passive_usage_rejects_nonzero_subagent_activity(self) -> None:
+        payload = json.loads(self._usage())
+        payload["subagent_stats"] = {"spawned": 1}
+        responses = {
+            ("auth", "status", "--json"): _completed([], self._logged_in()),
+            ("--version",): _completed([], "2.1.239 (Claude Code)\n"),
+            ("-p", "/usage", "--output-format", "json", "--no-session-persistence"): _completed(
+                [], json.dumps(payload)
+            ),
+        }
+
+        with self.assertRaisesRegex(ClaudeQuotaError, "must not record permissions"):
+            self._collector(responses).collect()
+        self._assert_fail_closed_snapshot(auth_ok=True)
 
     def test_missing_pool_or_format_drift_immediately_replaces_old_quota_with_fail_closed_snapshot(self) -> None:
         self.output.write_text("last-known-good\n")

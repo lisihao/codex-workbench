@@ -295,7 +295,11 @@ def _validate_passive_usage(outer: Mapping[str, Any]) -> None:
     usage = outer.get("usage")
     if not isinstance(usage, Mapping) or usage.get("iterations") != []:
         raise ClaudeQuotaError("/usage must report usage.iterations=[]")
-    if outer.get("permission_denials") != [] or outer.get("subagent_stats") != {} or outer.get("stop_reason") is not None:
+    if (
+        outer.get("permission_denials") != []
+        or not _zero_activity_mapping(outer.get("subagent_stats"))
+        or outer.get("stop_reason") is not None
+    ):
         raise ClaudeQuotaError("/usage must not record permissions, subagents, or a stop reason")
     for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
         _zero_number(usage, field)
@@ -306,6 +310,20 @@ def _validate_passive_usage(outer: Mapping[str, Any]) -> None:
         _zero_number(usage.get("cache_creation"), field)
     if not isinstance(outer.get("result"), str):
         raise ClaudeQuotaError("/usage result display is missing")
+
+
+def _zero_activity_mapping(value: object) -> bool:
+    """Accept Claude's version-pinned empty or recursively zero activity map."""
+
+    if not isinstance(value, Mapping):
+        return False
+    for item in value.values():
+        if isinstance(item, Mapping):
+            if not _zero_activity_mapping(item):
+                return False
+        elif isinstance(item, bool) or not isinstance(item, (int, float)) or item != 0:
+            return False
+    return True
 
 
 def _zero_number(container: object, field: str) -> None:
