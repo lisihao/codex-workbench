@@ -482,6 +482,10 @@ def render_client_plist(
     label: str,
     transport_arguments: tuple[str, ...],
     authority_mcp_path: str | None = None,
+    heartbeat_launcher: Path | None = None,
+    authority_state_root: str | None = None,
+    location_proxy: Path | None = None,
+    location_config: Path | None = None,
 ) -> dict[str, object]:
     template = (source / "launchd" / f"{label}.plist.in").read_text()
     rendered = (
@@ -493,6 +497,23 @@ def render_client_plist(
     program_arguments = payload["ProgramArguments"]
     if not isinstance(program_arguments, list):
         raise SystemExit(f"LaunchAgent ProgramArguments is invalid: {label}")
+    if heartbeat_launcher is not None and label == HEARTBEAT_LABEL:
+        if authority_state_root is None or location_proxy is None or location_config is None:
+            raise SystemExit("location-aware heartbeat requires its launcher, proxy, config, and authority state root")
+        payload["ProgramArguments"] = [
+            str(heartbeat_launcher),
+            "--location-proxy",
+            str(location_proxy),
+            "--transport-config",
+            str(location_config),
+            "--authority",
+            authority_ssh_alias,
+            "--authority-state-root",
+            authority_state_root,
+            "--client-id",
+            client_id,
+        ]
+        return payload
     if authority_ssh_alias not in program_arguments:
         raise SystemExit(
             f"LaunchAgent template does not contain authority SSH destination: {label}"
@@ -525,6 +546,10 @@ def preflight_client_plists(
     authority_ssh_alias: str,
     transport_arguments: tuple[str, ...],
     authority_mcp_path: str | None = None,
+    heartbeat_launcher: Path | None = None,
+    authority_state_root: str | None = None,
+    location_proxy: Path | None = None,
+    location_config: Path | None = None,
 ) -> None:
     for label in (TUNNEL_LABEL, HEARTBEAT_LABEL):
         render_client_plist(
@@ -535,6 +560,10 @@ def preflight_client_plists(
             label,
             transport_arguments,
             authority_mcp_path,
+            heartbeat_launcher,
+            authority_state_root,
+            location_proxy,
+            location_config,
         )
 
 
@@ -823,6 +852,8 @@ def main() -> int:
     client_libexec = client_root / "libexec"
     location_proxy = client_bin / "workbench-location-proxy"
     location_proxy_runtime = client_libexec / "workbench-location-proxy.py"
+    heartbeat_launcher = client_bin / "workbench-client-heartbeat"
+    heartbeat_runtime = client_libexec / "workbench-client-heartbeat.py"
     location_config = client_root / "transport.json"
     location_status = client_root / "status.json"
     dynamic_transport = location_aware_enabled(
@@ -837,6 +868,9 @@ def main() -> int:
     location_transport: LocationAwareTransport | None = None
     if dynamic_transport:
         source_location_proxy = location_proxy_source(source)
+        source_heartbeat = source / "scripts" / "workbench-client-heartbeat.py"
+        if not source_heartbeat.is_file():
+            raise SystemExit(f"location-aware heartbeat helper is missing: {source_heartbeat}")
         location_transport = build_location_aware_transport(
             lan_host=args.authority_lan_host,
             lan_port=args.authority_lan_port or DEFAULT_LAN_SSH_PORT,
@@ -868,6 +902,8 @@ def main() -> int:
         assert_directory_target(client_libexec, "MacBook Workbench client libexec")
         assert_file_target(location_proxy, "location-aware proxy")
         assert_file_target(location_proxy_runtime, "location-aware proxy runtime")
+        assert_file_target(heartbeat_launcher, "location-aware heartbeat launcher")
+        assert_file_target(heartbeat_runtime, "location-aware heartbeat runtime")
     assert_file_target(location_config, "location-aware transport config")
     assert_file_target(location_status, "location-aware transport status")
     domain = f"gui/{run('id', '-u').stdout.strip()}"
@@ -887,6 +923,10 @@ def main() -> int:
         authority_ssh_alias,
         transport_arguments,
         remote_binary,
+        heartbeat_launcher if dynamic_transport else None,
+        args.authority_state_root if dynamic_transport else None,
+        location_proxy if dynamic_transport else None,
+        location_config if dynamic_transport else None,
     )
     codex = shutil.which("codex")
     if not codex:
@@ -920,6 +960,7 @@ def main() -> int:
             print(f"plan: Tailscale endpoint={tailscale['host']}:{tailscale['port']}")
             print(f"plan: home networks={','.join(location_transport.configuration['home_networks'])}")
             print(f"plan: location proxy={location_proxy} (0700)")
+            print(f"plan: location heartbeat={heartbeat_launcher} (0700; sends a short-lived home-LAN lease)")
             print(f"plan: location config={location_config} (0600)")
             print(f"plan: location status={location_status}")
         else:
@@ -973,6 +1014,8 @@ def main() -> int:
             (
                 (location_proxy, "location-aware proxy"),
                 (location_proxy_runtime, "location-aware proxy runtime"),
+                (heartbeat_launcher, "location-aware heartbeat launcher"),
+                (heartbeat_runtime, "location-aware heartbeat runtime"),
             )
         )
     for path, label in snapshot_paths:
@@ -996,6 +1039,12 @@ def main() -> int:
                 location_proxy_runtime,
                 sys.executable,
             )
+            install_location_proxy(
+                source_heartbeat,
+                heartbeat_launcher,
+                heartbeat_runtime,
+                sys.executable,
+            )
             write_location_aware_config(location_config, location_transport.configuration)
         else:
             location_config.unlink(missing_ok=True)
@@ -1009,6 +1058,10 @@ def main() -> int:
                 label,
                 transport_arguments,
                 remote_binary,
+                heartbeat_launcher if dynamic_transport else None,
+                args.authority_state_root if dynamic_transport else None,
+                location_proxy if dynamic_transport else None,
+                location_config if dynamic_transport else None,
             )
             plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
             plist_path.chmod(0o600)

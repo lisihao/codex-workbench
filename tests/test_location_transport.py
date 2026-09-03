@@ -199,6 +199,30 @@ class LocationTransportTests(unittest.TestCase):
         printed = stdout.getvalue()
         self.assertEqual(json.loads(printed)["route"], "lan")
 
+    def test_force_tailscale_never_counts_as_home_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "location.json"
+            status_file = Path(directory) / "status.json"
+            config_file.write_text(json.dumps(config(status_file)), encoding="utf-8")
+            with (
+                mock.patch.object(location, "read_ifconfig", return_value=HOME_IPV4),
+                mock.patch.object(location, "probe_lan", return_value=True) as probe,
+                mock.patch.object(location.os, "execv") as execv,
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                self.assertEqual(
+                    location.main(
+                        ["--config", str(config_file), "--select", "--force-tailscale"]
+                    ),
+                    0,
+                )
+
+        probe.assert_not_called()
+        execv.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["route"], "tailscale")
+        self.assertEqual(payload["reason"], "forced_remote_archive")
+
     def test_normal_mode_execs_the_selected_argument_vector(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_file = Path(directory) / "location.json"

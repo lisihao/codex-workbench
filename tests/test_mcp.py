@@ -110,6 +110,9 @@ class MCPTests(unittest.TestCase):
                 "workbench_read_events",
                 "workbench_read_artifact",
                 "workbench_acceptance_report",
+                "workbench_worktree_status",
+                "workbench_reclaim_worktrees",
+                "workbench_restore_worktree",
                 "workbench_list_approvals",
                 "workbench_decide_approval",
             },
@@ -119,6 +122,19 @@ class MCPTests(unittest.TestCase):
         self.assertFalse(report["complete"])
         self.assertEqual(len(report["checks"]), 12)
         self.assertEqual(report["backlog"], [])
+
+        recovery = json.loads(
+            self.call("workbench_worktree_status", {})["content"][0]["text"]
+        )
+        self.assertTrue(recovery["enabled"])
+        self.assertEqual(recovery["allocations"], [])
+        self.assertEqual(recovery["archives"], [])
+        self.assertIsNone(recovery["home_presence"])
+
+        swept = json.loads(
+            self.call("workbench_reclaim_worktrees", {"max_items": 1})["content"][0]["text"]
+        )
+        self.assertEqual(swept["status"], "idle")
 
     def test_continue_session_appends_steering_without_terminating_active_task(self) -> None:
         context_ref = "sha256:" + "e" * 64 + ":tar.gz"

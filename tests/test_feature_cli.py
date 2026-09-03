@@ -71,6 +71,31 @@ class FeatureCLITests(unittest.TestCase):
         self.assertEqual(mobile.workbench_binary, "/opt/workbench")
         self.assertTrue(mobile.dry_run)
 
+        heartbeat = parser.parse_args(
+            [
+                "client",
+                "heartbeat",
+                "--client-id",
+                "macbook-fixture",
+                "--kind",
+                "macbook",
+                "--route",
+                "lan",
+                "--reason",
+                "home_network_lan_probe_ok",
+                "--observed-at",
+                "2026-09-03T12:00:00Z",
+            ]
+        )
+        self.assertEqual(heartbeat.route, "lan")
+        self.assertEqual(heartbeat.reason, "home_network_lan_probe_ok")
+
+        worktree = parser.parse_args(
+            ["worktree", "send", "wta-fixture", "--host", "macmini"]
+        )
+        self.assertEqual(worktree.worktree_action, "send")
+        self.assertEqual(worktree.allocation_id, "wta-fixture")
+
     def test_capability_refresh_uses_actual_binary_env_and_returns_explicit_ok(self) -> None:
         with tempfile.TemporaryDirectory(prefix="feature-cli-") as directory:
             args = build_parser().parse_args(

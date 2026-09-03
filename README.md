@@ -18,6 +18,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 | --- | --- |
 | MacBook 合盖或网络中断后，任务难以接续 | Mac mini 是唯一的持久 Authority；MacBook 只消费同一份状态。已绑定会话失联时明确回退本地 checkout，并保留可重试的 outbox。 |
 | 多个 Agent 同时改代码互相踩踏 | DAG 只并行运行无依赖、作用域不冲突的节点；每个 Worker 使用独立分支和 Git worktree。 |
+| Worktree 自动清理误删了以后需要的数据 | 终态 worktree 先移入本地回收区；只有 NAS 压缩包通过完整恢复验证并产生持久回执后才删除。离家时也可强制走 Tailscale 把恢复包交给 Mac mini 写入 NAS。 |
 | “Worker 跑完了”被误当作完成 | Worker 结果不是验收。只有独立 verifier 收齐约定的 diff、检查日志和 verdict 后，任务才可 `accepted`。 |
 | 强模型被实现细节占满 | Sol 负责需求编译、跨模块判断和最终验收；边界明确的实现优先交给 Spark、Luna、Terra 或受配额约束的 Claude Worker。 |
 | Claude Code 订阅被后台任务耗尽 | Claude Worker 只在认证和新鲜配额快照可证明时启用；未知状态会 fail closed 并转交 Codex。系统保留至少 20% 的目标配额空间，并设有更早的调度门槛。 |
@@ -71,6 +72,33 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 路由不是固定“弱模型干活”的盲目规则：低风险、短且可机械验收的工作可进入独立 Spark 池；边界明确的常规实现优先 Luna；较大的独立切片可以升级 Terra；需求拆解、跨模块判断和最终验收留给 Sol。Claude Code 的 Sonnet、Opus 或 Fable 只在其订阅资格和受保护配额可证明时作为 Worker 使用。
 
 Spark 是一个独立的逻辑队列，不是另一套协调器。它和普通 Worker 共享全局执行器上限，但拥有自己的容量、等待、启动和 busy-slot 计数；默认上限为 `min(4, max_workers)`，可用 `serve --spark-workers N` 调整，`0` 表示关闭 Spark 优先 lane。规划器会主动寻找互不冲突、可单独验收的短切片；无法安全拆分时保留 Luna/Terra 的较大切片。routing-v3 的 Spark 失败不会被当成成功，也不会在 claim 时绕过已固定能力目录静默换模型；需要换档时由后续 planner repair 重新路由，最终仍由 Sol 验收。
+
+### 可恢复的 Worktree 回收与 NAS 归档
+
+每次 worktree 分配都会写入持久账本。任务进入 `accepted` 或 `cancelled` 后，后台维护线程只做以下有序状态转换：
+
+```text
+active → quarantine_pending → quarantined
+       → archive pending → verified → purged
+                                └────→ restored
+```
+
+- 没有新鲜家庭 LAN 凭证且未配置远程归档目标时，只使用 `git worktree move` 移到本地回收目录，不删除工作树或分支。
+- MacBook 的 location-aware heartbeat 只有在显式 home CIDR 匹配且 LAN 探测成功时，才写入十分钟短效在家凭证；Tailscale 连通、普通私网地址或手机心跳都不能解除删除门禁。
+- 配置 NAS 后，Authority 写入 `.partial` 压缩包，执行压缩流校验、完整安全解包、文件清单、关联 Evidence 哈希对账和 Git bundle 克隆恢复；随后原子改名并写 SHA-256/SQLite 回执。只有这份回执存在，才执行 `git worktree remove`、删除专属分支和 `git worktree prune`。
+- MacBook 回落运行产生的隔离 worktree 可以执行 `worktree send`。该命令强制 location proxy 使用 Tailscale，把压缩包送到 Mac mini；Mac mini 在本地写入 NAS并完成同样的恢复验证，返回匹配回执后源端才删除。
+- 需要外部 GitHub delivery 的 verifier worktree，在 delivery 进入 `merged`/`released` 前不会进入回收候选。
+
+常用观察与恢复命令：
+
+```bash
+codex-workbench worktree status
+codex-workbench worktree sweep --max-items 10
+codex-workbench worktree send <allocation-id> --host macmini
+codex-workbench worktree restore <archive-id> --destination <local-path>
+```
+
+当前 Codex 会话也可直接调用 MCP 工具 `workbench_worktree_status`、`workbench_reclaim_worktrees` 与 `workbench_restore_worktree`。远程 `send` 没有 direct-SSH fallback：它必须复用已安装的 location-aware profile 并强制 `--force-tailscale`；远端 receipt 缺失或不匹配时保留源 worktree。
 
 ### Benchmark 基线、长期校准与快照绑定
 
@@ -151,7 +179,9 @@ git clone <repository-url> codex-workbench
 cd codex-workbench
 
 # Mac mini: inspect the Authority installation plan first
-scripts/python-runtime scripts/install-macos.py --dry-run
+scripts/python-runtime scripts/install-macos.py \
+  --nas-archive-root <MOUNTED_NAS_WORKTREE_ARCHIVE_ROOT> \
+  --dry-run
 ```
 
 确认计划和本机前提条件后，按照 [AI 安装与配置指南](docs/AI_INSTALL.md) 在 Mac mini 安装 Authority，并在 MacBook 安装 cockpit/MCP：
@@ -274,6 +304,12 @@ codex-workbench performance status
 codex-workbench performance show
 codex-workbench performance refresh
 
+# Recoverable worktree lifecycle
+codex-workbench worktree status
+codex-workbench worktree sweep --max-items 10
+codex-workbench worktree send <allocation-id> --host macmini
+codex-workbench worktree restore <archive-id> --destination <local-path>
+
 # Tune the logical Spark lane inside the shared executor
 codex-workbench serve --max-workers 8 --spark-workers 4
 
@@ -301,7 +337,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.7.2`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.7.2 包含 benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列，以及 Claude Code 2.1.239 被动配额格式兼容修复；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
+当前源码版本为 `1.8.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.8.0 包含 benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证和强制 Tailscale 远程归档；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

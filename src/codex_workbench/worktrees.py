@@ -30,6 +30,12 @@ class WorktreeManager:
             return self._repository_locks.setdefault(repository, threading.Lock())
 
     @staticmethod
+    def branch_name(task_id: str, node_id: str, attempt: int) -> str:
+        task_segment = _safe_segment(task_id)
+        node_segment = _safe_segment(node_id)
+        return f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
+
+    @staticmethod
     def _git(repository: Path, *args: str) -> str:
         result = subprocess.run(
             ["git", "-C", str(repository), *args],
@@ -58,7 +64,7 @@ class WorktreeManager:
             task_segment = _safe_segment(task_id)
             node_segment = _safe_segment(node_id)
             worktree = self.root / task_segment / f"{node_segment}-a{attempt}"
-            branch = f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
+            branch = self.branch_name(task_id, node_id, attempt)
             if worktree.exists():
                 actual = self._git(worktree, "rev-parse", "HEAD")
                 if actual != resolved_base:
@@ -76,6 +82,43 @@ class WorktreeManager:
                 raise WorktreeError(result.stderr.strip() or result.stdout.strip())
             os.chmod(worktree.parent, 0o700)
             return worktree
+
+    def move(self, repository: str | Path, worktree: Path, destination: Path) -> Path:
+        repo = Path(repository).expanduser().resolve(strict=True)
+        source = worktree.expanduser().resolve(strict=True)
+        target = destination.expanduser().absolute()
+        with self._repository_lock(repo):
+            if target.exists():
+                raise WorktreeError(f"worktree quarantine destination already exists: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._git(repo, "worktree", "move", str(source), str(target))
+            os.chmod(target.parent, 0o700)
+            return target
+
+    def remove(
+        self,
+        repository: str | Path,
+        worktree: Path,
+        branch: str,
+    ) -> None:
+        repo = Path(repository).expanduser().resolve(strict=True)
+        target = worktree.expanduser().absolute()
+        with self._repository_lock(repo):
+            if target.exists():
+                self._git(repo, "worktree", "remove", "--force", str(target))
+            self._git(repo, "worktree", "prune")
+            branch_result = subprocess.run(
+                ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            if branch_result.returncode == 0:
+                self._git(repo, "branch", "-D", branch)
+            elif branch_result.returncode != 1:
+                raise WorktreeError(f"cannot inspect worktree branch {branch!r}")
+            if target.exists():
+                raise WorktreeError(f"worktree path still exists after removal: {target}")
 
     def changed_paths(self, worktree: Path, base_sha: str) -> set[str]:
         committed = self._git(worktree, "diff", "--name-only", f"{base_sha}...HEAD").splitlines()

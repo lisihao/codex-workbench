@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
@@ -30,10 +30,16 @@ from .scheduler_metrics import (
     execution_lane_for_spec,
     quota_pool_id_for_spec,
 )
-from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
+from .worktrees import (
+    WorktreeManager,
+    normalize_scope,
+    scope_access_conflicts,
+    scope_allows,
+    scopes_overlap,
+)
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 
@@ -227,6 +233,46 @@ class WorkbenchStore:
                     active_task_id TEXT REFERENCES tasks(task_id),
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS worktree_allocations (
+                    allocation_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    node_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    repository TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    current_path TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    node_result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(task_id, node_id, attempt)
+                );
+                CREATE TABLE IF NOT EXISTS worktree_archives (
+                    archive_id TEXT PRIMARY KEY,
+                    allocation_id TEXT,
+                    source_host TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    transport TEXT NOT NULL,
+                    archive_path TEXT,
+                    archive_sha256 TEXT,
+                    size_bytes INTEGER,
+                    state TEXT NOT NULL,
+                    manifest_json TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    verified_at TEXT,
+                    purged_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS home_presence_leases (
+                    client_id TEXT PRIMARY KEY,
+                    route TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
@@ -234,6 +280,10 @@ class WorkbenchStore:
                     ON task_steering(task_id, created_at);
                 CREATE INDEX IF NOT EXISTS context_import_thread_created_idx
                     ON context_import_receipts(source_thread_id, created_at);
+                CREATE INDEX IF NOT EXISTS worktree_allocations_state_idx
+                    ON worktree_allocations(state, updated_at);
+                CREATE INDEX IF NOT EXISTS worktree_archives_state_idx
+                    ON worktree_archives(state, updated_at);
                 """
             )
             current = connection.execute(
@@ -244,7 +294,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -567,13 +617,15 @@ class WorkbenchStore:
         task_id: str | None,
         node_id: str | None,
         payload: dict[str, Any],
+        *,
+        created_at: str | None = None,
     ) -> int:
         cursor = connection.execute(
             """
             INSERT INTO events(event_type, task_id, node_id, payload_json, created_at)
             VALUES(?, ?, ?, ?, ?)
             """,
-            (event_type, task_id, node_id, canonical_json(payload), now_iso()),
+            (event_type, task_id, node_id, canonical_json(payload), created_at or now_iso()),
         ).lastrowid
         assert cursor is not None
         return int(cursor)
@@ -1509,6 +1561,8 @@ class WorkbenchStore:
             "coordinator.failed",
             "quota.refresh_failed",
             "quota.refresh_unavailable",
+            "worktree.recovery_failed",
+            "worktree.purge_failed",
         }
         with self.connection() as connection:
             rows = connection.execute(
@@ -1716,15 +1770,439 @@ class WorkbenchStore:
                 {"source_thread_id": source_thread_id},
             )
 
-    def record_client_heartbeat(self, client_id: str, client_kind: str) -> int:
+    @staticmethod
+    def _parse_observed_at(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("observed_at must be an ISO-8601 timestamp") from error
+        if parsed.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        return parsed.astimezone(UTC)
+
+    def record_client_heartbeat(
+        self,
+        client_id: str,
+        client_kind: str,
+        *,
+        route: str | None = None,
+        reason: str | None = None,
+        observed_at: str | None = None,
+        presence_ttl_seconds: int = 600,
+    ) -> int:
         if not client_id or len(client_id) > 128 or any(character.isspace() for character in client_id):
             raise ValueError("client_id must be non-empty, contain no whitespace, and be at most 128 characters")
         if client_kind not in {"macbook", "phone"}:
             raise ValueError("client_kind must be macbook or phone")
-        return self.record_system_event(
-            "client.heartbeat",
-            {"client_id": client_id, "client_kind": client_kind},
+        if presence_ttl_seconds < 60 or presence_ttl_seconds > 3600:
+            raise ValueError("presence_ttl_seconds must be between 60 and 3600")
+        location_values = (route, reason, observed_at)
+        if any(value is not None for value in location_values) and not all(
+            isinstance(value, str) and value for value in location_values
+        ):
+            raise ValueError("route, reason, and observed_at must be supplied together")
+        timestamp = now_iso()
+        payload: dict[str, Any] = {"client_id": client_id, "client_kind": client_kind}
+        with self.transaction() as connection:
+            if route is not None:
+                assert reason is not None and observed_at is not None
+                if route not in {"lan", "tailscale"}:
+                    raise ValueError("route must be lan or tailscale")
+                observed = self._parse_observed_at(observed_at)
+                now = datetime.now(UTC)
+                age = (now - observed).total_seconds()
+                if age < -30 or age > 120:
+                    raise ValueError("location observation is outside the trusted freshness window")
+                payload.update(
+                    {"route": route, "reason": reason, "observed_at": observed.isoformat()}
+                )
+                if (
+                    client_kind == "macbook"
+                    and route == "lan"
+                    and reason == "home_network_lan_probe_ok"
+                ):
+                    expires_at = (now + timedelta(seconds=presence_ttl_seconds)).isoformat()
+                    connection.execute(
+                        """
+                        INSERT INTO home_presence_leases(
+                            client_id, route, reason, observed_at, expires_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(client_id) DO UPDATE SET
+                            route = excluded.route,
+                            reason = excluded.reason,
+                            observed_at = excluded.observed_at,
+                            expires_at = excluded.expires_at,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            client_id,
+                            route,
+                            reason,
+                            observed.isoformat(),
+                            expires_at,
+                            timestamp,
+                        ),
+                    )
+                    payload["home_presence_expires_at"] = expires_at
+                else:
+                    connection.execute(
+                        "DELETE FROM home_presence_leases WHERE client_id = ?",
+                        (client_id,),
+                    )
+            return self._event(connection, "client.heartbeat", None, None, payload)
+
+    def active_home_presence(self, *, at: datetime | None = None) -> dict[str, Any] | None:
+        now = (at or datetime.now(UTC)).astimezone(UTC)
+        with self.transaction() as connection:
+            connection.execute(
+                "DELETE FROM home_presence_leases WHERE expires_at <= ?",
+                (now.isoformat(),),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM home_presence_leases
+                WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1
+                """,
+                (now.isoformat(),),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    @staticmethod
+    def _allocation_row(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        if "contract_json" in value:
+            value["contract"] = json.loads(value.pop("contract_json"))
+        if "spec_json" in value:
+            value["spec"] = json.loads(value.pop("spec_json"))
+        if "node_result_json" in value:
+            raw_result = value.pop("node_result_json")
+            value["node_result"] = json.loads(raw_result) if raw_result else None
+        return value
+
+    def list_worktree_allocations(self, *, states: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT a.*, t.state AS task_state, t.contract_json, n.spec_json,
+                   n.attempt AS current_attempt, n.worktree AS node_worktree
+            FROM worktree_allocations a
+            JOIN tasks t USING(task_id)
+            JOIN nodes n ON n.task_id = a.task_id AND n.node_id = a.node_id
+        """
+        parameters: tuple[Any, ...] = ()
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            query += f" WHERE a.state IN ({placeholders})"
+            parameters = states
+        query += " ORDER BY a.created_at, a.allocation_id"
+        with self.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+            return [self._allocation_row(row) for row in rows]
+
+    def get_worktree_allocation(self, allocation_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT a.*, t.state AS task_state, t.contract_json, n.spec_json,
+                       n.attempt AS current_attempt, n.worktree AS node_worktree
+                FROM worktree_allocations a
+                JOIN tasks t USING(task_id)
+                JOIN nodes n ON n.task_id = a.task_id AND n.node_id = a.node_id
+                WHERE allocation_id = ?
+                """,
+                (allocation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(allocation_id)
+            return self._allocation_row(row)
+
+    def reclaimable_worktree_allocations(self) -> list[dict[str, Any]]:
+        candidates = self.list_worktree_allocations(
+            states=("active", "quarantine_pending", "quarantined", "archive_failed", "archived_verified", "purge_failed")
         )
+        with self.connection() as connection:
+            delivered = {
+                str(row["task_id"])
+                for row in connection.execute(
+                    "SELECT DISTINCT task_id FROM delivery_receipts WHERE state IN ('merged', 'released')"
+                ).fetchall()
+            }
+        result: list[dict[str, Any]] = []
+        for allocation in candidates:
+            if allocation["task_state"] not in {"accepted", "cancelled"}:
+                continue
+            verifier = bool(allocation["spec"].get("verifier"))
+            external = bool(allocation["contract"].get("external_write_permission"))
+            allocation["purge_allowed"] = (
+                allocation["task_state"] == "cancelled"
+                or not verifier
+                or not external
+                or allocation["task_id"] in delivered
+            )
+            if allocation["purge_allowed"]:
+                result.append(allocation)
+        return result
+
+    def begin_worktree_quarantine(self, allocation_id: str, destination: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(allocation_id)
+            if row["state"] not in {"active", "quarantine_pending"}:
+                return dict(row)
+            connection.execute(
+                "UPDATE worktree_allocations SET state = 'quarantine_pending', updated_at = ? WHERE allocation_id = ?",
+                (timestamp, allocation_id),
+            )
+            self._event(
+                connection,
+                "worktree.quarantine_pending",
+                row["task_id"],
+                row["node_id"],
+                {"allocation_id": allocation_id, "from": row["current_path"], "to": destination},
+            )
+        return self.get_worktree_allocation(allocation_id)
+
+    def finish_worktree_quarantine(self, allocation_id: str, destination: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(allocation_id)
+            previous = str(row["current_path"])
+            connection.execute(
+                """
+                UPDATE worktree_allocations
+                SET current_path = ?, state = 'quarantined', updated_at = ?
+                WHERE allocation_id = ?
+                """,
+                (destination, timestamp, allocation_id),
+            )
+            connection.execute(
+                """
+                UPDATE nodes SET worktree = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND attempt = ? AND worktree = ?
+                """,
+                (
+                    destination,
+                    timestamp,
+                    row["task_id"],
+                    row["node_id"],
+                    row["attempt"],
+                    previous,
+                ),
+            )
+            self._event(
+                connection,
+                "worktree.quarantined",
+                row["task_id"],
+                row["node_id"],
+                {"allocation_id": allocation_id, "path": destination},
+            )
+        return self.get_worktree_allocation(allocation_id)
+
+    def begin_worktree_archive(
+        self,
+        archive_id: str,
+        allocation_id: str | None,
+        *,
+        source_host: str,
+        source_path: str,
+        transport: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO worktree_archives(
+                        archive_id, allocation_id, source_host, source_path,
+                        transport, state, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        archive_id,
+                        allocation_id,
+                        source_host,
+                        source_path,
+                        transport,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def finish_worktree_archive(
+        self,
+        archive_id: str,
+        *,
+        archive_path: str,
+        archive_sha256: str,
+        size_bytes: int,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(archive_id)
+            connection.execute(
+                """
+                UPDATE worktree_archives
+                SET archive_path = ?, archive_sha256 = ?, size_bytes = ?,
+                    state = 'verified', manifest_json = ?, error = NULL,
+                    verified_at = ?, updated_at = ?
+                WHERE archive_id = ?
+                """,
+                (
+                    archive_path,
+                    archive_sha256,
+                    size_bytes,
+                    canonical_json(manifest),
+                    timestamp,
+                    timestamp,
+                    archive_id,
+                ),
+            )
+            if row["allocation_id"]:
+                connection.execute(
+                    """
+                    UPDATE worktree_allocations
+                    SET state = 'archived_verified', updated_at = ?
+                    WHERE allocation_id = ?
+                    """,
+                    (timestamp, row["allocation_id"]),
+                )
+            self._event(
+                connection,
+                "worktree.archive_verified",
+                manifest.get("task_id"),
+                manifest.get("node_id"),
+                {
+                    "archive_id": archive_id,
+                    "allocation_id": row["allocation_id"],
+                    "path": archive_path,
+                    "sha256": archive_sha256,
+                    "size_bytes": size_bytes,
+                    "transport": row["transport"],
+                },
+            )
+        return self.get_worktree_archive(archive_id)
+
+    def fail_worktree_archive(self, archive_id: str, error: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(archive_id)
+            connection.execute(
+                "UPDATE worktree_archives SET state = 'failed', error = ?, updated_at = ? WHERE archive_id = ?",
+                (error[:2000], timestamp, archive_id),
+            )
+            if row["allocation_id"]:
+                connection.execute(
+                    "UPDATE worktree_allocations SET state = 'archive_failed', updated_at = ? WHERE allocation_id = ?",
+                    (timestamp, row["allocation_id"]),
+                )
+            return dict(
+                connection.execute(
+                    "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                    (archive_id,),
+                ).fetchone()
+            )
+
+    def get_worktree_archive(self, archive_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(archive_id)
+            result = dict(row)
+            result["manifest"] = json.loads(result.pop("manifest_json")) if result.get("manifest_json") else None
+            return result
+
+    def list_worktree_archives(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT archive_id FROM worktree_archives ORDER BY created_at DESC"
+            ).fetchall()
+        return [self.get_worktree_archive(str(row["archive_id"])) for row in rows]
+
+    def mark_worktree_purged(self, allocation_id: str, archive_id: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            allocation = connection.execute(
+                "SELECT * FROM worktree_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+            archive = connection.execute(
+                "SELECT * FROM worktree_archives WHERE archive_id = ? AND allocation_id = ?",
+                (archive_id, allocation_id),
+            ).fetchone()
+            if allocation is None or archive is None:
+                raise KeyError((allocation_id, archive_id))
+            if archive["state"] != "verified":
+                raise StateConflictError("local worktree purge requires a verified archive receipt")
+            connection.execute(
+                "UPDATE worktree_allocations SET state = 'purged', updated_at = ? WHERE allocation_id = ?",
+                (timestamp, allocation_id),
+            )
+            connection.execute(
+                "UPDATE worktree_archives SET purged_at = ?, updated_at = ? WHERE archive_id = ?",
+                (timestamp, timestamp, archive_id),
+            )
+            self._event(
+                connection,
+                "worktree.purged",
+                allocation["task_id"],
+                allocation["node_id"],
+                {"allocation_id": allocation_id, "archive_id": archive_id},
+            )
+        return self.get_worktree_allocation(allocation_id)
+
+    def mark_worktree_purge_failed(self, allocation_id: str, error: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worktree_allocations WHERE allocation_id = ?",
+                (allocation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(allocation_id)
+            connection.execute(
+                "UPDATE worktree_allocations SET state = 'purge_failed', updated_at = ? WHERE allocation_id = ?",
+                (timestamp, allocation_id),
+            )
+            self._event(
+                connection,
+                "worktree.purge_failed",
+                row["task_id"],
+                row["node_id"],
+                {"allocation_id": allocation_id, "error": error[:2000]},
+            )
+        return self.get_worktree_allocation(allocation_id)
 
     def record_client_observation(
         self,
@@ -2212,6 +2690,7 @@ class WorkbenchStore:
                     "lane_active_units": running_lane_active[selected_lane] + 1,
                     "claimed_at": timestamp,
                 },
+                created_at=timestamp,
             )
             steering = tuple(
                 row["instruction"]
@@ -2254,6 +2733,18 @@ class WorkbenchStore:
     ) -> None:
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
+            task = connection.execute(
+                "SELECT contract_json FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            contract = json.loads(task["contract_json"])
+            branch = WorktreeManager.branch_name(task_id, node_id, attempt)
+            allocation_id = "wta-" + canonical_hash(
+                {"task_id": task_id, "node_id": node_id, "attempt": attempt}
+            )[:24]
+            timestamp = now_iso()
             changed = connection.execute(
                 """
                 UPDATE nodes SET worktree = ?, updated_at = ?
@@ -2262,7 +2753,7 @@ class WorkbenchStore:
                 """,
                 (
                     worktree,
-                    now_iso(),
+                    timestamp,
                     task_id,
                     node_id,
                     attempt,
@@ -2272,6 +2763,41 @@ class WorkbenchStore:
             ).rowcount
             if changed != 1:
                 raise StateConflictError(f"node {node_id} lease is stale")
+            connection.execute(
+                """
+                INSERT INTO worktree_allocations(
+                    allocation_id, task_id, node_id, attempt, repository,
+                    base_sha, branch, current_path, state, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                ON CONFLICT(task_id, node_id, attempt) DO UPDATE SET
+                    current_path = excluded.current_path,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    allocation_id,
+                    task_id,
+                    node_id,
+                    attempt,
+                    contract["repository"],
+                    contract["base_sha"],
+                    branch,
+                    worktree,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._event(
+                connection,
+                "worktree.allocated",
+                task_id,
+                node_id,
+                {
+                    "allocation_id": allocation_id,
+                    "attempt": attempt,
+                    "path": worktree,
+                    "branch": branch,
+                },
+            )
 
     def settle_node(
         self,
@@ -2336,6 +2862,14 @@ class WorkbenchStore:
                 WHERE task_id = ? AND node_id = ?
                 """,
                 (node_state, timestamp, timestamp, canonical_json(result.to_dict()), task_id, node_id),
+            )
+            connection.execute(
+                """
+                UPDATE worktree_allocations
+                SET node_result_json = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND attempt = ?
+                """,
+                (canonical_json(result.to_dict()), timestamp, task_id, node_id, attempt),
             )
             self._event(
                 connection,
@@ -2899,6 +3433,18 @@ class WorkbenchStore:
                 ).fetchall()
                 if row["model"]
             }
+            worktree_counts = {
+                row["state"]: row["count"]
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM worktree_allocations GROUP BY state"
+                ).fetchall()
+            }
+            archive_counts = {
+                row["state"]: row["count"]
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM worktree_archives GROUP BY state"
+                ).fetchall()
+            }
         authority = self.authority_status()
         with self.connection() as connection:
             lifecycle = connection.execute(
@@ -2918,6 +3464,9 @@ class WorkbenchStore:
             "task_counts": counts,
             "active_executors": active_executors,
             "active_models": active_models,
+            "worktree_counts": worktree_counts,
+            "worktree_archive_counts": archive_counts,
+            "home_presence": self.active_home_presence(),
             "authority": authority,
             "coordinator_failure": coordinator_failure,
         }

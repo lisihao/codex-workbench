@@ -719,6 +719,10 @@ def main() -> int:
     )
     parser.add_argument("--quota-snapshot-file")
     parser.add_argument(
+        "--nas-archive-root",
+        help="mounted NAS directory for verified worktree recovery archives",
+    )
+    parser.add_argument(
         "--research-skill-source",
         default="~/.agents/skills/research",
         help="complete Research skill copied into the isolated Sol planner home",
@@ -759,6 +763,9 @@ def main() -> int:
         if args.quota_snapshot_file
         else state_root / "claude-quota.json"
     )
+    nas_archive_root = (
+        absolute_path(Path(args.nas_archive_root)) if args.nas_archive_root else None
+    )
     assert_directory_target(state_root, "state root")
     assert_directory_target(logs, "log root")
     assert_directory_target(runtime_root, "runtime root")
@@ -772,6 +779,8 @@ def main() -> int:
     assert_file_target(quota_plist_path, "quota LaunchAgent")
     assert_file_target(capability_plist_path, "capability LaunchAgent")
     assert_file_target(quota_snapshot_file, "quota snapshot")
+    if nas_archive_root is not None:
+        assert_directory_target(nas_archive_root, "NAS worktree archive root")
     backup_root = state_root / "previous-app"
     if app_root.is_symlink():
         raise SystemExit(f"application root must not be a symlink: {app_root}")
@@ -797,6 +806,27 @@ def main() -> int:
     config_raw = json.loads(config_file.read_text()) if config_file.exists() else {}
     if not isinstance(config_raw, dict):
         raise SystemExit(f"config file must contain a JSON object: {config_file}")
+    recovery_raw = config_raw.get("worktree_recovery", {})
+    if not isinstance(recovery_raw, dict):
+        raise SystemExit("worktree_recovery config must be a JSON object")
+    recovery_config = dict(recovery_raw)
+    recovery_config.setdefault("enabled", True)
+    recovery_config.setdefault("recycle_root", str(state_root / "recycle" / "worktrees"))
+    recovery_config.setdefault("restore_root", str(state_root / "restored-worktrees"))
+    recovery_config.setdefault("outgoing_root", str(state_root / "recycle" / "outgoing"))
+    recovery_config.setdefault("sweep_interval_seconds", 60)
+    recovery_config.setdefault("home_presence_ttl_seconds", 600)
+    recovery_config.setdefault("retry_backoff_seconds", 900)
+    recovery_config.setdefault("compression", "zstd")
+    recovery_config.setdefault("require_smb", True)
+    if nas_archive_root is not None:
+        recovery_config["nas_archive_root"] = str(nas_archive_root)
+    if recovery_config.get("compression") == "zstd":
+        zstd_binary = recovery_config.get("zstd_binary") or shutil.which("zstd")
+        if nas_archive_root is not None and not zstd_binary:
+            raise SystemExit("--nas-archive-root requires a resolvable zstd binary")
+        if zstd_binary:
+            recovery_config["zstd_binary"] = str(Path(str(zstd_binary)).expanduser().absolute())
     capability_refresh_seconds = capability_refresh_interval(config_raw)
     max_workers = authority_max_workers(config_raw)
     spark_workers = authority_spark_workers(config_raw, max_workers=max_workers)
@@ -893,6 +923,11 @@ def main() -> int:
         print(f"plan: workers={max_workers} (Spark lane={spark_workers})")
         print(f"plan: performance state={performance_state_root}")
         print(f"plan: performance baseline={PERFORMANCE_BASELINE_RESOURCE}")
+        print(f"plan: worktree recycle={recovery_config['recycle_root']}")
+        print(
+            "plan: worktree NAS archive="
+            + (str(recovery_config.get("nas_archive_root")) if recovery_config.get("nas_archive_root") else "not configured; quarantine only")
+        )
         print(
             "plan: performance refresh="
             + " ".join(performance_config["refresh_command"])
@@ -962,6 +997,7 @@ def main() -> int:
                 ),
                 "capability_refresh_seconds": capability_refresh_seconds,
                 "performance": performance_config,
+                "worktree_recovery": recovery_config,
             }
         )
         config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
@@ -1002,6 +1038,7 @@ def main() -> int:
                         "refresh_interval_seconds": capability_refresh_seconds,
                         "refresh_command": performance_config["refresh_command"],
                     },
+                    "worktree_recovery": recovery_config,
                     "research_skill": {
                         "name": "Research",
                         "policy": "research-skill/v2",

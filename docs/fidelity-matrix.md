@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.7.2 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.8.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.7.2 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.8.0 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -24,6 +24,7 @@
 | Codex Worker | implemented | 原生订阅 CLI、结构化 worker/verifier 结果；低复杂度使用独立 `gpt-5.3-codex-spark` 池；routing-v3 重试保持已固定 capability，不允许普通 Worker 在 claim 时静默升级为 Sol；A4 已有 Luna + Sol 真实 Evidence | 旧 routing-v1/v2 合同保留原有有界升级行为；Spark 的真实生产质量和吞吐仍待长期 Evidence |
 | 确定性执行器 | implemented | 构建、测试、lint 等 argv 执行，不消耗模型 | 无 |
 | 一个 Worker 一个 worktree/branch | implemented | base SHA、规范化仓库、独立 worktree、作用域验证 | 无 |
+| 可恢复 worktree 回收与 NAS 归档 | implemented | 每个 attempt 持久 allocation；终态先 `git worktree move` 到隔离回收区；短效家庭 LAN 租约；NAS `.partial`、压缩流检查、完整安全解包、文件与 supporting Evidence 哈希对账、Git bundle 克隆恢复、原子改名和持久 receipt 后才清理；远程源端强制 Tailscale 并要求 Mac mini 返回匹配 receipt | 自动化测试已覆盖状态机、失败保留、远程 receipt 和恢复；仍需正式 Mac mini、真实 SMB NAS 与真实 Tailscale 链路的生产旅程 Evidence |
 | DAG 并行与冲突消除 | implemented | 无依赖且 scope 不冲突才并行；read/read 可并行；父子 scope 互斥 | Planner 产生冲突时 fail loud，不猜测自动串行化 |
 | Spark P0 专属队列、主动拆分与利用率 | implemented | 单一全局执行器内的 Spark logical lane、独立容量/队列计数、`spark_workers` 配置、NodeSpec lane/pool 元数据；Sol planner 与确定性 validator 只将短、低风险、单 scope、可机械验收切片送入 Spark；`/api/scheduler` 回放依赖就绪 `queue_depth`、`dependency_blocked`、`inflight`、`started`、`accepted`、`failed`、`blocked`、`indeterminate`、`retry`、`rework`、`busy_seconds`、`utilization`、`accepted_per_hour`，历史 lane/pool 以 NodeSpec 为准 | first-pass/final acceptance、duration 在 performance ledger 中单独统计；当前证据是实现与聚焦测试，尚无足够真实 Spark 回合的利用率/返工/质量趋势，不能宣称已优化线上交付周期 |
 | 结构化任务契约 | implemented | repository/base/objective/scope/dependency/acceptance/model/quota/timeout/retry/权限/任务点 | 无 |
@@ -39,7 +40,7 @@
 | 手机 Codex App Remote | external-pending | `mobile status/enable` 配置同一 WB plugin/MCP/Authority；桌面 App 独占原生 Remote host；`pair/disable` 只返回桌面操作路径，不启动冲突 CLI daemon | 尚需用户在 Mac mini 桌面 App 与真实手机 Codex App 完成二维码配对、查看和发任务旅程 |
 | 手机精简 Web 驾驶舱 | external-pending | 响应式 UI、认证、任务状态/控制与 A2 `client.observed` receipt 已实现并列入当前验收 | 尚需手机真机渲染真实 Authority 快照并写入服务端回执 |
 | 手机后台通知 | deferred | 页面打开时的浏览器 Notification 代码保留 | 页面关闭后的 Web Push 仍在 backlog |
-| 位置感知传输路由（家庭 LAN / Tailscale） | implemented | `workbench-location-proxy.py` 每次连接按显式 home CIDR 和有界 LAN probe 选路；MCP、Hook、tunnel、heartbeat 与 Git 增量同步共享同一 `ProxyCommand` profile；失败沿用 `degraded` + outbox | 尚未使用操作者的真实家庭 CIDR、LAN endpoint 与 Tailnet endpoint 完成双地点链路回放 |
+| 位置感知传输路由（家庭 LAN / Tailscale） | implemented | `workbench-location-proxy.py` 每次连接按显式 home CIDR 和有界 LAN probe 选路；MCP、Hook、tunnel、heartbeat 与 Git 增量同步共享同一 `ProxyCommand` profile；heartbeat 只有真实 LAN probe 产生短租约，远程归档用 `--force-tailscale` 禁止 LAN/direct fallback；失败沿用 `degraded` + outbox | 尚未使用操作者的真实家庭 CIDR、LAN endpoint、Tailnet endpoint、SMB NAS 完成双地点归档/恢复链路回放 |
 | GitHub 主同步与增量传输 | implemented | clean fast-forward；显式刷新目标 remote-tracking ref，不依赖本地 `remote.*.fetch`；SSH/Tailscale Git bundle 导入独立 refs；MacBook 自动以 `tailscale nc` 绕过错误 CGNAT 系统路由 | 无 |
 | 授权后 PR/CI/merge/release | implemented | accepted + external-write contract + durable delivery receipt；不确定时 indeterminate | 真实仓库权限仍由调用任务决定 |
 | 认证与费用保护 | implemented | Codex/Claude native-subscription；Claude 官方 macOS CLI 负责把 OAuth 凭据保存在 Keychain，Workbench 不复制 token；API key 不转发；认证失败不循环重登；A9 已记录 Claude 失效后单次接管并由 Luna 执行、Sol 验收 | Keychain 的真实跨重启可用性仍由目标主机环境决定；不能从静态检查宣称登录态永不过期 |
@@ -51,8 +52,8 @@
 
 ## 当前忠实度结论
 
-1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.7.2 另加入性能基线、长期账本和 Spark P0 调度闭环。
-2. 1.7.2 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
+1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.8.0 另加入性能基线、长期账本、Spark P0 调度闭环和可恢复的 NAS 归档生命周期。
+2. 1.8.0 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
 3. 公开 benchmark 只提供按领域、带迁移折扣的冷启动先验，不是统一排行榜，也不是本机成功率；当前 performance calibrate 只报告 advisory `cold-start` 或 `ok`，尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态和阈值，不能称为动态校准完成。
-4. 1.7.2 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
+4. 1.8.0 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
 5. 手机原生 Remote 与响应式 cockpit 已有实现，但真实配对、查看、发任务和 A2 receipt 仍是 external-pending；只有页面关闭后的 Web Push 留在 backlog。

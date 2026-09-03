@@ -76,7 +76,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 10)
+        self.assertEqual(self.store.health()["schema_version"], 11)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -88,6 +88,16 @@ class StoreTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
             }
         self.assertIn("priority", task_columns)
+        with self.store.connection() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        self.assertTrue(
+            {"worktree_allocations", "worktree_archives", "home_presence_leases"}.issubset(tables)
+        )
 
     def test_schema_three_adds_effective_route_columns(self) -> None:
         path = Path(self.temp.name) / "schema-three.sqlite"
@@ -114,7 +124,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 10)
+        self.assertEqual(migrated.health()["schema_version"], 11)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()

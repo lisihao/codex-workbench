@@ -33,6 +33,7 @@ from .model import (
     codex_model_reasoning_effort,
 )
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
+from .recovery import RecoveryPolicy, WorktreeRecoveryManager
 from .routing import codex_fallback_model, route_task, strategy_for_node
 from .store import StateConflictError, WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
@@ -89,6 +90,13 @@ class Coordinator:
         self._routed_to_codex: set[str] = set()
         self._routing_lock = threading.Lock()
         self._stop = threading.Event()
+        self.recovery = WorktreeRecoveryManager(store, RecoveryPolicy.load(state_root))
+        self._recovery_thread = threading.Thread(
+            target=self.recovery.run_forever,
+            args=(self._stop,),
+            name="workbench-worktree-recovery",
+            daemon=True,
+        )
         self._fatal_exit = fatal_exit if fatal_exit is not None else os._exit
         quota_path = os.environ.get("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE")
         quota_source = Path(quota_path).expanduser() if quota_path else quota_snapshot_file
@@ -109,6 +117,7 @@ class Coordinator:
 
     def run_forever(self) -> None:
         worker_counter = 0
+        self._recovery_thread.start()
         while not self._stop.is_set():
             if self._quota_refresher is not None and time.monotonic() >= self._next_quota_refresh:
                 try:
@@ -161,6 +170,7 @@ class Coordinator:
                 )
             self._stop.wait(self.poll_seconds)
         self._pool.shutdown(wait=True, cancel_futures=False)
+        self._recovery_thread.join(timeout=30)
 
     def _claim_next_ready_node(self, worker_id: str) -> dict | None:
         """Prefer ready, admissible Spark work without reserving idle threads.

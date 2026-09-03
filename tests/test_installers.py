@@ -1002,11 +1002,21 @@ class InstallerTests(unittest.TestCase):
                 configuration,
                 module.LOCATION_AWARE_HOST_KEY_ALIAS,
             )
-            for label in (module.TUNNEL_LABEL, module.HEARTBEAT_LABEL):
-                plist = home / "Library" / "LaunchAgents" / f"{label}.plist"
-                arguments = plistlib.loads(plist.read_bytes())["ProgramArguments"]
-                for value in expected_transport:
-                    self.assertIn(value, arguments)
+            tunnel_plist = home / "Library" / "LaunchAgents" / f"{module.TUNNEL_LABEL}.plist"
+            tunnel_arguments = plistlib.loads(tunnel_plist.read_bytes())["ProgramArguments"]
+            for value in expected_transport:
+                self.assertIn(value, tunnel_arguments)
+            heartbeat_plist = home / "Library" / "LaunchAgents" / f"{module.HEARTBEAT_LABEL}.plist"
+            heartbeat_arguments = plistlib.loads(heartbeat_plist.read_bytes())["ProgramArguments"]
+            heartbeat_launcher = client_root / "bin" / "workbench-client-heartbeat"
+            heartbeat_runtime = client_root / "libexec" / "workbench-client-heartbeat.py"
+            self.assertEqual(heartbeat_arguments[0], str(heartbeat_launcher))
+            self.assertIn(str(proxy), heartbeat_arguments)
+            self.assertIn(str(configuration), heartbeat_arguments)
+            self.assertEqual(
+                heartbeat_runtime.read_bytes(),
+                (source / "scripts" / "workbench-client-heartbeat.py").read_bytes(),
+            )
             mcp_add = next(
                 command for command in calls if len(command) >= 3 and command[1:3] == ("mcp", "add")
             )
@@ -1622,6 +1632,20 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(config["max_workers"], 8)
             self.assertEqual(config["spark_workers"], 4)
             self.assertEqual(
+                config["worktree_recovery"],
+                {
+                    "enabled": True,
+                    "recycle_root": str(state_root / "recycle" / "worktrees"),
+                    "restore_root": str(state_root / "restored-worktrees"),
+                    "outgoing_root": str(state_root / "recycle" / "outgoing"),
+                    "sweep_interval_seconds": 60,
+                    "home_presence_ttl_seconds": 600,
+                    "retry_backoff_seconds": 900,
+                    "compression": "zstd",
+                    "require_smb": True,
+                },
+            )
+            self.assertEqual(
                 config["performance"],
                 {
                     "state_root": str(state_root / "performance"),
@@ -1655,6 +1679,10 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(
                 manifest["performance"],
                 config["performance"],
+            )
+            self.assertEqual(
+                manifest["worktree_recovery"],
+                config["worktree_recovery"],
             )
             capability_plist = home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist"
             payload = plistlib.loads(capability_plist.read_bytes())

@@ -32,7 +32,7 @@ codex plugin add codex-workbench@codex-workbench
 Codex asks you to review and approve the `UserPromptSubmit` hook.  Do that in
 `/hooks` before activating a session.
 
-## What the v1.7.2 authority adds
+## What the v1.8.0 authority adds
 
 The plugin remains a thin session-binding entry point; scheduling and evidence
 stay on the configured Mac mini authority. The authority now provides:
@@ -42,7 +42,10 @@ stay on the configured Mac mini authority. The authority now provides:
 - quality-gated routing that uses conservative benchmark/runtime posterior
   lower bounds only after role, tool, evidence, quota, and capacity gates;
 - a dedicated logical Spark lane with planner-side decomposition checks and
-  observable queue/utilization metrics.
+  observable queue/utilization metrics;
+- a recoverable worktree lifecycle that quarantines first, requires a fully
+  verified NAS recovery capsule before deletion, and forces remote capsule
+  transfers through the installed Tailscale profile.
 
 Public benchmark results are transfer priors, not a unified leaderboard or a
 claim about local success rates. The current calibration interface is

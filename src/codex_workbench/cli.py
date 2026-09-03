@@ -33,6 +33,7 @@ from .performance import PerformanceRegistry, PerformanceRegistryError
 from .planner import PlannerError
 from .research import managed_research_skill_status
 from .restart_readiness import assess_restart_readiness
+from .recovery import RecoveryPolicy, WorktreeRecoveryManager
 from .service import Coordinator
 from .session_context import import_session_context
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
@@ -535,17 +536,96 @@ def command_acceptance(args: argparse.Namespace) -> int:
 
 
 def command_client(args: argparse.Namespace) -> int:
-    store = _store(_config(args))
+    config = _config(args)
+    store = _store(config)
     if args.client_action == "heartbeat":
-        cursor = store.record_client_heartbeat(args.client_id, args.kind)
+        policy = RecoveryPolicy.load(config.state_root)
+        cursor = store.record_client_heartbeat(
+            args.client_id,
+            args.kind,
+            route=args.route,
+            reason=args.reason,
+            observed_at=args.observed_at,
+            presence_ttl_seconds=policy.home_presence_ttl_seconds,
+        )
         print(
             json.dumps(
-                {"ok": True, "event_cursor": cursor, "client_id": args.client_id, "kind": args.kind},
+                {
+                    "ok": True,
+                    "event_cursor": cursor,
+                    "client_id": args.client_id,
+                    "kind": args.kind,
+                    "route": args.route,
+                    "home_presence": store.active_home_presence(),
+                },
                 ensure_ascii=False,
             )
         )
         return 0
     raise ValueError(f"unsupported client action: {args.client_action}")
+
+
+def command_worktree(args: argparse.Namespace) -> int:
+    config = _config(args)
+    store = _store(config)
+    policy = RecoveryPolicy.load(config.state_root)
+    manager = WorktreeRecoveryManager(store, policy)
+    action = args.worktree_action
+    if action == "status":
+        result = {
+            "ok": True,
+            "policy": {
+                "enabled": policy.enabled,
+                "recycle_root": str(policy.recycle_root),
+                "nas_archive_root": str(policy.archive_root) if policy.archive_root else None,
+                "compression": policy.compression,
+                "require_smb": policy.require_smb,
+                "remote_archive_host": policy.remote_archive_host,
+                "sweep_interval_seconds": policy.sweep_interval_seconds,
+                "retry_backoff_seconds": policy.retry_backoff_seconds,
+            },
+            "home_presence": store.active_home_presence(),
+            "allocations": store.list_worktree_allocations(),
+            "archives": store.list_worktree_archives(),
+        }
+    elif action == "sweep":
+        if args.max_items < 1 or args.max_items > 100:
+            raise ValueError("--max-items must be between 1 and 100")
+        result = manager.sweep(max_items=args.max_items)
+    elif action == "quarantine":
+        result = manager.quarantine(args.allocation_id)
+    elif action == "archive":
+        if store.active_home_presence() is None:
+            raise StateConflictError("local NAS archive requires a fresh MacBook home-LAN presence lease")
+        result = manager.archive_allocation(args.allocation_id, purge=not args.keep_local)
+    elif action == "send":
+        result = manager.send_allocation(args.allocation_id, args.host)
+    elif action == "ingest":
+        if args.archive == "-":
+            source = sys.stdin.buffer
+            result = manager.ingest_remote(
+                source,
+                archive_id=args.archive_id,
+                expected_sha256=args.sha256,
+                transport=args.transport,
+                compression=args.compression,
+            )
+        else:
+            with Path(args.archive).expanduser().open("rb") as source:
+                result = manager.ingest_remote(
+                    source,
+                    archive_id=args.archive_id,
+                    expected_sha256=args.sha256,
+                    transport=args.transport,
+                    compression=args.compression,
+                )
+    elif action == "restore":
+        destination = Path(args.destination) if args.destination else None
+        result = manager.restore(args.archive_id, destination)
+    else:
+        raise ValueError(f"unsupported worktree action: {action}")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def command_token(args: argparse.Namespace) -> int:
@@ -1156,7 +1236,34 @@ def build_parser() -> argparse.ArgumentParser:
     client_heartbeat = client_sub.add_parser("heartbeat")
     client_heartbeat.add_argument("--client-id", required=True)
     client_heartbeat.add_argument("--kind", choices=("macbook", "phone"), required=True)
+    client_heartbeat.add_argument("--route", choices=("lan", "tailscale"))
+    client_heartbeat.add_argument("--reason")
+    client_heartbeat.add_argument("--observed-at")
     client.set_defaults(func=command_client)
+
+    worktree = sub.add_parser("worktree", help="quarantine, archive, transfer, and restore Workbench worktrees")
+    worktree_sub = worktree.add_subparsers(dest="worktree_action", required=True)
+    worktree_sub.add_parser("status")
+    worktree_sweep = worktree_sub.add_parser("sweep")
+    worktree_sweep.add_argument("--max-items", type=int, default=1)
+    worktree_quarantine = worktree_sub.add_parser("quarantine")
+    worktree_quarantine.add_argument("allocation_id")
+    worktree_archive = worktree_sub.add_parser("archive")
+    worktree_archive.add_argument("allocation_id")
+    worktree_archive.add_argument("--keep-local", action="store_true")
+    worktree_send = worktree_sub.add_parser("send")
+    worktree_send.add_argument("allocation_id")
+    worktree_send.add_argument("--host")
+    worktree_ingest = worktree_sub.add_parser("ingest")
+    worktree_ingest.add_argument("--archive", default="-", help="archive path or '-' for stdin")
+    worktree_ingest.add_argument("--archive-id", required=True)
+    worktree_ingest.add_argument("--sha256", required=True)
+    worktree_ingest.add_argument("--transport", choices=("tailscale",), required=True)
+    worktree_ingest.add_argument("--compression", choices=("zstd", "gzip"), required=True)
+    worktree_restore = worktree_sub.add_parser("restore")
+    worktree_restore.add_argument("archive_id")
+    worktree_restore.add_argument("--destination")
+    worktree.set_defaults(func=command_worktree)
 
     demo = sub.add_parser("fixture-demo")
     demo.add_argument("--repository", default=".")

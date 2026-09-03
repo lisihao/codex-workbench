@@ -13,6 +13,7 @@ from .config import WorkbenchConfig
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .governance import code_as_harness_health
 from .planner import PlannerError
+from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
 from .sync import RepositorySynchronizer, RepositorySyncError
@@ -212,6 +213,39 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "workbench_worktree_status",
+        "description": "Read Workbench-owned worktree recycling, NAS archive, and short-lived home-presence state.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
+        },
+    },
+    {
+        "name": "workbench_reclaim_worktrees",
+        "description": "Run one bounded recovery sweep. Eligible worktrees are quarantined first; deletion requires a fully restored and verified NAS receipt.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "max_items": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1}
+            },
+        },
+    },
+    {
+        "name": "workbench_restore_worktree",
+        "description": "Restore one verified NAS worktree archive into a new recovery directory on the authority.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["archive_id"],
+            "properties": {
+                "archive_id": {"type": "string"},
+                "destination": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "workbench_list_approvals",
         "description": "List durable pending approval receipts from the Mac mini authority.",
         "inputSchema": {
@@ -276,6 +310,7 @@ class WorkbenchMCPServer:
             PlannerError,
             RepositorySyncError,
             StateConflictError,
+            WorktreeRecoveryError,
             subprocess.SubprocessError,
             ValueError,
         ) as error:
@@ -423,6 +458,37 @@ class WorkbenchMCPServer:
             )
         if name == "workbench_acceptance_report":
             return self._text(build_acceptance_report(self.store))
+        if name == "workbench_worktree_status":
+            policy = RecoveryPolicy.load(self.config.state_root)
+            return self._text(
+                {
+                    "enabled": policy.enabled,
+                    "home_presence": self.store.active_home_presence(),
+                    "allocations": self.store.list_worktree_allocations(),
+                    "archives": self.store.list_worktree_archives(),
+                }
+            )
+        if name == "workbench_reclaim_worktrees":
+            max_items = int(arguments.get("max_items", 1))
+            if max_items < 1 or max_items > 100:
+                raise ValueError("max_items must be between 1 and 100")
+            return self._text(
+                WorktreeRecoveryManager(
+                    self.store,
+                    RecoveryPolicy.load(self.config.state_root),
+                ).sweep(max_items=max_items)
+            )
+        if name == "workbench_restore_worktree":
+            destination = arguments.get("destination")
+            return self._text(
+                WorktreeRecoveryManager(
+                    self.store,
+                    RecoveryPolicy.load(self.config.state_root),
+                ).restore(
+                    arguments["archive_id"],
+                    Path(destination) if destination is not None else None,
+                )
+            )
         if name == "workbench_list_approvals":
             return self._text(
                 self.store.list_approvals(

@@ -47,6 +47,7 @@ export WB_AUTHORITY_LAN_PORT="22"
 export WB_AUTHORITY_TAILNET_HOST="<TAILNET_DNS_NAME>"
 export WB_CLIENT_TAILSCALE_SOCKET="<OPTIONAL_MACBOOK_USERSPACE_TAILSCALED_SOCKET>"
 export WB_AUTHORITY_USER="<MACOS_ACCOUNT_NAME>"
+export WB_NAS_ARCHIVE_ROOT="<MOUNTED_NAS_DIRECTORY_FOR_WORKTREE_ARCHIVES>"
 ```
 
 先确认平台与基础工具。以下仅检查，不会修改系统。
@@ -107,8 +108,12 @@ test -f "$WB_RESEARCH_SKILL_SOURCE/Workflows/StandardResearch.md"
 test -f "$WB_RESEARCH_SKILL_SOURCE/Workflows/DeepInvestigation.md"
 
 command -v tailscale
+command -v zstd
 test -S "$WB_TAILSCALE_SOCKET"
 tailscale --socket="$WB_TAILSCALE_SOCKET" status --json >/dev/null
+test -d "$WB_NAS_ARCHIVE_ROOT"
+test -w "$WB_NAS_ARCHIVE_ROOT"
+smbutil statshares -m "$WB_NAS_ARCHIVE_ROOT"
 
 "$WB_ROOT/scripts/python-runtime" \
   "$WB_ROOT/scripts/install-code-as-harness.py" \
@@ -124,6 +129,7 @@ tailscale --socket="$WB_TAILSCALE_SOCKET" status --json >/dev/null
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
   --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
+  --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET" \
   --dry-run
 ```
@@ -161,6 +167,7 @@ Authority 的被动配额采集器只接受兼容的本地 Claude CLI 使用量�
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
   --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
+  --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET"
 ```
 
@@ -171,6 +178,7 @@ Authority 的被动配额采集器只接受兼容的本地 Claude CLI 使用量�
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
   --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
+  --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET" \
   --claude-binary "$WB_CLAUDE_BINARY"
 ```
@@ -287,6 +295,8 @@ curl --ipv4 --fail --silent --show-error http://localhost:18766/health
 3. 其余场景走 `--authority-tailnet-host` 的 Tailscale 原生 SSH TCP Serve（不改变认证模型，不使用 userspace SSH）。
 4. 两条链路都失败时，返回 `degraded` receipt 并进入 outbox，不会自动改写系统网络或绕过登录。
 
+heartbeat 使用同一选路器把 `route`、`reason` 与新鲜观察时间送到 Authority。只有 `home_network_lan_probe_ok` 会产生最多十分钟的家庭 LAN 租约；Tailscale 可达、手机在线或普通私网地址都不能产生该租约。
+
 `--ssh-transport auto` 在同时提供 `--authority-lan-host`、`--authority-tailnet-host` 与至少一条 `--home-network` 时，等效于 `location-aware`。未配置完整参数时请明确保留 `location-aware`，避免默认回退被误解为“纯 auto”。
 
 `--home-network` 不能使用 Tailscale 的 `100.64.0.0/10`；否则 Tailscale 接口会让 MacBook 在任何地点都被误判为“在家”。应填写家中路由器实际分配给 Wi-Fi 或有线网络的 CIDR。
@@ -349,6 +359,7 @@ codex plugin list --json
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
 | 会话接管 | `WB_SYNC_RECEIPT` 的 `active` 状态 | Context Bundle 已被 Authority 持久绑定 | 任务已 accepted 或模型已调用 |
 | 手机 Remote | `mobile status`、桌面 App 生成二维码、手机真机查看/发送 | 原生 Remote 配置与真实手机旅程 | 仅凭 plugin/MCP 就绪不能声称已配对 |
+| Worktree 恢复 | `worktree status`，以及一次受控归档/恢复 | 隔离、NAS verified receipt、恢复路径与清理状态 | 没有真实 NAS/SMB 与 Tailscale 旅程时，单元测试不能替代生产证明 |
 | Claude 可选项 | `quota show` | 当前被动快照是否被识别，或是否 fail-closed | 真实剩余百分比、一次回合的最终消耗 |
 
 ## 5. 日常使用与离线回退
@@ -356,6 +367,31 @@ codex plugin list --json
 连接正常时，Codex 是唯一用户入口：在已有会话输入 `wb`，随后用 MCP 工具提交、查看或追加任务。Authority 持有唯一账本；MacBook 只是 cockpit，关闭或离线不会停止已在 Mac mini 运行的任务。
 
 MCP、Hook、tunnel 与 Git 同步共享同一传输 profile。Git 的 `sync` 与 `tailscale bundle` 也会复用安装时写入的 `workbench-location-proxy` 路径与 `ProxyCommand` 规则，故 transport 语义对同一设备一致。
+
+终态 worktree 先进入 `$WB_STATE_ROOT/recycle/worktrees`。后台恢复线程每次只处理有持久 allocation 的 Workbench worktree，并遵守以下门禁：
+
+1. 没有新鲜家庭 LAN 租约时，Authority 只执行 `git worktree move`，不删除分支或目录。
+2. 有租约且 NAS 的 SMB 挂载可写时，先写 `.partial`，再做压缩流检查、完整安全解包、文件清单对账、supporting Evidence 哈希核验和 Git bundle 克隆恢复。
+3. 只有归档原子改名、SHA-256 sidecar 与 SQLite `verified` receipt 都完成后，才清理源 worktree 和 Workbench 专属分支。
+4. 如果归档源在远程 MacBook，可显式执行 `worktree send`；该动作强制 location proxy 使用 Tailscale，不会因为 MacBook 恰好在家就改走 LAN。Mac mini 必须先完成同样的 NAS 恢复校验并返回匹配 receipt，源端才清理。
+
+归档或传输失败会进入 `archive_failed` 并保留源目录；后台默认至少等待 15 分钟才重试，避免每分钟重复压缩和重复占用 I/O。
+
+可在当前 Codex 会话调用 MCP 工具 `workbench_worktree_status`、`workbench_reclaim_worktrees` 和 `workbench_restore_worktree`，也可以在 Authority 上直接使用：
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" worktree status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" worktree sweep --max-items 10
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" worktree restore <archive-id> --destination <new-empty-path>
+```
+
+远程源端已经安装完整 Workbench 和 location-aware client profile 时，可用：
+
+```bash
+codex-workbench worktree send <allocation-id> --host "$WB_AUTHORITY_ALIAS"
+```
+
+`send` 没有 direct-SSH fallback：location-aware Tailscale profile 缺失、远端校验失败或 receipt 不匹配时，压缩临时文件会清理，但隔离 worktree 保留在回收目录。
 
 若 Hook 回执为 `degraded`，AI 必须明确报告 Mac mini 未接管，并在当前 MacBook checkout 中继续本地工作。不得伪称任务已派到 Authority，也不得复制、编辑或合并 Authority SQLite。网络恢复后，在同一会话再次输入 `wb`；Hook 会重新尝试同步当前上下文与允许的 Git 增量。
 

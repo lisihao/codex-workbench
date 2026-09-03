@@ -343,13 +343,22 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the decision as JSON instead of replacing the process",
     )
+    parser.add_argument(
+        "--force-tailscale",
+        action="store_true",
+        help="use the configured Tailscale endpoint for an explicitly remote transfer",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_config(args.config)
-    selection = select_route(config)
+    selection = (
+        {"route": "tailscale", "reason": "forced_remote_archive", "matched_network": None}
+        if args.force_tailscale
+        else select_route(config)
+    )
     write_status(config.status_file, selection)
     if args.select:
         print(json.dumps({**selection, "observed_at": _observed_at()}, ensure_ascii=False, sort_keys=True))
