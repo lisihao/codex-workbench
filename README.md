@@ -130,6 +130,7 @@ scripts/python-runtime scripts/install-macbook-client.py \
   --authority-lan-host <HOME_LAN_HOST> \
   --authority-lan-port <HOME_LAN_SSH_PORT> \
   --authority-tailnet-host <TAILNET_HOST> \
+  --tailscale-socket <OPTIONAL_USERSPACE_TAILSCALED_SOCKET> \
   --home-network <HOME_CIDR> \
   --home-network <HOME_CIDR_BACKUP> \
   --ssh-transport location-aware \
@@ -238,7 +239,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.5.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
+当前源码版本为 `1.5.1`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。

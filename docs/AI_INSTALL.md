@@ -45,6 +45,7 @@ export WB_AUTHORITY_HOST="<TAILSCALE_DNS_NAME>"
 export WB_AUTHORITY_LAN_HOST="<HOME_LAN_HOST_OR_IP>"
 export WB_AUTHORITY_LAN_PORT="22"
 export WB_AUTHORITY_TAILNET_HOST="<TAILNET_DNS_NAME>"
+export WB_CLIENT_TAILSCALE_SOCKET="<OPTIONAL_MACBOOK_USERSPACE_TAILSCALED_SOCKET>"
 export WB_AUTHORITY_USER="<MACOS_ACCOUNT_NAME>"
 ```
 
@@ -238,6 +239,7 @@ test -f "$WB_ROOT/plugins/codex-workbench/.codex-plugin/plugin.json"
   --authority-lan-host "$WB_AUTHORITY_LAN_HOST" \
   --authority-lan-port "$WB_AUTHORITY_LAN_PORT" \
   --authority-tailnet-host "$WB_AUTHORITY_TAILNET_HOST" \
+  --tailscale-socket "$WB_CLIENT_TAILSCALE_SOCKET" \
   --home-network "<HOME_CIDR_1>" \
   --home-network "<HOME_CIDR_2>" \
   --ssh-transport location-aware \
@@ -259,6 +261,7 @@ test -f "$WB_ROOT/plugins/codex-workbench/.codex-plugin/plugin.json"
   --authority-lan-host "$WB_AUTHORITY_LAN_HOST" \
   --authority-lan-port "$WB_AUTHORITY_LAN_PORT" \
   --authority-tailnet-host "$WB_AUTHORITY_TAILNET_HOST" \
+  --tailscale-socket "$WB_CLIENT_TAILSCALE_SOCKET" \
   --home-network "<HOME_CIDR_1>" \
   --home-network "<HOME_CIDR_2>" \
   --ssh-transport location-aware
@@ -282,6 +285,8 @@ curl --ipv4 --fail --silent --show-error http://localhost:18766/health
 `--ssh-transport auto` 在同时提供 `--authority-lan-host`、`--authority-tailnet-host` 与至少一条 `--home-network` 时，等效于 `location-aware`。未配置完整参数时请明确保留 `location-aware`，避免默认回退被误解为“纯 auto”。
 
 `--home-network` 不能使用 Tailscale 的 `100.64.0.0/10`；否则 Tailscale 接口会让 MacBook 在任何地点都被误判为“在家”。应填写家中路由器实际分配给 Wi-Fi 或有线网络的 CIDR。
+
+如果 MacBook 使用 userspace tailscaled，设置 `--tailscale-socket` 为现有 socket 路径；选路器会把它作为单个 `--socket=...` 参数传给 `tailscale nc`。使用系统默认 tailscaled 时省略该参数和对应环境变量。
 
 若连接失败，停止并修复 Tailscale、SSH key、别名或 Authority 健康；不要把 `tailscale-userspace` 当成绕过认证的后备方案。
 

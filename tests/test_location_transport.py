@@ -25,6 +25,7 @@ def config(status_file: Path, **changes: object) -> dict[str, object]:
             "host": "mac-mini.tailnet",
             "port": 10022,
             "binary": "/opt/homebrew/bin/tailscale",
+            "socket": "/Users/example/.local/share/tailscale/tailscaled.sock",
         },
         "probe_timeout_seconds": 2,
         "status_file": str(status_file),
@@ -140,11 +141,26 @@ class LocationTransportTests(unittest.TestCase):
                 location.build_tailscale_command(value),
                 [
                     "/opt/homebrew/bin/tailscale",
+                    "--socket=/Users/example/.local/share/tailscale/tailscaled.sock",
                     "nc",
                     "mac-mini.tailnet",
                     "10022",
                 ],
             )
+
+    def test_tailscale_socket_is_optional_but_must_be_non_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = config(Path(directory) / "status.json")
+            tailscale = dict(value["tailscale"])
+            tailscale.pop("socket")
+            value["tailscale"] = tailscale
+            self.assertEqual(
+                location.build_tailscale_command(value),
+                ["/opt/homebrew/bin/tailscale", "nc", "mac-mini.tailnet", "10022"],
+            )
+            tailscale["socket"] = ""
+            with self.assertRaisesRegex(location.ConfigError, "tailscale.socket"):
+                location.validate_config(value)
 
     def test_status_is_atomic_metadata_without_observed_local_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

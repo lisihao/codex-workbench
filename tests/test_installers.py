@@ -658,10 +658,15 @@ class InstallerTests(unittest.TestCase):
             home_networks=["192.168.40.25/24"],
             tailscale_binary="/opt/homebrew/bin/tailscale",
             status_file=Path("/tmp/location-status.json"),
+            tailscale_socket="/Users/example/.local/share/tailscale/tailscaled.sock",
         )
         self.assertEqual(transport.configuration["home_networks"], ["192.168.40.0/24"])
         self.assertEqual(transport.configuration["lan"], {"host": "mini-rn0x.home", "port": 2200})
         self.assertEqual(transport.host_key_alias, "codex-workbench-authority")
+        self.assertEqual(
+            transport.configuration["tailscale"]["socket"],
+            "/Users/example/.local/share/tailscale/tailscaled.sock",
+        )
         with self.assertRaisesRegex(SystemExit, "cannot overlap Tailscale"):
             module.normalise_home_networks(["100.64.0.0/10"])
 
@@ -774,6 +779,8 @@ class InstallerTests(unittest.TestCase):
                     "mini.tailnet.ts.net",
                     "--home-network",
                     "192.168.40.0/24",
+                    "--tailscale-socket",
+                    "/Users/example/.local/share/tailscale/tailscaled.sock",
                 ],
             ):
                 self.assertEqual(module.main(), 0)
@@ -796,6 +803,7 @@ class InstallerTests(unittest.TestCase):
                 "host": "mini.tailnet.ts.net",
                 "port": 10022,
                 "binary": "/opt/homebrew/bin/tailscale",
+                "socket": "/Users/example/.local/share/tailscale/tailscaled.sock",
             })
 
             expected_transport = module.location_aware_ssh_arguments(

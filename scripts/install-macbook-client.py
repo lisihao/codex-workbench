@@ -137,12 +137,14 @@ def location_aware_requested(
     tailnet_host: str | None,
     home_networks: list[str],
     lan_port: int | None,
+    tailscale_socket: str | None = None,
 ) -> bool:
     return (
         lan_host is not None
         or tailnet_host is not None
         or bool(home_networks)
         or lan_port is not None
+        or tailscale_socket is not None
     )
 
 
@@ -153,10 +155,17 @@ def location_aware_enabled(
     tailnet_host: str | None,
     home_networks: list[str],
     lan_port: int | None,
+    tailscale_socket: str | None = None,
 ) -> bool:
     """Apply the opt-in/compatibility contract for dynamic routing."""
 
-    requested = location_aware_requested(lan_host, tailnet_host, home_networks, lan_port)
+    requested = location_aware_requested(
+        lan_host,
+        tailnet_host,
+        home_networks,
+        lan_port,
+        tailscale_socket,
+    )
     complete = lan_host is not None and tailnet_host is not None and bool(home_networks)
     if transport in {"system", "tailscale-native-ssh", "tailscale-userspace"}:
         if requested:
@@ -206,6 +215,7 @@ def build_location_aware_transport(
     home_networks: list[str],
     tailscale_binary: str,
     status_file: Path,
+    tailscale_socket: str | None = None,
 ) -> LocationAwareTransport:
     """Build the schema-v1 config consumed by the connection-time selector."""
 
@@ -214,16 +224,22 @@ def build_location_aware_transport(
     networks = normalise_home_networks(home_networks)
     if not networks:
         raise SystemExit("at least one --home-network is required for location-aware SSH transport")
+    tailscale_configuration: dict[str, object] = {
+        "host": tailnet_endpoint,
+        "port": tailnet_port,
+        "binary": tailscale_binary,
+    }
+    if tailscale_socket is not None:
+        socket_path = tailscale_socket.strip()
+        if not socket_path or any(character in socket_path for character in "\r\n\x00"):
+            raise SystemExit("--tailscale-socket must be one non-empty socket path")
+        tailscale_configuration["socket"] = socket_path
     return LocationAwareTransport(
         configuration={
             "schema_version": 1,
             "home_networks": list(networks),
             "lan": {"host": lan_endpoint, "port": lan_port},
-            "tailscale": {
-                "host": tailnet_endpoint,
-                "port": tailnet_port,
-                "binary": tailscale_binary,
-            },
+            "tailscale": tailscale_configuration,
             "probe_timeout_seconds": DEFAULT_LOCATION_PROBE_TIMEOUT_SECONDS,
             "status_file": str(status_file),
         },
@@ -777,6 +793,10 @@ def main() -> int:
         help="Mac mini LAN SSH port for location-aware routing (default: 22)",
     )
     parser.add_argument(
+        "--tailscale-socket",
+        help="optional local userspace tailscaled socket passed to tailscale nc",
+    )
+    parser.add_argument(
         "--tailscale-native-ssh-port",
         type=network_port,
         default=DEFAULT_TAILSCALE_NATIVE_SSH_PORT,
@@ -811,6 +831,7 @@ def main() -> int:
         tailnet_host=args.authority_tailnet_host,
         home_networks=args.home_network,
         lan_port=args.authority_lan_port,
+        tailscale_socket=args.tailscale_socket,
     )
     source_location_proxy: Path | None = None
     location_transport: LocationAwareTransport | None = None
@@ -824,6 +845,7 @@ def main() -> int:
             home_networks=args.home_network,
             tailscale_binary=local_tailscale_binary(),
             status_file=location_status,
+            tailscale_socket=args.tailscale_socket,
         )
         transport_arguments = location_aware_ssh_arguments(
             location_proxy,

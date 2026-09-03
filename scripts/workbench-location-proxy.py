@@ -50,6 +50,7 @@ class LocationConfig(NamedTuple):
     lan: Endpoint
     tailscale: Endpoint
     tailscale_binary: str
+    tailscale_socket: str | None
     probe_timeout_seconds: float
     status_file: Path
 
@@ -112,6 +113,12 @@ def validate_config(raw: object) -> LocationConfig:
     )
     if any(character.isspace() for character in tailscale_binary):
         raise ConfigError("tailscale.binary must not contain whitespace")
+    raw_tailscale_socket = tailscale_raw.get("socket")
+    tailscale_socket = (
+        None
+        if raw_tailscale_socket is None
+        else _clean_text(raw_tailscale_socket, field="tailscale.socket")
+    )
 
     timeout_value = raw.get("probe_timeout_seconds")
     if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
@@ -132,6 +139,7 @@ def validate_config(raw: object) -> LocationConfig:
         lan=lan,
         tailscale=tailscale,
         tailscale_binary=tailscale_binary,
+        tailscale_socket=tailscale_socket,
         probe_timeout_seconds=timeout,
         status_file=status_file,
     )
@@ -273,12 +281,17 @@ def build_lan_command(config: LocationConfig | Mapping[str, object]) -> list[str
 
 def build_tailscale_command(config: LocationConfig | Mapping[str, object]) -> list[str]:
     normalized = _normalize_config(config)
-    return [
-        normalized.tailscale_binary,
-        "nc",
-        normalized.tailscale.host,
-        str(normalized.tailscale.port),
-    ]
+    command = [normalized.tailscale_binary]
+    if normalized.tailscale_socket is not None:
+        command.append(f"--socket={normalized.tailscale_socket}")
+    command.extend(
+        (
+            "nc",
+            normalized.tailscale.host,
+            str(normalized.tailscale.port),
+        )
+    )
+    return command
 
 
 def _observed_at() -> str:
