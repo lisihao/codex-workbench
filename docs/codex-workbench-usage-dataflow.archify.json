@@ -78,7 +78,7 @@
     {
       "id": "secure_transport",
       "type": "cloud",
-      "label": "SSH / Tailscale + MCP",
+      "label": "LAN / Tailscale 自动选路",
       "sublabel": "双向受控通道",
       "stage": 1,
       "row": 2,

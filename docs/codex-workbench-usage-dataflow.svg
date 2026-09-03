@@ -125,7 +125,7 @@
     <circle cx="122" cy="55" r="31" fill="#2367c9"/>
     <path d="M104 55H140M122 37V73" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
     <text class="card-title" x="122" y="109" text-anchor="middle">MCP 双向通道</text>
-    <text class="card-copy" x="122" y="138" text-anchor="middle">SSH / Tailscale</text>
+    <text class="card-copy" x="122" y="138" text-anchor="middle">LAN / Tailscale 自动选路</text>
     <rect x="35" y="160" width="174" height="34" rx="17" fill="#dceaff"/>
     <text class="pill mono" x="122" y="182" text-anchor="middle" fill="#1e5bad">WB_SYNC_RECEIPT</text>
   </g>

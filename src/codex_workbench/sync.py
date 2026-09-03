@@ -15,6 +15,22 @@ class RepositorySyncError(RuntimeError):
 
 class RepositorySynchronizer:
     @staticmethod
+    def _location_aware_transport() -> tuple[str, str] | None:
+        """Return the installed location-aware ProxyCommand when available.
+
+        The MacBook client installer owns these paths.  Checking both files at
+        send time keeps the normal SSH configuration path unchanged on hosts
+        without the optional location proxy.
+        """
+        client_root = Path.home() / "Library" / "Application Support" / "Codex Workbench Client"
+        proxy = client_root / "bin" / "workbench-location-proxy"
+        config = client_root / "transport.json"
+        if not proxy.is_file() or not config.is_file():
+            return None
+        command = f"{shlex.quote(str(proxy))} --config {shlex.quote(str(config))}"
+        return command, "location-aware"
+
+    @staticmethod
     def _git(repository: Path, *args: str, timeout: int = 120) -> str:
         result = subprocess.run(
             ["git", "-C", str(repository), *args],
@@ -147,16 +163,28 @@ class RepositorySynchronizer:
                     shlex.quote(ref_name),
                 ]
             )
+            transport = self._location_aware_transport()
+            transport_profile = "ssh-config"
+            ssh_arguments = [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+            ]
+            if transport is not None:
+                proxy_command, transport_profile = transport
+                ssh_arguments.extend(
+                    [
+                        "-o",
+                        f"ProxyCommand={proxy_command}",
+                        "-o",
+                        "HostKeyAlias=codex-workbench-authority",
+                    ]
+                )
+            ssh_arguments.extend([host, remote_command])
             result = runner(
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=15",
-                    host,
-                    remote_command,
-                ],
+                ssh_arguments,
                 input=bundle.read_bytes(),
                 capture_output=True,
                 timeout=300,
@@ -174,6 +202,7 @@ class RepositorySynchronizer:
                 "ok": True,
                 "mode": "tailscale-increment-send",
                 "host": host,
+                "transport_profile": transport_profile,
                 "exported": exported,
                 "imported": imported,
             }

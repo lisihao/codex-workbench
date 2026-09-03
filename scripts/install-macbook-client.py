@@ -20,6 +20,17 @@ TUNNEL_LABEL = "com.lisihao.codex-workbench-tunnel"
 HEARTBEAT_LABEL = "com.lisihao.codex-workbench-heartbeat"
 TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
+DEFAULT_LAN_SSH_PORT = 22
+DEFAULT_LOCATION_PROBE_TIMEOUT_SECONDS = 3
+LOCATION_AWARE_HOST_KEY_ALIAS = "codex-workbench-authority"
+
+
+class LocationAwareTransport:
+    """The explicit LAN and tailnet endpoints used by the runtime proxy."""
+
+    def __init__(self, configuration: dict[str, object], host_key_alias: str) -> None:
+        self.configuration = configuration
+        self.host_key_alias = host_key_alias
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -86,6 +97,178 @@ def network_port(value: str) -> int:
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
+
+
+def endpoint_host(value: str | None, flag: str) -> str:
+    """Validate an operator-provided LAN or tailnet endpoint host."""
+
+    if value is None:
+        raise SystemExit(f"{flag} is required for location-aware SSH transport")
+    host = value.strip()
+    if not host or host.startswith("-") or any(character.isspace() for character in host):
+        raise SystemExit(f"{flag} must be one non-option host name or address")
+    if any(character in host for character in "\r\n\x00"):
+        raise SystemExit(f"{flag} must be one non-option host name or address")
+    return host
+
+
+def normalise_home_networks(values: list[str]) -> tuple[str, ...]:
+    """Return deterministic CIDRs; private address space is not inferred."""
+
+    networks: list[str] = []
+    for raw_value in values:
+        value = raw_value.strip()
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError as error:
+            raise SystemExit(f"--home-network must be a valid CIDR: {raw_value}") from error
+        if network.version == 4 and network.overlaps(TAILSCALE_CGNAT):
+            raise SystemExit(
+                "--home-network cannot overlap Tailscale 100.64.0.0/10 because it would match away from home"
+            )
+        rendered = str(network)
+        if rendered not in networks:
+            networks.append(rendered)
+    return tuple(networks)
+
+
+def location_aware_requested(
+    lan_host: str | None,
+    tailnet_host: str | None,
+    home_networks: list[str],
+    lan_port: int | None,
+) -> bool:
+    return (
+        lan_host is not None
+        or tailnet_host is not None
+        or bool(home_networks)
+        or lan_port is not None
+    )
+
+
+def location_aware_enabled(
+    transport: str,
+    *,
+    lan_host: str | None,
+    tailnet_host: str | None,
+    home_networks: list[str],
+    lan_port: int | None,
+) -> bool:
+    """Apply the opt-in/compatibility contract for dynamic routing."""
+
+    requested = location_aware_requested(lan_host, tailnet_host, home_networks, lan_port)
+    complete = lan_host is not None and tailnet_host is not None and bool(home_networks)
+    if transport in {"system", "tailscale-native-ssh", "tailscale-userspace"}:
+        if requested:
+            raise SystemExit(
+                "location-aware endpoint options require --ssh-transport auto or location-aware"
+            )
+        return False
+    if transport == "location-aware":
+        if not complete:
+            raise SystemExit(
+                "--ssh-transport location-aware requires --authority-lan-host, "
+                "--authority-tailnet-host, and at least one --home-network"
+            )
+        return True
+    if transport == "auto":
+        if requested and not complete:
+            raise SystemExit(
+                "location-aware endpoint options require --authority-lan-host, "
+                "--authority-tailnet-host, and at least one --home-network"
+            )
+        return complete
+    raise SystemExit(f"unsupported SSH transport: {transport}")
+
+
+def location_proxy_source(source: Path) -> Path:
+    proxy = source / "scripts" / "workbench-location-proxy.py"
+    if not proxy.is_file():
+        raise SystemExit(f"location-aware proxy is missing: {proxy}")
+    return proxy
+
+
+def local_tailscale_binary() -> str:
+    tailscale = shutil.which("tailscale")
+    if not tailscale:
+        raise SystemExit(
+            "location-aware SSH transport requires the local tailscale CLI in PATH"
+        )
+    return str(Path(tailscale).expanduser())
+
+
+def build_location_aware_transport(
+    *,
+    lan_host: str | None,
+    lan_port: int,
+    tailnet_host: str | None,
+    tailnet_port: int,
+    home_networks: list[str],
+    tailscale_binary: str,
+    status_file: Path,
+) -> LocationAwareTransport:
+    """Build the schema-v1 config consumed by the connection-time selector."""
+
+    lan_endpoint = endpoint_host(lan_host, "--authority-lan-host")
+    tailnet_endpoint = endpoint_host(tailnet_host, "--authority-tailnet-host")
+    networks = normalise_home_networks(home_networks)
+    if not networks:
+        raise SystemExit("at least one --home-network is required for location-aware SSH transport")
+    return LocationAwareTransport(
+        configuration={
+            "schema_version": 1,
+            "home_networks": list(networks),
+            "lan": {"host": lan_endpoint, "port": lan_port},
+            "tailscale": {
+                "host": tailnet_endpoint,
+                "port": tailnet_port,
+                "binary": tailscale_binary,
+            },
+            "probe_timeout_seconds": DEFAULT_LOCATION_PROBE_TIMEOUT_SECONDS,
+            "status_file": str(status_file),
+        },
+        host_key_alias=LOCATION_AWARE_HOST_KEY_ALIAS,
+    )
+
+
+def location_aware_ssh_arguments(
+    proxy: Path,
+    configuration: Path,
+    host_key_alias: str,
+) -> tuple[str, ...]:
+    command = shlex.join((str(proxy), "--config", str(configuration)))
+    return (
+        "-o",
+        f"ProxyCommand={command}",
+        "-o",
+        f"HostKeyAlias={host_key_alias}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    )
+
+
+def write_location_aware_config(path: Path, configuration: dict[str, object]) -> None:
+    path.write_text(json.dumps(configuration, indent=2, sort_keys=True) + "\n")
+    path.chmod(0o600)
+
+
+def install_location_proxy(
+    source: Path,
+    launcher: Path,
+    runtime: Path,
+    python_executable: str,
+) -> None:
+    """Install a launchd-safe wrapper bound to the current Python 3.11+ runtime."""
+
+    launcher.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(source, runtime)
+    runtime.chmod(0o600)
+    launcher.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(python_executable)} {shlex.quote(str(runtime))} \"$@\"\n"
+    )
+    launcher.chmod(0o700)
 
 
 def absolute_path(path: Path) -> Path:
@@ -407,6 +590,41 @@ def preflight_remote_mcp(
     return binary
 
 
+def preflight_location_aware_mcp(
+    authority_ssh_alias: str,
+    source_proxy: Path,
+    transport: LocationAwareTransport,
+    state_root: str,
+) -> str:
+    """Use an ephemeral config for the only pre-install SSH connection."""
+
+    with tempfile.TemporaryDirectory(prefix=".codex-workbench-location-preflight-") as directory:
+        root = Path(directory)
+        proxy = root / "workbench-location-proxy"
+        proxy_runtime = root / "workbench-location-proxy.py"
+        configuration = root / "transport.json"
+        temporary_status = root / "status.json"
+        install_location_proxy(source_proxy, proxy, proxy_runtime, sys.executable)
+        preflight_configuration = dict(transport.configuration)
+        preflight_configuration["status_file"] = str(temporary_status)
+        write_location_aware_config(configuration, preflight_configuration)
+        arguments = location_aware_ssh_arguments(
+            proxy,
+            configuration,
+            transport.host_key_alias,
+        )
+        return preflight_remote_mcp(authority_ssh_alias, arguments, state_root)
+
+
+def stable_host_key_alias(hostname: str) -> str:
+    """Return the legacy endpoint-specific alias for static SSH transports."""
+
+    return "codex-workbench-" + "".join(
+        character if character.isalnum() or character in ".-_" else "-"
+        for character in hostname
+    )
+
+
 def read_mcp_registration(codex: str, name: str) -> dict[str, object] | None:
     result = run(codex, "mcp", "get", name, "--json", check=False)
     if result.returncode != 0:
@@ -456,6 +674,10 @@ def ssh_transport_arguments(
 ) -> tuple[str, ...]:
     if transport == "system":
         return ()
+    if transport == "location-aware":
+        raise SystemExit(
+            "location-aware SSH transport must be constructed from explicit LAN and tailnet endpoints"
+        )
     hostname = configured_ssh_hostname(destination) if probe_config else destination
     if transport == "auto":
         if not probe_config:
@@ -486,10 +708,7 @@ def ssh_transport_arguments(
                 "Tailscale native SSH transport was selected, but no configured ProxyCommand or tailscale CLI is available"
             )
         native_proxy = f"{tailscale} nc %h {native_ssh_port}"
-    host_key_alias = "codex-workbench-" + "".join(
-        character if character.isalnum() or character in ".-_" else "-"
-        for character in hostname
-    )
+    host_key_alias = stable_host_key_alias(hostname)
     return (
         "-o",
         f"ProxyCommand={native_proxy}",
@@ -522,13 +741,40 @@ def main() -> int:
     )
     parser.add_argument(
         "--ssh-transport",
-        choices=("auto", "system", "tailscale-native-ssh", "tailscale-userspace"),
+        choices=(
+            "auto",
+            "location-aware",
+            "system",
+            "tailscale-native-ssh",
+            "tailscale-userspace",
+        ),
         default="auto",
         help=(
-            "SSH data path. auto uses tailnet-only Tailscale Serve plus the authority's "
-            "native SSH key when the configured host is in 100.64.0.0/10; "
+            "SSH data path. auto enables connection-time LAN/Tailscale selection when all "
+            "location-aware endpoint options are supplied, otherwise it preserves the existing "
+            "configured-host behavior; "
             "tailscale-userspace retains built-in Tailscale SSH as an explicit legacy option"
         ),
+    )
+    parser.add_argument(
+        "--authority-lan-host",
+        help="Mac mini LAN host or address used while attached to --home-network",
+    )
+    parser.add_argument(
+        "--authority-tailnet-host",
+        help="Mac mini Tailscale DNS name or address used away from --home-network",
+    )
+    parser.add_argument(
+        "--home-network",
+        action="append",
+        default=[],
+        help="CIDR identifying a home LAN; repeat for each home network",
+    )
+    parser.add_argument(
+        "--authority-lan-port",
+        type=network_port,
+        default=None,
+        help="Mac mini LAN SSH port for location-aware routing (default: 22)",
     )
     parser.add_argument(
         "--tailscale-native-ssh-port",
@@ -547,17 +793,61 @@ def main() -> int:
         raise SystemExit("--authority-ssh-alias must be one non-option SSH destination")
     authority_state_root = remote_state_root(args.authority_state_root)
     remote_binary = authority_mcp_binary(args.authority_state_root)
-    transport_arguments = ssh_transport_arguments(
-        authority_ssh_alias,
-        args.ssh_transport,
-        args.tailscale_native_ssh_port,
-        probe_config=not args.dry_run,
-    )
 
     log_root = absolute_path(Path.home() / "Library" / "Logs" / "Codex Workbench")
     launch_agents = absolute_path(Path.home() / "Library" / "LaunchAgents")
+    client_root = absolute_path(
+        Path.home() / "Library" / "Application Support" / "Codex Workbench Client"
+    )
+    client_bin = client_root / "bin"
+    client_libexec = client_root / "libexec"
+    location_proxy = client_bin / "workbench-location-proxy"
+    location_proxy_runtime = client_libexec / "workbench-location-proxy.py"
+    location_config = client_root / "transport.json"
+    location_status = client_root / "status.json"
+    dynamic_transport = location_aware_enabled(
+        args.ssh_transport,
+        lan_host=args.authority_lan_host,
+        tailnet_host=args.authority_tailnet_host,
+        home_networks=args.home_network,
+        lan_port=args.authority_lan_port,
+    )
+    source_location_proxy: Path | None = None
+    location_transport: LocationAwareTransport | None = None
+    if dynamic_transport:
+        source_location_proxy = location_proxy_source(source)
+        location_transport = build_location_aware_transport(
+            lan_host=args.authority_lan_host,
+            lan_port=args.authority_lan_port or DEFAULT_LAN_SSH_PORT,
+            tailnet_host=args.authority_tailnet_host,
+            tailnet_port=args.tailscale_native_ssh_port,
+            home_networks=args.home_network,
+            tailscale_binary=local_tailscale_binary(),
+            status_file=location_status,
+        )
+        transport_arguments = location_aware_ssh_arguments(
+            location_proxy,
+            location_config,
+            location_transport.host_key_alias,
+        )
+    else:
+        transport_arguments = ssh_transport_arguments(
+            authority_ssh_alias,
+            args.ssh_transport,
+            args.tailscale_native_ssh_port,
+            probe_config=not args.dry_run,
+        )
+
     assert_directory_target(log_root, "log root")
     assert_directory_target(launch_agents, "LaunchAgents root")
+    if dynamic_transport:
+        assert_directory_target(client_root, "MacBook Workbench client root")
+        assert_directory_target(client_bin, "MacBook Workbench client bin")
+        assert_directory_target(client_libexec, "MacBook Workbench client libexec")
+        assert_file_target(location_proxy, "location-aware proxy")
+        assert_file_target(location_proxy_runtime, "location-aware proxy runtime")
+    assert_file_target(location_config, "location-aware transport config")
+    assert_file_target(location_status, "location-aware transport status")
     domain = f"gui/{run('id', '-u').stdout.strip()}"
     client_id = "macbook-" + "".join(
         character if character.isalnum() or character in ".-_" else "-"
@@ -583,17 +873,38 @@ def main() -> int:
     preflight_managed_agent_skills(source)
     mcp_before = read_mcp_registration(codex, "codex-workbench")
     if not args.dry_run:
-        preflight_remote_mcp(authority_ssh_alias, transport_arguments, args.authority_state_root)
+        if dynamic_transport:
+            assert source_location_proxy is not None and location_transport is not None
+            preflight_location_aware_mcp(
+                authority_ssh_alias,
+                source_location_proxy,
+                location_transport,
+                args.authority_state_root,
+            )
+        else:
+            preflight_remote_mcp(authority_ssh_alias, transport_arguments, args.authority_state_root)
     if args.dry_run:
         print("Codex Workbench MacBook dry-run: no filesystem writes, SSH, launchctl, or MCP changes")
         print(f"plan: source={source}")
         print(f"plan: authority={authority_ssh_alias}")
         print(f"plan: authority state-root={authority_state_root}")
         print(f"plan: remote MCP executable={remote_binary}")
-        print(
-            "plan: SSH transport="
-            + ("local-only auto detection deferred" if args.ssh_transport == "auto" else args.ssh_transport)
-        )
+        if dynamic_transport:
+            assert location_transport is not None
+            lan = location_transport.configuration["lan"]
+            tailscale = location_transport.configuration["tailscale"]
+            print("plan: SSH transport=location-aware (LAN when home network matches; otherwise Tailscale)")
+            print(f"plan: LAN endpoint={lan['host']}:{lan['port']}")
+            print(f"plan: Tailscale endpoint={tailscale['host']}:{tailscale['port']}")
+            print(f"plan: home networks={','.join(location_transport.configuration['home_networks'])}")
+            print(f"plan: location proxy={location_proxy} (0700)")
+            print(f"plan: location config={location_config} (0600)")
+            print(f"plan: location status={location_status}")
+        else:
+            print(
+                "plan: SSH transport="
+                + ("local-only auto detection deferred" if args.ssh_transport == "auto" else args.ssh_transport)
+            )
         print(f"plan: local log root={log_root}")
         print(f"plan: LaunchAgents={launch_agents}")
         print("plan: managed Code-as-Harness and Archify projections for Codex and Claude Code")
@@ -613,7 +924,14 @@ def main() -> int:
         transaction.track_created_directory(log_root)
     if not launch_agents.exists():
         transaction.track_created_directory(launch_agents)
-    for path, label in (
+    if dynamic_transport:
+        if not client_root.exists():
+            transaction.track_created_directory(client_root)
+        if not client_bin.exists():
+            transaction.track_created_directory(client_bin)
+        if not client_libexec.exists():
+            transaction.track_created_directory(client_libexec)
+    snapshot_paths = [
         *[(path, f"{label} LaunchAgent") for label, path in service_paths.items()],
         (Path.home() / ".codex" / "skills" / "code-as-harness", "Codex Code-as-Harness skill"),
         (Path.home() / ".codex" / "AGENTS.md", "Codex policy"),
@@ -621,7 +939,21 @@ def main() -> int:
         (Path.home() / ".claude" / "skills" / "code-as-harness", "Claude Code-as-Harness skill"),
         (Path.home() / ".claude" / "CLAUDE.md", "Claude policy"),
         (Path.home() / ".claude" / "skills" / "archify", "Claude Archify skill"),
-    ):
+    ]
+    snapshot_paths.extend(
+        (
+            (location_config, "location-aware transport config"),
+            (location_status, "location-aware transport status"),
+        )
+    )
+    if dynamic_transport:
+        snapshot_paths.extend(
+            (
+                (location_proxy, "location-aware proxy"),
+                (location_proxy_runtime, "location-aware proxy runtime"),
+            )
+        )
+    for path, label in snapshot_paths:
         transaction.snapshot(path, label)
     services_touched = False
     mcp_touched = False
@@ -631,6 +963,21 @@ def main() -> int:
 
         log_root.mkdir(parents=True, exist_ok=True)
         launch_agents.mkdir(parents=True, exist_ok=True)
+        if dynamic_transport:
+            assert source_location_proxy is not None and location_transport is not None
+            client_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            client_bin.mkdir(parents=True, exist_ok=True, mode=0o700)
+            client_libexec.mkdir(parents=True, exist_ok=True, mode=0o700)
+            install_location_proxy(
+                source_location_proxy,
+                location_proxy,
+                location_proxy_runtime,
+                sys.executable,
+            )
+            write_location_aware_config(location_config, location_transport.configuration)
+        else:
+            location_config.unlink(missing_ok=True)
+            location_status.unlink(missing_ok=True)
         for label, plist_path in service_paths.items():
             payload = render_client_plist(
                 source,
@@ -708,9 +1055,13 @@ def main() -> int:
     print("Codex native entry: MCP server 'codex-workbench'")
     print(f"Authority SSH destination: {authority_ssh_alias}")
     transport_label = args.ssh_transport
-    if transport_label == "auto":
+    if dynamic_transport:
+        transport_label = "location-aware"
+    elif transport_label == "auto":
         transport_label = "tailscale-native-ssh" if transport_arguments else "system"
     print(f"SSH transport: {transport_label}")
+    if dynamic_transport:
+        print(f"Location transport status: {location_status}")
     print(f"MacBook acceptance heartbeat: {client_id} every 5 minutes over the cockpit tunnel")
     return 0
 

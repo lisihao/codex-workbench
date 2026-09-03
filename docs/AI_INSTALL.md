@@ -42,6 +42,9 @@ export WB_STATE_ROOT="$HOME/Library/Application Support/Codex Workbench"
 export WB_MARKETPLACE="codex-workbench"
 export WB_AUTHORITY_ALIAS="workbench-authority"
 export WB_AUTHORITY_HOST="<TAILSCALE_DNS_NAME>"
+export WB_AUTHORITY_LAN_HOST="<HOME_LAN_HOST_OR_IP>"
+export WB_AUTHORITY_LAN_PORT="22"
+export WB_AUTHORITY_TAILNET_HOST="<TAILNET_DNS_NAME>"
 export WB_AUTHORITY_USER="<MACOS_ACCOUNT_NAME>"
 ```
 
@@ -208,6 +211,8 @@ tailscale status --json >/dev/null
 
 不要把密钥内容粘贴进本指南、终端日志或 Git。实际远端连通性由下一节的非 dry-run 安装器预检验证；它会使用 `BatchMode=yes`，不会互动索要密码。
 
+该传输策略按显式网络 CIDR 判断，而不是按国家/地区、Wi‑Fi 名称或 IP 段的语义猜测。它不改任何系统路由和 Tailscale 身份策略；也不会自动触发 Claude/Codex 登录。
+
 ### 3.2 Cockpit 只读预检
 
 MacBook 也需要同一已固定的 Workbench checkout。完成第 1 节的 clone 后运行：
@@ -230,7 +235,12 @@ test -f "$WB_ROOT/plugins/codex-workbench/.codex-plugin/plugin.json"
   --source "$WB_ROOT" \
   --authority-state-root "$WB_STATE_ROOT" \
   --authority-ssh-alias "$WB_AUTHORITY_ALIAS" \
-  --ssh-transport auto \
+  --authority-lan-host "$WB_AUTHORITY_LAN_HOST" \
+  --authority-lan-port "$WB_AUTHORITY_LAN_PORT" \
+  --authority-tailnet-host "$WB_AUTHORITY_TAILNET_HOST" \
+  --home-network "<HOME_CIDR_1>" \
+  --home-network "<HOME_CIDR_2>" \
+  --ssh-transport location-aware \
   --dry-run
 ```
 
@@ -246,13 +256,34 @@ test -f "$WB_ROOT/plugins/codex-workbench/.codex-plugin/plugin.json"
   --source "$WB_ROOT" \
   --authority-state-root "$WB_STATE_ROOT" \
   --authority-ssh-alias "$WB_AUTHORITY_ALIAS" \
-  --ssh-transport auto
+  --authority-lan-host "$WB_AUTHORITY_LAN_HOST" \
+  --authority-lan-port "$WB_AUTHORITY_LAN_PORT" \
+  --authority-tailnet-host "$WB_AUTHORITY_TAILNET_HOST" \
+  --home-network "<HOME_CIDR_1>" \
+  --home-network "<HOME_CIDR_2>" \
+  --ssh-transport location-aware
+
+export WB_CLIENT_ROOT="$HOME/Library/Application Support/Codex Workbench Client"
+"$WB_CLIENT_ROOT/bin/workbench-location-proxy" \
+  --config "$WB_CLIENT_ROOT/transport.json" \
+  --select
 
 codex mcp get codex-workbench
 curl --ipv4 --fail --silent --show-error http://localhost:18766/health
 ```
 
-`auto` 会在 SSH 配置解析到 Tailnet 地址时使用 Authority 提供的原生 SSH TCP Serve；其他 SSH 主机走系统 SSH 路径。若连接失败，停止并修复 Tailscale、SSH key、别名或 Authority 健康；不要把 `tailscale-userspace` 当成绕过认证的后备方案。
+`location-aware` 会按以下规则按次决策：
+
+1. 每次连接先检查 MacBook 当前非回环网络接口地址是否匹配任意 `--home-network` CIDR。
+2. 在家网段且 LAN TCP 可达时，走 `--authority-lan-host:--authority-lan-port`，不使用 Tailscale。
+3. 其余场景走 `--authority-tailnet-host` 的 Tailscale 原生 SSH TCP Serve（不改变认证模型，不使用 userspace SSH）。
+4. 两条链路都失败时，返回 `degraded` receipt 并进入 outbox，不会自动改写系统网络或绕过登录。
+
+`--ssh-transport auto` 在同时提供 `--authority-lan-host`、`--authority-tailnet-host` 与至少一条 `--home-network` 时，等效于 `location-aware`。未配置完整参数时请明确保留 `location-aware`，避免默认回退被误解为“纯 auto”。
+
+`--home-network` 不能使用 Tailscale 的 `100.64.0.0/10`；否则 Tailscale 接口会让 MacBook 在任何地点都被误判为“在家”。应填写家中路由器实际分配给 Wi-Fi 或有线网络的 CIDR。
+
+若连接失败，停止并修复 Tailscale、SSH key、别名或 Authority 健康；不要把 `tailscale-userspace` 当成绕过认证的后备方案。
 
 ### 3.4 安装个人 Codex 插件并信任 Hook
 
@@ -293,6 +324,8 @@ codex plugin list --json
 ## 5. 日常使用与离线回退
 
 连接正常时，Codex 是唯一用户入口：在已有会话输入 `wb`，随后用 MCP 工具提交、查看或追加任务。Authority 持有唯一账本；MacBook 只是 cockpit，关闭或离线不会停止已在 Mac mini 运行的任务。
+
+MCP、Hook、tunnel 与 Git 同步共享同一传输 profile。Git 的 `sync` 与 `tailscale bundle` 也会复用安装时写入的 `workbench-location-proxy` 路径与 `ProxyCommand` 规则，故 transport 语义对同一设备一致。
 
 若 Hook 回执为 `degraded`，AI 必须明确报告 Mac mini 未接管，并在当前 MacBook checkout 中继续本地工作。不得伪称任务已派到 Authority，也不得复制、编辑或合并 Authority SQLite。网络恢复后，在同一会话再次输入 `wb`；Hook 会重新尝试同步当前上下文与允许的 Git 增量。
 

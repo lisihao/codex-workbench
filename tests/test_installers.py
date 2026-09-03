@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import json
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -620,6 +622,370 @@ class InstallerTests(unittest.TestCase):
             arguments = module.ssh_transport_arguments("build-server", "auto")
 
         self.assertEqual(arguments, ())
+
+    def test_macbook_location_aware_options_require_complete_endpoints(self) -> None:
+        module = self._macbook_installer_module()
+        with self.assertRaisesRegex(SystemExit, "requires --authority-lan-host"):
+            module.location_aware_enabled(
+                "location-aware",
+                lan_host="mini.home",
+                tailnet_host=None,
+                home_networks=["192.168.40.0/24"],
+                lan_port=None,
+            )
+        with self.assertRaisesRegex(SystemExit, "require --ssh-transport auto or location-aware"):
+            module.location_aware_enabled(
+                "system",
+                lan_host="mini.home",
+                tailnet_host="mini.tailnet.ts.net",
+                home_networks=["192.168.40.0/24"],
+                lan_port=None,
+            )
+        self.assertTrue(
+            module.location_aware_enabled(
+                "auto",
+                lan_host="mini-rn0x.home",
+                tailnet_host="mini.tailnet.ts.net",
+                home_networks=["192.168.40.25/24"],
+                lan_port=2200,
+            )
+        )
+        transport = module.build_location_aware_transport(
+            lan_host="mini-rn0x.home",
+            lan_port=2200,
+            tailnet_host="mini.tailnet.ts.net",
+            tailnet_port=10022,
+            home_networks=["192.168.40.25/24"],
+            tailscale_binary="/opt/homebrew/bin/tailscale",
+            status_file=Path("/tmp/location-status.json"),
+        )
+        self.assertEqual(transport.configuration["home_networks"], ["192.168.40.0/24"])
+        self.assertEqual(transport.configuration["lan"], {"host": "mini-rn0x.home", "port": 2200})
+        self.assertEqual(transport.host_key_alias, "codex-workbench-authority")
+        with self.assertRaisesRegex(SystemExit, "cannot overlap Tailscale"):
+            module.normalise_home_networks(["100.64.0.0/10"])
+
+    def test_macbook_location_aware_preflight_uses_ephemeral_proxy_and_config(self) -> None:
+        module = self._macbook_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        source_proxy = root / "scripts" / "workbench-location-proxy.py"
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            persistent_status = Path(directory) / "persistent" / "status.json"
+            transport = module.build_location_aware_transport(
+                lan_host="mini.home",
+                lan_port=22,
+                tailnet_host="mini.tailnet.ts.net",
+                tailnet_port=10022,
+                home_networks=["192.168.40.0/24"],
+                tailscale_binary="/opt/homebrew/bin/tailscale",
+                status_file=persistent_status,
+            )
+            observed: list[tuple[Path, Path, Path]] = []
+
+            def check_preflight(
+                authority: str,
+                transport_arguments: tuple[str, ...],
+                state_root: str,
+            ) -> str:
+                self.assertEqual(authority, "macmini")
+                self.assertEqual(state_root, "/srv/codex-workbench")
+                proxy_command = next(
+                    value.removeprefix("ProxyCommand=")
+                    for value in transport_arguments
+                    if value.startswith("ProxyCommand=")
+                )
+                command = shlex.split(proxy_command)
+                self.assertEqual(command[1], "--config")
+                proxy = Path(command[0])
+                configuration = Path(command[2])
+                runtime = proxy.with_suffix(".py")
+                self.assertNotEqual(proxy, source_proxy)
+                self.assertEqual(proxy.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(runtime.read_bytes(), source_proxy.read_bytes())
+                self.assertEqual(runtime.stat().st_mode & 0o777, 0o600)
+                launcher = proxy.read_text()
+                self.assertIn(shlex.quote(module.sys.executable), launcher)
+                self.assertIn(shlex.quote(str(runtime)), launcher)
+                payload = json.loads(configuration.read_text())
+                self.assertEqual(payload["status_file"], str(configuration.parent / "status.json"))
+                self.assertNotEqual(payload["status_file"], str(persistent_status))
+                self.assertIn("HostKeyAlias=codex-workbench-authority", transport_arguments)
+                observed.append((proxy, configuration, runtime))
+                return "/srv/codex-workbench/app/bin/codex-workbench"
+
+            with mock.patch.object(module, "preflight_remote_mcp", side_effect=check_preflight):
+                result = module.preflight_location_aware_mcp(
+                    "macmini",
+                    source_proxy,
+                    transport,
+                    "/srv/codex-workbench",
+                )
+
+            self.assertEqual(result, "/srv/codex-workbench/app/bin/codex-workbench")
+            self.assertEqual(len(observed), 1)
+            self.assertFalse(observed[0][0].exists())
+            self.assertFalse(observed[0][1].exists())
+            self.assertFalse(observed[0][2].exists())
+
+    def test_macbook_location_aware_install_uses_one_transport_for_mcp_tunnel_and_heartbeat(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        source_proxy = source / "scripts" / "workbench-location-proxy.py"
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                if command[:2] == ("launchctl", "print"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            def fake_which(name: str) -> str | None:
+                return {
+                    "codex": "/usr/bin/codex",
+                    "tailscale": "/opt/homebrew/bin/tailscale",
+                }.get(name)
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", side_effect=fake_which
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "install_code_as_harness"
+            ), mock.patch.object(module, "install_archify"), mock.patch.object(
+                module, "preflight_location_aware_mcp", return_value="/remote/codex-workbench"
+            ) as preflight, mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--authority-lan-host",
+                    "mini.home",
+                    "--authority-tailnet-host",
+                    "mini.tailnet.ts.net",
+                    "--home-network",
+                    "192.168.40.0/24",
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+            proxy = client_root / "bin" / "workbench-location-proxy"
+            proxy_runtime = client_root / "libexec" / "workbench-location-proxy.py"
+            configuration = client_root / "transport.json"
+            status = client_root / "status.json"
+            self.assertEqual(proxy.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(proxy_runtime.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(configuration.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(proxy_runtime.read_bytes(), source_proxy.read_bytes())
+            launcher = proxy.read_text()
+            self.assertIn(shlex.quote(module.sys.executable), launcher)
+            self.assertIn(shlex.quote(str(proxy_runtime)), launcher)
+            payload = json.loads(configuration.read_text())
+            self.assertEqual(payload["status_file"], str(status))
+            self.assertEqual(payload["tailscale"], {
+                "host": "mini.tailnet.ts.net",
+                "port": 10022,
+                "binary": "/opt/homebrew/bin/tailscale",
+            })
+
+            expected_transport = module.location_aware_ssh_arguments(
+                proxy,
+                configuration,
+                module.LOCATION_AWARE_HOST_KEY_ALIAS,
+            )
+            for label in (module.TUNNEL_LABEL, module.HEARTBEAT_LABEL):
+                plist = home / "Library" / "LaunchAgents" / f"{label}.plist"
+                arguments = plistlib.loads(plist.read_bytes())["ProgramArguments"]
+                for value in expected_transport:
+                    self.assertIn(value, arguments)
+            mcp_add = next(
+                command for command in calls if len(command) >= 3 and command[1:3] == ("mcp", "add")
+            )
+            for value in expected_transport:
+                self.assertIn(value, mcp_add)
+            self.assertEqual(preflight.call_args.args[1], source_proxy)
+            self.assertEqual(
+                preflight.call_args.args[2].configuration["status_file"],
+                str(status),
+            )
+
+    def test_macbook_static_install_disables_stale_location_profile_for_git_sync(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+            proxy = client_root / "bin" / "workbench-location-proxy"
+            configuration = client_root / "transport.json"
+            status = client_root / "status.json"
+            proxy.parent.mkdir(parents=True)
+            proxy.write_text("#!/bin/sh\n")
+            configuration.write_text('{"schema_version":1}\n')
+            status.write_text('{"route":"tailscale"}\n')
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                if command[:2] == ("launchctl", "print"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "preflight_remote_mcp", return_value="/remote/codex-workbench"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--ssh-transport",
+                    "system",
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            self.assertTrue(proxy.exists())
+            self.assertFalse(configuration.exists())
+            self.assertFalse(status.exists())
+
+    def test_macbook_location_aware_dry_run_does_not_write_or_connect(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            def fake_which(name: str) -> str | None:
+                return {
+                    "codex": "/usr/bin/codex",
+                    "tailscale": "/opt/homebrew/bin/tailscale",
+                }.get(name)
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", side_effect=fake_which
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "preflight_location_aware_mcp"
+            ) as preflight, mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--dry-run",
+                    "--authority-lan-host",
+                    "mini.home",
+                    "--authority-tailnet-host",
+                    "mini.tailnet.ts.net",
+                    "--home-network",
+                    "192.168.40.0/24",
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            preflight.assert_not_called()
+            self.assertFalse(
+                (home / "Library" / "Application Support" / "Codex Workbench Client").exists()
+            )
+            self.assertFalse(any(command and command[0] in {"ssh", "launchctl"} for command in calls))
+            self.assertFalse(
+                any(
+                    len(command) >= 3 and command[1:3] in (("mcp", "remove"), ("mcp", "add"))
+                    for command in calls
+                )
+            )
+
+    def test_macbook_location_aware_rolls_back_proxy_config_and_status_on_launch_failure(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                if command[:2] == ("launchctl", "print"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if command[:2] == ("launchctl", "bootstrap"):
+                    raise RuntimeError("injected launchctl failure")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            def fake_which(name: str) -> str | None:
+                return {
+                    "codex": "/usr/bin/codex",
+                    "tailscale": "/opt/homebrew/bin/tailscale",
+                }.get(name)
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", side_effect=fake_which
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "preflight_location_aware_mcp", return_value="/remote/codex-workbench"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--ssh-transport",
+                    "location-aware",
+                    "--authority-lan-host",
+                    "mini.home",
+                    "--authority-tailnet-host",
+                    "mini.tailnet.ts.net",
+                    "--home-network",
+                    "192.168.40.0/24",
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected launchctl failure"):
+                    module.main()
+
+            client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+            self.assertFalse(client_root.exists())
+            self.assertFalse(
+                (home / "Library" / "LaunchAgents" / f"{module.TUNNEL_LABEL}.plist").exists()
+            )
 
     def test_authority_installer_configures_tailnet_only_https_and_native_ssh(self) -> None:
         module = self._macos_installer_module()

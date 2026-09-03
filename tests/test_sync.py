@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codex_workbench.sync import RepositorySynchronizer
 
@@ -120,9 +122,98 @@ class RepositorySyncTests(unittest.TestCase):
             runner=runner,
         )
         self.assertEqual(result["imported"]["commit"], head)
+        self.assertEqual(result["transport_profile"], "ssh-config")
         self.assertEqual(observed["command"][0], "ssh")
         self.assertEqual(observed["command"][-2], "macmini")
+        self.assertNotIn("ProxyCommand=", observed["command"])
+        self.assertNotIn("HostKeyAlias=codex-workbench-authority", observed["command"])
         self.assertTrue(observed["bundle"].startswith(b"# v2 git bundle"))
+
+    def test_send_uses_location_aware_proxy_and_shell_quotes_paths(self) -> None:
+        base = git(self.source, "rev-parse", "HEAD")
+        (self.source / "location-aware.txt").write_text("location-aware\n")
+        subprocess.run(["git", "add", "location-aware.txt"], cwd=self.source, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "location aware"],
+            cwd=self.source,
+            check=True,
+            capture_output=True,
+        )
+        head = git(self.source, "rev-parse", "HEAD")
+        home = self.root / "MacBook Home"
+        client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+        proxy = client_root / "bin" / "workbench-location-proxy"
+        config = client_root / "transport.json"
+        proxy.parent.mkdir(parents=True)
+        proxy.write_text("#!/bin/sh\n")
+        config.write_text('{"mode":"auto"}\n')
+        observed = {}
+
+        def runner(command, **kwargs):
+            observed["command"] = command
+            response = json.dumps({"ok": True, "commit": head}).encode()
+            return subprocess.CompletedProcess(command, 0, response, b"")
+
+        with patch("pathlib.Path.home", return_value=home):
+            result = self.sync.send_increment(
+                str(self.source),
+                base,
+                "HEAD",
+                host="macmini",
+                remote_repository="/Users/example/Projects/example repo",
+                ref_name="macbook/task-location-aware",
+                runner=runner,
+            )
+
+        proxy_option = next(
+            value for value in observed["command"] if value.startswith("ProxyCommand=")
+        )
+        expected_command = f"{shlex.quote(str(proxy))} --config {shlex.quote(str(config))}"
+        self.assertEqual(proxy_option, f"ProxyCommand={expected_command}")
+        self.assertEqual(
+            shlex.split(proxy_option.removeprefix("ProxyCommand=")),
+            [str(proxy), "--config", str(config)],
+        )
+        self.assertIn("HostKeyAlias=codex-workbench-authority", observed["command"])
+        self.assertEqual(result["transport_profile"], "location-aware")
+
+    def test_send_requires_both_location_profile_files(self) -> None:
+        base = git(self.source, "rev-parse", "HEAD")
+        (self.source / "partial-profile.txt").write_text("partial\n")
+        subprocess.run(["git", "add", "partial-profile.txt"], cwd=self.source, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "partial profile"],
+            cwd=self.source,
+            check=True,
+            capture_output=True,
+        )
+        head = git(self.source, "rev-parse", "HEAD")
+        home = self.root / "MacBook Home"
+        client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+        proxy = client_root / "bin" / "workbench-location-proxy"
+        proxy.parent.mkdir(parents=True)
+        proxy.write_text("#!/bin/sh\n")
+        observed = {}
+
+        def runner(command, **kwargs):
+            observed["command"] = command
+            response = json.dumps({"ok": True, "commit": head}).encode()
+            return subprocess.CompletedProcess(command, 0, response, b"")
+
+        with patch("pathlib.Path.home", return_value=home):
+            result = self.sync.send_increment(
+                str(self.source),
+                base,
+                "HEAD",
+                host="macmini",
+                remote_repository="/Users/example/Projects/example repo",
+                ref_name="macbook/task-partial-profile",
+                runner=runner,
+            )
+
+        self.assertEqual(result["transport_profile"], "ssh-config")
+        self.assertNotIn("ProxyCommand=", observed["command"])
+        self.assertNotIn("HostKeyAlias=codex-workbench-authority", observed["command"])
 
 
 if __name__ == "__main__":
