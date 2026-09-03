@@ -135,7 +135,7 @@ class LocationTransportTests(unittest.TestCase):
             value = config(Path(directory) / "status.json")
             self.assertEqual(
                 location.build_lan_command(value),
-                ["/usr/bin/nc", "-w", "2", "mac-mini.home", "10022"],
+                ["/usr/bin/nc", "-G", "2", "mac-mini.home", "10022"],
             )
             self.assertEqual(
                 location.build_tailscale_command(value),
@@ -213,7 +213,7 @@ class LocationTransportTests(unittest.TestCase):
 
         execv.assert_called_once_with(
             "/usr/bin/nc",
-            ["/usr/bin/nc", "-w", "2", "mac-mini.home", "10022"],
+            ["/usr/bin/nc", "-G", "2", "mac-mini.home", "10022"],
         )
 
 

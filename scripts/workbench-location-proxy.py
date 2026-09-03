@@ -272,7 +272,7 @@ def build_lan_command(config: LocationConfig | Mapping[str, object]) -> list[str
     normalized = _normalize_config(config)
     return [
         LAN_NETCAT_PATH,
-        "-w",
+        "-G",
         _format_timeout(normalized.probe_timeout_seconds),
         normalized.lan.host,
         str(normalized.lan.port),
