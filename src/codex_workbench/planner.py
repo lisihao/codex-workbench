@@ -27,6 +27,7 @@ from .model import (
     QuotaSnapshot,
     RoutingStrategy,
     TaskContract,
+    codex_model_long_context_overrides,
     codex_model_profile,
     codex_model_reasoning_effort,
     derive_execution_lane,
@@ -825,6 +826,44 @@ class CodexPlanner:
 
     validate_and_normalize_plan = normalize_and_validate_plan
 
+    @staticmethod
+    def _command(
+        binary: str,
+        model: str,
+        repository: str,
+        schema_path: Path,
+        output_path: Path,
+    ) -> list[str]:
+        command = [
+            binary,
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--disable",
+            "plugins",
+            "--disable",
+            "plugin_sharing",
+            "--disable",
+            "code_mode_host",
+            "--json",
+            "--model",
+            model,
+        ]
+        for override in codex_model_long_context_overrides(model):
+            command.extend(("--config", override))
+        command.extend((
+            "--sandbox",
+            "read-only",
+            "--cd",
+            repository,
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(output_path),
+            "-",
+        ))
+        return command
+
     def compile(
         self,
         contract: TaskContract,
@@ -861,30 +900,13 @@ class CodexPlanner:
             output_path = Path(directory) / "plan.json"
             schema_path.write_text(json.dumps(PLAN_SCHEMA))
             result = subprocess.run(
-                [
+                self._command(
                     binary,
-                    "exec",
-                    "--ephemeral",
-                    "--ignore-user-config",
-                    "--disable",
-                    "plugins",
-                    "--disable",
-                    "plugin_sharing",
-                    "--disable",
-                    "code_mode_host",
-                    "--json",
-                    "--model",
                     self.model,
-                    "--sandbox",
-                    "read-only",
-                    "--cd",
                     contract.repository,
-                    "--output-schema",
-                    str(schema_path),
-                    "--output-last-message",
-                    str(output_path),
-                    "-",
-                ],
+                    schema_path,
+                    output_path,
+                ),
                 input=prompt,
                 text=True,
                 capture_output=True,

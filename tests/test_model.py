@@ -25,6 +25,7 @@ from codex_workbench.model import (
     NodeSpec,
     QuotaSnapshot,
     TaskContract,
+    codex_model_long_context_overrides,
     codex_model_profile,
     codex_model_reasoning_effort,
     derive_execution_lane,
@@ -57,6 +58,16 @@ class ModelTests(unittest.TestCase):
             derive_execution_lane("codex", "gpt-5.3-codex-spark-evil"),
             "general",
         )
+
+    def test_long_context_overrides_require_exact_supported_model_ids(self) -> None:
+        expected = (
+            "model_context_window=1000000",
+            "model_auto_compact_token_limit=900000",
+        )
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            self.assertEqual(codex_model_long_context_overrides(model), expected)
+        self.assertEqual(codex_model_long_context_overrides("gpt-5.3-codex-spark"), ())
+        self.assertEqual(codex_model_long_context_overrides("gpt-5.6-luna-evil"), ())
 
     def test_routing_v3_retry_preserves_the_pinned_worker_capability(self) -> None:
         self.assertEqual(
@@ -469,12 +480,45 @@ class ModelTests(unittest.TestCase):
         )
         command = CodexExecutor._command("codex", request, Path("schema.json"), Path("result.json"))
         self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
+        configs = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
         self.assertEqual(
-            command[command.index("--config") + 1],
-            "model_reasoning_effort=max",
+            configs,
+            [
+                "model_reasoning_effort=max",
+                "model_context_window=1000000",
+                "model_auto_compact_token_limit=900000",
+            ],
         )
         self.assertIn("Execution profile: luna_worker", CodexExecutor._prompt(request))
         self.assertIn("Model reasoning effort: max", CodexExecutor._prompt(request))
+
+    def test_spark_command_does_not_emit_long_context_overrides(self) -> None:
+        request = ExecutionRequest(
+            task_id="task-spark",
+            node_id="worker",
+            attempt=1,
+            contract={"objective": "bounded work", "allowed_scope": ["src"], "forbidden_scope": [], "acceptance_commands": []},
+            spec={
+                "title": "worker",
+                "prompt": "implement",
+                "model": "gpt-5.3-codex-spark",
+                "model_profile": "spark_worker",
+                "model_reasoning_effort": "xhigh",
+                "verifier": False,
+            },
+            worktree=Path("/tmp/worktree"),
+        )
+        command = CodexExecutor._command("codex", request, Path("schema.json"), Path("result.json"))
+        configs = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
+        self.assertEqual(configs, ["model_reasoning_effort=xhigh"])
 
     def test_planner_receives_only_quota_admitted_claude_models(self) -> None:
         contract = TaskContract(

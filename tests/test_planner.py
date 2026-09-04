@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
 from codex_workbench.model import NodeSpec, TaskContract
@@ -88,6 +89,27 @@ def catalog() -> dict:
 
 
 class PlannerRoutingTests(unittest.TestCase):
+    def test_planner_command_emits_explicit_long_context_overrides(self) -> None:
+        command = CodexPlanner._command(
+            "codex",
+            "gpt-5.6-sol",
+            "/tmp/example",
+            Path("schema.json"),
+            Path("plan.json"),
+        )
+        configs = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
+        self.assertEqual(
+            configs,
+            [
+                "model_context_window=1000000",
+                "model_auto_compact_token_limit=900000",
+            ],
+        )
+
     def test_normalization_accepts_nodes_serialized_with_archify_metadata(self) -> None:
         contract = make_contract()
         worker = NodeSpec(

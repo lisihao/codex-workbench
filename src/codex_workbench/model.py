@@ -60,6 +60,13 @@ DEFAULT_QUOTA_TTL_SECONDS = 15 * 60
 LEGACY_ROUTING_STRATEGY_VERSION = "model-routing-v1"
 ROUTING_STRATEGY_VERSION = "model-routing-v2"
 CODEX_SOL_MODEL = "gpt-5.6-sol"
+CODEX_LONG_CONTEXT_WINDOW = 1_000_000
+CODEX_LONG_CONTEXT_AUTO_COMPACT_TOKEN_LIMIT = 900_000
+CODEX_LONG_CONTEXT_MODELS = frozenset({
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+})
 
 
 RoutingTaskType = Literal[
@@ -119,6 +126,19 @@ def codex_model_reasoning_effort(model: object) -> str | None:
 
     value = str(model).strip().lower()
     return CODEX_MODEL_REASONING_EFFORTS.get(value)
+
+
+def codex_model_long_context_overrides(model: object) -> tuple[str, ...]:
+    """Return explicit long-context overrides for supported GPT-5.6 models."""
+
+    value = str(model).strip().lower()
+    if value not in CODEX_LONG_CONTEXT_MODELS:
+        return ()
+    return (
+        f"model_context_window={CODEX_LONG_CONTEXT_WINDOW}",
+        "model_auto_compact_token_limit="
+        f"{CODEX_LONG_CONTEXT_AUTO_COMPACT_TOKEN_LIMIT}",
+    )
 
 
 def derive_execution_lane(

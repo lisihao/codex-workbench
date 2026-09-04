@@ -24,6 +24,7 @@ from .model import (
     DEFAULT_QUOTA_TTL_SECONDS,
     NodeResult,
     QuotaSnapshot,
+    codex_model_long_context_overrides,
     codex_model_profile,
     codex_model_reasoning_effort,
 )
@@ -1687,6 +1688,8 @@ class CodexExecutor(ProcessExecutor):
         # retain the profile/effort metadata on the durable NodeSpec.
         if effort is not None:
             command.extend(("--config", f"model_reasoning_effort={effort}"))
+        for override in codex_model_long_context_overrides(model):
+            command.extend(("--config", override))
         command.extend((
             "--sandbox",
             "workspace-write",
