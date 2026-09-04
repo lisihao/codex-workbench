@@ -658,7 +658,7 @@ class InstallerTests(unittest.TestCase):
         payload = plistlib.loads(rendered.encode())
         self.assertEqual(payload["Label"], module.RADAR_LABEL)
         self.assertTrue(payload["RunAtLoad"])
-        self.assertEqual(payload["StartInterval"], 6 * 60 * 60)
+        self.assertEqual(payload["StartInterval"], 24 * 60 * 60)
         self.assertEqual(
             payload["ProgramArguments"],
             [

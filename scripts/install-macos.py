@@ -22,7 +22,7 @@ DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_AUTHORITY_MAX_WORKERS = 8
 DEFAULT_AUTHORITY_SPARK_WORKERS = 4
 DEFAULT_CAPABILITY_REFRESH_SECONDS = 6 * 60 * 60
-DEFAULT_RADAR_REFRESH_SECONDS = 6 * 60 * 60
+DEFAULT_RADAR_REFRESH_SECONDS = 24 * 60 * 60
 CAPABILITY_REGISTRY_SCHEMA_VERSION = 1
 CAPABILITY_REGISTRY_POLICY = "model-routing-v3"
 PERFORMANCE_BASELINE_RESOURCE = "codex_workbench.data/model-performance-baseline-v1.json"
@@ -539,7 +539,7 @@ def radar_upstream_metadata(source: Path | None = None) -> dict[str, str]:
 
 
 def radar_refresh_interval(config: dict[str, object]) -> int:
-    """Resolve the authority Radar refresh period, defaulting to six hours."""
+    """Resolve the authority Radar refresh period, defaulting to one day."""
 
     value: object = config.get("radar_refresh_seconds")
     existing = config.get("radar")

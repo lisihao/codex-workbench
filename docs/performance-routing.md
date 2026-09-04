@@ -1,6 +1,6 @@
 # Workbench 性能路由：基线、账本与 Spark P0
 
-状态：`v1.9.0 已实现 / 生产校准 Evidence 待积累`
+状态：`v1.9.1 已实现 / 生产校准 Evidence 待积累`
 适用范围：Codex Workbench 的新任务路由、长期运行指标和 Spark 执行队列。本文不改变任务验收的权威性：Worker 结果永远不是验收结果，只有独立 verifier 的通过转换才能使任务 `accepted`。
 
 本文把“模型擅长什么”和“在 Workbench 里实际交付得怎样”分开建模。随包公开基准与获授权的 Codex Radar 快照用于冷启动先验；本机持久事件用于长期校准；三者都不能绕过能力、权限、证据和质量门禁。
@@ -157,7 +157,7 @@ v1.9.0 的实际 routing-v3 顺序是：先完成能力/角色/任务类型/复�
 
 未来可在版本化 policy 中加入低样本、分布漂移、近期失败聚集和稳定候选比较，并定义 `baseline`/`shadow`/`calibrated`/`stale` promotion、降级与回滚；v1.9.0 尚未实现这些生命周期，不会把一次 posterior 变化宣称为长期可靠性提升。
 
-`performance refresh` 只读取本地事实账本、可信 quota snapshot 与本地 Radar cache，不触发 Claude 登录、模型调用、付费 API 或人工配额探测。独立的 `radar refresh` 只有在本地授权 receipt 有效后才访问固定 JSON endpoints；默认每 6 小时一次，失败保留 last-known-good。performance snapshot 会生成或复用 content-addressed generation；本机 runtime 样本的衰减、漂移检测和 promotion 容忍范围尚未实现。
+`performance refresh` 只读取本地事实账本、可信 quota snapshot 与本地 Radar cache，不触发 Claude 登录、模型调用、付费 API 或人工配额探测。独立的 `radar refresh` 只有在本地授权 receipt 有效后才访问固定 JSON endpoints；默认每 24 小时一次，失败保留 last-known-good。performance snapshot 会生成或复用 content-addressed generation；本机 runtime 样本的衰减、漂移检测和 promotion 容忍范围尚未实现。
 
 关于保守在线学习的设计依据可参阅 [Conservative Contextual Linear Bandits](https://arxiv.org/abs/1611.06426) 与 [Conservative Contextual Bandits（ICLR 2025）](https://proceedings.iclr.cc/paper_files/paper/2025/hash/dbca58f35bddc6e4003b2dd80e42f838-Abstract-Conference.html)。模型/Agent 变化的检测可采用版本隔离和显式漂移事件；不应因为一个短窗口的偶然提升就覆盖长期基线。
 

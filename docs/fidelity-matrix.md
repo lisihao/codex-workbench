@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.9.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.9.1 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.9.0 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.9.1 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -20,7 +20,7 @@
 | Sol 规划、分层执行、Sol 验收 | implemented | routing-v3 固定 Sol planner/verifier/control；低风险机械任务进入独立 Spark 池，标准生产按任务角色选择 Luna/Sonnet，较大独立切片选择 Terra，Opus/Fable 承担架构/审核/研究挑战；通过硬门禁后才参考性能下界 | routing-v1/v2 仅为无能力目录的旧合同兼容；公开 benchmark 只是按领域的弱先验，质量/成本/时延尚无长期本机生产证明 |
 | 版本化模型与 Agent 能力目录 | implemented | 安装时 bundled safe refresh；LaunchAgent 每 6 小时被动读取 Codex/Claude Code 版本、帮助和模型元数据；无变化 generation 去重；新任务固定 catalog ID/digest；支持 status/show/diff/activate/rollback | Claude alias 背后的精确服务端模型只能在正常任务返回的 actual model receipt 中观察；未知和新 Sol 默认不获路由权限 |
 | benchmark-backed 性能基线与运行账本校准 | implemented | `performance.py` 和 `data/model-performance-baseline-v1.json` 保存按领域的 Terminal-Bench 2.1、SWE-Bench Pro、GPT-5.6 官方表与 HLE 迁移先验；从 append-only `events`/`tasks` 统计 first-pass/final acceptance、返工、时延、吞吐和池指标；Beta 保守下界、content-addressed snapshot、TaskContract/NodeSpec pinning、CLI/API 观测已接入；calibrate 当前只返回 advisory `cold-start`/`ok` | 不把不同 benchmark 合成统一排行榜；尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值，也没有可宣称的长期生产校准结论 |
-| Codex Radar 通用离线 Provider | implemented | 独立 `codex_radar_provider` package/CLI 固定 WineChord/codex-radar v0.1.69；授权前零网络，四端点 JSON、脱敏 raw、规范化 content-addressed generation、原子 active、last-known-good 与时间回退保护；Workbench 只把 exact model/effort + pass rate + 正样本作为有界弱先验，7–31 天降权、31 天后失效；API/CLI/authority-only 6 小时 sidecar 与插件已接入 | 当前没有真实 Codex Radar 数据授权/快照；软件许可不替代数据授权；IQ 不用于通过率，Radar 不用于 quota；DSH 仅有可复用消费合同，本次未改 DSH |
+| Codex Radar 通用离线 Provider | implemented | 独立 `codex_radar_provider` package/CLI 固定 WineChord/codex-radar v0.1.69；授权前零网络，四端点 JSON、脱敏 raw、规范化 content-addressed generation、原子 active、last-known-good 与时间回退保护；Workbench 只把 exact model/effort + pass rate + 正样本作为有界弱先验，7–31 天降权、31 天后失效；API/CLI/authority-only 24 小时 sidecar 与插件已接入 | 当前没有真实 Codex Radar 数据授权/快照；软件许可不替代数据授权；IQ 不用于通过率，Radar 不用于 quota；DSH 仅有可复用消费合同，本次未改 DSH |
 | Claude Opus/Sonnet/Fable Worker | implemented | 原生订阅资格、结构化 JSON Schema、工具/权限映射、实际模型证明 | A4 真实 Sonnet 工件仍需一次最小真实回合 |
 | Codex Worker | implemented | 原生订阅 CLI、结构化 worker/verifier 结果；低复杂度使用独立 `gpt-5.3-codex-spark` 池；routing-v3 重试保持已固定 capability，不允许普通 Worker 在 claim 时静默升级为 Sol；A4 已有 Luna + Sol 真实 Evidence | 旧 routing-v1/v2 合同保留原有有界升级行为；Spark 的真实生产质量和吞吐仍待长期 Evidence |
 | 确定性执行器 | implemented | 构建、测试、lint 等 argv 执行，不消耗模型 | 无 |
@@ -53,8 +53,8 @@
 
 ## 当前忠实度结论
 
-1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.9.0 另加入通用 Codex Radar 离线 Provider/外部先验、性能基线、长期账本、Spark P0 调度闭环、可恢复的 NAS 归档生命周期，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖。
-2. 1.9.0 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
+1. 控制面、执行面、配额治理、持久状态、工作树隔离和证据验收已按原设计实现；1.9.1 包含通用 Codex Radar 离线 Provider/外部先验、性能基线、长期账本、Spark P0 调度闭环、可恢复的 NAS 归档生命周期，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖。
+2. 1.9.1 的 routing-v3 以版本化能力目录和 pinned performance snapshot 作为新任务路由输入：硬门禁先于保守质量下界、角色适配、成本和时延排序；Sol 不做常规 Worker，Claude 继续受认证和 20% 保留政策约束。
 3. 公开 benchmark 与获授权 Radar 只提供按领域、带迁移折扣的冷启动先验，不是统一排行榜，也不是本机成功率；Radar 未授权/过期时回落内置 baseline，当前 performance calibrate 只报告 advisory `cold-start` 或 `ok`，尚未实现 promotion 阈值，不能称为动态校准完成。
-4. 1.9.0 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
+4. 1.9.1 在完成当前 A1–A12 外部旅程前仍应称为“设计兼容实现”，不能称为“全部验收完成”；尤其不应把 quota/capability sidecar 的夹具验证描述为登录态生产验证或真实模型质量基准。
 5. 手机原生 Remote 与响应式 cockpit 已有实现，但真实配对、查看、发任务和 A2 receipt 仍是 external-pending；只有页面关闭后的 Web Push 留在 backlog。

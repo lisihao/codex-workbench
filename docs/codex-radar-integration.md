@@ -1,6 +1,6 @@
 # Codex Radar 通用 Provider 与 Workbench 集成
 
-状态：`v1.9.0 已实现 / 真实数据采集待 Codex Radar 授权`
+状态：`v1.9.1 已实现 / 真实数据采集待 Codex Radar 授权`
 
 本集成固定使用 [WineChord/codex-radar](https://github.com/WineChord/codex-radar)
 `v0.1.69` / commit `4c83973df6b17e6b18b0b56e8735168580fea12b` 的公开 JSON
@@ -16,7 +16,7 @@ IPC 或 server；因此本仓库提供一个独立、标准库-only 的 `codex_r
 
 ```text
 Codex Radar JSON endpoints
-          │  仅在本地授权 receipt 有效后；默认每 6 小时
+          │  仅在本地授权 receipt 有效后；默认每 24 小时
           ▼
 codex_radar_provider                     通用、无 Workbench/DSH 依赖
   ├── raw/<snapshot-id>.json             原始响应，敏感字段脱敏
@@ -123,7 +123,7 @@ Provider 的失败语义：
 
 ## 4. Workbench 的保守校准
 
-Mac mini authority 安装一个独立 LaunchAgent，默认每 21600 秒运行：
+Mac mini authority 安装一个独立 LaunchAgent，默认每 86400 秒运行：
 
 ```bash
 codex-workbench --home <WB_STATE_ROOT> radar refresh
@@ -188,7 +188,7 @@ DSH adapter 的最小责任：
 
 - 已实现：通用 package/CLI、授权前零网络、四端点 JSON、脱敏 raw、规范化 generation、
   原子 active、last-known-good、时间戳回退保护、Workbench 状态/API/性能快照接入、
-  authority-only 六小时定时任务、插件 Skill 与上游 source lock。
+  authority-only 每日定时任务、插件 Skill 与上游 source lock。
 - 已验证：无网络 fixture 测试、installer rollback、plugin validation、Workbench 受影响
   测试与完整仓库 gate。
 - 未宣称：当前机器已经获得 Codex Radar 数据授权；当前缓存已有真实 Radar 记录；Radar

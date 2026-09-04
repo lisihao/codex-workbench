@@ -215,7 +215,7 @@ curl --ipv4 --fail --silent --show-error http://localhost:8766/health
 
 Authority 安装器会在主服务启动前，以已安装的 Codex runtime 生成一份 bundled capability catalog；只有存在明确的 Sol planner/verifier 和至少一个 Codex Worker 时才激活。随后 `com.lisihao.codex-workbench-capabilities` LaunchAgent 默认每 6 小时执行一次 live metadata refresh。刷新只调用 CLI 版本、帮助与模型目录命令，不登录、不发模型提示；未变化结果不会制造新 generation，失败会继续使用上一份完整目录。
 
-Authority 还会安装 `com.lisihao.codex-workbench-radar`，默认每 6 小时执行一次
+Authority 还会安装 `com.lisihao.codex-workbench-radar`，默认每 24 小时执行一次
 `codex-workbench ... radar refresh`。在 Codex Radar 尚未明确授权衍生集成时，安装器不会
 创建或伪造 `authorization.json`；sidecar 应稳定返回 `unauthorized`，并保证零网络请求。
 获得授权并写入不含秘密的 receipt 后，它才采集固定 JSON endpoints；断网继续使用
