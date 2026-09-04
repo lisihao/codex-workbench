@@ -1,6 +1,6 @@
 # Codex Radar 通用 Provider 与 Workbench 集成
 
-状态：`v1.10.0 / codex-radar-provider 0.2.0 已实现；Mac mini 真实生产采集 Evidence 待部署后补齐`
+状态：`v1.10.0 / codex-radar-provider 0.2.0 已实现并部署；Mac mini 真实生产首采 Evidence 已闭环`
 
 本集成固定使用 [WineChord/codex-radar](https://github.com/WineChord/codex-radar)
 `v0.1.69` / commit `4c83973df6b17e6b18b0b56e8735168580fea12b` 的公开 JSON
@@ -213,13 +213,17 @@ DSH adapter 的最小责任：
   原子 active、last-known-good、时间戳回退保护、Workbench 状态/API/性能快照接入、
   authority-only 每日定时任务、插件 Skill 与上游 source lock。
 - 已验证：无网络 fixture 测试、installer rollback、plugin validation、Workbench 受影响
-  测试与完整仓库 gate。
-- 未宣称：个人 consent 等同站方授权；Mac mini 已经完成真实生产首采；Radar 能证明某模型
-  在本机项目上的真实成功率；DSH 已经完成接入。
+  测试与完整仓库 gate；Mac mini authority 已部署 build `v1.10.0` / commit
+  `5f99ef4cffe74687e23363b79a017e497175c3c3`。个人自用 receipt 后的生产首采生成 snapshot
+  `codex-radar-v1-f121a13f8301c655`，SQLite 五表 row counts 为 `1/4/58/1/1`，并把 17 条
+  精确 Codex model/effort 记录导入 performance snapshot。紧接着的第二次 refresh 被 86400 秒
+  门禁阻止联网，两个过程均为 `model_calls=0`。
+- 未宣称：个人 consent 等同站方授权；Radar 能证明某模型在本机项目上的真实成功率；DSH
+  已经完成接入。
 
-当前问题：Mac mini 的真实生产采集 Evidence 需在 v1.10.0 部署后补齐；个人自用 consent
-不授予完整 API/衍生集成的站方许可。
+当前问题：生产首采已经完成；仍需靠后续真实 Workbench attempt 长期校准公开数据先验，且
+个人自用 consent 不等于站方对完整 API/衍生集成的授权。
 
-下一步：主控部署后在 Mac mini 执行 `radar consent-personal-use` 与一次 `radar refresh`，
-核对 SQLite 路径/row counts、归因、snapshot ID、model/effort 映射和 performance provenance；
-DSH 接入另开任务，仅实现上述 CLI/JSON 只读 adapter，不修改 DSH 或复制 Workbench 调度逻辑。
+下一步：Mac mini 按 86400 秒低频计划持续刷新并复用 SQLite last-known-good；只有输入闭包
+变化时才生成新的 performance snapshot。DSH 接入另开任务，仅实现上述 CLI/JSON 只读
+adapter，不修改 DSH 或复制 Workbench 调度逻辑。
