@@ -18,6 +18,7 @@ import uuid
 
 from . import __version__
 from .acceptance import build_acceptance_report
+from .ai_frontier import WorkbenchAIFrontier
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
@@ -70,6 +71,18 @@ def command_init(args: argparse.Namespace) -> int:
             authority_machine_id=authority_machine_id(),
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
+            radar_enabled=config.radar_enabled,
+            radar_state_root=config.effective_radar_state_root,
+            radar_authorization_file=config.effective_radar_authorization_file,
+            radar_refresh_seconds=config.radar_refresh_seconds,
+            radar_stale_after_seconds=config.radar_stale_after_seconds,
+            radar_expire_after_seconds=config.radar_expire_after_seconds,
+            ai_frontier_enabled=config.ai_frontier_enabled,
+            ai_frontier_state_root=config.effective_ai_frontier_state_root,
+            ai_frontier_authorization_file=config.effective_ai_frontier_authorization_file,
+            ai_frontier_refresh_seconds=config.ai_frontier_refresh_seconds,
+            ai_frontier_stale_after_seconds=config.ai_frontier_stale_after_seconds,
+            ai_frontier_expire_after_seconds=config.ai_frontier_expire_after_seconds,
         )
         config.initialize()
     _store(config)
@@ -97,6 +110,18 @@ def command_serve(args: argparse.Namespace) -> int:
             authority_machine_id=config.authority_machine_id,
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
+            radar_enabled=config.radar_enabled,
+            radar_state_root=config.effective_radar_state_root,
+            radar_authorization_file=config.effective_radar_authorization_file,
+            radar_refresh_seconds=config.radar_refresh_seconds,
+            radar_stale_after_seconds=config.radar_stale_after_seconds,
+            radar_expire_after_seconds=config.radar_expire_after_seconds,
+            ai_frontier_enabled=config.ai_frontier_enabled,
+            ai_frontier_state_root=config.effective_ai_frontier_state_root,
+            ai_frontier_authorization_file=config.effective_ai_frontier_authorization_file,
+            ai_frontier_refresh_seconds=config.ai_frontier_refresh_seconds,
+            ai_frontier_stale_after_seconds=config.ai_frontier_stale_after_seconds,
+            ai_frontier_expire_after_seconds=config.ai_frontier_expire_after_seconds,
         )
     store = _store(config)
     lease = CoordinatorAuthorityLease(config.state_root / "coordinator.lock")
@@ -663,6 +688,54 @@ def _radar(config: WorkbenchConfig) -> WorkbenchRadar:
     )
 
 
+def _ai_frontier(config: WorkbenchConfig) -> WorkbenchAIFrontier:
+    return WorkbenchAIFrontier(
+        state_root=config.effective_ai_frontier_state_root,
+        authorization_file=config.effective_ai_frontier_authorization_file,
+        enabled=config.ai_frontier_enabled,
+        refresh_interval_seconds=config.ai_frontier_refresh_seconds,
+        stale_after_seconds=config.ai_frontier_stale_after_seconds,
+        expire_after_seconds=config.ai_frontier_expire_after_seconds,
+    )
+
+
+def _ai_frontier_source_ids(config: WorkbenchConfig) -> list[str]:
+    """Return bounded exact-model source ids from the active catalog.
+
+    AI Frontier collection is intentionally scoped to models that this
+    Workbench can route now.  In particular, a Claude family alias is not
+    upgraded to an invented version; only an exact ``claude-*`` id is sent.
+    """
+
+    try:
+        catalog = _capability_registry(config).active()
+    except CapabilityCatalogError:
+        return []
+    if not isinstance(catalog, dict):
+        return []
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return []
+    source_ids: list[str] = []
+    for model in models:
+        if not isinstance(model, dict) or model.get("routable") is not True:
+            continue
+        provider = model.get("provider")
+        model_id = model.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        source_id: str | None = None
+        if provider == "codex":
+            source_id = f"openai/{model_id}"
+        elif provider in {"claude", "anthropic"} and model_id.startswith("claude-"):
+            source_id = f"anthropic/{model_id}"
+        if source_id is not None and source_id not in source_ids:
+            source_ids.append(source_id)
+        if len(source_ids) >= 8:
+            break
+    return source_ids
+
+
 def _refresh_performance_after_capabilities(
     config: WorkbenchConfig,
     refresh: dict[str, object],
@@ -704,6 +777,7 @@ def _refresh_performance_after_capabilities(
             _store(config),
             catalog,
             radar_status=_radar(config).status(),
+            ai_frontier_status=_ai_frontier(config).status(),
         )
     except PerformanceRegistryError as error:
         return {"ok": False, "status": "unavailable", "reason": str(error)}
@@ -825,12 +899,15 @@ def command_performance(args: argparse.Namespace) -> int:
             }
         elif args.performance_action == "refresh":
             catalog, catalog_status = _performance_catalog(config)
+            ai_frontier_status = _ai_frontier(config).status()
             result = registry.refresh(
                 store,
                 catalog,
                 radar_status=_radar(config).status(),
+                ai_frontier_status=ai_frontier_status,
             )
             result["catalog"] = catalog_status
+            result["ai_frontier"] = ai_frontier_status
             result["model_calls"] = 0
         else:
             raise ValueError(f"unsupported performance action: {args.performance_action}")
@@ -875,6 +952,7 @@ def command_radar(args: argparse.Namespace) -> int:
             store,
             catalog,
             radar_status=usable,
+            ai_frontier_status=_ai_frontier(config).status(),
         )
         result["performance"] = {
             "ok": True,
@@ -905,6 +983,121 @@ def command_radar(args: argparse.Namespace) -> int:
             result["model_calls"] = 0
     else:
         raise ValueError(f"unsupported radar action: {action}")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def command_ai_frontier(args: argparse.Namespace) -> int:
+    """Inspect or refresh the AI Frontier public-data provider.
+
+    Status and show are strictly local.  Refresh and local consent are
+    authority-only operations; refresh is still followed by a local
+    performance materialization using the provider's current LKG snapshot,
+    even when the network update is unavailable.
+    """
+
+    config = _config(args)
+    frontier = _ai_frontier(config)
+    action = args.ai_frontier_action
+    if action == "status":
+        result = frontier.status()
+        result["network_requested"] = False
+        result["model_calls"] = 0
+    elif action == "show":
+        snapshot = (
+            frontier.registry.load_generation(args.snapshot_id)
+            if args.snapshot_id
+            else frontier.registry.active()
+        )
+        result = {
+            "ok": snapshot is not None,
+            "state": frontier.status().get("state"),
+            "snapshot_id": snapshot.get("snapshot_id") if snapshot else None,
+            "snapshot": snapshot,
+            **(
+                {}
+                if snapshot is not None
+                else {"error": "no cached AI Frontier snapshot"}
+            ),
+        }
+        result["network_requested"] = False
+        result["model_calls"] = 0
+    elif action == "refresh":
+        source_ids: list[str] = []
+        try:
+            config.assert_authority()
+        except RuntimeError as error:
+            result = {
+                "ok": False,
+                "operation": "refresh",
+                "state": "forbidden",
+                "source_ids": source_ids,
+                "network_requested": False,
+                "model_calls": 0,
+                "error": str(error),
+            }
+        else:
+            source_ids = _ai_frontier_source_ids(config)
+            result = frontier.refresh(source_ids=source_ids)
+            result["source_ids"] = source_ids
+            result["model_calls"] = 0
+
+            # Always replay the latest usable LKG into the local ledger after
+            # the provider operation, including a failed/deferred refresh.
+            usable = frontier.status()
+            radar_status = _radar(config).status()
+            catalog, catalog_status = _performance_catalog(config)
+            try:
+                performance = PerformanceRegistry(config.state_root).refresh(
+                    _store(config),
+                    catalog,
+                    radar_status=radar_status,
+                    ai_frontier_status=usable,
+                )
+            except PerformanceRegistryError as error:
+                result["performance"] = {
+                    "ok": False,
+                    "status": "unavailable",
+                    "reason": str(error),
+                    "ai_frontier_state": usable.get("state"),
+                    "radar_state": radar_status.get("state"),
+                    "catalog": catalog_status,
+                    "model_calls": 0,
+                }
+            else:
+                result["performance"] = {
+                    "ok": True,
+                    "snapshot_id": performance["active_generation_id"],
+                    "activated": performance["activated"],
+                    "unchanged": performance["unchanged"],
+                    "ai_frontier_state": usable.get("state"),
+                    "imported_ai_frontier_prior": usable.get(
+                        "routing_prior_eligible"
+                    )
+                    is True,
+                    "radar_state": radar_status.get("state"),
+                    "catalog": catalog_status,
+                    "model_calls": 0,
+                }
+    elif action == "consent-personal-use":
+        try:
+            config.assert_authority()
+        except RuntimeError as error:
+            result = {
+                "ok": False,
+                "operation": "consent-personal-use",
+                "state": "forbidden",
+                "network_requested": False,
+                "model_calls": 0,
+                "error": str(error),
+            }
+        else:
+            result = frontier.registry.consent_personal_use(
+                config.effective_ai_frontier_authorization_file
+            )
+            result["model_calls"] = 0
+    else:
+        raise ValueError(f"unsupported AI Frontier action: {action}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
 
@@ -1302,6 +1495,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="write a local personal-use consent receipt (authority only; no network)",
     )
     radar.set_defaults(func=command_radar)
+
+    ai_frontier = sub.add_parser(
+        "ai-frontier",
+        help="inspect or refresh authorized/consented AI Frontier public data and its offline cache",
+    )
+    ai_frontier_sub = ai_frontier.add_subparsers(
+        dest="ai_frontier_action", required=True
+    )
+    ai_frontier_sub.add_parser("status")
+    ai_frontier_show = ai_frontier_sub.add_parser("show")
+    ai_frontier_show.add_argument("snapshot_id", nargs="?")
+    ai_frontier_sub.add_parser(
+        "refresh",
+        help="refresh scoped public data and update the advisory performance snapshot",
+    )
+    ai_frontier_sub.add_parser(
+        "consent-personal-use",
+        help="write a local personal-use consent receipt (authority only; no network)",
+    )
+    ai_frontier.set_defaults(func=command_ai_frontier)
 
     mobile = sub.add_parser(
         "mobile",

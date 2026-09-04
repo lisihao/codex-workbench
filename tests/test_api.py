@@ -25,6 +25,67 @@ from codex_workbench.store import WorkbenchStore
 
 
 class APITests(unittest.TestCase):
+    def test_ai_frontier_endpoint_and_summaries_are_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            fake_frontier = mock.Mock()
+            fake_frontier.status.return_value = {
+                "schema_version": 1,
+                "provider": "ai-frontier-provider",
+                "ok": True,
+                "state": "fresh",
+                "routing_prior_eligible": True,
+                "network_requested": False,
+                "snapshot_id": "frontier-api-snapshot",
+                "digest": "f" * 64,
+                "snapshot": {
+                    "snapshot_id": "frontier-api-snapshot",
+                    "digest": "f" * 64,
+                    "source_ids": ["openai/gpt-5.6-luna"],
+                    "models": [{"model": "gpt-5.6-luna", "quality": 0.9}],
+                },
+            }
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            try:
+                with mock.patch(
+                    "codex_workbench.api.WorkbenchAIFrontier", return_value=fake_frontier
+                ):
+                    with urlopen(
+                        f"http://127.0.0.1:{port}/api/ai-frontier", timeout=2
+                    ) as response:
+                        frontier = json.load(response)
+                    with urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=2
+                    ) as response:
+                        health = json.load(response)
+                    with urlopen(
+                        f"http://127.0.0.1:{port}/api/snapshot", timeout=2
+                    ) as response:
+                        snapshot = json.load(response)
+
+                self.assertTrue(frontier["ok"])
+                self.assertTrue(frontier["read_only"])
+                self.assertFalse(frontier["network_requested"])
+                self.assertEqual(frontier["active"]["snapshot_id"], "frontier-api-snapshot")
+                self.assertIn("ai_frontier", health)
+                self.assertIn("ai_frontier", snapshot)
+                self.assertEqual(
+                    snapshot["ai_frontier"]["active"]["source_ids"],
+                    ["openai/gpt-5.6-luna"],
+                )
+                fake_frontier.refresh.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_performance_and_scheduler_endpoints_are_read_only_and_expose_spark_na_quota(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

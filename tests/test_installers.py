@@ -242,6 +242,88 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertTrue(radar["authority_only"])
 
+    def test_authority_installer_persists_ai_frontier_contract_without_overwriting_unknown_fields(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            state_root = root / "state"
+            app_root = state_root / "app"
+            config = {
+                "user_setting": "preserve",
+                "ai_frontier": {
+                    "operator_note": "preserve",
+                    "database": {"local_note": "preserve"},
+                },
+            }
+            ai_frontier = module.ai_frontier_installation_config(
+                config,
+                app_root=app_root,
+                state_root=state_root,
+                refresh_seconds=module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+            )
+
+        self.assertEqual(config["user_setting"], "preserve")
+        self.assertEqual(ai_frontier["operator_note"], "preserve")
+        self.assertTrue(ai_frontier["enabled"])
+        self.assertEqual(ai_frontier["producer"], module.AI_FRONTIER_PRODUCER)
+        self.assertEqual(ai_frontier["state_root"], str(state_root / "ai-frontier"))
+        self.assertEqual(
+            ai_frontier["authorization_receipt"],
+            str(state_root / "ai-frontier" / "authorization.json"),
+        )
+        self.assertEqual(
+            ai_frontier["database"],
+            {
+                "local_note": "preserve",
+                "backend": "sqlite",
+                "path": str(state_root / "ai-frontier" / "ai-frontier.sqlite3"),
+                "schema_version": module.AI_FRONTIER_DATABASE_SCHEMA_VERSION,
+            },
+        )
+        self.assertEqual(
+            ai_frontier["refresh_interval_seconds"],
+            module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+        )
+        self.assertEqual(
+            ai_frontier["stale_after_seconds"],
+            module.AI_FRONTIER_DEFAULT_STALE_AFTER_SECONDS,
+        )
+        self.assertEqual(
+            ai_frontier["expire_after_seconds"],
+            module.AI_FRONTIER_DEFAULT_EXPIRE_AFTER_SECONDS,
+        )
+        self.assertTrue(ai_frontier["authority_only"])
+        self.assertEqual(ai_frontier["source"], module.AI_FRONTIER_SOURCE)
+        self.assertEqual(ai_frontier["paper"], module.AI_FRONTIER_PAPER)
+        self.assertEqual(ai_frontier["terms"], module.AI_FRONTIER_TERMS)
+        self.assertEqual(
+            ai_frontier["authorization_note"], module.AI_FRONTIER_AUTHORIZATION_NOTE
+        )
+        self.assertEqual(
+            ai_frontier["refresh_command"],
+            [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "ai-frontier",
+                "refresh",
+            ],
+        )
+        self.assertEqual(
+            module.ai_frontier_refresh_interval({}),
+            module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+        )
+        self.assertEqual(
+            module.ai_frontier_refresh_interval(
+                {"ai_frontier": {"refresh_interval_seconds": 24 * 60 * 60}}
+            ),
+            24 * 60 * 60,
+        )
+        with self.assertRaisesRegex(SystemExit, "at least 86400"):
+            module.ai_frontier_refresh_interval({"ai_frontier_refresh_seconds": 60})
+
     def test_authority_service_render_uses_real_home_and_explicit_claude_path(self) -> None:
         module = self._macos_installer_module()
         root = Path(__file__).resolve().parents[1]
@@ -691,11 +773,66 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/radar.log")
         self.assertEqual(payload["StandardErrorPath"], "/tmp/state/logs/radar.error.log")
 
+    def test_ai_frontier_launch_agent_is_authority_only_and_has_no_secret_environment(self) -> None:
+        module = self._macos_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / f"{module.AI_FRONTIER_LABEL}.plist.in").read_text()
+        with mock.patch.object(module.Path, "home", return_value=Path("/Users/example")):
+            rendered = module.render_ai_frontier_plist(
+                template,
+                app_root=Path("/tmp/app"),
+                state_root=Path("/tmp/state"),
+                refresh_seconds=module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+            )
+
+        payload = plistlib.loads(rendered.encode())
+        self.assertEqual(payload["Label"], module.AI_FRONTIER_LABEL)
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertEqual(payload["StartInterval"], 3 * 24 * 60 * 60)
+        self.assertNotIn("KeepAlive", payload)
+        self.assertEqual(
+            payload["ProgramArguments"],
+            [
+                "/tmp/app/scripts/python-runtime",
+                "-m",
+                "codex_workbench",
+                "--home",
+                "/tmp/state",
+                "ai-frontier",
+                "refresh",
+            ],
+        )
+        self.assertEqual(
+            set(payload["EnvironmentVariables"]),
+            {"HOME", "PATH", "PYTHONPATH", "PYTHONUNBUFFERED"},
+        )
+        self.assertNotIn("CODEX_HOME", payload["EnvironmentVariables"])
+        self.assertNotIn("CODEX_WORKBENCH_CODEX", payload["EnvironmentVariables"])
+        self.assertNotIn("CODEX_WORKBENCH_CLAUDE", payload["EnvironmentVariables"])
+        self.assertNotIn("OPENAI_API_KEY", payload["EnvironmentVariables"])
+        self.assertNotIn("ANTHROPIC_API_KEY", payload["EnvironmentVariables"])
+        self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/ai-frontier.log")
+        self.assertEqual(payload["StandardErrorPath"], "/tmp/state/logs/ai-frontier.error.log")
+        with self.assertRaisesRegex(SystemExit, "24-hour floor"):
+            module.render_ai_frontier_plist(
+                template,
+                app_root=Path("/tmp/app"),
+                state_root=Path("/tmp/state"),
+                refresh_seconds=60,
+                user_home=Path("/Users/example"),
+            )
+
     def test_radar_provider_writer_is_not_installed_by_macbook_client(self) -> None:
         root = Path(__file__).resolve().parents[1]
         client_source = (root / "scripts" / "install-macbook-client.py").read_text()
         self.assertNotIn("codex_radar_provider", client_source)
         self.assertNotIn("codex-workbench-radar", client_source)
+
+    def test_ai_frontier_provider_writer_is_not_installed_by_macbook_client(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        client_source = (root / "scripts" / "install-macbook-client.py").read_text()
+        self.assertNotIn("ai_frontier_provider", client_source)
+        self.assertNotIn("codex-workbench-ai-frontier", client_source)
 
     def test_initial_capability_refresh_uses_fixture_runtime_without_api_keys_or_model_prompt(self) -> None:
         module = self._macos_installer_module()
@@ -1494,6 +1631,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("plan: radar=", output.getvalue())
             self.assertIn("codex_workbench --home", output.getvalue())
             self.assertIn("radar refresh", output.getvalue())
+            self.assertIn("plan: ai-frontier=", output.getvalue())
+            self.assertIn("ai-frontier refresh", output.getvalue())
+            self.assertIn("no authorization file is created", output.getvalue())
 
     def test_macbook_dry_run_skips_ssh_launchctl_and_mcp_mutations(self) -> None:
         module = self._macbook_installer_module()
@@ -1681,7 +1821,16 @@ class InstallerTests(unittest.TestCase):
             state_root = root / "state"
             state_root.mkdir()
             (state_root / "config.json").write_text(
-                json.dumps({"user_setting": "preserve", "capability_refresh_seconds": 1234})
+                json.dumps(
+                    {
+                        "user_setting": "preserve",
+                        "capability_refresh_seconds": 1234,
+                        "ai_frontier": {
+                            "operator_note": "preserve",
+                            "database": {"local_note": "preserve"},
+                        },
+                    }
+                )
             )
             calls: list[tuple[str, ...]] = []
             refreshes: list[dict[str, object]] = []
@@ -1807,6 +1956,43 @@ class InstallerTests(unittest.TestCase):
                     "authority_only": True,
                 },
             )
+            self.assertEqual(
+                config["ai_frontier"],
+                {
+                    "operator_note": "preserve",
+                    "database": {
+                        "local_note": "preserve",
+                        "backend": "sqlite",
+                        "path": str(
+                            state_root / "ai-frontier" / "ai-frontier.sqlite3"
+                        ),
+                        "schema_version": module.AI_FRONTIER_DATABASE_SCHEMA_VERSION,
+                    },
+                    "enabled": True,
+                    "producer": module.AI_FRONTIER_PRODUCER,
+                    "state_root": str(state_root / "ai-frontier"),
+                    "authorization_receipt": str(
+                        state_root / "ai-frontier" / "authorization.json"
+                    ),
+                    "refresh_interval_seconds": module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+                    "stale_after_seconds": module.AI_FRONTIER_DEFAULT_STALE_AFTER_SECONDS,
+                    "expire_after_seconds": module.AI_FRONTIER_DEFAULT_EXPIRE_AFTER_SECONDS,
+                    "authority_only": True,
+                    "source": module.AI_FRONTIER_SOURCE,
+                    "paper": module.AI_FRONTIER_PAPER,
+                    "terms": module.AI_FRONTIER_TERMS,
+                    "authorization_note": module.AI_FRONTIER_AUTHORIZATION_NOTE,
+                    "refresh_command": [
+                        str(state_root / "app" / "scripts" / "python-runtime"),
+                        "-m",
+                        "codex_workbench",
+                        "--home",
+                        str(state_root),
+                        "ai-frontier",
+                        "refresh",
+                    ],
+                },
+            )
             manifest = json.loads((state_root / "app" / "install-manifest.json").read_text())
             self.assertEqual(
                 manifest["capabilities"],
@@ -1829,8 +2015,13 @@ class InstallerTests(unittest.TestCase):
                 config["worktree_recovery"],
             )
             self.assertEqual(manifest["radar"], config["radar"])
+            self.assertEqual(manifest["ai_frontier"], config["ai_frontier"])
             self.assertTrue((state_root / "radar").is_dir())
             self.assertFalse((state_root / "radar" / "authorization.json").exists())
+            self.assertTrue((state_root / "ai-frontier").is_dir())
+            self.assertFalse(
+                (state_root / "ai-frontier" / "authorization.json").exists()
+            )
             capability_plist = home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist"
             payload = plistlib.loads(capability_plist.read_bytes())
             self.assertEqual(payload["StartInterval"], 1234)
@@ -1865,6 +2056,40 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(
                 any(command[1] == "print" and command[-1] == radar_service for command in launchctl_commands)
             )
+            ai_frontier_plist = (
+                home / "Library" / "LaunchAgents" / f"{module.AI_FRONTIER_LABEL}.plist"
+            )
+            ai_frontier_payload = plistlib.loads(ai_frontier_plist.read_bytes())
+            self.assertEqual(
+                ai_frontier_payload["StartInterval"],
+                module.DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
+            )
+            self.assertEqual(
+                ai_frontier_payload["ProgramArguments"],
+                config["ai_frontier"]["refresh_command"],
+            )
+            ai_frontier_service = f"gui/501/{module.AI_FRONTIER_LABEL}"
+            self.assertTrue(
+                any(
+                    command[1] == "bootstrap"
+                    and str(ai_frontier_plist) in command
+                    for command in launchctl_commands
+                )
+            )
+            self.assertTrue(
+                any(
+                    command[1] == "kickstart"
+                    and command[-1] == ai_frontier_service
+                    for command in launchctl_commands
+                )
+            )
+            self.assertTrue(
+                any(
+                    command[1] == "print"
+                    and command[-1] == ai_frontier_service
+                    for command in launchctl_commands
+                )
+            )
 
     def test_authority_installer_rolls_back_catalog_when_initial_bundled_refresh_fails(self) -> None:
         module = self._macos_installer_module()
@@ -1892,7 +2117,15 @@ class InstallerTests(unittest.TestCase):
             previous_radar = state_root / "radar" / "last-known-good.json"
             previous_radar.parent.mkdir(parents=True)
             previous_radar.write_text('{"radar":"previous"}\n')
-            original_config = '{"unrelated":"keep"}\n'
+            previous_ai_frontier = state_root / "ai-frontier" / "last-known-good.json"
+            previous_ai_frontier.parent.mkdir(parents=True)
+            previous_ai_frontier.write_text('{"ai_frontier":"previous"}\n')
+            previous_manifest = state_root / "app" / "install-manifest.json"
+            previous_manifest.parent.mkdir(parents=True)
+            previous_manifest.write_text('{"previous":"manifest"}\n')
+            original_config = (
+                '{"unrelated":"keep","ai_frontier":{"operator_note":"keep"}}\n'
+            )
             (state_root / "config.json").write_text(original_config)
             calls: list[tuple[str, ...]] = []
 
@@ -1945,12 +2178,19 @@ class InstallerTests(unittest.TestCase):
 
             self.assertEqual(previous_catalog.read_text(), '{"previous":true}\n')
             self.assertEqual(previous_radar.read_text(), '{"radar":"previous"}\n')
+            self.assertEqual(
+                previous_ai_frontier.read_text(), '{"ai_frontier":"previous"}\n'
+            )
             self.assertFalse((state_root / "capabilities" / "generations" / "failed.json").exists())
             self.assertFalse((state_root / "radar" / "authorization.json").exists())
+            self.assertFalse((state_root / "ai-frontier" / "authorization.json").exists())
             self.assertEqual((state_root / "config.json").read_text(), original_config)
-            self.assertFalse((state_root / "app").exists())
+            self.assertEqual(previous_manifest.read_text(), '{"previous":"manifest"}\n')
             self.assertFalse((home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist").exists())
             self.assertFalse((home / "Library" / "LaunchAgents" / f"{module.RADAR_LABEL}.plist").exists())
+            self.assertFalse(
+                (home / "Library" / "LaunchAgents" / f"{module.AI_FRONTIER_LABEL}.plist").exists()
+            )
             self.assertFalse(any(command[:2] == ("launchctl", "bootstrap") for command in calls))
 
 

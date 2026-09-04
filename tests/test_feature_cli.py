@@ -13,6 +13,7 @@ from codex_workbench.authority import authority_machine_id
 from codex_workbench.cli import (
     build_parser,
     command_capabilities,
+    command_ai_frontier,
     command_mobile,
     command_performance,
     command_radar,
@@ -100,6 +101,12 @@ class FeatureCLITests(unittest.TestCase):
         radar = parser.parse_args(["radar", "show", "codex-radar-v1-0123456789abcdef"])
         self.assertEqual(radar.radar_action, "show")
         self.assertEqual(radar.snapshot_id, "codex-radar-v1-0123456789abcdef")
+
+        frontier = parser.parse_args(
+            ["ai-frontier", "show", "ai-frontier-v1-0123456789abcdef"]
+        )
+        self.assertEqual(frontier.ai_frontier_action, "show")
+        self.assertEqual(frontier.snapshot_id, "ai-frontier-v1-0123456789abcdef")
 
     def test_capability_refresh_uses_actual_binary_env_and_returns_explicit_ok(self) -> None:
         with tempfile.TemporaryDirectory(prefix="feature-cli-") as directory:
@@ -270,6 +277,167 @@ class FeatureCLITests(unittest.TestCase):
             self.assertEqual(payload["model_calls"], 0)
             fake_registry.consent_personal_use.assert_called_once_with(
                 root / "radar" / "authorization.json"
+            )
+
+    def test_ai_frontier_status_is_local_and_refresh_is_client_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ai-frontier-cli-client-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(root).initialize()
+            fake_frontier = mock.Mock()
+            fake_frontier.status.return_value = {
+                "ok": False,
+                "state": "unauthorized",
+                "network_requested": False,
+                "routing_prior_eligible": False,
+            }
+            with mock.patch(
+                "codex_workbench.cli.WorkbenchAIFrontier", return_value=fake_frontier
+            ):
+                status_code, status_payload = self._run(
+                    command_ai_frontier,
+                    build_parser().parse_args(
+                        ["--home", directory, "ai-frontier", "status"]
+                    ),
+                )
+                refresh_code, refresh_payload = self._run(
+                    command_ai_frontier,
+                    build_parser().parse_args(
+                        ["--home", directory, "ai-frontier", "refresh"]
+                    ),
+                )
+
+            self.assertEqual(status_code, 1)
+            self.assertEqual(status_payload["state"], "unauthorized")
+            self.assertFalse(status_payload["network_requested"])
+            self.assertEqual(refresh_code, 1)
+            self.assertEqual(refresh_payload["state"], "forbidden")
+            self.assertFalse(refresh_payload["network_requested"])
+            self.assertEqual(refresh_payload["model_calls"], 0)
+            fake_frontier.status.assert_called_once()
+            fake_frontier.refresh.assert_not_called()
+
+    def test_ai_frontier_refresh_scopes_sources_and_rebuilds_performance_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ai-frontier-cli-authority-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(
+                root,
+                deployment_role="authority",
+                authority_host=socket.gethostname(),
+                authority_machine_id=authority_machine_id(),
+            ).initialize()
+            args = build_parser().parse_args(
+                ["--home", directory, "ai-frontier", "refresh"]
+            )
+            catalog = {
+                "catalog_id": "catalog-active",
+                "models": [
+                    {"provider": "codex", "model_id": "gpt-5.6-luna", "routable": True},
+                    {"provider": "claude", "model_id": "claude-opus-4-6", "routable": True},
+                    {"provider": "claude", "model_id": "opus", "routable": True},
+                    {"provider": "codex", "model_id": "gpt-5.6-luna", "routable": True},
+                ],
+            }
+            fake_frontier = mock.Mock()
+            fake_frontier.refresh.return_value = {
+                "ok": False,
+                "state": "unavailable",
+                "network_requested": True,
+                "generation_created": False,
+            }
+            fake_frontier.status.return_value = {
+                "ok": False,
+                "state": "stale",
+                "routing_prior_eligible": True,
+                "snapshot_id": "frontier-lkg",
+                "network_requested": False,
+            }
+            fake_performance = mock.Mock()
+            fake_performance.refresh.return_value = {
+                "active_generation_id": "performance-after-frontier",
+                "activated": True,
+                "unchanged": False,
+            }
+            with (
+                mock.patch(
+                    "codex_workbench.cli.WorkbenchAIFrontier", return_value=fake_frontier
+                ),
+                mock.patch(
+                    "codex_workbench.cli.CapabilityRegistry"
+                ) as registry_class,
+                mock.patch(
+                    "codex_workbench.cli.PerformanceRegistry", return_value=fake_performance
+                ),
+                mock.patch(
+                    "codex_workbench.cli._performance_catalog",
+                    return_value=(catalog, {"status": "active", "catalog_id": "catalog-active"}),
+                ),
+            ):
+                registry_class.return_value.active.return_value = catalog
+                code, payload = self._run(command_ai_frontier, args)
+
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(
+                payload["source_ids"],
+                ["openai/gpt-5.6-luna", "anthropic/claude-opus-4-6"],
+            )
+            self.assertEqual(payload["model_calls"], 0)
+            self.assertTrue(payload["performance"]["ok"])
+            fake_frontier.refresh.assert_called_once_with(
+                source_ids=["openai/gpt-5.6-luna", "anthropic/claude-opus-4-6"]
+            )
+            fake_performance.refresh.assert_called_once()
+            self.assertEqual(
+                fake_performance.refresh.call_args.kwargs["ai_frontier_status"]["snapshot_id"],
+                "frontier-lkg",
+            )
+
+    def test_ai_frontier_personal_use_consent_is_authority_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ai-frontier-consent-client-") as directory:
+            WorkbenchConfig(Path(directory)).initialize()
+            fake_frontier = mock.Mock()
+            with mock.patch(
+                "codex_workbench.cli.WorkbenchAIFrontier", return_value=fake_frontier
+            ):
+                code, payload = self._run(
+                    command_ai_frontier,
+                    build_parser().parse_args(
+                        ["--home", directory, "ai-frontier", "consent-personal-use"]
+                    ),
+                )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["state"], "forbidden")
+            self.assertFalse(payload["network_requested"])
+            fake_frontier.registry.consent_personal_use.assert_not_called()
+
+        with tempfile.TemporaryDirectory(prefix="ai-frontier-consent-authority-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(
+                root,
+                deployment_role="authority",
+                authority_host=socket.gethostname(),
+                authority_machine_id=authority_machine_id(),
+            ).initialize()
+            fake_frontier = mock.Mock()
+            fake_frontier.registry.consent_personal_use.return_value = {
+                "ok": True,
+                "state": "consented",
+                "network_requested": False,
+            }
+            with mock.patch(
+                "codex_workbench.cli.WorkbenchAIFrontier", return_value=fake_frontier
+            ):
+                code, payload = self._run(
+                    command_ai_frontier,
+                    build_parser().parse_args(
+                        ["--home", directory, "ai-frontier", "consent-personal-use"]
+                    ),
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["state"], "consented")
+            self.assertEqual(payload["model_calls"], 0)
+            fake_frontier.registry.consent_personal_use.assert_called_once_with(
+                root / "ai-frontier" / "authorization.json"
             )
 
     def test_capability_refresh_on_authority_refreshes_the_matching_performance_snapshot(self) -> None:

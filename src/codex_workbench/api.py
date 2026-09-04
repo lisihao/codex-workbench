@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
 from .acceptance import build_acceptance_report
+from .ai_frontier import WorkbenchAIFrontier
 from .artifacts import ArtifactStore
 from .capabilities import CapabilityRegistry
 from .config import WorkbenchConfig
@@ -62,6 +63,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "harness": harness_health,
                     "capability_registry": capability_registry,
                     "radar": self._radar_summary(),
+                    "ai_frontier": self._ai_frontier_summary(),
                     "ok": overall_ok,
                 },
                 HTTPStatus.OK if overall_ok else HTTPStatus.SERVICE_UNAVAILABLE,
@@ -77,6 +79,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "capability_registry": self._capability_registry_summary(),
                     "performance": self._performance_registry_summary(),
                     "radar": self._radar_summary(),
+                    "ai_frontier": self._ai_frontier_summary(),
                     "scheduler": self._scheduler_metrics(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
@@ -96,6 +99,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return self._json(self._performance_registry_summary())
         if parsed.path == "/api/radar":
             return self._json(self._radar_summary())
+        if parsed.path == "/api/ai-frontier":
+            return self._json(self._ai_frontier_summary())
         if parsed.path == "/api/scheduler":
             return self._json(self._scheduler_metrics())
         if parsed.path == "/api/capabilities":
@@ -362,6 +367,43 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "source_updated_at": snapshot.get("source_updated_at"),
                 "models": snapshot.get("models") if isinstance(snapshot.get("models"), list) else [],
                 "insights": snapshot.get("insights") if isinstance(snapshot.get("insights"), dict) else {},
+                "attribution": snapshot.get("attribution"),
+            }
+        return {**status, "active": active, "read_only": True, "network_requested": False}
+
+    def _ai_frontier_summary(self) -> dict[str, object]:
+        """Expose AI Frontier cache state without refreshing or credentials."""
+
+        config = self.server.config
+        frontier = WorkbenchAIFrontier(
+            state_root=config.effective_ai_frontier_state_root,
+            authorization_file=config.effective_ai_frontier_authorization_file,
+            enabled=config.ai_frontier_enabled,
+            stale_after_seconds=config.ai_frontier_stale_after_seconds,
+            expire_after_seconds=config.ai_frontier_expire_after_seconds,
+        )
+        status = dict(frontier.status())
+        snapshot = status.pop("snapshot", None)
+        active = None
+        if isinstance(snapshot, dict):
+            active = {
+                "snapshot_id": snapshot.get("snapshot_id"),
+                "digest": snapshot.get("digest"),
+                "upstream": snapshot.get("upstream"),
+                "source_urls": snapshot.get("source_urls"),
+                "source_ids": snapshot.get("source_ids"),
+                "fetched_at": snapshot.get("fetched_at"),
+                "source_updated_at": snapshot.get("source_updated_at"),
+                "models": snapshot.get("models")
+                if isinstance(snapshot.get("models"), list)
+                else [],
+                "categories": snapshot.get("categories")
+                if isinstance(snapshot.get("categories"), list)
+                else [],
+                "benchmarks": snapshot.get("benchmarks")
+                if isinstance(snapshot.get("benchmarks"), list)
+                else [],
+                "routing_boundary": snapshot.get("routing_boundary"),
                 "attribution": snapshot.get("attribution"),
             }
         return {**status, "active": active, "read_only": True, "network_requested": False}

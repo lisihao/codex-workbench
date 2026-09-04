@@ -1,0 +1,36 @@
+{
+  "name": "ai-frontier-provider",
+  "version": "0.1.0",
+  "description": "Offline-first Martian AI Frontier observations for model-aware consumers.",
+  "author": {
+    "name": "Codex Workbench contributors"
+  },
+  "homepage": "https://github.com/lisihao/codex-workbench",
+  "repository": "https://github.com/lisihao/codex-workbench",
+  "license": "MIT",
+  "keywords": [
+    "ai-frontier",
+    "model-observations",
+    "offline-first",
+    "provider"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AI Frontier Provider",
+    "shortDescription": "Offline snapshots of public model-quality and cost observations.",
+    "longDescription": "Consumes only selected public JSON endpoints from Martian AI Frontier after an explicit local personal-use opt-in. It preserves a local last-known-good snapshot, never logs in or sends cookies, and never represents local consent as publisher authorization.",
+    "developerName": "Codex Workbench contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Model quality observations",
+      "Cost and consistency observations",
+      "Offline SQLite snapshots"
+    ],
+    "websiteURL": "https://github.com/lisihao/codex-workbench",
+    "defaultPrompt": [
+      "Show the local AI Frontier provider status.",
+      "Explain the AI Frontier personal-use consent boundary.",
+      "Show the latest local AI Frontier observation snapshot."
+    ]
+  }
+}

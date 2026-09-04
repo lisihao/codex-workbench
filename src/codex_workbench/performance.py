@@ -24,6 +24,7 @@ from statistics import median
 import tempfile
 from typing import Any, Iterable
 
+from .ai_frontier import ai_frontier_prior_records
 from .radar import radar_prior_records
 from .store import WorkbenchStore
 
@@ -129,6 +130,9 @@ def validate_benchmark_baseline(raw: Mapping[str, Any] | object) -> dict[str, An
             not isinstance(score, (int, float)) or isinstance(score, bool) or not 0 <= float(score) <= 1
         ):
             raise PerformanceRegistryError(f"record {record_id} score must be a percentage in [0, 1] or null")
+        external_signals = record.get("external_signals")
+        if external_signals is not None:
+            _validate_external_signals(external_signals, record_id)
         for field in ("transfer_weight", "effective_sample_strength"):
             value = record.get(field)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0:
@@ -494,13 +498,16 @@ def build_performance_snapshot(
     quota: object | None = None,
     baseline: Mapping[str, Any] | None = None,
     radar_status: Mapping[str, Any] | None = None,
+    ai_frontier_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic, content-addressed performance generation."""
 
     active_baseline = validate_benchmark_baseline(
         baseline if baseline is not None else load_benchmark_baseline()
     )
-    external_records = radar_prior_records(radar_status or {}, catalog)
+    radar_records = radar_prior_records(radar_status or {}, catalog)
+    ai_frontier_records = ai_frontier_prior_records(ai_frontier_status or {}, catalog)
+    external_records = [*radar_records, *ai_frontier_records]
     if external_records:
         active_baseline = validate_benchmark_baseline(
             {
@@ -535,8 +542,15 @@ def build_performance_snapshot(
     }
     if radar_status is not None:
         source_provenance["external_priors"] = {
-            "codex_radar": _radar_provenance(radar_status, len(external_records))
+            "codex_radar": _radar_provenance(radar_status, len(radar_records))
         }
+    if ai_frontier_status is not None:
+        source_provenance.setdefault("external_priors", {})[
+            "ai_frontier"
+        ] = _ai_frontier_provenance(
+            ai_frontier_status,
+            len(ai_frontier_records),
+        )
     body = {
         "schema_version": PERFORMANCE_SNAPSHOT_SCHEMA_VERSION,
         "producer": PERFORMANCE_SNAPSHOT_PRODUCER,
@@ -650,6 +664,7 @@ class PerformanceRegistry:
         catalog: Mapping[str, Any],
         *,
         radar_status: Mapping[str, Any] | None = None,
+        ai_frontier_status: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Read the full durable ledger and atomically activate its generation."""
 
@@ -661,6 +676,7 @@ class PerformanceRegistry:
             catalog,
             quota=_latest_quota(store),
             radar_status=radar_status,
+            ai_frontier_status=ai_frontier_status,
         )
         current = self.active()
         unchanged = current is not None and current["digest"] == snapshot["digest"]
@@ -1135,36 +1151,80 @@ def _prior_for(
         alpha = 1.0
         beta = 1.0
         evidence: list[dict[str, Any]] = []
+        signal_sums: dict[str, float] = defaultdict(float)
+        signal_weights: dict[str, float] = defaultdict(float)
+        signal_sources: set[str] = set()
         for record, multiplier, match_kind in selected:
             selected_effort = _text(record.get("reasoning_effort"))
             strength = float(record["effective_sample_strength"]) * multiplier
             score = float(record["score"])
             alpha += score * strength
             beta += (1 - score) * strength
-            evidence.append(
-                {
-                    "record_id": record["record_id"],
-                    "source_url": record["source_url"],
-                    "benchmark": record["benchmark"],
-                    "benchmark_version": record["benchmark_version"],
-                    "domain": record["domain"],
-                    "provenance": record["provenance"],
-                    "match_kind": match_kind,
-                    "effective_sample_strength": round(strength, 6),
-                    "agent_scaffold": record["agent_scaffold"],
-                    **(
-                        {"reasoning_effort": selected_effort}
-                        if selected_effort is not None
-                        else {}
-                    ),
-                }
+            evidence_item: dict[str, Any] = {
+                "record_id": record["record_id"],
+                "source_url": record["source_url"],
+                "benchmark": record["benchmark"],
+                "benchmark_version": record["benchmark_version"],
+                "domain": record["domain"],
+                "provenance": record["provenance"],
+                "match_kind": match_kind,
+                "effective_sample_strength": round(strength, 6),
+                "agent_scaffold": record["agent_scaffold"],
+                **(
+                    {"reasoning_effort": selected_effort}
+                    if selected_effort is not None
+                    else {}
+                ),
+            }
+            for field in ("source_id", "lineage_id", "metric_kind", "correlation_group"):
+                if _text(record.get(field)) is not None:
+                    evidence_item[field] = record[field]
+            evidence.append(evidence_item)
+
+            external = record.get("external_signals")
+            if not isinstance(external, Mapping) or strength <= 0:
+                continue
+            source_id = _text(record.get("source_id")) or _text(record.get("lineage_id"))
+            if source_id is not None:
+                signal_sources.add(source_id)
+            for field in (
+                "quality_mean",
+                "consistency_mean",
+                "consistency_std_mean",
+                "observed_cost_mean",
+                "cost_surprise_mean",
+            ):
+                value = external.get(field)
+                if field == "observed_cost_mean" and value is None:
+                    # Read old snapshots produced before the neutral cost
+                    # field name was adopted; never emit that legacy label.
+                    value = external.get("observed_cost_usd_mean")
+                value = _external_signal_number(value, field)
+                if value is not None:
+                    signal_sums[field] += value * strength
+                    signal_weights[field] += strength
+        external_signals = {
+            field: (
+                round(signal_sums[field] / signal_weights[field], 8)
+                if signal_weights[field] > 0
+                else None
             )
+            for field in (
+                "quality_mean",
+                "consistency_mean",
+                "consistency_std_mean",
+                "observed_cost_mean",
+                "cost_surprise_mean",
+            )
+        }
+        external_signals["source_count"] = len(signal_sources)
         return {
             "kind": "benchmark-backed-weak-prior",
             "evidence_status": "available",
             "alpha": round(alpha, 8),
             "beta": round(beta, 8),
             "evidence": evidence,
+            "external_signals": external_signals,
         }
 
     if declarative:
@@ -1184,6 +1244,7 @@ def _prior_for(
                 }
                 for record in declarative
             ],
+            "external_signals": _empty_external_signals(),
         }
     return {
         "kind": "generic-conservative-prior",
@@ -1191,7 +1252,67 @@ def _prior_for(
         "alpha": 1.0,
         "beta": 2.0,
         "evidence": [],
+        "external_signals": _empty_external_signals(),
     }
+
+
+def _empty_external_signals() -> dict[str, float | int | None]:
+    return {
+        "quality_mean": None,
+        "consistency_mean": None,
+        "consistency_std_mean": None,
+        "observed_cost_mean": None,
+        "cost_surprise_mean": None,
+        "source_count": 0,
+    }
+
+
+def _external_signal_number(value: object, field: str) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    if field in {"quality_mean", "consistency_mean", "consistency_std_mean"}:
+        return number if 0 <= number <= 1 else None
+    if field in {"observed_cost_mean", "observed_cost_usd_mean"}:
+        return number if number >= 0 else None
+    return number
+
+
+def _validate_external_signals(value: object, record_id: str) -> None:
+    if not isinstance(value, Mapping):
+        raise PerformanceRegistryError(
+            f"record {record_id} external_signals must be an object"
+        )
+    for field in (
+        "quality_mean",
+        "consistency_mean",
+        "consistency_std_mean",
+        "observed_cost_mean",
+        "cost_surprise_mean",
+    ):
+        candidate = value.get(field)
+        if field == "observed_cost_mean" and candidate is None:
+            # Accept the legacy input key while keeping the canonical output
+            # neutral because this source does not publish a USD unit.
+            candidate = value.get("observed_cost_usd_mean")
+        if candidate is not None:
+            if _external_signal_number(candidate, field) is None:
+                raise PerformanceRegistryError(
+                    f"record {record_id} external_signals {field} is invalid"
+                )
+    source_count = value.get("source_count")
+    if source_count is not None and (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 0
+    ):
+        raise PerformanceRegistryError(
+            f"record {record_id} external_signals source_count is invalid"
+        )
 
 
 def _preferred_effort(record: Mapping[str, Any]) -> str | None:
@@ -1222,6 +1343,31 @@ def _radar_provenance(status: Mapping[str, Any], imported_records: int) -> dict[
         "attribution": status.get("attribution"),
         "offline_last_known_good": status.get("offline_cache_available") is True,
         "iq_used_as_pass_rate": False,
+    }
+
+
+def _ai_frontier_provenance(
+    status: Mapping[str, Any],
+    imported_records: int,
+) -> dict[str, Any]:
+    """Persist AI Frontier freshness and source identity without routing authority."""
+
+    return {
+        "provider": "ai-frontier-provider",
+        "state": status.get("state"),
+        "routing_prior_eligible": status.get("routing_prior_eligible") is True,
+        "snapshot_id": status.get("snapshot_id"),
+        "digest": status.get("digest"),
+        "fetched_at": status.get("fetched_at"),
+        "source_updated_at": status.get("source_updated_at"),
+        "transfer_multiplier": status.get("transfer_multiplier", 0.0),
+        "imported_record_count": imported_records,
+        "offline_last_known_good": status.get("offline_cache_available") is True,
+        "authorization_status": status.get("snapshot_authorization"),
+        "quality_is_accuracy_pseudo_evidence": True,
+        "quality_is_local_first_pass": False,
+        "consistency_is_success_rate": False,
+        "cost_is_quota_admission": False,
     }
 
 

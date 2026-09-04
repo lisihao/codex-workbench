@@ -24,7 +24,19 @@ from typing import Any, Literal
 
 
 ROUTING_V3_POLICY_VERSION = "model-routing-v3"
+RANKING_ALGORITHM_VERSION = "quality-equivalence-efficiency-v1"
 RoutingV3Role = Literal["planner", "worker", "verifier", "challenge", "control"]
+
+# A candidate must first be in the quality-equivalence band before any
+# efficiency signal can affect its rank.  Values are percentage points on the
+# 0-100 ``ranking_quality_score`` scale, not probability multipliers.
+QUALITY_EQUIVALENCE_BAND_POINTS = {
+    "critical": 0.0,
+    "high": 0.5,
+    "standard": 2.0,
+    "low": 4.0,
+}
+_MISSING_RANKING_VALUE = 1_000_000_000.0
 
 _ACTIVE_STATUSES = frozenset({"active", "available", "current", "verified"})
 _CLAUDE_PROVIDERS = frozenset({"claude", "anthropic"})
@@ -115,6 +127,21 @@ class RankedCandidate:
     performance_first_pass_rate: float | None = None
     performance_rework_rate: float | None = None
     performance_latency_ms: float | None = None
+    ranking_algorithm_version: str = RANKING_ALGORITHM_VERSION
+    quality_gap: float = 0.0
+    quality_equivalence_tolerance: float = 0.0
+    quality_equivalence_band: bool = True
+    performance_p_first_rate: float | None = None
+    performance_consistency_risk: float | None = None
+    external_quality_mean: float | None = None
+    external_consistency_mean: float | None = None
+    external_consistency_std_mean: float | None = None
+    external_observed_cost_mean: float | None = None
+    external_cost_surprise_mean: float | None = None
+    external_source_count: int = 0
+    expected_attempts: float | None = None
+    expected_completion_units: float | None = None
+    efficiency_score: float | None = None
 
     @property
     def lower_bound_95(self) -> float | None:
@@ -159,6 +186,21 @@ class RankedCandidate:
             "performance_first_pass_rate": self.performance_first_pass_rate,
             "performance_rework_rate": self.performance_rework_rate,
             "performance_latency_ms": self.performance_latency_ms,
+            "ranking_algorithm_version": self.ranking_algorithm_version,
+            "quality_gap": self.quality_gap,
+            "quality_equivalence_tolerance": self.quality_equivalence_tolerance,
+            "quality_equivalence_band": self.quality_equivalence_band,
+            "performance_p_first_rate": self.performance_p_first_rate,
+            "performance_consistency_risk": self.performance_consistency_risk,
+            "external_quality_mean": self.external_quality_mean,
+            "external_consistency_mean": self.external_consistency_mean,
+            "external_consistency_std_mean": self.external_consistency_std_mean,
+            "external_observed_cost_mean": self.external_observed_cost_mean,
+            "external_cost_surprise_mean": self.external_cost_surprise_mean,
+            "external_source_count": self.external_source_count,
+            "expected_attempts": self.expected_attempts,
+            "expected_completion_units": self.expected_completion_units,
+            "efficiency_score": self.efficiency_score,
         }
 
 
@@ -178,6 +220,7 @@ class RoutingV3Decision:
     performance_snapshot_id: str | None = None
     performance_digest: str | None = None
     performance_status: str | None = None
+    ranking_algorithm_version: str = RANKING_ALGORITHM_VERSION
 
     def __post_init__(self) -> None:
         if (self.performance_snapshot_id is None) != (self.performance_digest is None):
@@ -204,6 +247,7 @@ class RoutingV3Decision:
             "ranked_candidates": [candidate.to_dict() for candidate in self.ranked_candidates],
             "parallel_candidates": [candidate.to_dict() for candidate in self.parallel_candidates],
             "rejected_candidates": [candidate.to_dict() for candidate in self.rejected_candidates],
+            "ranking_algorithm_version": self.ranking_algorithm_version,
             "performance_snapshot_id": self.performance_snapshot_id,
             "performance_digest": self.performance_digest,
             "performance_status": self.performance_status,
@@ -307,10 +351,20 @@ def route_capability_snapshot(
             )
         )
 
-    # Quality is intentionally the first sort key.  This makes it impossible
-    # for a lower-quality candidate to win purely because it is cheap; cost,
-    # latency, throughput, and current pool pressure only decide among equal
-    # acceptance-quality candidates.
+    # Stage 1 establishes the acceptance-quality frontier.  Only candidates
+    # inside the risk-specific equivalence band may compete on preference and
+    # efficiency; a cheap candidate outside the band can never win.
+    highest_quality = max(
+        (float(candidate["ranking_quality_score"]) for candidate in admitted),
+        default=0.0,
+    )
+    quality_tolerance = _quality_equivalence_tolerance(risk)
+    for candidate in admitted:
+        _finalize_candidate_ranking(
+            candidate,
+            highest_quality=highest_quality,
+            quality_tolerance=quality_tolerance,
+        )
     admitted.sort(key=_candidate_sort_key)
     ranked = tuple(
         RankedCandidate(rank=index, **candidate)
@@ -338,6 +392,7 @@ def route_capability_snapshot(
         ranked_candidates=ranked,
         parallel_candidates=parallel,
         rejected_candidates=rejected,
+        ranking_algorithm_version=RANKING_ALGORITHM_VERSION,
         performance_snapshot_id=performance[1],
         performance_digest=performance[2],
         performance_status=performance[3],
@@ -1028,6 +1083,13 @@ def _performance_inputs(
         "first_pass_rate": None,
         "rework_rate": None,
         "latency_ms": None,
+        "external_quality_mean": None,
+        "external_consistency_mean": None,
+        "external_consistency_std_mean": None,
+        "external_observed_cost_mean": None,
+        "external_cost_surprise_mean": None,
+        "external_source_count": 0,
+        "consistency_risk": None,
     }
     if candidate is None:
         return empty
@@ -1038,7 +1100,39 @@ def _performance_inputs(
         posterior = candidate.get("posterior")
     posterior = posterior if isinstance(posterior, Mapping) else {}
     prior = quality_mapping.get("prior")
+    if not isinstance(prior, Mapping):
+        prior = candidate.get("prior")
     prior = prior if isinstance(prior, Mapping) else {}
+    external = prior.get("external_signals")
+    if not isinstance(external, Mapping):
+        external = candidate.get("external_signals")
+    external = external if isinstance(external, Mapping) else {}
+    external_quality = _rate_value(
+        _first(external, "quality_mean", "quality")
+    )
+    external_consistency = _rate_value(
+        _first(external, "consistency_mean", "consistency")
+    )
+    external_consistency_std = _rate_value(
+        _first(external, "consistency_std_mean", "consistency_std")
+    )
+    external_observed_cost = _number(
+        _first(
+            external,
+            "observed_cost_mean",
+            "observed_cost_usd_mean",
+            "observed_cost_usd",
+            "cost_usd_mean",
+        )
+    )
+    if external_observed_cost is not None and external_observed_cost < 0:
+        external_observed_cost = None
+    external_cost_surprise = _number(
+        _first(external, "cost_surprise_mean", "cost_surprise")
+    )
+    source_count = _nonnegative_int(
+        _first(external, "source_count", "sources", "source_count_total")
+    )
     lower = _number(_first(posterior, "lower_bound_95", "lower_bound", "quality_lower_bound_95"))
     samples = _nonnegative_int(
         _first(posterior, "runtime_sample_count", "sample_count", "runtime_samples")
@@ -1068,13 +1162,32 @@ def _performance_inputs(
         if rework_count is not None and denominator is not None and denominator > 0:
             rework = max(0.0, rework_count / denominator)
     latency = _runtime_latency_ms(candidate, runtime)
+    consistency_risk = _external_consistency_risk(
+        external_consistency,
+        external_consistency_std,
+    )
     return {
-        "quality_source": "calibrated" if usable else "declared",
+        "quality_source": (
+            "calibrated"
+            if usable
+            else "external"
+            if external_quality is not None
+            else "declared"
+        ),
         "lower_bound_95": lower if usable else None,
         "runtime_sample_count": samples if usable else 0,
         "first_pass_rate": first_pass,
         "rework_rate": rework,
         "latency_ms": latency,
+        "external_quality_mean": external_quality,
+        "external_consistency_mean": external_consistency,
+        "external_consistency_std_mean": external_consistency_std,
+        "external_observed_cost_mean": external_observed_cost,
+        "external_cost_surprise_mean": external_cost_surprise,
+        "external_source_count": source_count,
+        # Consistency is deliberately exposed as uncertainty/rework risk; it
+        # is never used as a success probability or quality score.
+        "consistency_risk": consistency_risk,
     }
 
 
@@ -1100,6 +1213,25 @@ def _rate_value(value: Any) -> float | None:
     if number > 1 and number <= 100:
         number /= 100
     return number if 0 <= number <= 1 else None
+
+
+def _external_consistency_risk(
+    consistency_mean: float | None,
+    consistency_std_mean: float | None,
+) -> float | None:
+    """Convert external consistency observations into a rework-risk signal.
+
+    AI Frontier's consistency is an uncertainty/repeatability measure, not a
+    task acceptance probability.  Keep it out of ``p_first`` and
+    ``ranking_quality_score``; use a bounded penalty only when ordering
+    otherwise quality-equivalent candidates.
+    """
+
+    if consistency_mean is None and consistency_std_mean is None:
+        return None
+    mean_risk = 1.0 - consistency_mean if consistency_mean is not None else 0.5
+    spread = consistency_std_mean if consistency_std_mean is not None else 0.0
+    return max(0.0, min(1.0, mean_risk + spread * 0.5))
 
 
 def _runtime_latency_ms(candidate: Mapping[str, Any], runtime: Mapping[str, Any]) -> float | None:
@@ -1175,6 +1307,11 @@ def _candidate_inputs(
     performance_values = _performance_inputs(performance_candidate)
     quality_source = performance_values["quality_source"]
     performance_lower_bound = performance_values["lower_bound_95"]
+    external_quality = performance_values["external_quality_mean"]
+    # A raw public quality mean is not a local pass-rate observation.  It may
+    # be used by the performance adapter when constructing a conservative
+    # posterior, but routing itself only trusts that posterior (or the
+    # catalog-declared quality when no posterior exists).
     quality_for_ranking = (
         performance_lower_bound * 100
         if performance_lower_bound is not None
@@ -1187,21 +1324,28 @@ def _candidate_inputs(
         if family in preferred_families
         else len(preferred_families)
     )
-    score = (
-        -quality_for_ranking,
-        # A measured first-pass signal breaks otherwise equal conservative
-        # bounds.  Missing observations sort after observed values.
-        -(performance_values["first_pass_rate"] if performance_values["first_pass_rate"] is not None else -1.0),
-        performance_values["rework_rate"] if performance_values["rework_rate"] is not None else 1_000_000.0,
-        performance_values["latency_ms"] if performance_values["latency_ms"] is not None else 1_000_000.0,
-        preference_rank,
-        cost,
-        latency,
-        -throughput,
-        utilization,
-        provider,
-        model,
-        capability_id,
+    first_pass = performance_values["first_pass_rate"]
+    p_first = (
+        first_pass
+        if first_pass is not None
+        else performance_lower_bound
+    )
+    expected_attempts = (
+        1.0 / p_first
+        if p_first is not None and p_first > 0
+        else None
+    )
+    consistency_risk = performance_values["consistency_risk"]
+    observed_cost = performance_values["external_observed_cost_mean"]
+    expected_completion_units = (
+        expected_attempts * cost
+        if expected_attempts is not None and cost >= 0
+        else None
+    )
+    efficiency_score = (
+        1.0 / expected_completion_units
+        if expected_completion_units is not None and expected_completion_units > 0
+        else None
     )
     return {
         "provider": provider,
@@ -1217,16 +1361,23 @@ def _candidate_inputs(
         "estimated_throughput": throughput,
         "concurrency_utilization": utilization,
         "preference_rank": preference_rank,
-        "score": score,
+        # Filled after all hard-gated candidates are known, because the
+        # quality-equivalence band is relative to the best candidate.
+        "score": (),
         "reasons": (
             f"quality {quality:g} meets floor {quality_floor:g}",
             (
                 f"ranking quality source {quality_source}; posterior lower_bound_95="
                 f"{performance_lower_bound:g}"
                 if performance_lower_bound is not None
-                else "quality source declared; no exact calibrated posterior was available"
+                else (
+                    f"ranking quality source declared; external quality_mean="
+                    f"{external_quality:g} is advisory only"
+                    if external_quality is not None
+                    else "quality source declared; no exact calibrated posterior was available"
+                )
             ),
-            "quality is the primary routing-v3 rank; first-pass, rework, latency, cost, and throughput are tie-breakers",
+            "quality-equivalence-v1 keeps quality gates authoritative; efficiency only competes inside the risk-specific band",
         ),
         "performance_snapshot_id": performance_snapshot_id,
         "performance_digest": performance_digest,
@@ -1236,6 +1387,17 @@ def _candidate_inputs(
         "performance_first_pass_rate": performance_values["first_pass_rate"],
         "performance_rework_rate": performance_values["rework_rate"],
         "performance_latency_ms": performance_values["latency_ms"],
+        "performance_p_first_rate": p_first,
+        "performance_consistency_risk": consistency_risk,
+        "external_quality_mean": external_quality,
+        "external_consistency_mean": performance_values["external_consistency_mean"],
+        "external_consistency_std_mean": performance_values["external_consistency_std_mean"],
+        "external_observed_cost_mean": observed_cost,
+        "external_cost_surprise_mean": performance_values["external_cost_surprise_mean"],
+        "external_source_count": performance_values["external_source_count"],
+        "expected_attempts": expected_attempts,
+        "expected_completion_units": expected_completion_units,
+        "efficiency_score": efficiency_score,
     }
 
 
@@ -1258,6 +1420,107 @@ def _record_reasoning_effort(
     return next(iter(supported)) if len(supported) == 1 else None
 
 
+def _quality_equivalence_tolerance(acceptance_risk: str) -> float:
+    """Return the allowed quality gap in percentage points."""
+
+    return QUALITY_EQUIVALENCE_BAND_POINTS.get(
+        _text(acceptance_risk),
+        QUALITY_EQUIVALENCE_BAND_POINTS["standard"],
+    )
+
+
+def _finalize_candidate_ranking(
+    candidate: dict[str, Any],
+    *,
+    highest_quality: float,
+    quality_tolerance: float,
+) -> None:
+    """Apply stage two of the quality-equivalence efficiency ordering."""
+
+    quality = float(candidate["ranking_quality_score"])
+    gap = max(0.0, highest_quality - quality)
+    # The equivalence band is inclusive.  A candidate exactly on a positive
+    # boundary remains in the parallel eligibility set, while the secondary
+    # boundary key below preserves the existing q90/q88 quality preference.
+    # Critical's zero tolerance remains exact (within floating-point noise).
+    in_band = gap <= quality_tolerance + 1e-9
+    boundary_rank = (
+        0
+        if gap < quality_tolerance - 1e-9 or quality_tolerance == 0
+        else 1
+    )
+    expected_attempts = candidate.get("expected_attempts")
+    rework_rate = candidate.get("performance_rework_rate")
+    if rework_rate is None:
+        rework_rate = candidate.get("performance_consistency_risk")
+    latency = candidate.get("performance_latency_ms")
+    if latency is None:
+        latency = candidate.get("estimated_latency_ms")
+    consistency_risk = candidate.get("performance_consistency_risk")
+    external_quality = candidate.get("external_quality_mean")
+    observed_cost = candidate.get("external_observed_cost_mean")
+    cost_surprise = candidate.get("external_cost_surprise_mean")
+    completion_units = candidate.get("expected_completion_units")
+    candidate["quality_gap"] = round(gap, 8)
+    candidate["quality_equivalence_tolerance"] = quality_tolerance
+    candidate["quality_equivalence_band"] = in_band
+    candidate["score"] = (
+        # Stage 1: every in-band candidate outranks every out-of-band one.
+        0 if in_band else 1,
+        # Preserve quality ordering among candidates that are all outside the
+        # band.  In-band candidates are intentionally equal at this position.
+        0.0 if in_band else -quality,
+        # Stage 2: explicit user preference comes before efficiency signals.
+        candidate["preference_rank"],
+        # Do not let a candidate exactly at the allowed quality boundary win
+        # solely on cost; strictly interior candidates remain fully
+        # efficiency-comparable (e.g. 89 vs 90 at standard risk).
+        boundary_rank,
+        expected_attempts
+        if expected_attempts is not None
+        else _MISSING_RANKING_VALUE,
+        rework_rate if rework_rate is not None else _MISSING_RANKING_VALUE,
+        latency if latency is not None else _MISSING_RANKING_VALUE,
+        # Consistency is uncertainty/rework risk only; it never enters the
+        # quality position above or the p_first calculation.
+        consistency_risk if consistency_risk is not None else _MISSING_RANKING_VALUE,
+        # A raw external quality mean is advisory only and is considered after
+        # the quality band, preference, and local efficiency observations.
+        -external_quality if external_quality is not None else _MISSING_RANKING_VALUE,
+        # External observed cost is a relative signal inside the quality band;
+        # its unit is intentionally not asserted.  Catalog cost remains a
+        # separate subscription/capacity signal below.
+        observed_cost if observed_cost is not None else _MISSING_RANKING_VALUE,
+        cost_surprise if cost_surprise is not None else _MISSING_RANKING_VALUE,
+        completion_units if completion_units is not None else _MISSING_RANKING_VALUE,
+        candidate["estimated_cost_units"],
+        -candidate["estimated_throughput"],
+        candidate["concurrency_utilization"],
+        candidate["provider"],
+        candidate["model"],
+        candidate["capability_id"],
+    )
+    expected_text = (
+        f"{expected_attempts:g}" if expected_attempts is not None else "N/A"
+    )
+    completion_text = (
+        f"{completion_units:g}" if completion_units is not None else "N/A"
+    )
+    efficiency_text = (
+        f"{candidate['efficiency_score']:g}"
+        if candidate.get("efficiency_score") is not None
+        else "N/A"
+    )
+    candidate["reasons"] = tuple(candidate["reasons"]) + (
+        f"quality gap {gap:g} percentage points; equivalence tolerance "
+        f"{'0 exact' if quality_tolerance == 0 else f'≤{quality_tolerance:g}'}; "
+        f"quality-equivalence-band={'in' if in_band else 'out'}",
+        "efficiency: expected_attempts="
+        f"{expected_text}, expected_completion_units={completion_text}, "
+        f"efficiency_score={efficiency_text}",
+    )
+
+
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[float | str, ...]:
     return tuple(candidate["score"])
 
@@ -1272,6 +1535,8 @@ def _parallel_provider_candidates(
     selected: list[RankedCandidate] = []
     providers: set[str] = set()
     for candidate in ranked:
+        if not candidate.quality_equivalence_band:
+            continue
         if candidate.provider in providers:
             continue
         selected.append(candidate)

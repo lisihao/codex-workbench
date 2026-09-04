@@ -24,6 +24,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 | Claude Code 订阅被后台任务耗尽 | Claude Worker 只在认证和新鲜配额快照可证明时启用；未知状态会 fail closed 并转交 Codex。系统保留至少 20% 的目标配额空间，并设有更早的调度门槛。 |
 | 不知道哪个模型在当前工作里更合适 | Workbench 使用按领域的公开 benchmark 冷启动先验，再用长期运行账本校准；它不把不同 benchmark 拼成一个排行榜，也不把公开分数冒充本机成功率。 |
 | 联网时能看到模型众测数据，断网后调度却失去依据 | 通用 `codex_radar_provider` 将 personal-use consent 允许读取的 Codex Radar 公共 JSON 写入自己的 SQLite；断网复用数据库 last-known-good，过期后回落内置 baseline。 |
+| 需要跨模型的质量、稳定性和成本观察 | 可选的 AI Frontier Provider 只采集两个聚合 JSON 和最多八个当前可路由精确模型的 benchmark；Mac mini 保存 SQLite/LKG，断网继续用缓存或内置基线，字段只作外部弱先验。 |
 | 验证反复运行、成本高且结论不清 | `code-as-harness/v1` 将 L0–L3 验证层级和 Evidence fingerprint 写入任务契约；相同输入闭包的已通过证据可复用。 |
 
 ## 运行模型
@@ -43,7 +44,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 │         │                       ├── optional Claude Code workers   │
 │         │                       └── deterministic build/test tools │
 │         │                                                          │
-│         ├── public baseline + consented Radar DB LKG               │
+│         ├── public baseline + consented Radar/AI Frontier DB LKG   │
 │         │                         + runtime ledger ──► score policy │
 │         │                                                          │
 │         └──► independent Sol verifier ──► Evidence ──► accepted   │
@@ -64,6 +65,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 - **Claude Code Worker**：可选的订阅型执行器，不承担规划或最终验收。认证、CLI 兼容性或配额状态不明确时不会猜测余额，也不会使用 API-key fallback。
 - **Claude 登录与配额采集**：Claude Code 原生订阅 OAuth 的凭据由官方 macOS CLI 保存在系统 Keychain；Workbench 不复制、导出或持久化 token，只调用 `auth status` 与受限的 `/usage` 观察。当前受支持的 collector 兼容锁定的 Claude CLI `2.1.239`，既接受对象也接受其真实数组 envelope；认证或解析失败会 fail closed，不循环重新登录。
 - **Codex Radar Provider**：独立于 Workbench/DSH 的标准库-only package/CLI（provider plugin 0.2.0）。Mac mini 在 personal-use consent 或官方 receipt 成立后低频采集；`<state_root>/radar.sqlite3` 是 snapshots/raw/models/insights/active 的权威真源，JSON 仅为兼容投影，MacBook 只读 Authority 状态。Radar 不是配额源，也不能绕过路由硬门禁。
+- **AI Frontier Provider**：独立于 Workbench/DSH 的标准库-only package/CLI（provider plugin 0.1.0）。Mac mini 在个人自用 consent 后低频采集两个聚合 JSON，并为最多八个当前可路由精确模型读取分类 benchmark；`<state_root>/ai-frontier/ai-frontier.sqlite3` 保存快照、原始 payload、模型、分类和 active LKG。安装不创建 receipt，MacBook 只读；Quality、Consistency、Real Cost 和 frontier/oracle 都不能替代本机验收、订阅 quota 或单模型质量证明。
 - **离线回落**：如果 Authority 不可达，已绑定会话继续在 MacBook 当前 checkout 上工作；系统不会在离线端静默创建第二个 Authority，下一次可用连接再重试同步。
 
 ## 核心能力与边界
@@ -108,6 +110,7 @@ codex-workbench worktree restore <archive-id> --destination <local-path>
 ### Benchmark 基线、长期校准与快照绑定
 
 Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam) 等公开资料建立按领域的冷启动先验。Terminal、SWE 和 HLE 衡量的事情不同，因此不会被合并成一个“总分”；每条先验都保留来源、模型/Agent 配对和迁移折扣，不能替代本机验收。
+同时可选接入 [Martian AI Frontier](https://aifrontier.withmartian.com/) 公共 JSON。它的 Quality、Consistency、Real Cost 和分类 benchmark 只作为带来源与新鲜度的外部弱先验；frontier/oracle 不绑定单模型，且不会改变本机验收、Claude 配额或质量门禁。
 
 长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率，并按 provider/model/Agent version/reasoning effort/task/complexity 精确分桶。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 仍保留为运行证据，但只记作 unresolved，不进入模型质量成功/失败分母。当前尚无更细的 `failure_origin` 分类器，不能进一步区分网络、主机、harness 或模型自身原因。Beta 后验的保守排名信号与声明质量门禁分开记录，只在硬门禁之后参与 advisory 排序；当前校准接口仅报告 `cold-start`（无活动快照）或 `ok`（有活动快照），尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值。
 
@@ -131,8 +134,12 @@ codex-workbench radar consent-personal-use # Authority；只写本地 personal-u
 codex-workbench radar status               # 只读本地 consent 与缓存状态
 codex-workbench radar show                 # 只读 last-known-good 快照
 codex-workbench radar refresh              # Authority；无 consent/授权时零网络
+codex-workbench ai-frontier status         # 只读 SQLite/LKG 与 consent 状态
+codex-workbench ai-frontier show           # 只读当前快照与 routing boundary
+codex-workbench ai-frontier refresh         # Authority；无 consent 时零网络
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/performance
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/radar
+curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/ai-frontier
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/scheduler
 ```
 
@@ -163,6 +170,8 @@ Workbench 将 `code-as-harness/v1` 投影到 Codex 与 Claude Code 的受控路�
 详情请见 [原设计忠实度矩阵](docs/fidelity-matrix.md) 与 [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md)。
 Radar 的 consent、SQLite 离线缓存、保守权重与未来 DSH 消费协议见
 [Codex Radar 通用 Provider 与 Workbench 集成](docs/codex-radar-integration.md)。
+AI Frontier 的独立 Provider、允许的 endpoint、72 小时采集窗口、personal-use consent、
+SQLite/LKG、字段语义和多源调度算法见 [AI Frontier 集成文档](docs/ai-frontier-integration.md)。
 
 ### Claude 配额保护
 
@@ -357,12 +366,13 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.10.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.10.0 包含通用 Codex Radar Provider 0.2.0（personal-use consent、SQLite 权威真源、旧 JSON 自动迁移、默认每 86400 秒同步；Mac mini 真实生产采集 Evidence 待部署后补齐）、benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证、强制 Tailscale 远程归档，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
+当前源码版本为 `1.11.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.11.0 新增通用 AI Frontier Provider 0.1.0、72 小时离线优先采集、跨来源弱先验融合，以及 `quality-equivalence-efficiency-v1` 路由；它继承 1.10.0 的 Codex Radar、长期运行账本、Spark P0 逻辑队列、可恢复 worktree/NAS 生命周期和 Sol/Terra/Luna 500K 上下文。外部榜单只用于冷启动，真实模型质量仍需本机任务 Evidence 长期校准。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
 - [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、personal-use consent、SQLite 断网缓存、Workbench 先验与未来 DSH 消费合同。
+- [AI Frontier 集成](docs/ai-frontier-integration.md) — 自动采集白名单、SQLite LKG、字段语义、质量等价带算法与未来通用消费合同。
 - [Backlog](docs/backlog.md) — 已明确后置的真实外部 Evidence 与通知工作。
 
 ## 项目边界

@@ -15,8 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKETPLACE_PATH = ROOT / ".agents" / "plugins" / "marketplace.json"
 PLUGIN_ROOT = ROOT / "plugins" / "codex-workbench"
 PROVIDER_PLUGIN_ROOT = ROOT / "plugins" / "codex-radar-provider"
+AI_FRONTIER_PROVIDER_PLUGIN_ROOT = ROOT / "plugins" / "ai-frontier-provider"
 MANIFEST_PATH = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 PROVIDER_MANIFEST_PATH = PROVIDER_PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
+AI_FRONTIER_PROVIDER_MANIFEST_PATH = (
+    AI_FRONTIER_PROVIDER_PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
+)
 PROVIDER_UPSTREAM_LOCK_PATH = PROVIDER_PLUGIN_ROOT / "upstream-lock.json"
 HOOKS_PATH = PLUGIN_ROOT / "hooks" / "hooks.json"
 HOOK_SCRIPT = PLUGIN_ROOT / "scripts" / "wb_hook.py"
@@ -47,6 +51,9 @@ class PluginDistributionTests(unittest.TestCase):
         provider_manifest = json.loads(
             PROVIDER_MANIFEST_PATH.read_text(encoding="utf-8")
         )
+        ai_frontier_provider_manifest = json.loads(
+            AI_FRONTIER_PROVIDER_MANIFEST_PATH.read_text(encoding="utf-8")
+        )
         upstream_lock = json.loads(
             PROVIDER_UPSTREAM_LOCK_PATH.read_text(encoding="utf-8")
         )
@@ -58,12 +65,14 @@ class PluginDistributionTests(unittest.TestCase):
         self.assertEqual(provider_manifest["name"], "codex-radar-provider")
         self.assertEqual(provider_manifest["version"], "0.2.0")
         self.assertEqual(provider_manifest["license"], "MIT")
+        self.assertEqual(ai_frontier_provider_manifest["name"], "ai-frontier-provider")
+        self.assertEqual(ai_frontier_provider_manifest["version"], "0.1.0")
 
         self.assertIsInstance(marketplace["plugins"], list)
         plugin_entries = {entry["name"]: entry for entry in marketplace["plugins"]}
         self.assertEqual(
             set(plugin_entries.keys()),
-            {"codex-workbench", "codex-radar-provider"},
+            {"codex-workbench", "codex-radar-provider", "ai-frontier-provider"},
         )
 
         workbench_entry = plugin_entries["codex-workbench"]
@@ -89,6 +98,20 @@ class PluginDistributionTests(unittest.TestCase):
         self.assertEqual(
             (ROOT / provider_entry["source"]["path"]).resolve(),
             PROVIDER_PLUGIN_ROOT,
+        )
+
+        ai_frontier_provider_entry = plugin_entries["ai-frontier-provider"]
+        self.assertEqual(
+            ai_frontier_provider_entry["source"],
+            {"source": "local", "path": "./plugins/ai-frontier-provider"},
+        )
+        self.assertEqual(
+            ai_frontier_provider_entry["policy"],
+            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+        )
+        self.assertEqual(
+            (ROOT / ai_frontier_provider_entry["source"]["path"]).resolve(),
+            AI_FRONTIER_PROVIDER_PLUGIN_ROOT,
         )
 
         self.assertEqual(
@@ -180,6 +203,7 @@ class PluginDistributionTests(unittest.TestCase):
             installed_plugins = [
                 ("codex-workbench@codex-workbench", self._project_version()),
                 ("codex-radar-provider@codex-workbench", "0.2.0"),
+                ("ai-frontier-provider@codex-workbench", "0.1.0"),
             ]
             installed_names = set()
             for plugin_id, expected_version in installed_plugins:

@@ -97,7 +97,7 @@ binary 运行同一解析检查。配置只在新进程/新任务建立上下文
 旧任务被追溯扩容；保存工作后重启 App 并创建新任务。
 
 Workbench 的 planner/worker 使用 `--ignore-user-config`，所以不能依赖上述用户配置。
-1.10.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
+1.11.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
 `500000/450000`；Spark 保持其自身模型合同。
 
 ## 2. Mac mini Authority
@@ -240,6 +240,26 @@ codex-radar-provider --state-root "$WB_STATE_ROOT/radar" consent --personal-use
 `radar_snapshots`、`radar_raw_payloads`、`radar_models`、`radar_insights`、`radar_active`
 的 row counts。Provider SQLite 与 Workbench task SQLite 是两个独立账本。
 
+Authority 还会安装 `com.lisihao.codex-workbench-ai-frontier`，默认每 259200 秒（72 小时）
+运行一次，Provider 自身再强制 24 小时最短间隔。安装不会创建 consent receipt，也不会联网；
+因此首次 `status` 显示 `disabled_by_policy` 是正确状态。只有操作者决定采用个人自用模式后，
+才依次写入本地 receipt、执行一次首采并检查性能快照：
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier consent-personal-use
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier refresh
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier show
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" performance status
+```
+
+该 receipt 固定包含 `not_official_authorization=true` 和 Martian Terms URL；它只记录本地操作者
+选择，不代表 Martian 官方授权或条款豁免。刷新只读取 reliability、cost 两个聚合 JSON，及
+最多八个同时出现在 capability catalog 与 AI Frontier leaderboard 的精确模型分类数据；
+不抓 HTML、examples、frontier/oracle、Cookie 或凭据，也不调用 Codex/Claude 模型。SQLite
+位于 `$WB_STATE_ROOT/ai-frontier/ai-frontier.sqlite3`；失败保留 LKG，7--31 天降权，31 天后
+退出新任务先验。详细合同见 [AI Frontier 集成](ai-frontier-integration.md)。
+
 如果接入了 Claude，也只能查看被动快照；`unknown`、`unavailable` 或未登录都是正确的 fail-closed 结果，而不是让 AI 重试登录的理由。
 
 ```bash
@@ -353,8 +373,8 @@ heartbeat 使用同一选路器把 `route`、`reason` 与新鲜观察时间送�
 ### 3.4 安装个人 Codex 插件并信任 Hook
 
 插件通过公开仓库的 marketplace 发行。marketplace 名为 `codex-workbench`，包含主
-`codex-workbench` 插件和通用 `codex-radar-provider` 0.2.0 插件；后者只提供 Skill/消费契约，
-不会在 MacBook 启动第二个采集 writer。
+`codex-workbench` 插件、通用 `codex-radar-provider` 0.2.0 和 `ai-frontier-provider` 0.1.0；
+两个 Provider 插件只提供 Skill/消费契约，不会在 MacBook 启动第二个采集 writer。
 
 ```bash
 codex plugin marketplace add "$WB_MARKETPLACE_SOURCE" --ref "$WB_REF" --json
@@ -363,6 +383,7 @@ codex plugin marketplace list --json
 codex plugin list --marketplace "$WB_MARKETPLACE" --available --json
 codex plugin add "codex-workbench@$WB_MARKETPLACE" --json
 codex plugin add "codex-radar-provider@$WB_MARKETPLACE" --json
+codex plugin add "ai-frontier-provider@$WB_MARKETPLACE" --json
 codex plugin list --json
 ```
 
@@ -404,6 +425,7 @@ codex plugin list --json
 | Authority 健康 | `doctor`、`harness health`、`curl ...:8766/health` | 本地服务、治理投影、回环健康端点 | 任一真实模型回合或任务已验收 |
 | 能力目录 | `capabilities status/show/diff` | 当前激活 generation、模型/Agent 版本与静态策略 | 某模型在真实任务上的质量优于另一模型 |
 | Radar Provider | `radar consent-personal-use`、`radar status/show`、`/api/radar` | 本地 consent 字段、SQLite backend/schema/path/row counts、缓存、快照 ID/digest、fresh/stale/expired 与归因；查看不联网 | personal-use consent 不是站方授权；未完成真实采集时不能声称已有生产 Radar 数据；Radar 不是配额或本机成功率 |
+| AI Frontier Provider | `ai-frontier consent-personal-use/refresh/status/show`、`/api/ai-frontier` | 72 小时节流、SQLite LKG、模型/分类/原始 payload 行数、精确模型 selected/skipped、快照 ID/digest 与零模型调用 | personal-use consent 不是 Martian 授权；Quality/Consistency/Real Cost 不是本机成功率、订阅 quota 或已证明的美元成本 |
 | 500K 上下文 | 两机用户配置解析、App 内嵌 CLI 解析、Workbench argv 测试 | 新 App/CLI/Workbench 任务会请求 500K/450K | 不能证明旧任务已追溯扩容，也不代表每回合使用满 500K |
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |

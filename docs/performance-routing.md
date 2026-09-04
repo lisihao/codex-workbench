@@ -1,11 +1,12 @@
 # Workbench 性能路由：基线、账本与 Spark P0
 
-状态：`v1.10.0 已实现 / 生产校准 Evidence 待积累`
+状态：`v1.11.0 已实现 / 长期生产校准 Evidence 持续积累`
 适用范围：Codex Workbench 的新任务路由、长期运行指标和 Spark 执行队列。本文不改变任务验收的权威性：Worker 结果永远不是验收结果，只有独立 verifier 的通过转换才能使任务 `accepted`。
 
-本文把“模型擅长什么”和“在 Workbench 里实际交付得怎样”分开建模。随包公开基准与本地
-personal-use consent 取得的 Codex Radar 公共 JSON 快照用于冷启动先验；本机持久事件用于
-长期校准；三者都不能绕过能力、权限、证据和质量门禁。
+本文把“模型擅长什么”和“在 Workbench 里实际交付得怎样”分开建模。随包公开基准、本机
+personal-use consent 取得的 Codex Radar 公共 JSON 快照，以及 AI Frontier 公共 JSON 快照
+都只用于冷启动弱先验；本机持久事件用于长期校准；这些来源都不能绕过能力、权限、证据和
+质量门禁。
 
 ## 1. 目标与状态语义
 
@@ -16,7 +17,7 @@ Workbench 当前把公开 benchmark 先验与本地运行账本合成一个可�
 | `cold-start` | 没有活动 performance snapshot；`calibrate` 使用随包的公开 benchmark 先验 | 可以作为 advisory 候选信息，但不能降低质量门禁 |
 | `ok` | 存在有效的 content-addressed performance snapshot；候选同时带公开先验和已采集的运行统计（若有） | 只能在硬能力/角色/配额/作用域门禁之后作为 advisory 排序输入 |
 
-当前没有 `baseline`、`shadow`、`calibrated` 或 `stale` 的晋级、过期和回滚生命周期，也没有按有效样本量或稳定性自动晋级的阈值。它们是后续设计可采用的状态，不应当写成 v1.10.0 已实现能力。当前 posterior/lower-bound 仍只是 advisory 估计，不是模型质量已被证明。
+当前没有 `baseline`、`shadow`、`calibrated` 或 `stale` 的晋级、过期和回滚生命周期，也没有按有效样本量或稳定性自动晋级的阈值。它们是后续设计可采用的状态，不应当写成 v1.11.0 已实现能力。当前 posterior/lower-bound 仍只是 advisory 估计，不是模型质量已被证明。
 
 非目标：把 Terminal-Bench、SWE-Bench Pro、HLE 的分数做一个全局平均；用成本或速度换取低于质量下界的候选；用一次成功回合宣称模型长期可靠；在没有真实配额证据时编造剩余百分比。
 
@@ -56,6 +57,28 @@ consent 只表示操作者承担责任、读取公共 JSON，不是站方许可�
 Workbench 只把以下 Radar 记录加入 coding prior：本机 capability catalog 中存在且 routable 的精确 provider/model、推理档位受支持、上游 `routing_eligible=true`、显式 pass rate 合法且 sample count 为正。`iq` 只作为元数据。外部有效样本强度上限为 `min(2.0, sample_count × 0.05)`；7 天内乘 1，7–31 天乘 0.25，超过 31 天不参与新路由。Radar snapshot ID/digest 与来源/归因固定进 performance snapshot provenance。
 
 这组阈值是保守迁移权重，不是模型质量认证。Workbench 本机的真实 verifier 结果与返工记录仍是后验事实；Radar 也永远不是 Codex/Claude 的配额、订阅资格或并发容量证据。完整 provider、离线状态与未来 DSH 消费合同见 [Codex Radar 集成文档](codex-radar-integration.md)。
+### 2.3 AI Frontier：多源外部弱先验
+
+AI Frontier Provider 是独立的 `ai_frontier_provider` SQLite/LKG 组件。Authority 默认每
+72 小时刷新一次，硬下限为 24 小时；没有本地 personal-use consent 时网络请求必须为零，
+安装器只安装组件、配置和 Authority-only LaunchAgent，不写 consent receipt。刷新只允许
+两个聚合 JSON endpoint：
+
+```text
+/api/reliability/leaderboard
+/api/cost-comparison
+```
+
+并且最多为当前 capability catalog 中八个 `routable=true` 的精确模型请求
+`/api/single-model/benchmarks?llm_name=...`。不抓 HTML、examples、Plotly/frontier/oracle
+图表或视频，不读取凭据；MacBook 只读 Authority 的快照/API。完整网络、receipt、schema、
+LKG 与未来 DSH consumer 合同见 [AI Frontier 集成文档](ai-frontier-integration.md)。
+
+AI Frontier 的 `Quality` 是外部 benchmark accuracy/quality 弱先验，不是本机 first-pass 或
+`accepted` 率；`Consistency` 是稳定性/离散程度，100% 也可能是稳定地错，只能调节不确定性
+与风险；`Real Cost` 是来源发布口径下的 API 成本观察，不是 Codex/Claude 订阅 quota。
+frontier/oracle 是多模型选择后的研究上界，不绑定单模型，也不直接参与单模型路由。
+个人 consent 不是 Martian 官方授权；使用前应阅读 [Martian Terms of Service](https://withmartian.com/terms-of-service)。
 
 ## 3. 分层先验与迁移降权
 
@@ -100,7 +123,7 @@ effective_count = source_sample_count
 
 Workbench 已有的 append-only `events` 与 `tasks` 是长期运行事实账本。性能层读取全量事件和任务合同，重建任务、节点、attempt、开始/结束和 verifier 转换，不另造一份会与 Workbench task SQLite 状态漂移的“真相库”。Codex Radar Provider 的 `radar.sqlite3` 是另一套仅负责外部快照的数据库；它不替代、不复制 Workbench task/event SQLite，消费者通过 provider CLI/JSON 合同读取。当前 quota 只从最新可信 snapshot 形成池视图；带时间的配额/容量历史和完整 reservation 账本仍是未来扩展。
 
-v1.10.0 的性能层生成 content-addressed `performance snapshot` 作为派生缓存，实际包括：
+v1.11.0 的性能层生成 content-addressed `performance snapshot` 作为派生缓存，实际包括：
 
 ```text
 schema_version
@@ -137,7 +160,7 @@ performance snapshot 的每个 runtime metric 会同时保存 `first_pass` 和 `
 
 当前代码的可确认规则较窄：fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 或 provider 不支持的 terminal attempt 会进入 exclusion ledger，不参与质量 posterior；`agent_version=unattested`、非零或未知进程退出、认证/配额阻断形成的 `blocked`，以及 `indeterminate` 会保留运行指标但记作 unresolved，不进入已确认的质量成功/失败。只有进程成功、Agent 版本已证明且 receipt 形成可判定的模型结果时，最终 `accepted` 或 `needs_fix` 才进入质量分母。
 
-当前没有 `failure_origin` 字段或完整的 `infrastructure_failure` / `model_or_task_failure` 分类器。因此 process crash、主机断开、网络失败、harness 启动失败或超时不能被文档宣称为已完全从模型质量失败中分离；若 receipt 无法确认归因，应保留为 unresolved/unknown，不能强行归因给模型。未来可增加显式 failure origin 和可靠性报表，但那不是 v1.10.0 当前实现。
+当前没有 `failure_origin` 字段或完整的 `infrastructure_failure` / `model_or_task_failure` 分类器。因此 process crash、主机断开、网络失败、harness 启动失败或超时不能被文档宣称为已完全从模型质量失败中分离；若 receipt 无法确认归因，应保留为 unresolved/unknown，不能强行归因给模型。未来可增加显式 failure origin 和可靠性报表，但那不是 v1.11.0 当前实现。
 
 没有真实模型 receipt 的 fixture/测试/演示只能验证管线，不能校准生产模型质量。当前纳入质量 posterior 的 terminal attempt 至少要求实际 `actual_model`、已证明的 Agent version、Codex/Claude provider、零进程退出和非 fixture/deterministic/verifier 路径；harness profile、effort 和完整 `failure_origin` 尚未作为独立校准维度。`baseline`/`shadow`/`calibrated` 集合与 promotion 规则是未来设计。
 
@@ -152,19 +175,92 @@ posterior   = Beta(alpha_prior + success,
 quality_lcb = lower_quantile(posterior, policy.alpha)
 ```
 
-`quality_lcb` 是设计上的保守质量下界，而不是均值。v1.10.0 当前实现保存 prior/posterior 的 alpha、beta、mean，并以固定 `z=1.96` 的方差近似计算 `lower_bound_95`；它是 advisory 值，不是已通过独立质量认证的分数，也没有 promotion threshold。
+`quality_lcb` 是设计上的保守质量下界，而不是均值。v1.11.0 当前实现保存 prior/posterior 的 alpha、beta、mean，并以固定 `z=1.96` 的正态近似计算 `lower_bound_95`；它不是 Beta 分布的精确 5% 分位数，也不是已通过独立质量认证的分数，当前仍没有 promotion threshold。
 
-v1.10.0 的实际 routing-v3 顺序是：先完成能力/角色/任务类型/复杂度/工具/权限/结构化输出/作用域/Claude 认证配额与并发等硬门禁，再以质量分数或可用的 posterior lower bound 为主排序，first-pass、rework、时延、显式偏好、成本、吞吐、容量利用率和 provider/model 作为后续 tie-breaker：
+v1.11.0 的实际 routing-v3 顺序是：先完成能力、角色、任务类型、工具权限、结构化输出、作用域、Claude 认证配额与并发等硬门禁，再计算保守质量；质量差距超过验收风险带时质量优先，只有带内候选才按显式偏好与交付效率排序：
 
 ```text
-硬门禁 → 质量/下界 → first-pass → rework → latency → preference/cost/throughput/utilization → 确定性 tie-break
+硬门禁 → 保守质量 → 验收风险等价带
+       → 用户/角色偏好 → attempts/rework/latency/consistency
+       → relative cost/catalog cost/throughput/utilization → 确定性 tie-break
 ```
 
 硬门禁包括 role、task type、complexity、工具和权限、结构化输出、harness/Agent 版本、证据能力、Claude quota freshness/admission、并发容量和任务作用域。任何候选低于 role 的 `quality_floor` 都不可用；成本和速度不能把它重新买回来。当前没有 quota reservation/cost-unit 预留账本；只有通过硬门禁的候选，才比较保守质量下界、已观测返工、延迟、成本、吞吐和容量利用率。
 
-未来可在版本化 policy 中加入低样本、分布漂移、近期失败聚集和稳定候选比较，并定义 `baseline`/`shadow`/`calibrated`/`stale` promotion、降级与回滚；v1.10.0 尚未实现这些生命周期，不会把一次 posterior 变化宣称为长期可靠性提升。
+### 5.1 AI Frontier 与本地账本的融合算法
 
-`performance refresh` 只读取本地事实账本、可信 quota snapshot 与本地 Radar cache，不触发 Claude 登录、模型调用、付费 API 或人工配额探测。独立的 `radar refresh` 只有在本地 personal-use consent 或官方 receipt 有效后才访问固定 JSON endpoints；默认每 86400 秒一次，失败保留数据库 last-known-good。performance snapshot 会生成或复用 content-addressed generation；本机 runtime 样本的衰减、漂移检测和 promotion 容忍范围尚未实现。
+外部资料不应被压缩成一个全局排行榜。当前本地运行账本建立的精确上下文桶为：
+
+```text
+(provider, exact_model_id, agent_version, reasoning_effort,
+ task_type, complexity)
+```
+
+`harness_profile` 和 tool/permission contract 作为路由硬门禁存在，但 v1.11.0 尚未把它们加入
+运行校准桶键；不能把硬门禁误写成已经实现的统计隔离维度。
+
+只有 identity、任务领域和来源 benchmark family 可以证明匹配时，才把外部记录加入该桶。
+AI Frontier、Codex Radar 和随包 benchmark 的相关观测按 source cluster 去重并设置总强度上限；
+Quality 先转换成 accuracy 弱先验，不能当作本机 first-pass。 `Consistency` 只调节不确定性
+或风险；`Consistency=100%` 也可能代表稳定地答错。`Real Cost` 保留为 publisher-defined
+API cost observation，不是订阅 quota，也不是 Claude 五小时/周剩余量。
+
+对每个桶用外部弱先验加本机真实结果构造 Beta 后验：
+
+```text
+alpha = alpha_external + local_confirmed_successes
+beta  = beta_external  + local_confirmed_failures
+quality_lcb95 = max(0, posterior_mean - 1.96 * posterior_stddev)
+```
+
+其中 local confirmed success/failure 只来自非 fixture、非 deterministic、非 verifier、
+具有 actual model/Agent version、零进程退出且由独立 verifier 明确判定的 terminal attempt。
+网络、主机、harness、认证/配额阻断和 indeterminate 只记为 unresolved，不进入 Beta 分母。
+外部 prior 按 freshness、domain、identity 和 benchmark cluster cap 降权；本地长期数据不断
+累积后自然压过外部 prior，不会因一次刷新覆盖历史。新 Agent/CLI 版本必须开新桶。
+
+### 5.2 质量等价带内的效率排序
+
+先执行全部硬门禁，再取候选中最高的 `quality_lcb95`。只有质量下界落在该最高值的等价带
+内，才允许比较效率：
+
+| complexity | 质量下界允许差距 |
+| --- | ---: |
+| `critical` | 0 个百分点 |
+| `high` | 0.5 个百分点 |
+| `standard` | 2 个百分点 |
+| `low` | 4 个百分点 |
+
+等价带内按以下顺序选择，保证“质量优先，成本/速度优化”：
+
+```text
+用户/角色偏好优先
+expected_attempts 越低
+rework_rate 越低
+执行时延越短
+consistency risk 越低
+发布者相对成本越低
+catalog cost units 越低
+accepted throughput 越高
+lane/quota utilization 拥塞惩罚越低
+provider/model 的稳定确定性 tie-break
+```
+
+可解释的效率指标可写为：
+
+```text
+useful_rate = quality_lcb95 × (1 - rework_rate)
+expected_time = queue_wait + execution_latency + verifier_latency
+efficiency = useful_rate / max(expected_time, epsilon)
+```
+
+该指标只能在质量等价带内使用，不能让更快、更便宜但低于质量门禁的候选重新入选。
+并行启动还要通过 scope 冲突、独立验收和 marginal useful-rate/cost 门禁；相关性过高的
+候选不重复启动。所有输入来自 pinned catalog、performance snapshot 和 policy，故同一输入
+闭包应产生相同排序。
+
+
+`performance refresh` 只读取本地事实账本、可信 quota snapshot、Radar cache 与 AI Frontier cache，不触发 Claude 登录、模型调用、付费 API 或人工配额探测。独立的 `radar refresh` 与 `ai-frontier refresh` 只有在本地 personal-use consent 有效后才访问各自固定 JSON endpoints；AI Frontier 默认 72 小时、硬性不低于 24 小时，失败保留数据库 last-known-good。performance snapshot 会生成或复用 content-addressed generation；本机 runtime 样本的衰减、漂移检测和 promotion 容忍范围尚未实现。
 
 关于保守在线学习的设计依据可参阅 [Conservative Contextual Linear Bandits](https://arxiv.org/abs/1611.06426) 与 [Conservative Contextual Bandits（ICLR 2025）](https://proceedings.iclr.cc/paper_files/paper/2025/hash/dbca58f35bddc6e4003b2dd80e42f838-Abstract-Conference.html)。模型/Agent 变化的检测可采用版本隔离和显式漂移事件；不应因为一个短窗口的偶然提升就覆盖长期基线。
 
@@ -187,7 +283,7 @@ runtime_lane = {
 
 Claude 的五小时/周窗口只接受可信的被动 quota snapshot；至少保留用户要求的 20% 可用目标，并在 policy 的停线阈值前停止 admission。Codex 订阅若没有官方剩余百分比，不得伪造 `remaining`；可以记录本地并发、429/限流和等待时间作为 capacity evidence，但它们不是配额余额。
 
-当前实现不做 pool/cost unit reservation、release 或 reservation-failure admission ledger；它只在 Claude quota gate 和 runtime lane capacity gate 上做判断，并把 Codex/Spark remaining 保持为 `N/A`。按 provider/family/lane 分离的 reservation、成本扣账和释放事件是未来扩展，不能当作 v1.10.0 已有功能。
+当前实现不做 pool/cost unit reservation、release 或 reservation-failure admission ledger；它只在 Claude quota gate 和 runtime lane capacity gate 上做判断，并把 Codex/Spark remaining 保持为 `N/A`。按 provider/family/lane 分离的 reservation、成本扣账和释放事件是未来扩展，不能当作 v1.11.0 已有功能。
 
 ## 7. Spark P0：专属逻辑队列、主动拆分与质量保护
 
@@ -233,7 +329,7 @@ busy_seconds, utilization, accepted_per_hour
 
 ### 7.4 失败升级
 
-当前 v1.10.0 对 Spark 的可观察行为是：
+当前 v1.11.0 对 Spark 的可观察行为是：
 
 1. terminal 结果、retry 和 rework 会进入 append-only event ledger；v3 节点保持其已选 capability，不在 claim 时静默升级；
 2. Claude 的认证/配额阻断可在同一 attempt 走 Codex fallback，但这不是 Spark 的自动升级指标；
@@ -243,11 +339,11 @@ busy_seconds, utilization, accepted_per_hour
 
 ## 8. 验收边界与持续更新
 
-v1.10.0 当前的最小可证明闭环如下；实现状态与真实生产 Evidence 分开记录：
+v1.11.0 当前的最小可证明闭环如下；实现状态与真实生产 Evidence 分开记录：
 
 | 验收项 | 证据要求 | 当前设计状态 |
 |---|---|---|
-| 外部基线可追溯 | 随包 baseline JSON 保留来源、benchmark 版本、模型/家族、task types、分数（若有）、provenance、transfer weight；consented public JSON 或官方 receipt 的 Radar 另固定 snapshot/digest、freshness、exact effort 与归因；Provider SQLite status 暴露 backend/schema/path/row counts | `implemented`；Mac mini 真实生产快照仍 external-pending |
+| 外部基线可追溯 | 随包 baseline JSON 保留来源、benchmark 版本、模型/家族、task types、分数（若有）、provenance、transfer weight；Radar 与 AI Frontier 各自固定 snapshot/digest、freshness、exact identity 与归因；Provider SQLite status 暴露 backend/schema/path/row counts | `implemented`；运行快照仍按每次部署单独验收 |
 | 长期账本不丢 attempt | 从 append-only events/tasks 读取并重建 runtime metrics，记录 exclusion ledger | `implemented`；真实生产样本仍需积累 |
 | snapshot 可重建且可 pin | content-addressed 派生快照；新任务 pin performance/catalog identity，运行中不重路由 | `implemented` |
 | 质量优先 | 硬能力/角色/作用域/Claude quota gate 先于 advisory quality posterior、成本和速度；不能绕过验收 | `implemented`；没有 promotion lifecycle |
@@ -266,6 +362,6 @@ v1.10.0 当前的最小可证明闭环如下；实现状态与真实生产 Evide
 
 作为新鲜度与污染讨论的补充，可参阅 [SWE-rebench](https://arxiv.org/abs/2505.20411)；它不替代上述四个主来源，也不直接提供 Workbench 当前模型的本机质量证明。
 
-当前问题：v1.10.0 已实现公开 benchmark baseline、consented public JSON Radar 外部先验接口、SQLite 权威 Provider、旧 JSON 自动迁移、离线数据库 last-known-good、append-only runtime ledger、advisory posterior、content-addressed snapshot pinning 和 Spark logical lane；但 Mac mini 真实生产快照仍待部署后 Evidence。个人 consent 不等同站方授权；`performance calibrate` 仍只返回 `cold-start`/`ok`，没有 promotion lifecycle、quota reservation、failure_origin 或足够真实生产 receipt 可宣称动态质量校准完成。
+当前问题：v1.11.0 已实现公开 benchmark baseline、Radar 与 AI Frontier 两个独立 SQLite/LKG 外部先验源、append-only runtime ledger、advisory posterior、quality-equivalence efficiency 路由、content-addressed snapshot pinning 和 Spark logical lane；`performance calibrate` 仍只返回 `cold-start`/`ok`，没有 promotion lifecycle、quota reservation、failure_origin 或足够长期生产 receipt 可宣称动态质量校准完成。
 
-下一步：在不触发模型调用的前提下，由主控在 Mac mini 执行一次 `radar consent-personal-use` 与 `radar refresh`，核对数据库路径/row counts、snapshot/digest 和 performance provenance；随后持续收集真实任务的 actual model/Agent version、first-pass/final acceptance、rework、duration 与 Spark lane 指标。DSH 未来仅通过 provider CLI/JSON 合同只读接入，不修改 DSH 或复制 Workbench task SQLite。
+下一步：在不触发模型调用的前提下，逐次部署核对两个 Provider 的数据库路径、row counts、snapshot/digest 和 performance provenance；随后持续收集真实任务的 actual model/Agent version、first-pass/final acceptance、rework、duration 与 Spark lane 指标。DSH 未来仅通过稳定 provider CLI/JSON 合同只读接入，不修改 DSH 或复制 Workbench task SQLite。

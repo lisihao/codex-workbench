@@ -31,6 +31,12 @@ class WorkbenchConfig:
     radar_refresh_seconds: int = 24 * 60 * 60
     radar_stale_after_seconds: int = 7 * 24 * 60 * 60
     radar_expire_after_seconds: int = 31 * 24 * 60 * 60
+    ai_frontier_enabled: bool = True
+    ai_frontier_state_root: Path | None = None
+    ai_frontier_authorization_file: Path | None = None
+    ai_frontier_refresh_seconds: int = 3 * 24 * 60 * 60
+    ai_frontier_stale_after_seconds: int = 7 * 24 * 60 * 60
+    ai_frontier_expire_after_seconds: int = 31 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         if self.max_workers < 1:
@@ -46,6 +52,14 @@ class WorkbenchConfig:
         if self.radar_expire_after_seconds < self.radar_stale_after_seconds:
             raise ValueError(
                 "radar_expire_after_seconds must be at least radar_stale_after_seconds"
+            )
+        if self.ai_frontier_refresh_seconds <= 0:
+            raise ValueError("ai_frontier_refresh_seconds must be positive")
+        if self.ai_frontier_stale_after_seconds <= 0:
+            raise ValueError("ai_frontier_stale_after_seconds must be positive")
+        if self.ai_frontier_expire_after_seconds < self.ai_frontier_stale_after_seconds:
+            raise ValueError(
+                "ai_frontier_expire_after_seconds must be at least ai_frontier_stale_after_seconds"
             )
 
     @property
@@ -67,6 +81,17 @@ class WorkbenchConfig:
         return (
             self.radar_authorization_file
             or self.effective_radar_state_root / "authorization.json"
+        )
+
+    @property
+    def effective_ai_frontier_state_root(self) -> Path:
+        return self.ai_frontier_state_root or self.state_root / "ai-frontier"
+
+    @property
+    def effective_ai_frontier_authorization_file(self) -> Path:
+        return (
+            self.ai_frontier_authorization_file
+            or self.effective_ai_frontier_state_root / "authorization.json"
         )
 
     @property
@@ -99,6 +124,11 @@ class WorkbenchConfig:
             existing_radar = {}
         if not isinstance(existing_radar, dict):
             raise ValueError("radar config must be an object")
+        existing_ai_frontier = raw.get("ai_frontier", {})
+        if existing_ai_frontier is None:
+            existing_ai_frontier = {}
+        if not isinstance(existing_ai_frontier, dict):
+            raise ValueError("ai_frontier config must be an object")
         desired = {
             **raw,
             "host": self.host,
@@ -120,6 +150,18 @@ class WorkbenchConfig:
                 "refresh_interval_seconds": self.radar_refresh_seconds,
                 "stale_after_seconds": self.radar_stale_after_seconds,
                 "expire_after_seconds": self.radar_expire_after_seconds,
+                "authority_only": True,
+            },
+            "ai_frontier": {
+                **existing_ai_frontier,
+                "enabled": self.ai_frontier_enabled,
+                "state_root": str(self.effective_ai_frontier_state_root),
+                "authorization_receipt": str(
+                    self.effective_ai_frontier_authorization_file
+                ),
+                "refresh_interval_seconds": self.ai_frontier_refresh_seconds,
+                "stale_after_seconds": self.ai_frontier_stale_after_seconds,
+                "expire_after_seconds": self.ai_frontier_expire_after_seconds,
                 "authority_only": True,
             },
         }
@@ -164,6 +206,11 @@ class WorkbenchConfig:
                 radar = {}
             if not isinstance(radar, dict):
                 raise ValueError("radar config must be an object")
+            ai_frontier = raw.get("ai_frontier", {})
+            if ai_frontier is None:
+                ai_frontier = {}
+            if not isinstance(ai_frontier, dict):
+                raise ValueError("ai_frontier config must be an object")
             inferred_authority = bool(os.environ.get("CODEX_WORKBENCH_PROCESS_HOME"))
             role = raw.get("deployment_role") or (
                 "authority" if inferred_authority else "client"
@@ -206,6 +253,24 @@ class WorkbenchConfig:
                 radar_expire_after_seconds=int(
                     radar.get("expire_after_seconds", 31 * 24 * 60 * 60)
                 ),
+                ai_frontier_enabled=bool(ai_frontier.get("enabled", True)),
+                ai_frontier_state_root=Path(ai_frontier["state_root"]).expanduser()
+                if ai_frontier.get("state_root")
+                else root / "ai-frontier",
+                ai_frontier_authorization_file=Path(
+                    ai_frontier["authorization_receipt"]
+                ).expanduser()
+                if ai_frontier.get("authorization_receipt")
+                else root / "ai-frontier" / "authorization.json",
+                ai_frontier_refresh_seconds=int(
+                    ai_frontier.get("refresh_interval_seconds", 3 * 24 * 60 * 60)
+                ),
+                ai_frontier_stale_after_seconds=int(
+                    ai_frontier.get("stale_after_seconds", 7 * 24 * 60 * 60)
+                ),
+                ai_frontier_expire_after_seconds=int(
+                    ai_frontier.get("expire_after_seconds", 31 * 24 * 60 * 60)
+                ),
             )
         inferred_authority = bool(os.environ.get("CODEX_WORKBENCH_PROCESS_HOME"))
         return cls(
@@ -214,4 +279,6 @@ class WorkbenchConfig:
             authority_host=socket.gethostname() if inferred_authority else None,
             authority_machine_id=None,
             quota_snapshot_file=root / "claude-quota.json",
+            ai_frontier_state_root=root / "ai-frontier",
+            ai_frontier_authorization_file=root / "ai-frontier" / "authorization.json",
         )

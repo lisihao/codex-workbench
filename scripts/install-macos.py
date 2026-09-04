@@ -17,12 +17,15 @@ LABEL = "com.lisihao.codex-workbench"
 QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
 CAPABILITY_LABEL = "com.lisihao.codex-workbench-capabilities"
 RADAR_LABEL = "com.lisihao.codex-workbench-radar"
+AI_FRONTIER_LABEL = "com.lisihao.codex-workbench-ai-frontier"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_AUTHORITY_MAX_WORKERS = 8
 DEFAULT_AUTHORITY_SPARK_WORKERS = 4
 DEFAULT_CAPABILITY_REFRESH_SECONDS = 6 * 60 * 60
 DEFAULT_RADAR_REFRESH_SECONDS = 24 * 60 * 60
+DEFAULT_AI_FRONTIER_REFRESH_SECONDS = 3 * 24 * 60 * 60
+MIN_AI_FRONTIER_REFRESH_SECONDS = 24 * 60 * 60
 CAPABILITY_REGISTRY_SCHEMA_VERSION = 1
 CAPABILITY_REGISTRY_POLICY = "model-routing-v3"
 PERFORMANCE_BASELINE_RESOURCE = "codex_workbench.data/model-performance-baseline-v1.json"
@@ -31,6 +34,20 @@ RADAR_STATE_DIRECTORY = "radar"
 RADAR_AUTHORIZATION_FILENAME = "authorization.json"
 RADAR_DATABASE_FILENAME = "radar.sqlite3"
 RADAR_DATABASE_SCHEMA_VERSION = 1
+AI_FRONTIER_STATE_DIRECTORY = "ai-frontier"
+AI_FRONTIER_AUTHORIZATION_FILENAME = "authorization.json"
+AI_FRONTIER_DATABASE_FILENAME = "ai-frontier.sqlite3"
+AI_FRONTIER_DATABASE_SCHEMA_VERSION = 1
+AI_FRONTIER_PRODUCER = "ai-frontier-provider"
+AI_FRONTIER_SOURCE = "https://aifrontier.withmartian.com/"
+AI_FRONTIER_PAPER = "https://arxiv.org/abs/2606.26836"
+AI_FRONTIER_TERMS = "https://withmartian.com/terms-of-service"
+AI_FRONTIER_DEFAULT_STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
+AI_FRONTIER_DEFAULT_EXPIRE_AFTER_SECONDS = 31 * 24 * 60 * 60
+AI_FRONTIER_AUTHORIZATION_NOTE = (
+    "A local personal consent receipt enables only this installation; it is not "
+    "Martian authorization or a waiver of the source terms."
+)
 RADAR_PRODUCER = "codex-radar-provider"
 RADAR_UPSTREAM_REPOSITORY = "https://github.com/WineChord/codex-radar"
 RADAR_UPSTREAM_TAG = "v0.1.69"
@@ -404,6 +421,7 @@ def preflight_authority_plists(
     claude_binary: Path | None,
     capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
     radar_refresh_seconds: int = DEFAULT_RADAR_REFRESH_SECONDS,
+    ai_frontier_refresh_seconds: int = DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
 ) -> None:
     template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
     render_authority_service_plist(
@@ -449,6 +467,15 @@ def preflight_authority_plists(
         app_root=app_root,
         state_root=state_root,
         refresh_seconds=radar_refresh_seconds,
+    )
+    ai_frontier_template = (
+        source / "launchd" / f"{AI_FRONTIER_LABEL}.plist.in"
+    ).read_text()
+    render_ai_frontier_plist(
+        ai_frontier_template,
+        app_root=app_root,
+        state_root=state_root,
+        refresh_seconds=ai_frontier_refresh_seconds,
     )
 
 
@@ -619,6 +646,117 @@ def radar_installation_config(
     )
     radar["upstream"] = upstream_config
     return radar
+
+
+def ai_frontier_refresh_interval(config: dict[str, object]) -> int:
+    """Resolve the authority AI Frontier period with a conservative floor."""
+
+    value: object = config.get("ai_frontier_refresh_seconds")
+    existing = config.get("ai_frontier")
+    if value is None and isinstance(existing, dict):
+        value = existing.get(
+            "refresh_interval_seconds", DEFAULT_AI_FRONTIER_REFRESH_SECONDS
+        )
+    if value is None:
+        value = DEFAULT_AI_FRONTIER_REFRESH_SECONDS
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(
+            "ai_frontier_refresh_seconds must be an integer at least 86400"
+        ) from error
+    if resolved < MIN_AI_FRONTIER_REFRESH_SECONDS:
+        raise SystemExit("ai_frontier_refresh_seconds must be at least 86400")
+    return resolved
+
+
+def _ai_frontier_lifecycle_seconds(
+    config: dict[str, object],
+    *,
+    field: str,
+    default: int,
+) -> int:
+    value = config.get(field, default)
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"ai_frontier.{field} must be an integer greater than zero") from error
+    if resolved <= 0:
+        raise SystemExit(f"ai_frontier.{field} must be greater than zero")
+    return resolved
+
+
+def ai_frontier_installation_config(
+    config: dict[str, object],
+    *,
+    app_root: Path,
+    state_root: Path,
+    refresh_seconds: int,
+) -> dict[str, object]:
+    """Persist the AI Frontier contract while retaining unknown user settings."""
+
+    existing = config.get("ai_frontier", {})
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise SystemExit("ai_frontier config must be a JSON object")
+    ai_frontier = dict(existing)
+    database_existing = ai_frontier.get("database", {})
+    if database_existing is None:
+        database_existing = {}
+    if not isinstance(database_existing, dict):
+        raise SystemExit("ai_frontier database config must be a JSON object")
+    database = dict(database_existing)
+    state = state_root / AI_FRONTIER_STATE_DIRECTORY
+    authorization_file = state / AI_FRONTIER_AUTHORIZATION_FILENAME
+    database_file = state / AI_FRONTIER_DATABASE_FILENAME
+    stale_after_seconds = _ai_frontier_lifecycle_seconds(
+        ai_frontier,
+        field="stale_after_seconds",
+        default=AI_FRONTIER_DEFAULT_STALE_AFTER_SECONDS,
+    )
+    expire_after_seconds = _ai_frontier_lifecycle_seconds(
+        ai_frontier,
+        field="expire_after_seconds",
+        default=AI_FRONTIER_DEFAULT_EXPIRE_AFTER_SECONDS,
+    )
+    database.update(
+        {
+            "backend": "sqlite",
+            "path": str(database_file),
+            "schema_version": AI_FRONTIER_DATABASE_SCHEMA_VERSION,
+        }
+    )
+    ai_frontier.update(
+        {
+            # The sidecar requires an explicit local receipt before it can make
+            # an HTTP request, so this install writes no receipt and starts in
+            # disabled_by_policy state even though the feature is installed.
+            "enabled": True,
+            "producer": AI_FRONTIER_PRODUCER,
+            "state_root": str(state),
+            "authorization_receipt": str(authorization_file),
+            "database": database,
+            "refresh_interval_seconds": refresh_seconds,
+            "stale_after_seconds": stale_after_seconds,
+            "expire_after_seconds": expire_after_seconds,
+            "authority_only": True,
+            "source": AI_FRONTIER_SOURCE,
+            "paper": AI_FRONTIER_PAPER,
+            "terms": AI_FRONTIER_TERMS,
+            "authorization_note": AI_FRONTIER_AUTHORIZATION_NOTE,
+            "refresh_command": [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "ai-frontier",
+                "refresh",
+            ],
+        }
+    )
+    return ai_frontier
 
 
 def _set_authority_runtime_environment(
@@ -800,6 +938,65 @@ def render_radar_plist(
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
 
 
+def render_ai_frontier_plist(
+    template: str,
+    *,
+    app_root: Path,
+    state_root: Path,
+    refresh_seconds: int,
+    user_home: Path | None = None,
+) -> str:
+    """Render the authority-only AI Frontier collector without credentials."""
+
+    if refresh_seconds < MIN_AI_FRONTIER_REFRESH_SECONDS:
+        raise SystemExit("AI Frontier LaunchAgent schedule is below the 24-hour floor")
+    app_root = Path(app_root)
+    state_root = Path(state_root)
+    home = user_home if user_home is not None else Path.home()
+    rendered = (
+        template.replace("__APP_ROOT__", str(app_root))
+        .replace("__STATE_ROOT__", str(state_root))
+        .replace("__USER_HOME__", str(home))
+        .replace("__AI_FRONTIER_REFRESH_SECONDS__", str(refresh_seconds))
+    )
+    payload = plistlib.loads(rendered.encode())
+    if not isinstance(payload, dict):
+        raise SystemExit("AI Frontier LaunchAgent plist is invalid")
+    expected_arguments = [
+        str(app_root / "scripts" / "python-runtime"),
+        "-m",
+        "codex_workbench",
+        "--home",
+        str(state_root),
+        "ai-frontier",
+        "refresh",
+    ]
+    if payload.get("Label") != AI_FRONTIER_LABEL:
+        raise SystemExit("AI Frontier LaunchAgent label is invalid")
+    if payload.get("ProgramArguments") != expected_arguments:
+        raise SystemExit("AI Frontier LaunchAgent command is invalid")
+    if payload.get("RunAtLoad") is not True or payload.get("StartInterval") != refresh_seconds:
+        raise SystemExit("AI Frontier LaunchAgent schedule is invalid")
+    if "KeepAlive" in payload:
+        raise SystemExit("AI Frontier LaunchAgent must not keep itself alive")
+    environment = payload.get("EnvironmentVariables")
+    expected_environment_keys = {"HOME", "PATH", "PYTHONPATH", "PYTHONUNBUFFERED"}
+    if not isinstance(environment, dict) or set(environment) != expected_environment_keys:
+        raise SystemExit(
+            "AI Frontier LaunchAgent environment must contain only HOME, PATH, "
+            "PYTHONPATH, and PYTHONUNBUFFERED"
+        )
+    if environment.get("HOME") != str(home):
+        raise SystemExit("AI Frontier LaunchAgent HOME is invalid")
+    if environment.get("PYTHONPATH") != str(app_root / "src"):
+        raise SystemExit("AI Frontier LaunchAgent PYTHONPATH is invalid")
+    if payload.get("StandardOutPath") != str(state_root / "logs" / "ai-frontier.log"):
+        raise SystemExit("AI Frontier LaunchAgent stdout path is invalid")
+    if payload.get("StandardErrorPath") != str(state_root / "logs" / "ai-frontier.error.log"):
+        raise SystemExit("AI Frontier LaunchAgent stderr path is invalid")
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
+
+
 def capability_refresh_environment(
     *,
     app_root: Path,
@@ -938,6 +1135,7 @@ def main() -> int:
     quota_plist_path = launch_agents / f"{QUOTA_LABEL}.plist"
     capability_plist_path = launch_agents / f"{CAPABILITY_LABEL}.plist"
     radar_plist_path = launch_agents / f"{RADAR_LABEL}.plist"
+    ai_frontier_plist_path = launch_agents / f"{AI_FRONTIER_LABEL}.plist"
     logs = state_root / "logs"
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
@@ -946,6 +1144,10 @@ def main() -> int:
     performance_state_root = state_root / PERFORMANCE_STATE_DIRECTORY
     radar_state_root = state_root / RADAR_STATE_DIRECTORY
     radar_authorization_file = radar_state_root / RADAR_AUTHORIZATION_FILENAME
+    ai_frontier_state_root = state_root / AI_FRONTIER_STATE_DIRECTORY
+    ai_frontier_authorization_file = (
+        ai_frontier_state_root / AI_FRONTIER_AUTHORIZATION_FILENAME
+    )
     quota_snapshot_file = (
         absolute_path(Path(args.quota_snapshot_file))
         if args.quota_snapshot_file
@@ -962,14 +1164,17 @@ def main() -> int:
     assert_directory_target(capability_registry_root, "capability registry")
     assert_directory_target(performance_state_root, "performance state")
     assert_directory_target(radar_state_root, "Radar state")
+    assert_directory_target(ai_frontier_state_root, "AI Frontier state")
     assert_directory_target(launch_agents, "LaunchAgents root")
     assert_file_target(config_file := state_root / "config.json", "config file")
     assert_file_target(plist_path, "service LaunchAgent")
     assert_file_target(quota_plist_path, "quota LaunchAgent")
     assert_file_target(capability_plist_path, "capability LaunchAgent")
     assert_file_target(radar_plist_path, "Radar LaunchAgent")
+    assert_file_target(ai_frontier_plist_path, "AI Frontier LaunchAgent")
     assert_file_target(quota_snapshot_file, "quota snapshot")
     assert_file_target(radar_authorization_file, "Radar authorization receipt")
+    assert_file_target(ai_frontier_authorization_file, "AI Frontier authorization receipt")
     if nas_archive_root is not None:
         assert_directory_target(nas_archive_root, "NAS worktree archive root")
     backup_root = state_root / "previous-app"
@@ -1020,6 +1225,7 @@ def main() -> int:
             recovery_config["zstd_binary"] = str(Path(str(zstd_binary)).expanduser().absolute())
     capability_refresh_seconds = capability_refresh_interval(config_raw)
     radar_refresh_seconds = radar_refresh_interval(config_raw)
+    ai_frontier_refresh_seconds = ai_frontier_refresh_interval(config_raw)
     max_workers = authority_max_workers(config_raw)
     spark_workers = authority_spark_workers(config_raw, max_workers=max_workers)
     performance_config = performance_installation_config(
@@ -1035,6 +1241,12 @@ def main() -> int:
         state_root=state_root,
         refresh_seconds=radar_refresh_seconds,
         upstream=radar_metadata,
+    )
+    ai_frontier_config = ai_frontier_installation_config(
+        config_raw,
+        app_root=app_root,
+        state_root=state_root,
+        refresh_seconds=ai_frontier_refresh_seconds,
     )
     authority_machine_id = macos_machine_id()
     research_source = validate_research_skill_source(Path(args.research_skill_source))
@@ -1109,6 +1321,7 @@ def main() -> int:
         claude_binary,
         capability_refresh_seconds,
         radar_refresh_seconds,
+        ai_frontier_refresh_seconds,
     )
     preflight_global_agent_targets(Path.home())
     preflight_managed_agent_skills(source)
@@ -1146,11 +1359,26 @@ def main() -> int:
             f"(authority-only RunAtLoad + every {radar_refresh_seconds}s; no authorization file is created)"
         )
         print("plan: radar refresh=" + " ".join(radar_config["refresh_command"]))
+        print(
+            f"plan: ai-frontier={ai_frontier_plist_path} "
+            f"(authority-only RunAtLoad + every {ai_frontier_refresh_seconds}s; "
+            "no authorization file is created and no network runs without one)"
+        )
+        print(
+            "plan: ai-frontier refresh="
+            + " ".join(ai_frontier_config["refresh_command"])
+        )
         print("plan: managed Code-as-Harness and Archify projections for Codex and Claude Code")
         return 0
 
     domain = f"gui/{run('id', '-u').stdout.strip()}"
-    service_labels = (LABEL, QUOTA_LABEL, CAPABILITY_LABEL, RADAR_LABEL)
+    service_labels = (
+        LABEL,
+        QUOTA_LABEL,
+        CAPABILITY_LABEL,
+        RADAR_LABEL,
+        AI_FRONTIER_LABEL,
+    )
     service_was_loaded = {
         label: run("launchctl", "print", f"{domain}/{label}", check=False).returncode == 0
         for label in service_labels
@@ -1163,6 +1391,7 @@ def main() -> int:
         codex_home,
         process_home,
         radar_state_root,
+        ai_frontier_state_root,
         launch_agents,
     ):
         if not directory.exists():
@@ -1178,8 +1407,10 @@ def main() -> int:
         (quota_plist_path, "quota LaunchAgent"),
         (capability_plist_path, "capability LaunchAgent"),
         (radar_plist_path, "Radar LaunchAgent"),
+        (ai_frontier_plist_path, "AI Frontier LaunchAgent"),
         (quota_snapshot_file, "quota snapshot"),
         (radar_state_root, "Radar state"),
+        (ai_frontier_state_root, "AI Frontier state"),
         (Path.home() / ".codex" / "skills" / "code-as-harness", "Codex Code-as-Harness skill"),
         (Path.home() / ".codex" / "AGENTS.md", "Codex policy"),
         (Path.home() / ".codex" / "skills" / "archify", "Codex Archify skill"),
@@ -1199,6 +1430,7 @@ def main() -> int:
         codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         radar_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ai_frontier_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         research_skill = install_research_skill(research_source, process_home)
         config_raw.update(
             {
@@ -1215,6 +1447,7 @@ def main() -> int:
                 "capability_refresh_seconds": capability_refresh_seconds,
                 "performance": performance_config,
                 "radar": radar_config,
+                "ai_frontier": ai_frontier_config,
                 "worktree_recovery": recovery_config,
             }
         )
@@ -1257,6 +1490,7 @@ def main() -> int:
                         "refresh_command": performance_config["refresh_command"],
                     },
                     "radar": radar_config,
+                    "ai_frontier": ai_frontier_config,
                     "worktree_recovery": recovery_config,
                     "research_skill": {
                         "name": "Research",
@@ -1369,6 +1603,18 @@ def main() -> int:
         radar_plist_path.write_text(radar_rendered)
         radar_plist_path.chmod(0o600)
 
+        ai_frontier_template = (
+            source / "launchd" / f"{AI_FRONTIER_LABEL}.plist.in"
+        ).read_text()
+        ai_frontier_rendered = render_ai_frontier_plist(
+            ai_frontier_template,
+            app_root=app_root,
+            state_root=state_root,
+            refresh_seconds=ai_frontier_refresh_seconds,
+        )
+        ai_frontier_plist_path.write_text(ai_frontier_rendered)
+        ai_frontier_plist_path.chmod(0o600)
+
         initial_capability_refresh(
             app_root=app_root,
             state_root=state_root,
@@ -1389,6 +1635,7 @@ def main() -> int:
                 remove_path(quota_plist_path)
         restart_launch_agent(domain, CAPABILITY_LABEL, capability_plist_path)
         restart_launch_agent(domain, RADAR_LABEL, radar_plist_path)
+        restart_launch_agent(domain, AI_FRONTIER_LABEL, ai_frontier_plist_path)
         if tailscale_socket:
             configure_tailscale_serve(
                 tailscale,
@@ -1404,6 +1651,7 @@ def main() -> int:
                 (QUOTA_LABEL, quota_plist_path),
                 (CAPABILITY_LABEL, capability_plist_path),
                 (RADAR_LABEL, radar_plist_path),
+                (AI_FRONTIER_LABEL, ai_frontier_plist_path),
             ):
                 try:
                     run("launchctl", "bootout", domain, str(path), check=False)
@@ -1419,6 +1667,7 @@ def main() -> int:
                 (QUOTA_LABEL, quota_plist_path),
                 (CAPABILITY_LABEL, capability_plist_path),
                 (RADAR_LABEL, radar_plist_path),
+                (AI_FRONTIER_LABEL, ai_frontier_plist_path),
             ):
                 if not service_was_loaded[label] or not path.is_file():
                     continue

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lisihao.codex-workbench-ai-frontier</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP_ROOT__/scripts/python-runtime</string>
+    <string>-m</string>
+    <string>codex_workbench</string>
+    <string>--home</string>
+    <string>__STATE_ROOT__</string>
+    <string>ai-frontier</string>
+    <string>refresh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__USER_HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONPATH</key>
+    <string>__APP_ROOT__/src</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>__AI_FRONTIER_REFRESH_SECONDS__</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__STATE_ROOT__/logs/ai-frontier.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE_ROOT__/logs/ai-frontier.error.log</string>
+</dict>
+</plist>

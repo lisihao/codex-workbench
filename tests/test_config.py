@@ -75,6 +75,40 @@ class WorkbenchConfigTests(unittest.TestCase):
                     radar_expire_after_seconds=9,
                 )
 
+    def test_ai_frontier_defaults_and_unknown_fields_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = WorkbenchConfig(root)
+            configured.initialize()
+            raw = json.loads(configured.config_file.read_text(encoding="utf-8"))
+            raw["ai_frontier"]["operator_note"] = "keep this"
+            configured.config_file.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+            loaded = WorkbenchConfig.load(root)
+            loaded.initialize()
+            rewritten = json.loads(configured.config_file.read_text(encoding="utf-8"))
+
+            self.assertTrue(loaded.ai_frontier_enabled)
+            self.assertEqual(loaded.ai_frontier_refresh_seconds, 259200)
+            self.assertEqual(loaded.ai_frontier_stale_after_seconds, 7 * 24 * 60 * 60)
+            self.assertEqual(loaded.ai_frontier_expire_after_seconds, 31 * 24 * 60 * 60)
+            self.assertEqual(loaded.effective_ai_frontier_state_root, root / "ai-frontier")
+            self.assertEqual(
+                loaded.effective_ai_frontier_authorization_file,
+                root / "ai-frontier" / "authorization.json",
+            )
+            self.assertEqual(rewritten["ai_frontier"]["operator_note"], "keep this")
+            self.assertTrue(rewritten["ai_frontier"]["authority_only"])
+
+    def test_ai_frontier_expiry_cannot_precede_stale_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "ai_frontier_expire_after_seconds"):
+                WorkbenchConfig(
+                    Path(directory),
+                    ai_frontier_stale_after_seconds=10,
+                    ai_frontier_expire_after_seconds=9,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

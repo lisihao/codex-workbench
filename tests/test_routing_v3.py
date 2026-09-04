@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from codex_workbench.routing_v3 import ROUTING_V3_POLICY_VERSION, route_capability_snapshot
@@ -234,6 +235,136 @@ class RoutingV3Tests(unittest.TestCase):
 
         self.assertEqual(decision.model, "gpt-5.6-luna")
         self.assertEqual(decision.ranked_candidates[1].model, "sonnet")
+
+    def test_standard_quality_equivalence_band_allows_lower_cost_candidate(self) -> None:
+        expensive_best = capability("codex", "gpt-5.6-terra", quality=90, cost=100)
+        cheap_equivalent = capability("codex", "gpt-5.6-luna", quality=89, cost=1)
+
+        decision = route_capability_snapshot(
+            snapshot(expensive_best, cheap_equivalent),
+            request(acceptance_risk="standard", independent_slice=True),
+        )
+
+        self.assertEqual(decision.model, "gpt-5.6-luna")
+        self.assertEqual(decision.ranking_algorithm_version, "quality-equivalence-efficiency-v1")
+        self.assertTrue(decision.selected.quality_equivalence_band)  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.quality_gap, 1)  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.quality_equivalence_tolerance, 2)  # type: ignore[union-attr]
+        self.assertEqual(
+            decision.selected.ranking_algorithm_version,  # type: ignore[union-attr]
+            "quality-equivalence-efficiency-v1",
+        )
+
+    def test_quality_outside_standard_band_cannot_win_on_cost(self) -> None:
+        expensive_best = capability("codex", "gpt-5.6-terra", quality=90, cost=100)
+        cheap_outside = capability("codex", "gpt-5.6-luna", quality=85, cost=1)
+
+        decision = route_capability_snapshot(
+            snapshot(expensive_best, cheap_outside),
+            request(allow_parallel_providers=True, independent_slice=True),
+        )
+
+        self.assertEqual(decision.model, "gpt-5.6-terra")
+        self.assertTrue(decision.ranked_candidates[0].quality_equivalence_band)
+        self.assertFalse(decision.ranked_candidates[1].quality_equivalence_band)
+        self.assertEqual([item.model for item in decision.parallel_candidates], ["gpt-5.6-terra"])
+
+    def test_critical_risk_requires_exact_quality_frontier(self) -> None:
+        best = capability("codex", "gpt-5.6-terra", quality=90, cost=100)
+        cheaper = capability("codex", "gpt-5.6-luna", quality=89, cost=1)
+
+        decision = route_capability_snapshot(
+            snapshot(best, cheaper),
+            request(acceptance_risk="critical", independent_slice=True),
+        )
+
+        self.assertEqual(decision.model, "gpt-5.6-terra")
+        self.assertEqual(decision.ranked_candidates[0].quality_equivalence_tolerance, 0)
+        self.assertFalse(decision.ranked_candidates[1].quality_equivalence_band)
+
+    def test_external_quality_and_consistency_are_not_local_success_rates(self) -> None:
+        first = self._calibrated_candidate("codex", "gpt-5.6-luna", 0.70)
+        first["quality"]["prior"]["external_signals"] = {  # type: ignore[index]
+            "quality_mean": 0.99,
+            "consistency_mean": 0.99,
+            "consistency_std_mean": 0.01,
+            "observed_cost_usd_mean": 0.01,
+            "cost_surprise_mean": 0.02,
+            "source_count": 3,
+        }
+        second = self._calibrated_candidate("codex", "gpt-5.6-terra", 0.70)
+        second["quality"]["prior"]["external_signals"] = {  # type: ignore[index]
+            "quality_mean": 0.10,
+            "consistency_mean": 0.10,
+            "consistency_std_mean": 0.50,
+            "observed_cost_usd_mean": 0.90,
+            "cost_surprise_mean": 0.80,
+            "source_count": 1,
+        }
+        catalog = snapshot(
+            capability("codex", "gpt-5.6-luna", quality=80, cost=1),
+            capability("codex", "gpt-5.6-terra", quality=80, cost=1),
+        )
+        catalog["performance_calibration"] = self._calibration(first, second)
+
+        decision = route_capability_snapshot(catalog, request(independent_slice=True))
+
+        self.assertEqual(decision.ranked_candidates[0].ranking_quality_score, 70)
+        self.assertEqual(decision.ranked_candidates[1].ranking_quality_score, 70)
+        self.assertEqual(decision.ranked_candidates[0].external_quality_mean, 0.99)
+        self.assertEqual(decision.ranked_candidates[1].external_quality_mean, 0.10)
+        self.assertEqual(decision.ranked_candidates[0].external_observed_cost_mean, 0.01)
+        self.assertNotIn(
+            "external_observed_cost_usd_mean",
+            decision.ranked_candidates[0].to_dict(),
+        )
+        self.assertNotEqual(
+            decision.ranked_candidates[0].performance_consistency_risk,
+            decision.ranked_candidates[1].performance_consistency_risk,
+        )
+        self.assertEqual(decision.ranked_candidates[0].performance_p_first_rate, 0.70)
+
+    def test_efficiency_receipt_is_serializable_and_deterministic(self) -> None:
+        luna = capability("codex", "gpt-5.6-luna", quality=80, cost=2)
+        catalog = snapshot(luna)
+        candidate = self._calibrated_candidate(
+            "codex",
+            "gpt-5.6-luna",
+            0.70,
+            first_pass=0.80,
+            latency_ms=250,
+        )
+        catalog["performance_calibration"] = self._calibration(candidate)
+
+        first = route_capability_snapshot(catalog, request())
+        second = route_capability_snapshot(catalog, request())
+
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(json.loads(json.dumps(first.to_dict())), first.to_dict())
+        self.assertEqual(first.selected.expected_attempts, 1.25)  # type: ignore[union-attr]
+        self.assertEqual(first.selected.expected_completion_units, 2.5)  # type: ignore[union-attr]
+        self.assertEqual(first.selected.efficiency_score, 0.4)  # type: ignore[union-attr]
+
+    def test_external_signals_cannot_bypass_claude_quota_gate(self) -> None:
+        sonnet = capability("claude", "sonnet", quality=80, cost=1)
+        luna = capability("codex", "gpt-5.6-luna", quality=79, cost=100)
+        catalog = snapshot(sonnet, luna, quota=healthy_quota(remaining_percent=20))
+        external = self._calibrated_candidate("claude", "sonnet", 0.99)
+        external["quality"]["prior"]["external_signals"] = {  # type: ignore[index]
+            "quality_mean": 0.99,
+            "consistency_mean": 0.99,
+            "observed_cost_usd_mean": 0.001,
+            "source_count": 5,
+        }
+        catalog["performance_calibration"] = self._calibration(external)
+
+        decision = route_capability_snapshot(catalog, request())
+
+        self.assertEqual(decision.model, "gpt-5.6-luna")
+        claude_rejection = next(
+            item for item in decision.rejected_candidates if item.provider == "claude"
+        )
+        self.assertIn("20% hard reserve", " ".join(claude_rejection.reasons))
 
     def test_cost_is_a_deterministic_tie_break_after_equal_quality(self) -> None:
         low_cost_luna = capability("codex", "gpt-5.6-luna", quality=90, cost=2)
