@@ -1,0 +1,36 @@
+{
+  "name": "codex-radar-provider",
+  "version": "0.1.0",
+  "description": "Offline-first Codex Radar data bridge for model capability and scheduling consumers.",
+  "author": {
+    "name": "Codex Workbench contributors"
+  },
+  "homepage": "https://github.com/lisihao/codex-workbench",
+  "repository": "https://github.com/lisihao/codex-workbench",
+  "license": "MIT",
+  "keywords": [
+    "codex-radar",
+    "model-routing",
+    "offline-first",
+    "capability-catalog"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Radar Provider",
+    "shortDescription": "Offline-first radar data for model-aware routing.",
+    "longDescription": "Projects the upstream Codex Radar sync skill and defines a provider bridge contract for Workbench and DSH consumers. It preserves last-known-good observations, fails closed when data authorization or freshness is unavailable, and never treats Radar as live quota.",
+    "developerName": "Codex Workbench contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Model capability data",
+      "Offline snapshots",
+      "Provider scheduling contract"
+    ],
+    "websiteURL": "https://github.com/lisihao/codex-workbench",
+    "defaultPrompt": [
+      "Show the latest offline Codex Radar snapshot.",
+      "Explain the provider contract for Workbench or DSH.",
+      "Check whether radar data is fresh and authorized."
+    ]
+  }
+}

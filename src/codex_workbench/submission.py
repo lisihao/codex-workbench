@@ -22,6 +22,7 @@ from .model import (
 )
 from .performance import PerformanceRegistry, PerformanceRegistryError
 from .planner import CodexPlanner
+from .radar import WorkbenchRadar
 from .research import route_research
 from .store import WorkbenchStore
 
@@ -131,7 +132,14 @@ def _performance_calibration_for_submission(
         }
     registry = PerformanceRegistry(config.state_root)
     try:
-        refreshed = registry.refresh(store, catalog)
+        radar_status = WorkbenchRadar(
+            state_root=config.effective_radar_state_root,
+            authorization_file=config.effective_radar_authorization_file,
+            enabled=config.radar_enabled,
+            stale_after_seconds=config.radar_stale_after_seconds,
+            expire_after_seconds=config.radar_expire_after_seconds,
+        ).status()
+        refreshed = registry.refresh(store, catalog, radar_status=radar_status)
         snapshot = refreshed["snapshot"]
         calibration = registry.calibrate(catalog, task_type, complexity)
         calibration_matrix = registry.calibrate_matrix(

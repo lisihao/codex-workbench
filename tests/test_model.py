@@ -61,8 +61,8 @@ class ModelTests(unittest.TestCase):
 
     def test_long_context_overrides_require_exact_supported_model_ids(self) -> None:
         expected = (
-            "model_context_window=1000000",
-            "model_auto_compact_token_limit=900000",
+            "model_context_window=500000",
+            "model_auto_compact_token_limit=450000",
         )
         for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
             self.assertEqual(codex_model_long_context_overrides(model), expected)
@@ -489,8 +489,8 @@ class ModelTests(unittest.TestCase):
             configs,
             [
                 "model_reasoning_effort=max",
-                "model_context_window=1000000",
-                "model_auto_compact_token_limit=900000",
+                "model_context_window=500000",
+                "model_auto_compact_token_limit=450000",
             ],
         )
         self.assertIn("Execution profile: luna_worker", CodexExecutor._prompt(request))

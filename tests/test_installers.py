@@ -177,6 +177,63 @@ class InstallerTests(unittest.TestCase):
             ],
         )
 
+    def test_authority_installer_persists_radar_contract_without_overwriting_unknown_fields(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            state_root = root / "state"
+            app_root = state_root / "app"
+            config = {
+                "user_setting": "preserve",
+                "radar": {"operator_note": "preserve", "upstream": {"local_note": "preserve"}},
+            }
+            radar = module.radar_installation_config(
+                config,
+                app_root=app_root,
+                state_root=state_root,
+                refresh_seconds=1234,
+                upstream={
+                    "repository": "https://github.com/WineChord/codex-radar",
+                    "tag": "v0.1.69",
+                    "commit": "fixture-radar-commit",
+                    "attribution": "数据来自 Codex 雷达 codexradar.com",
+                },
+            )
+
+        self.assertEqual(config["user_setting"], "preserve")
+        self.assertEqual(radar["operator_note"], "preserve")
+        self.assertEqual(radar["upstream"]["local_note"], "preserve")
+        self.assertEqual(radar["producer"], module.RADAR_PRODUCER)
+        self.assertEqual(
+            radar["upstream"],
+            {
+                "local_note": "preserve",
+                "repository": "https://github.com/WineChord/codex-radar",
+                "tag": "v0.1.69",
+                "commit": "fixture-radar-commit",
+            },
+        )
+        self.assertEqual(radar["state_root"], str(state_root / "radar"))
+        self.assertEqual(
+            radar["authorization_receipt"],
+            str(state_root / "radar" / "authorization.json"),
+        )
+        self.assertEqual(radar["refresh_interval_seconds"], 1234)
+        self.assertEqual(radar["attribution"], "数据来自 Codex 雷达 codexradar.com")
+        self.assertEqual(
+            radar["refresh_command"],
+            [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "radar",
+                "refresh",
+            ],
+        )
+        self.assertTrue(radar["authority_only"])
+
     def test_authority_service_render_uses_real_home_and_explicit_claude_path(self) -> None:
         module = self._macos_installer_module()
         root = Path(__file__).resolve().parents[1]
@@ -585,6 +642,52 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertNotIn("login", arguments)
         self.assertNotIn("exec", arguments)
+
+    def test_radar_launch_agent_is_authority_only_and_has_no_secret_environment(self) -> None:
+        module = self._macos_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / f"{module.RADAR_LABEL}.plist.in").read_text()
+        with mock.patch.object(module.Path, "home", return_value=Path("/Users/example")):
+            rendered = module.render_radar_plist(
+                template,
+                app_root=Path("/tmp/app"),
+                state_root=Path("/tmp/state"),
+                refresh_seconds=module.DEFAULT_RADAR_REFRESH_SECONDS,
+            )
+
+        payload = plistlib.loads(rendered.encode())
+        self.assertEqual(payload["Label"], module.RADAR_LABEL)
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertEqual(payload["StartInterval"], 6 * 60 * 60)
+        self.assertEqual(
+            payload["ProgramArguments"],
+            [
+                "/tmp/app/scripts/python-runtime",
+                "-m",
+                "codex_workbench",
+                "--home",
+                "/tmp/state",
+                "radar",
+                "refresh",
+            ],
+        )
+        self.assertEqual(
+            set(payload["EnvironmentVariables"]),
+            {"HOME", "PATH", "PYTHONPATH", "PYTHONUNBUFFERED"},
+        )
+        self.assertNotIn("CODEX_HOME", payload["EnvironmentVariables"])
+        self.assertNotIn("CODEX_WORKBENCH_CODEX", payload["EnvironmentVariables"])
+        self.assertNotIn("CODEX_WORKBENCH_CLAUDE", payload["EnvironmentVariables"])
+        self.assertNotIn("OPENAI_API_KEY", payload["EnvironmentVariables"])
+        self.assertNotIn("ANTHROPIC_API_KEY", payload["EnvironmentVariables"])
+        self.assertEqual(payload["StandardOutPath"], "/tmp/state/logs/radar.log")
+        self.assertEqual(payload["StandardErrorPath"], "/tmp/state/logs/radar.error.log")
+
+    def test_radar_provider_writer_is_not_installed_by_macbook_client(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        client_source = (root / "scripts" / "install-macbook-client.py").read_text()
+        self.assertNotIn("codex_radar_provider", client_source)
+        self.assertNotIn("codex-workbench-radar", client_source)
 
     def test_initial_capability_refresh_uses_fixture_runtime_without_api_keys_or_model_prompt(self) -> None:
         module = self._macos_installer_module()
@@ -1380,6 +1483,9 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(all(command[0] == "git" for command in calls))
             self.assertIn("plan: capabilities=", output.getvalue())
             self.assertIn("passive bundled refresh before services", output.getvalue())
+            self.assertIn("plan: radar=", output.getvalue())
+            self.assertIn("codex_workbench --home", output.getvalue())
+            self.assertIn("radar refresh", output.getvalue())
 
     def test_macbook_dry_run_skips_ssh_launchctl_and_mcp_mutations(self) -> None:
         module = self._macbook_installer_module()
@@ -1663,6 +1769,31 @@ class InstallerTests(unittest.TestCase):
                     ],
                 },
             )
+            self.assertEqual(
+                config["radar"],
+                {
+                    "producer": module.RADAR_PRODUCER,
+                    "upstream": {
+                        "repository": module.RADAR_UPSTREAM_REPOSITORY,
+                        "tag": module.RADAR_UPSTREAM_TAG,
+                        "commit": module.RADAR_UPSTREAM_COMMIT,
+                    },
+                    "state_root": str(state_root / "radar"),
+                    "authorization_receipt": str(state_root / "radar" / "authorization.json"),
+                    "refresh_interval_seconds": module.DEFAULT_RADAR_REFRESH_SECONDS,
+                    "attribution": module.RADAR_ATTRIBUTION,
+                    "refresh_command": [
+                        str(state_root / "app" / "scripts" / "python-runtime"),
+                        "-m",
+                        "codex_workbench",
+                        "--home",
+                        str(state_root),
+                        "radar",
+                        "refresh",
+                    ],
+                    "authority_only": True,
+                },
+            )
             manifest = json.loads((state_root / "app" / "install-manifest.json").read_text())
             self.assertEqual(
                 manifest["capabilities"],
@@ -1684,6 +1815,9 @@ class InstallerTests(unittest.TestCase):
                 manifest["worktree_recovery"],
                 config["worktree_recovery"],
             )
+            self.assertEqual(manifest["radar"], config["radar"])
+            self.assertTrue((state_root / "radar").is_dir())
+            self.assertFalse((state_root / "radar" / "authorization.json").exists())
             capability_plist = home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist"
             payload = plistlib.loads(capability_plist.read_bytes())
             self.assertEqual(payload["StartInterval"], 1234)
@@ -1700,6 +1834,23 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(command[1] == "print" and command[-1] == sidecar_service for command in launchctl_commands)
+            )
+            radar_plist = home / "Library" / "LaunchAgents" / f"{module.RADAR_LABEL}.plist"
+            radar_payload = plistlib.loads(radar_plist.read_bytes())
+            self.assertEqual(radar_payload["StartInterval"], module.DEFAULT_RADAR_REFRESH_SECONDS)
+            self.assertEqual(
+                radar_payload["ProgramArguments"],
+                config["radar"]["refresh_command"],
+            )
+            radar_service = f"gui/501/{module.RADAR_LABEL}"
+            self.assertTrue(
+                any(command[1] == "bootstrap" and str(radar_plist) in command for command in launchctl_commands)
+            )
+            self.assertTrue(
+                any(command[1] == "kickstart" and command[-1] == radar_service for command in launchctl_commands)
+            )
+            self.assertTrue(
+                any(command[1] == "print" and command[-1] == radar_service for command in launchctl_commands)
             )
 
     def test_authority_installer_rolls_back_catalog_when_initial_bundled_refresh_fails(self) -> None:
@@ -1725,6 +1876,9 @@ class InstallerTests(unittest.TestCase):
             previous_catalog = state_root / "capabilities" / "generations" / "previous.json"
             previous_catalog.parent.mkdir(parents=True)
             previous_catalog.write_text('{"previous":true}\n')
+            previous_radar = state_root / "radar" / "last-known-good.json"
+            previous_radar.parent.mkdir(parents=True)
+            previous_radar.write_text('{"radar":"previous"}\n')
             original_config = '{"unrelated":"keep"}\n'
             (state_root / "config.json").write_text(original_config)
             calls: list[tuple[str, ...]] = []
@@ -1777,10 +1931,13 @@ class InstallerTests(unittest.TestCase):
                     module.main()
 
             self.assertEqual(previous_catalog.read_text(), '{"previous":true}\n')
+            self.assertEqual(previous_radar.read_text(), '{"radar":"previous"}\n')
             self.assertFalse((state_root / "capabilities" / "generations" / "failed.json").exists())
+            self.assertFalse((state_root / "radar" / "authorization.json").exists())
             self.assertEqual((state_root / "config.json").read_text(), original_config)
             self.assertFalse((state_root / "app").exists())
             self.assertFalse((home / "Library" / "LaunchAgents" / f"{module.CAPABILITY_LABEL}.plist").exists())
+            self.assertFalse((home / "Library" / "LaunchAgents" / f"{module.RADAR_LABEL}.plist").exists())
             self.assertFalse(any(command[:2] == ("launchctl", "bootstrap") for command in calls))
 
 

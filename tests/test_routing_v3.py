@@ -116,6 +116,7 @@ class RoutingV3Tests(unittest.TestCase):
         first_pass: float | None = None,
         rework_rate: float | None = None,
         latency_ms: float | None = None,
+        reasoning_effort: str | None = "max",
     ) -> dict[str, object]:
         quality: dict[str, object] = {
             "prior": {"evidence_status": "available"},
@@ -130,6 +131,8 @@ class RoutingV3Tests(unittest.TestCase):
             "agent_version": agent_version,
             "quality": quality,
         }
+        if reasoning_effort is not None:
+            result["reasoning_effort"] = reasoning_effort
         if first_pass is not None:
             result["first_pass_rate"] = first_pass
         if rework_rate is not None:
@@ -393,6 +396,26 @@ class RoutingV3Tests(unittest.TestCase):
         self.assertEqual(second.model, "gpt-5.6-luna")
         self.assertEqual(second.performance_snapshot_id, "performance-" + "a" * 16)
         self.assertEqual(second.performance_digest, "b" * 64)
+
+    def test_performance_candidate_requires_exact_reasoning_effort(self) -> None:
+        luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1, efforts=("high", "max"))
+        catalog = snapshot(luna)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate(
+                "codex",
+                "gpt-5.6-luna",
+                0.99,
+                reasoning_effort="high",
+            ),
+        )
+
+        decision = route_capability_snapshot(catalog, request(reasoning_effort="max"))
+
+        self.assertEqual(decision.model, "gpt-5.6-luna")
+        luna_candidate = decision.selected
+        self.assertIsNotNone(luna_candidate)
+        self.assertEqual(luna_candidate.quality_source, "declared")
+        self.assertIsNone(luna_candidate.performance_lower_bound_95)
 
     def test_runtime_first_pass_rework_and_latency_break_equal_quality_bounds(self) -> None:
         luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1)

@@ -31,6 +31,7 @@ from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContr
 from .mobile import MobileRemote, MobileRemoteError
 from .performance import PerformanceRegistry, PerformanceRegistryError
 from .planner import PlannerError
+from .radar import WorkbenchRadar
 from .research import managed_research_skill_status
 from .restart_readiness import assess_restart_readiness
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
@@ -651,6 +652,16 @@ def _capability_registry(config: WorkbenchConfig) -> CapabilityRegistry:
     )
 
 
+def _radar(config: WorkbenchConfig) -> WorkbenchRadar:
+    return WorkbenchRadar(
+        state_root=config.effective_radar_state_root,
+        authorization_file=config.effective_radar_authorization_file,
+        enabled=config.radar_enabled,
+        stale_after_seconds=config.radar_stale_after_seconds,
+        expire_after_seconds=config.radar_expire_after_seconds,
+    )
+
+
 def _refresh_performance_after_capabilities(
     config: WorkbenchConfig,
     refresh: dict[str, object],
@@ -688,7 +699,11 @@ def _refresh_performance_after_capabilities(
             "catalog_id": catalog.get("catalog_id"),
         }
     try:
-        result = PerformanceRegistry(config.state_root).refresh(_store(config), catalog)
+        result = PerformanceRegistry(config.state_root).refresh(
+            _store(config),
+            catalog,
+            radar_status=_radar(config).status(),
+        )
     except PerformanceRegistryError as error:
         return {"ok": False, "status": "unavailable", "reason": str(error)}
     return {
@@ -809,13 +824,68 @@ def command_performance(args: argparse.Namespace) -> int:
             }
         elif args.performance_action == "refresh":
             catalog, catalog_status = _performance_catalog(config)
-            result = registry.refresh(store, catalog)
+            result = registry.refresh(
+                store,
+                catalog,
+                radar_status=_radar(config).status(),
+            )
             result["catalog"] = catalog_status
             result["model_calls"] = 0
         else:
             raise ValueError(f"unsupported performance action: {args.performance_action}")
     except PerformanceRegistryError as error:
         result = {"ok": False, "error": str(error)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def command_radar(args: argparse.Namespace) -> int:
+    """Inspect or refresh the portable, offline-capable Radar provider."""
+
+    config = _config(args)
+    radar = _radar(config)
+    action = args.radar_action
+    if action == "status":
+        result = radar.status()
+    elif action == "show":
+        snapshot = (
+            radar.registry.load_generation(args.snapshot_id)
+            if args.snapshot_id
+            else radar.registry.active()
+        )
+        result = {
+            "ok": snapshot is not None,
+            "state": radar.status().get("state"),
+            "snapshot_id": snapshot.get("snapshot_id") if snapshot else None,
+            "snapshot": snapshot,
+            **({} if snapshot is not None else {"error": "no cached Radar snapshot"}),
+        }
+    elif action == "refresh":
+        store = _store(config)
+        result = radar.refresh()
+        usable = radar.status()
+        # Rebuild for every deterministic Radar state.  Ineligible states add
+        # no external records, which actively removes an expired, disabled, or
+        # revoked Radar prior from the performance snapshot instead of leaving
+        # a formerly eligible generation in use indefinitely.
+        catalog, catalog_status = _performance_catalog(config)
+        performance = PerformanceRegistry(config.state_root).refresh(
+            store,
+            catalog,
+            radar_status=usable,
+        )
+        result["performance"] = {
+            "ok": True,
+            "snapshot_id": performance["active_generation_id"],
+            "activated": performance["activated"],
+            "unchanged": performance["unchanged"],
+            "radar_state": usable.get("state"),
+            "imported_radar_prior": usable.get("routing_prior_eligible") is True,
+            "catalog": catalog_status,
+            "model_calls": 0,
+        }
+    else:
+        raise ValueError(f"unsupported radar action: {action}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
 
@@ -1195,6 +1265,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="replay local SQLite events/tasks into a content-addressed snapshot; never calls a model",
     )
     performance.set_defaults(func=command_performance)
+
+    radar = sub.add_parser(
+        "radar",
+        help="inspect or refresh authorized Codex Radar data and its offline cache",
+    )
+    radar_sub = radar.add_subparsers(dest="radar_action", required=True)
+    radar_sub.add_parser("status")
+    radar_show = radar_sub.add_parser("show")
+    radar_show.add_argument("snapshot_id", nargs="?")
+    radar_sub.add_parser(
+        "refresh",
+        help="refresh authorized JSON data and update the advisory performance snapshot",
+    )
+    radar.set_defaults(func=command_radar)
 
     mobile = sub.add_parser(
         "mobile",

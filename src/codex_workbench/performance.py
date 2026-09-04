@@ -24,6 +24,7 @@ from statistics import median
 import tempfile
 from typing import Any, Iterable
 
+from .radar import radar_prior_records
 from .store import WorkbenchStore
 
 
@@ -112,7 +113,11 @@ def validate_benchmark_baseline(raw: Mapping[str, Any] | object) -> dict[str, An
             _require_text(record.get(field), f"record {record_id} {field}")
         if not str(record["source_url"]).startswith("https://"):
             raise PerformanceRegistryError(f"record {record_id} source_url must use https")
-        if record["provenance"] not in {"vendor_report", "independent"}:
+        if record["provenance"] not in {
+            "vendor_report",
+            "independent",
+            "community_observation",
+        }:
             raise PerformanceRegistryError(f"record {record_id} has invalid provenance")
         task_types = record.get("task_types")
         if not isinstance(task_types, list) or not task_types or not all(
@@ -227,6 +232,7 @@ class _Attempt:
     model_id: str
     agent_name: str
     agent_version: str
+    reasoning_effort: str
     task_type: str
     complexity: str
     task_state: str | None
@@ -346,10 +352,21 @@ def compute_runtime_metrics(
         task_type = _normalized_task_type(spec.get("task_type") or contract.get("task_type"))
         complexity = _normalized_complexity(spec.get("complexity") or contract.get("complexity"))
         start = starts.get((task_id, node_id, attempt))
+        start_payload = (
+            start.get("payload")
+            if isinstance(start, Mapping) and isinstance(start.get("payload"), Mapping)
+            else {}
+        )
         agent_version = (
             _text(result.get("agent_version"))
             or _text(spec.get("agent_version"))
             or "unattested"
+        )
+        reasoning_effort = (
+            _text(result.get("model_reasoning_effort"))
+            or _text(start_payload.get("model_reasoning_effort"))
+            or _text(spec.get("model_reasoning_effort"))
+            or "unspecified"
         )
         attempts.append(
             _Attempt(
@@ -362,6 +379,7 @@ def compute_runtime_metrics(
                 model_id=model_id,
                 agent_name=_text(result.get("agent_name")) or _text(spec.get("agent_name")) or provider,
                 agent_version=agent_version,
+                reasoning_effort=reasoning_effort,
                 task_type=task_type,
                 complexity=complexity,
                 task_state=task_states.get(task_id),
@@ -382,7 +400,7 @@ def compute_runtime_metrics(
             )
         )
 
-    grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     logical: dict[tuple[str, str], list[_Attempt]] = defaultdict(list)
     for attempt in attempts:
         group = grouped.setdefault(_attempt_group_key(attempt), _empty_group(attempt))
@@ -475,12 +493,21 @@ def build_performance_snapshot(
     *,
     quota: object | None = None,
     baseline: Mapping[str, Any] | None = None,
+    radar_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic, content-addressed performance generation."""
 
     active_baseline = validate_benchmark_baseline(
         baseline if baseline is not None else load_benchmark_baseline()
     )
+    external_records = radar_prior_records(radar_status or {}, catalog)
+    if external_records:
+        active_baseline = validate_benchmark_baseline(
+            {
+                **active_baseline,
+                "records": [*active_baseline["records"], *external_records],
+            }
+        )
     runtime = compute_runtime_metrics(events, tasks, baseline=active_baseline)
     catalog_identity = {
         "catalog_id": _text(catalog.get("catalog_id")) if isinstance(catalog, Mapping) else None,
@@ -499,6 +526,17 @@ def build_performance_snapshot(
         }
         for record in active_baseline["records"]
     ]
+    source_provenance: dict[str, Any] = {
+        "benchmark_records": sources,
+        "runtime_ledger": {
+            "kind": "append-only-events-and-current-task-contracts",
+            "event_cursor": runtime["event_cursor"],
+        },
+    }
+    if radar_status is not None:
+        source_provenance["external_priors"] = {
+            "codex_radar": _radar_provenance(radar_status, len(external_records))
+        }
     body = {
         "schema_version": PERFORMANCE_SNAPSHOT_SCHEMA_VERSION,
         "producer": PERFORMANCE_SNAPSHOT_PRODUCER,
@@ -512,13 +550,7 @@ def build_performance_snapshot(
         "ledger": runtime["ledger"],
         "metrics": runtime["metrics"],
         "pools": _quota_pools(quota),
-        "source_provenance": {
-            "benchmark_records": sources,
-            "runtime_ledger": {
-                "kind": "append-only-events-and-current-task-contracts",
-                "event_cursor": runtime["event_cursor"],
-            },
-        },
+        "source_provenance": source_provenance,
         "advisory_policy": {
             "quality_first": True,
             "hard_capability_gates_required": True,
@@ -612,7 +644,13 @@ class PerformanceRegistry:
     def active_path(self) -> Path:
         return self.root / "active.json"
 
-    def refresh(self, store: WorkbenchStore, catalog: Mapping[str, Any]) -> dict[str, Any]:
+    def refresh(
+        self,
+        store: WorkbenchStore,
+        catalog: Mapping[str, Any],
+        *,
+        radar_status: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Read the full durable ledger and atomically activate its generation."""
 
         events = read_all_events(store, page_size=self.event_page_size)
@@ -622,6 +660,7 @@ class PerformanceRegistry:
             tasks,
             catalog,
             quota=_latest_quota(store),
+            radar_status=radar_status,
         )
         current = self.active()
         unchanged = current is not None and current["digest"] == snapshot["digest"]
@@ -773,7 +812,7 @@ class PerformanceRegistry:
         task_type: str,
         complexity: str,
     ) -> dict[str, Any]:
-        metric_index: dict[tuple[str, str, str, str, str], Mapping[str, Any]] = {}
+        metric_index: dict[tuple[str, str, str, str, str, str], Mapping[str, Any]] = {}
         if snapshot is not None:
             for metric in snapshot["metrics"]:
                 key = metric.get("key")
@@ -783,6 +822,7 @@ class PerformanceRegistry:
                             str(key.get("provider")),
                             str(key.get("model_id")),
                             str(key.get("agent_version")),
+                            _text(key.get("reasoning_effort")) or "unspecified",
                             str(key.get("task_type")),
                             str(key.get("complexity")),
                         )
@@ -804,16 +844,25 @@ class PerformanceRegistry:
                 if isinstance(agent, Mapping):
                     agent_version = _text(agent.get("cli_version"))
             agent_version = agent_version or "unattested"
-            key = (provider, model_id, agent_version, task_type, complexity)
+            reasoning_effort = _preferred_effort(record)
+            key = (
+                provider,
+                model_id,
+                agent_version,
+                reasoning_effort or "unspecified",
+                task_type,
+                complexity,
+            )
             metric = metric_index.get(key)
+            prior = _prior_for(
+                active_baseline,
+                provider=provider,
+                model_id=model_id,
+                model_family=_text(record.get("model_family")) or _model_family(model_id),
+                task_type=task_type,
+                reasoning_effort=reasoning_effort,
+            )
             if metric is None:
-                prior = _prior_for(
-                    active_baseline,
-                    provider=provider,
-                    model_id=model_id,
-                    model_family=_text(record.get("model_family")) or _model_family(model_id),
-                    task_type=task_type,
-                )
                 posterior = _posterior(prior["alpha"], prior["beta"])
                 quality = {
                     "prior": prior,
@@ -826,21 +875,37 @@ class PerformanceRegistry:
                 }
                 runtime = _empty_runtime_metrics()
             else:
-                quality = {
-                    "prior": metric["prior"],
-                    "posterior": metric["posterior"],
-                }
                 raw_runtime = metric.get("runtime")
                 if not isinstance(raw_runtime, Mapping):
                     raise PerformanceRegistryError(
                         "performance metric runtime must be an object"
                     )
                 runtime = dict(raw_runtime)
+                quality_calibration = runtime.get("quality_calibration")
+                if not isinstance(quality_calibration, Mapping):
+                    raise PerformanceRegistryError(
+                        "performance metric quality_calibration must be an object"
+                    )
+                successes = int(quality_calibration.get("successes", 0))
+                failures = int(quality_calibration.get("failures", 0))
+                quality = {
+                    "prior": prior,
+                    "posterior": {
+                        **_posterior(
+                            float(prior["alpha"]) + successes,
+                            float(prior["beta"]) + failures,
+                        ),
+                        "runtime_sample_count": successes + failures,
+                        "runtime_successes": successes,
+                        "runtime_failures": failures,
+                    },
+                }
             candidates.append(
                 {
                     "provider": provider,
                     "model_id": model_id,
                     "model_family": _text(record.get("model_family")) or _model_family(model_id),
+                    "reasoning_effort": reasoning_effort,
                     "agent_version": agent_version,
                     "routable": record.get("routable") is True,
                     "quality": quality,
@@ -928,11 +993,12 @@ class PerformanceRegistry:
             raise
 
 
-def _attempt_group_key(attempt: _Attempt) -> tuple[str, str, str, str, str]:
+def _attempt_group_key(attempt: _Attempt) -> tuple[str, str, str, str, str, str]:
     return (
         attempt.provider,
         attempt.model_id,
         attempt.agent_version,
+        attempt.reasoning_effort,
         attempt.task_type,
         attempt.complexity,
     )
@@ -945,6 +1011,7 @@ def _empty_group(attempt: _Attempt) -> dict[str, Any]:
             "model_id": attempt.model_id,
             "agent_name": attempt.agent_name,
             "agent_version": attempt.agent_version,
+            "reasoning_effort": attempt.reasoning_effort,
             "task_type": attempt.task_type,
             "complexity": attempt.complexity,
         },
@@ -974,6 +1041,11 @@ def _finish_group(group: Mapping[str, Any], baseline: Mapping[str, Any]) -> dict
         model_id=str(key["model_id"]),
         model_family=_model_family(str(key["model_id"])),
         task_type=str(key["task_type"]),
+        reasoning_effort=(
+            None
+            if str(key.get("reasoning_effort", "unspecified")) == "unspecified"
+            else str(key["reasoning_effort"])
+        ),
     )
     successes = int(group["quality_successes"])
     failures = int(group["quality_failures"])
@@ -1024,12 +1096,16 @@ def _prior_for(
     model_id: str,
     model_family: str | None,
     task_type: str,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     exact: list[Mapping[str, Any]] = []
     family: list[Mapping[str, Any]] = []
     declarative: list[Mapping[str, Any]] = []
     for record in baseline["records"]:
         if record["provider"] != provider or task_type not in record["task_types"]:
+            continue
+        record_effort = _text(record.get("reasoning_effort"))
+        if record_effort is not None and record_effort != reasoning_effort:
             continue
         if record["model_id"] == model_id:
             if record.get("score") is None:
@@ -1060,6 +1136,7 @@ def _prior_for(
         beta = 1.0
         evidence: list[dict[str, Any]] = []
         for record, multiplier, match_kind in selected:
+            selected_effort = _text(record.get("reasoning_effort"))
             strength = float(record["effective_sample_strength"]) * multiplier
             score = float(record["score"])
             alpha += score * strength
@@ -1075,6 +1152,11 @@ def _prior_for(
                     "match_kind": match_kind,
                     "effective_sample_strength": round(strength, 6),
                     "agent_scaffold": record["agent_scaffold"],
+                    **(
+                        {"reasoning_effort": selected_effort}
+                        if selected_effort is not None
+                        else {}
+                    ),
                 }
             )
         return {
@@ -1109,6 +1191,37 @@ def _prior_for(
         "alpha": 1.0,
         "beta": 2.0,
         "evidence": [],
+    }
+
+
+def _preferred_effort(record: Mapping[str, Any]) -> str | None:
+    reasoning = record.get("reasoning")
+    if not isinstance(reasoning, Mapping):
+        return None
+    for field in ("preferred_effort", "default_effort"):
+        value = _text(reasoning.get(field))
+        if value is not None:
+            return value
+    supported = reasoning.get("supported_efforts")
+    if isinstance(supported, list) and len(supported) == 1:
+        return _text(supported[0])
+    return None
+
+
+def _radar_provenance(status: Mapping[str, Any], imported_records: int) -> dict[str, Any]:
+    return {
+        "provider": "codex-radar-provider",
+        "state": status.get("state"),
+        "routing_prior_eligible": status.get("routing_prior_eligible") is True,
+        "snapshot_id": status.get("snapshot_id"),
+        "digest": status.get("digest"),
+        "fetched_at": status.get("fetched_at"),
+        "source_updated_at": status.get("source_updated_at"),
+        "transfer_multiplier": status.get("transfer_multiplier", 0.0),
+        "imported_record_count": imported_records,
+        "attribution": status.get("attribution"),
+        "offline_last_known_good": status.get("offline_cache_available") is True,
+        "iq_used_as_pass_rate": False,
     }
 
 

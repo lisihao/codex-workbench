@@ -23,6 +23,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 | 强模型被实现细节占满 | Sol 负责需求编译、跨模块判断和最终验收；边界明确的实现优先交给 Spark、Luna、Terra 或受配额约束的 Claude Worker。 |
 | Claude Code 订阅被后台任务耗尽 | Claude Worker 只在认证和新鲜配额快照可证明时启用；未知状态会 fail closed 并转交 Codex。系统保留至少 20% 的目标配额空间，并设有更早的调度门槛。 |
 | 不知道哪个模型在当前工作里更合适 | Workbench 使用按领域的公开 benchmark 冷启动先验，再用长期运行账本校准；它不把不同 benchmark 拼成一个排行榜，也不把公开分数冒充本机成功率。 |
+| 联网时能看到模型众测数据，断网后调度却失去依据 | 通用 `codex_radar_provider` 将获授权的 Codex Radar JSON 以内容寻址 generation 缓存；断网复用 last-known-good，过期后回落内置 baseline。 |
 | 验证反复运行、成本高且结论不清 | `code-as-harness/v1` 将 L0–L3 验证层级和 Evidence fingerprint 写入任务契约；相同输入闭包的已通过证据可复用。 |
 
 ## 运行模型
@@ -42,7 +43,8 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 │         │                       ├── optional Claude Code workers   │
 │         │                       └── deterministic build/test tools │
 │         │                                                          │
-│         ├── performance baseline + runtime ledger ──► score policy │
+│         ├── public baseline + authorized Radar offline cache       │
+│         │                         + runtime ledger ──► score policy │
 │         │                                                          │
 │         └──► independent Sol verifier ──► Evidence ──► accepted   │
 └────────────────────────────────────────────────────────────────────┘
@@ -61,6 +63,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 - **`wb` Codex 入口**：一个薄插件，将新会话或已有会话绑定到同一份持久任务。它同步经脱敏的会话摘要与受控 Git 上下文，而不持有第二份任务状态。
 - **Claude Code Worker**：可选的订阅型执行器，不承担规划或最终验收。认证、CLI 兼容性或配额状态不明确时不会猜测余额，也不会使用 API-key fallback。
 - **Claude 登录与配额采集**：Claude Code 原生订阅 OAuth 的凭据由官方 macOS CLI 保存在系统 Keychain；Workbench 不复制、导出或持久化 token，只调用 `auth status` 与受限的 `/usage` 观察。当前受支持的 collector 兼容锁定的 Claude CLI `2.1.239`，既接受对象也接受其真实数组 envelope；认证或解析失败会 fail closed，不循环重新登录。
+- **Codex Radar Provider**：独立于 Workbench/DSH 的标准库-only package/CLI。Mac mini 在授权成立后低频采集，原始响应脱敏、标准化快照原子落盘；MacBook 只读 Authority 状态。Radar 不是配额源，也不能绕过路由硬门禁。
 - **离线回落**：如果 Authority 不可达，已绑定会话继续在 MacBook 当前 checkout 上工作；系统不会在离线端静默创建第二个 Authority，下一次可用连接再重试同步。
 
 ## 核心能力与边界
@@ -71,7 +74,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 
 路由不是固定“弱模型干活”的盲目规则：低风险、短且可机械验收的工作可进入独立 Spark 池；边界明确的常规实现优先 Luna；较大的独立切片可以升级 Terra；需求拆解、跨模块判断和最终验收留给 Sol。Claude Code 的 Sonnet、Opus 或 Fable 只在其订阅资格和受保护配额可证明时作为 Worker 使用。
 
-Workbench 对 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna` 的 Codex 进程显式传入 `model_context_window=1000000` 与 `model_auto_compact_token_limit=900000`。这是必须的，因为受管 planner/worker 使用 `--ignore-user-config`；`gpt-5.3-codex-spark` 不接收这两个覆盖值，保持其模型自身的上下文合同。
+Workbench 对 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna` 的 Codex 进程显式传入 `model_context_window=500000` 与 `model_auto_compact_token_limit=450000`。这是容量与额度消耗之间的默认平衡点；受管 planner/worker 使用 `--ignore-user-config`，因此必须显式传入。`gpt-5.3-codex-spark` 不接收这两个覆盖值，保持其模型自身的上下文合同。
 
 Spark 是一个独立的逻辑队列，不是另一套协调器。它和普通 Worker 共享全局执行器上限，但拥有自己的容量、等待、启动和 busy-slot 计数；默认上限为 `min(4, max_workers)`，可用 `serve --spark-workers N` 调整，`0` 表示关闭 Spark 优先 lane。规划器会主动寻找互不冲突、可单独验收的短切片；无法安全拆分时保留 Luna/Terra 的较大切片。routing-v3 的 Spark 失败不会被当成成功，也不会在 claim 时绕过已固定能力目录静默换模型；需要换档时由后续 planner repair 重新路由，最终仍由 Sol 验收。
 
@@ -106,9 +109,16 @@ codex-workbench worktree restore <archive-id> --destination <local-path>
 
 Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam) 等公开资料建立按领域的冷启动先验。Terminal、SWE 和 HLE 衡量的事情不同，因此不会被合并成一个“总分”；每条先验都保留来源、模型/Agent 配对和迁移折扣，不能替代本机验收。
 
-长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 仍保留为运行证据，但只记作 unresolved，不进入模型质量成功/失败分母。当前尚无更细的 `failure_origin` 分类器，不能进一步区分网络、主机、harness 或模型自身原因。Beta 后验的保守排名信号与声明质量门禁分开记录，只在硬门禁之后参与 advisory 排序；当前校准接口仅报告 `cold-start`（无活动快照）或 `ok`（有活动快照），尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值。
+长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率，并按 provider/model/Agent version/reasoning effort/task/complexity 精确分桶。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 仍保留为运行证据，但只记作 unresolved，不进入模型质量成功/失败分母。当前尚无更细的 `failure_origin` 分类器，不能进一步区分网络、主机、harness 或模型自身原因。Beta 后验的保守排名信号与声明质量门禁分开记录，只在硬门禁之后参与 advisory 排序；当前校准接口仅报告 `cold-start`（无活动快照）或 `ok`（有活动快照），尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值。
 
-创建任务时，当前 performance snapshot、能力目录 digest 和 policy version 会固定进 TaskContract/NodeSpec；刷新或升级不会重路由已运行任务。快照是可重建的派生缓存，不是第二份状态真相；所有刷新都是本地、被动、无模型调用和无登录操作。
+创建任务时，当前 performance snapshot、能力目录 digest 和 policy version 会固定进 TaskContract/NodeSpec；刷新或升级不会重路由已运行任务。快照是可重建的派生缓存，不是第二份状态真相；`performance refresh` 只读本地账本与缓存，无模型调用和登录操作。
+
+可选的 Codex Radar 集成复用上游 `WineChord/codex-radar` 同步契约，但采集与缓存由通用
+`codex_radar_provider` 承担。没有官方数据授权时，它在网络请求前返回 `unauthorized`；有
+有效缓存时，Workbench 只接纳精确 model + reasoning effort、显式 pass rate 和正样本量，
+fresh 数据最多形成 5 个等效弱样本，stale 数据再乘 0.25，超过 31 天停止影响路由。IQ
+只保留为元数据，绝不转换成通过率。该 Provider 可由 DSH 后续独立安装和消费，本版本没有
+修改 DSH。
 
 常用观测入口：
 
@@ -116,7 +126,11 @@ Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方�
 codex-workbench performance status
 codex-workbench performance show
 codex-workbench performance refresh       # 只重放本地账本，不调用模型
+codex-workbench radar status               # 只读本地授权与缓存状态
+codex-workbench radar show                 # 只读 last-known-good 快照
+codex-workbench radar refresh              # Authority；无授权时零网络
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/performance
+curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/radar
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/scheduler
 ```
 
@@ -145,6 +159,8 @@ Workbench 将 `code-as-harness/v1` 投影到 Codex 与 Claude Code 的受控路�
 - **Archify**：仓库固定携带 Archify 的 stable core，并把它用于架构、设计、审核和需求类任务的 typed JSON IR、渲染与 receipt。渲染/Schema 通过只证明工件约束通过，不证明架构事实、运行时因果或推理质量；语义和视觉结论仍需要外部或人工 Evidence。
 
 详情请见 [原设计忠实度矩阵](docs/fidelity-matrix.md) 与 [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md)。
+Radar 的授权、离线缓存、保守权重与未来 DSH 消费协议见
+[Codex Radar 通用 Provider 与 Workbench 集成](docs/codex-radar-integration.md)。
 
 ### Claude 配额保护
 
@@ -339,12 +355,13 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.8.2`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.8.2 包含 benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证、强制 Tailscale 远程归档，以及受管 Sol/Terra/Luna 的显式长上下文覆盖；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
+当前源码版本为 `1.9.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.9.0 包含通用 Codex Radar 离线 Provider（真实采集待授权）、benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证、强制 Tailscale 远程归档，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
-- [Backlog](docs/backlog.md) — 已明确后置的手机接入与通知工作。
+- [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、授权、断网缓存、Workbench 先验与未来 DSH 消费合同。
+- [Backlog](docs/backlog.md) — 已明确后置的真实外部 Evidence 与通知工作。
 
 ## 项目边界
 

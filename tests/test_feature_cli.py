@@ -15,6 +15,7 @@ from codex_workbench.cli import (
     command_capabilities,
     command_mobile,
     command_performance,
+    command_radar,
     command_serve,
 )
 from codex_workbench.config import WorkbenchConfig
@@ -95,6 +96,10 @@ class FeatureCLITests(unittest.TestCase):
         )
         self.assertEqual(worktree.worktree_action, "send")
         self.assertEqual(worktree.allocation_id, "wta-fixture")
+
+        radar = parser.parse_args(["radar", "show", "codex-radar-v1-0123456789abcdef"])
+        self.assertEqual(radar.radar_action, "show")
+        self.assertEqual(radar.snapshot_id, "codex-radar-v1-0123456789abcdef")
 
     def test_capability_refresh_uses_actual_binary_env_and_returns_explicit_ok(self) -> None:
         with tempfile.TemporaryDirectory(prefix="feature-cli-") as directory:
@@ -182,6 +187,34 @@ class FeatureCLITests(unittest.TestCase):
             self.assertEqual(show_code, 0)
             self.assertEqual(shown["snapshot_id"], snapshot_id)
             self.assertEqual(shown["snapshot"]["pools"]["spark"]["remaining_display"], "N/A")
+
+    def test_radar_status_and_unauthorized_refresh_make_no_network_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="radar-cli-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(
+                root,
+                deployment_role="authority",
+                authority_host=socket.gethostname(),
+                authority_machine_id=authority_machine_id(),
+            ).initialize()
+            parser = build_parser()
+            status = parser.parse_args(["--home", directory, "radar", "status"])
+            refresh = parser.parse_args(["--home", directory, "radar", "refresh"])
+
+            with mock.patch("codex_radar_provider.provider.urlopen") as network:
+                status_code, status_payload = self._run(command_radar, status)
+                refresh_code, refresh_payload = self._run(command_radar, refresh)
+
+            self.assertEqual(status_code, 1)
+            self.assertEqual(status_payload["state"], "unauthorized")
+            self.assertEqual(refresh_code, 1)
+            self.assertEqual(refresh_payload["state"], "unauthorized")
+            self.assertFalse(refresh_payload["network_requested"])
+            self.assertTrue(refresh_payload["performance"]["ok"])
+            self.assertEqual(refresh_payload["performance"]["radar_state"], "unauthorized")
+            self.assertFalse(refresh_payload["performance"]["imported_radar_prior"])
+            self.assertEqual(refresh_payload["performance"]["model_calls"], 0)
+            network.assert_not_called()
 
     def test_capability_refresh_on_authority_refreshes_the_matching_performance_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capability-performance-cli-") as directory:

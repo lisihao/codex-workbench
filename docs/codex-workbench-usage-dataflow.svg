@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
   <title id="title">Codex Workbench 使用方式与数据流</title>
-  <desc id="desc">从 MacBook 或手机 Remote 的任意 Codex 会话输入 wb，经受控上下文同步到 Mac mini Authority；版本化能力目录驱动 Sol、Spark、Luna、Terra 与受配额保护的 Claude Worker 路由，在隔离 worktree 中执行，经过 Evidence 验收后将状态和结果回传原会话。网络中断时回落到 MacBook 当前 checkout 并写入待重试 outbox。</desc>
+  <desc id="desc">从 MacBook 或手机 Remote 的任意 Codex 会话输入 wb，经受控上下文同步到 Mac mini Authority；版本化能力目录、公开基线、获授权的 Codex Radar 离线缓存与本机运行账本共同形成保守性能快照，驱动 Sol、Spark、Luna、Terra 与受配额保护的 Claude Worker 路由，在隔离 worktree 中执行，经过 Evidence 验收后将状态和结果回传原会话。网络中断时回落到 MacBook 当前 checkout 并写入待重试 outbox。</desc>
 
   <defs>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
@@ -141,8 +141,8 @@
     <rect class="amber-node" width="724" height="82" rx="17"/>
     <rect x="18" y="18" width="36" height="26" rx="8" fill="#b67b12"/>
     <text class="step mono" x="28" y="36" fill="#ffffff">05</text>
-    <text class="card-title" x="68" y="37">能力目录 + Sol：恢复目标与验收边界</text>
-    <text class="card-copy" x="68" y="62">固定 catalog → TaskContract → 质量优先路由 → scope-aware DAG</text>
+    <text class="card-title" x="68" y="37">能力目录 + 性能快照 + Sol：恢复目标与验收边界</text>
+    <text class="card-copy" x="68" y="62">固定 catalog / Radar LKG / runtime ledger → 质量优先 DAG</text>
   </g>
 
   <path d="M696 461H716V337H752" fill="none" stroke="#2367c9" stroke-width="3" marker-end="url(#arrow-blue)"/>

@@ -105,8 +105,8 @@ class PlannerRoutingTests(unittest.TestCase):
         self.assertEqual(
             configs,
             [
-                "model_context_window=1000000",
-                "model_auto_compact_token_limit=900000",
+                "model_context_window=500000",
+                "model_auto_compact_token_limit=450000",
             ],
         )
 

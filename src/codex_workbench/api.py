@@ -17,6 +17,7 @@ from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
 from .performance import PerformanceRegistry
 from .quota_productivity import build_quota_productivity
+from .radar import WorkbenchRadar
 from .scheduler_metrics import build_scheduler_metrics
 from .store import StateConflictError, WorkbenchStore
 
@@ -60,6 +61,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     **store_health,
                     "harness": harness_health,
                     "capability_registry": capability_registry,
+                    "radar": self._radar_summary(),
                     "ok": overall_ok,
                 },
                 HTTPStatus.OK if overall_ok else HTTPStatus.SERVICE_UNAVAILABLE,
@@ -74,6 +76,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "harness": code_as_harness_health(self.server.config),
                     "capability_registry": self._capability_registry_summary(),
                     "performance": self._performance_registry_summary(),
+                    "radar": self._radar_summary(),
                     "scheduler": self._scheduler_metrics(),
                     "health": self.server.store.health(),
                     "tasks": self.server.store.list_tasks(),
@@ -91,6 +94,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/performance":
             return self._json(self._performance_registry_summary())
+        if parsed.path == "/api/radar":
+            return self._json(self._radar_summary())
         if parsed.path == "/api/scheduler":
             return self._json(self._scheduler_metrics())
         if parsed.path == "/api/capabilities":
@@ -333,6 +338,33 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         """Read the local, materialized performance ledger without probing models."""
 
         return PerformanceRegistry(self.server.config.state_root)
+
+    def _radar_summary(self) -> dict[str, object]:
+        """Expose provider/cache state without refreshing or touching credentials."""
+
+        config = self.server.config
+        status = WorkbenchRadar(
+            state_root=config.effective_radar_state_root,
+            authorization_file=config.effective_radar_authorization_file,
+            enabled=config.radar_enabled,
+            stale_after_seconds=config.radar_stale_after_seconds,
+            expire_after_seconds=config.radar_expire_after_seconds,
+        ).status()
+        snapshot = status.pop("snapshot", None)
+        active = None
+        if isinstance(snapshot, dict):
+            active = {
+                "snapshot_id": snapshot.get("snapshot_id"),
+                "digest": snapshot.get("digest"),
+                "upstream": snapshot.get("upstream"),
+                "source_urls": snapshot.get("source_urls"),
+                "fetched_at": snapshot.get("fetched_at"),
+                "source_updated_at": snapshot.get("source_updated_at"),
+                "models": snapshot.get("models") if isinstance(snapshot.get("models"), list) else [],
+                "insights": snapshot.get("insights") if isinstance(snapshot.get("insights"), dict) else {},
+                "attribution": snapshot.get("attribution"),
+            }
+        return {**status, "active": active, "read_only": True, "network_requested": False}
 
     def _performance_registry_summary(self) -> dict[str, object]:
         """Return the active calibrated snapshot, if one has been materialized.

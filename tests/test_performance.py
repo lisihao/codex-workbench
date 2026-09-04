@@ -67,21 +67,23 @@ def task(
     verifier: bool = False,
     task_type: str = "implementation",
     complexity: str = "standard",
+    reasoning_effort: str | None = None,
 ) -> dict[str, object]:
+    node: dict[str, object] = {
+        "node_id": "work",
+        "executor": executor,
+        "model": model,
+        "verifier": verifier,
+        "task_type": task_type,
+        "complexity": complexity,
+    }
+    if reasoning_effort is not None:
+        node["model_reasoning_effort"] = reasoning_effort
     return {
         "task_id": task_id,
         "state": state,
         "contract": {"task_type": task_type, "complexity": complexity},
-        "nodes": [
-            {
-                "node_id": "work",
-                "executor": executor,
-                "model": model,
-                "verifier": verifier,
-                "task_type": task_type,
-                "complexity": complexity,
-            }
-        ],
+        "nodes": [node],
     }
 
 
@@ -288,6 +290,108 @@ class PerformanceRegistryTests(unittest.TestCase):
         self.assertEqual(retried["runtime"]["duration_seconds"]["mean"], 15)
         self.assertEqual(clean["runtime"]["quality_calibration"]["sample_count"], 1)
         self.assertGreater(clean["posterior"]["mean"], retried["posterior"]["mean"])
+
+    def test_runtime_metrics_and_calibration_are_isolated_by_reasoning_effort(self) -> None:
+        effort_catalog = catalog()
+        effort_catalog["models"][0]["reasoning"] = {
+            "preferred_effort": "max",
+            "supported_efforts": ["high", "max"],
+        }
+        events = [
+            event(1, "node.started", task_id="max-task", node_id="work", payload={"attempt": 1}),
+            event(2, "node.accepted", task_id="max-task", node_id="work", payload={"attempt": 1, "result": result("succeeded")}),
+            event(3, "task.state_changed", task_id="max-task", payload={"to": "accepted"}),
+            event(4, "node.started", task_id="high-task", node_id="work", payload={"attempt": 1}),
+            event(5, "node.failed", task_id="high-task", node_id="work", payload={"attempt": 1, "result": result("failed")}),
+            event(6, "task.state_changed", task_id="high-task", payload={"to": "needs_fix"}),
+        ]
+        registry = PerformanceRegistry(self.root)
+        refreshed = registry.refresh(
+            FakeStore(
+                events,
+                [
+                    task("max-task", reasoning_effort="max"),
+                    task("high-task", state="needs_fix", reasoning_effort="high"),
+                ],
+            ),
+            effort_catalog,
+        )
+
+        metrics = {
+            item["key"]["reasoning_effort"]: item
+            for item in refreshed["snapshot"]["metrics"]
+        }
+        self.assertEqual(set(metrics), {"high", "max"})
+        self.assertEqual(metrics["max"]["runtime"]["quality_calibration"]["successes"], 1)
+        self.assertEqual(metrics["high"]["runtime"]["quality_calibration"]["failures"], 1)
+
+        calibration = registry.calibrate(effort_catalog, "implementation", "standard")
+        luna = next(item for item in calibration["candidates"] if item["model_id"] == "gpt-5.6-luna")
+        self.assertEqual(luna["reasoning_effort"], "max")
+        self.assertEqual(luna["quality"]["posterior"]["runtime_sample_count"], 1)
+        self.assertEqual(luna["quality"]["posterior"]["runtime_successes"], 1)
+        self.assertEqual(luna["quality"]["posterior"]["runtime_failures"], 0)
+
+    def test_retry_uses_the_effective_started_effort_instead_of_the_original_node_spec(self) -> None:
+        events = [
+            event(
+                1,
+                "node.started",
+                task_id="retry-effort",
+                node_id="work",
+                payload={"attempt": 1, "model_reasoning_effort": "xhigh"},
+            ),
+            event(
+                2,
+                "node.failed",
+                task_id="retry-effort",
+                node_id="work",
+                payload={
+                    "attempt": 1,
+                    "result": result("failed", model="gpt-5.3-codex-spark"),
+                },
+            ),
+            event(3, "node.retry_scheduled", task_id="retry-effort", node_id="work", payload={"attempt": 1}),
+            event(
+                4,
+                "node.started",
+                task_id="retry-effort",
+                node_id="work",
+                payload={"attempt": 2, "model_reasoning_effort": "max"},
+            ),
+            event(
+                5,
+                "node.accepted",
+                task_id="retry-effort",
+                node_id="work",
+                payload={"attempt": 2, "result": result("succeeded")},
+            ),
+            event(6, "task.state_changed", task_id="retry-effort", payload={"to": "accepted"}),
+        ]
+
+        snapshot = build_performance_snapshot(
+            events,
+            [
+                task(
+                    "retry-effort",
+                    model="gpt-5.3-codex-spark",
+                    reasoning_effort="xhigh",
+                )
+            ],
+            catalog(),
+        )
+        identities = {
+            (metric["key"]["model_id"], metric["key"]["reasoning_effort"])
+            for metric in snapshot["metrics"]
+        }
+
+        self.assertEqual(
+            identities,
+            {
+                ("gpt-5.3-codex-spark", "xhigh"),
+                ("gpt-5.6-luna", "max"),
+            },
+        )
 
     def test_nonzero_process_failure_is_operational_not_model_quality_rework(self) -> None:
         failed = result("failed")

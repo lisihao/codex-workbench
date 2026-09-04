@@ -970,6 +970,7 @@ def _performance_candidate(
     provider: str,
     model: str,
     agent_version: str,
+    reasoning_effort: str | None,
     task_type: str,
     complexity: str,
 ) -> dict[str, Any] | None:
@@ -999,12 +1000,14 @@ def _performance_candidate(
             _first(raw, "agent_version", "agent_cli_version", "cli_version"),
             default="unattested",
         )
+        candidate_effort = _optional_text(raw.get("reasoning_effort"))
         candidate_task = _optional_text(raw.get("task_type"))
         candidate_complexity = _optional_text(raw.get("complexity"))
         if (
             candidate_provider != provider
             or candidate_model != model
             or candidate_agent != agent_version
+            or candidate_effort != reasoning_effort
             or candidate_task not in {None, task_type}
             or candidate_complexity not in {None, complexity}
         ):
@@ -1158,12 +1161,14 @@ def _candidate_inputs(
     utilization = (active + weight) / capacity if capacity > 0 else 1.0
     capability_digest = _text(record.get("digest"), default=_digest_mapping(record))
     agent_version = _record_agent_version(snapshot, record, provider)
+    reasoning_effort = _record_reasoning_effort(record, request)
     performance_calibration, performance_snapshot_id, performance_digest, _ = performance
     performance_candidate = _performance_candidate(
         performance_calibration,
         provider=provider,
         model=model,
         agent_version=agent_version,
+        reasoning_effort=reasoning_effort,
         task_type=task_type,
         complexity=complexity,
     )
@@ -1232,6 +1237,25 @@ def _candidate_inputs(
         "performance_rework_rate": performance_values["rework_rate"],
         "performance_latency_ms": performance_values["latency_ms"],
     }
+
+
+def _record_reasoning_effort(
+    record: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> str | None:
+    requested = _optional_text(request.get("reasoning_effort"))
+    if requested is not None:
+        return requested
+    reasoning = _first(record, "reasoning", "reasoning_efforts", "supported_reasoning_efforts")
+    if isinstance(reasoning, Mapping):
+        for key in ("preferred_effort", "default_effort"):
+            value = _optional_text(reasoning.get(key))
+            if value is not None:
+                return value
+        supported = _declared_values(record, ("reasoning", "reasoning_efforts", "supported_reasoning_efforts"))
+    else:
+        supported = _string_set(reasoning)
+    return next(iter(supported)) if len(supported) == 1 else None
 
 
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[float | str, ...]:

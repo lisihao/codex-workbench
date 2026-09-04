@@ -56,6 +56,8 @@ class APITests(unittest.TestCase):
                     performance = json.load(response)
                 with urlopen(f"http://127.0.0.1:{port}/api/scheduler", timeout=2) as response:
                     scheduler = json.load(response)
+                with urlopen(f"http://127.0.0.1:{port}/api/radar", timeout=2) as response:
+                    radar = json.load(response)
                 with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
                     snapshot = json.load(response)
 
@@ -67,8 +69,13 @@ class APITests(unittest.TestCase):
                 self.assertEqual(performance["active"]["pools"]["spark"]["remaining_display"], "N/A")
                 self.assertEqual(scheduler["lanes"]["spark"]["capacity"], 2)
                 self.assertEqual(scheduler["quota_pools"]["codex-spark"]["status"], "N/A")
+                self.assertEqual(radar["state"], "unauthorized")
+                self.assertTrue(radar["read_only"])
+                self.assertFalse(radar["network_requested"])
+                self.assertIsNone(radar["active"])
                 self.assertEqual(snapshot["performance"]["active_generation_id"], refreshed["active_generation_id"])
                 self.assertEqual(snapshot["scheduler"]["lanes"]["spark"]["capacity"], 2)
+                self.assertEqual(snapshot["radar"]["state"], "unauthorized")
             finally:
                 server.shutdown()
                 server.server_close()

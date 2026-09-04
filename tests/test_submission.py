@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 from typing import get_args
 import unittest
 from unittest.mock import MagicMock, patch
 
+from codex_radar_provider import RadarRegistry
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.claude_quota import (
     COMPATIBLE_SOURCE,
@@ -21,6 +23,7 @@ from codex_workbench.model import (
     RoutingTaskType,
     now_iso,
 )
+from codex_workbench.performance import PerformanceRegistry
 from codex_workbench.store import WorkbenchStore
 from codex_workbench.submission import submit_natural_language_request
 
@@ -54,11 +57,77 @@ def active_catalog() -> dict[str, object]:
             {
                 "provider": "codex",
                 "model_id": "gpt-5.6-sol",
+                "model_family": "sol",
                 "status": "available",
                 "routable": True,
+                "reasoning": {
+                    "preferred_effort": "max",
+                    "supported_efforts": ["max"],
+                },
             }
         ],
     }
+
+
+def install_fresh_radar(config: WorkbenchConfig) -> None:
+    observed_at = now_iso()
+    authorization = config.effective_radar_authorization_file
+    authorization.parent.mkdir(parents=True, exist_ok=True)
+    authorization.write_text(
+        json.dumps(
+            {
+                "schema": "codex-radar-provider-authorization",
+                "version": 1,
+                "provider": "codex-radar",
+                "status": "authorized",
+                "scope": ["fixture-model-quality-json"],
+                "attribution": "数据来自 Codex 雷达 codexradar.com",
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = RadarRegistry(config.effective_radar_state_root).import_payloads(
+        {
+            "current": {
+                "schema_version": 2,
+                "checked_at": observed_at,
+                "model_iq": {
+                    "latest": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "max",
+                        "passed": 9,
+                        "valid_tasks": 10,
+                        "iq": 110,
+                    }
+                },
+            },
+            "intelligence_efficiency": {
+                "schema": 2,
+                "source_updated_at": observed_at,
+                "points": [
+                    {
+                        "model": "gpt-5.6-sol",
+                        "effort": "max",
+                        "passed": 9,
+                        "valid_tasks": 10,
+                        "iq": 110,
+                    }
+                ],
+            },
+            "model_ratings": {"updated_at": observed_at, "models": []},
+            "radar_insights": {
+                "schema": 1,
+                "generated_at": observed_at,
+                "source_updated_at": observed_at,
+                "recommendations": [],
+                "alerts": [],
+            },
+        },
+        authorization,
+        fetched_at=observed_at,
+    )
+    if imported.get("generation_created") is not True:
+        raise AssertionError(f"Radar fixture import failed: {imported}")
 
 
 class SubmissionTests(unittest.TestCase):
@@ -309,6 +378,7 @@ class SubmissionTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
             config = WorkbenchConfig(root / "state")
             config.initialize()
+            install_fresh_radar(config)
             store = WorkbenchStore(config.database)
             store.initialize()
             planned = [
@@ -380,6 +450,17 @@ class SubmissionTests(unittest.TestCase):
             self.assertEqual(
                 compile_plan.call_args.kwargs["performance_calibration"],
                 calibration,
+            )
+            active_performance = PerformanceRegistry(config.state_root).active()
+            self.assertIsNotNone(active_performance)
+            radar_provenance = active_performance["source_provenance"]["external_priors"]["codex_radar"]
+            self.assertEqual(radar_provenance["state"], "fresh")
+            self.assertEqual(radar_provenance["imported_record_count"], 1)
+            self.assertTrue(
+                any(
+                    record.get("provenance") == "community_observation"
+                    for record in active_performance["baseline"]["records"]
+                )
             )
 
     def test_failed_first_capability_refresh_reports_legacy_v2_without_pinning(self) -> None:

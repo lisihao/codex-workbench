@@ -16,15 +16,29 @@ import uuid
 LABEL = "com.lisihao.codex-workbench"
 QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
 CAPABILITY_LABEL = "com.lisihao.codex-workbench-capabilities"
+RADAR_LABEL = "com.lisihao.codex-workbench-radar"
 DEFAULT_TAILSCALE_HTTPS_PORT = 10443
 DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_AUTHORITY_MAX_WORKERS = 8
 DEFAULT_AUTHORITY_SPARK_WORKERS = 4
 DEFAULT_CAPABILITY_REFRESH_SECONDS = 6 * 60 * 60
+DEFAULT_RADAR_REFRESH_SECONDS = 6 * 60 * 60
 CAPABILITY_REGISTRY_SCHEMA_VERSION = 1
 CAPABILITY_REGISTRY_POLICY = "model-routing-v3"
 PERFORMANCE_BASELINE_RESOURCE = "codex_workbench.data/model-performance-baseline-v1.json"
 PERFORMANCE_STATE_DIRECTORY = "performance"
+RADAR_STATE_DIRECTORY = "radar"
+RADAR_AUTHORIZATION_FILENAME = "authorization.json"
+RADAR_PRODUCER = "codex-radar-provider"
+RADAR_UPSTREAM_REPOSITORY = "https://github.com/WineChord/codex-radar"
+RADAR_UPSTREAM_TAG = "v0.1.69"
+RADAR_UPSTREAM_COMMIT = "4c83973df6b17e6b18b0b56e8735168580fea12b"
+RADAR_ATTRIBUTION = "数据来自 Codex 雷达 codexradar.com"
+RADAR_UPSTREAM_METADATA = {
+    "repository": RADAR_UPSTREAM_REPOSITORY,
+    "tag": RADAR_UPSTREAM_TAG,
+    "commit": RADAR_UPSTREAM_COMMIT,
+}
 RESEARCH_SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "UrlVerificationProtocol.md",
@@ -387,6 +401,7 @@ def preflight_authority_plists(
     quota_snapshot_file: Path,
     claude_binary: Path | None,
     capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
+    radar_refresh_seconds: int = DEFAULT_RADAR_REFRESH_SECONDS,
 ) -> None:
     template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
     render_authority_service_plist(
@@ -425,6 +440,13 @@ def preflight_authority_plists(
         quota_snapshot_file=quota_snapshot_file,
         claude_binary=claude_binary,
         refresh_seconds=capability_refresh_seconds,
+    )
+    radar_template = (source / "launchd" / f"{RADAR_LABEL}.plist.in").read_text()
+    render_radar_plist(
+        radar_template,
+        app_root=app_root,
+        state_root=state_root,
+        refresh_seconds=radar_refresh_seconds,
     )
 
 
@@ -485,6 +507,110 @@ def performance_installation_config(
         }
     )
     return performance
+
+
+def radar_upstream_metadata(source: Path | None = None) -> dict[str, str]:
+    """Read the pinned Radar source metadata without contacting the network."""
+
+    metadata = dict(RADAR_UPSTREAM_METADATA)
+    attribution = RADAR_ATTRIBUTION
+    if source is not None:
+        lock_path = source / "plugins" / "codex-radar-provider" / "upstream-lock.json"
+        try:
+            raw = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(f"Radar upstream lock is unreadable: {lock_path}") from error
+        if not isinstance(raw, dict):
+            raise SystemExit(f"Radar upstream lock must contain a JSON object: {lock_path}")
+        for key in ("repository", "tag", "commit"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise SystemExit(f"Radar upstream lock field is invalid: {key}")
+            metadata[key] = value
+        data_source = raw.get("data_source")
+        if isinstance(data_source, dict):
+            locked_attribution = data_source.get("attribution")
+            if locked_attribution is not None:
+                if not isinstance(locked_attribution, str) or not locked_attribution.strip():
+                    raise SystemExit("Radar upstream lock attribution is invalid")
+                attribution = locked_attribution
+    metadata["attribution"] = attribution
+    return metadata
+
+
+def radar_refresh_interval(config: dict[str, object]) -> int:
+    """Resolve the authority Radar refresh period, defaulting to six hours."""
+
+    value: object = config.get("radar_refresh_seconds")
+    existing = config.get("radar")
+    if value is None and isinstance(existing, dict):
+        value = existing.get("refresh_interval_seconds", DEFAULT_RADAR_REFRESH_SECONDS)
+    if value is None:
+        value = DEFAULT_RADAR_REFRESH_SECONDS
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as error:
+        raise SystemExit("radar_refresh_seconds must be an integer greater than zero") from error
+    if resolved <= 0:
+        raise SystemExit("radar_refresh_seconds must be greater than zero")
+    return resolved
+
+
+def radar_installation_config(
+    config: dict[str, object],
+    *,
+    app_root: Path,
+    state_root: Path,
+    refresh_seconds: int,
+    upstream: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Persist the provider contract while retaining unknown user settings."""
+
+    existing = config.get("radar", {})
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise SystemExit("radar config must be a JSON object")
+    radar = dict(existing)
+    upstream_existing = radar.get("upstream", {})
+    if upstream_existing is None:
+        upstream_existing = {}
+    if not isinstance(upstream_existing, dict):
+        raise SystemExit("radar upstream config must be a JSON object")
+    upstream_config = dict(upstream_existing)
+    source_metadata = radar_upstream_metadata() if upstream is None else dict(upstream)
+    for key in ("repository", "tag", "commit"):
+        value = source_metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"Radar upstream metadata is missing: {key}")
+        upstream_config[key] = value
+    attribution = source_metadata.get("attribution", RADAR_ATTRIBUTION)
+    if not isinstance(attribution, str) or not attribution.strip():
+        raise SystemExit("Radar attribution is invalid")
+    radar_state_root = state_root / RADAR_STATE_DIRECTORY
+    authorization_file = radar_state_root / RADAR_AUTHORIZATION_FILENAME
+    radar.update(
+        {
+            "producer": RADAR_PRODUCER,
+            "upstream": upstream_config,
+            "state_root": str(radar_state_root),
+            "authorization_receipt": str(authorization_file),
+            "refresh_interval_seconds": refresh_seconds,
+            "attribution": attribution,
+            "refresh_command": [
+                str(app_root / "scripts" / "python-runtime"),
+                "-m",
+                "codex_workbench",
+                "--home",
+                str(state_root),
+                "radar",
+                "refresh",
+            ],
+            "authority_only": True,
+        }
+    )
+    radar["upstream"] = upstream_config
+    return radar
 
 
 def _set_authority_runtime_environment(
@@ -612,6 +738,57 @@ def render_capability_plist(
         codex_binary=codex_binary,
         claude_binary=claude_binary,
     )
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
+
+
+def render_radar_plist(
+    template: str,
+    *,
+    app_root: Path,
+    state_root: Path,
+    refresh_seconds: int,
+    user_home: Path | None = None,
+) -> str:
+    """Render the Radar writer with a credential-free, authority-only environment."""
+
+    app_root = Path(app_root)
+    state_root = Path(state_root)
+    rendered = (
+        template.replace("__APP_ROOT__", str(app_root))
+        .replace("__STATE_ROOT__", str(state_root))
+        .replace("__USER_HOME__", str(user_home if user_home is not None else Path.home()))
+        .replace("__RADAR_REFRESH_SECONDS__", str(refresh_seconds))
+    )
+    payload = plistlib.loads(rendered.encode())
+    if not isinstance(payload, dict):
+        raise SystemExit("Radar LaunchAgent plist is invalid")
+    expected_arguments = [
+        str(app_root / "scripts" / "python-runtime"),
+        "-m",
+        "codex_workbench",
+        "--home",
+        str(state_root),
+        "radar",
+        "refresh",
+    ]
+    if payload.get("Label") != RADAR_LABEL:
+        raise SystemExit("Radar LaunchAgent label is invalid")
+    if payload.get("ProgramArguments") != expected_arguments:
+        raise SystemExit("Radar LaunchAgent command is invalid")
+    if payload.get("RunAtLoad") is not True or payload.get("StartInterval") != refresh_seconds:
+        raise SystemExit("Radar LaunchAgent schedule is invalid")
+    environment = payload.get("EnvironmentVariables")
+    expected_environment_keys = {"HOME", "PATH", "PYTHONPATH", "PYTHONUNBUFFERED"}
+    if not isinstance(environment, dict) or set(environment) != expected_environment_keys:
+        raise SystemExit("Radar LaunchAgent environment must contain only HOME, PATH, PYTHONPATH, and PYTHONUNBUFFERED")
+    if environment.get("HOME") != str(user_home if user_home is not None else Path.home()):
+        raise SystemExit("Radar LaunchAgent HOME is invalid")
+    if environment.get("PYTHONPATH") != str(app_root / "src"):
+        raise SystemExit("Radar LaunchAgent PYTHONPATH is invalid")
+    if payload.get("StandardOutPath") != str(state_root / "logs" / "radar.log"):
+        raise SystemExit("Radar LaunchAgent stdout path is invalid")
+    if payload.get("StandardErrorPath") != str(state_root / "logs" / "radar.error.log"):
+        raise SystemExit("Radar LaunchAgent stderr path is invalid")
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
 
 
@@ -752,12 +929,15 @@ def main() -> int:
     plist_path = launch_agents / f"{LABEL}.plist"
     quota_plist_path = launch_agents / f"{QUOTA_LABEL}.plist"
     capability_plist_path = launch_agents / f"{CAPABILITY_LABEL}.plist"
+    radar_plist_path = launch_agents / f"{RADAR_LABEL}.plist"
     logs = state_root / "logs"
     runtime_root = state_root / "runtime"
     codex_home = state_root / "codex-home"
     process_home = state_root / "codex-process-home"
     capability_registry_root = state_root / "capabilities"
     performance_state_root = state_root / PERFORMANCE_STATE_DIRECTORY
+    radar_state_root = state_root / RADAR_STATE_DIRECTORY
+    radar_authorization_file = radar_state_root / RADAR_AUTHORIZATION_FILENAME
     quota_snapshot_file = (
         absolute_path(Path(args.quota_snapshot_file))
         if args.quota_snapshot_file
@@ -773,12 +953,15 @@ def main() -> int:
     assert_directory_target(process_home, "process home")
     assert_directory_target(capability_registry_root, "capability registry")
     assert_directory_target(performance_state_root, "performance state")
+    assert_directory_target(radar_state_root, "Radar state")
     assert_directory_target(launch_agents, "LaunchAgents root")
     assert_file_target(config_file := state_root / "config.json", "config file")
     assert_file_target(plist_path, "service LaunchAgent")
     assert_file_target(quota_plist_path, "quota LaunchAgent")
     assert_file_target(capability_plist_path, "capability LaunchAgent")
+    assert_file_target(radar_plist_path, "Radar LaunchAgent")
     assert_file_target(quota_snapshot_file, "quota snapshot")
+    assert_file_target(radar_authorization_file, "Radar authorization receipt")
     if nas_archive_root is not None:
         assert_directory_target(nas_archive_root, "NAS worktree archive root")
     backup_root = state_root / "previous-app"
@@ -828,6 +1011,7 @@ def main() -> int:
         if zstd_binary:
             recovery_config["zstd_binary"] = str(Path(str(zstd_binary)).expanduser().absolute())
     capability_refresh_seconds = capability_refresh_interval(config_raw)
+    radar_refresh_seconds = radar_refresh_interval(config_raw)
     max_workers = authority_max_workers(config_raw)
     spark_workers = authority_spark_workers(config_raw, max_workers=max_workers)
     performance_config = performance_installation_config(
@@ -835,6 +1019,14 @@ def main() -> int:
         app_root=app_root,
         state_root=state_root,
         refresh_seconds=capability_refresh_seconds,
+    )
+    radar_metadata = radar_upstream_metadata(source)
+    radar_config = radar_installation_config(
+        config_raw,
+        app_root=app_root,
+        state_root=state_root,
+        refresh_seconds=radar_refresh_seconds,
+        upstream=radar_metadata,
     )
     authority_machine_id = macos_machine_id()
     research_source = validate_research_skill_source(Path(args.research_skill_source))
@@ -908,6 +1100,7 @@ def main() -> int:
         quota_snapshot_file,
         claude_binary,
         capability_refresh_seconds,
+        radar_refresh_seconds,
     )
     preflight_global_agent_targets(Path.home())
     preflight_managed_agent_skills(source)
@@ -940,17 +1133,30 @@ def main() -> int:
             f"plan: capabilities={capability_plist_path} "
             f"(RunAtLoad + every {capability_refresh_seconds}s; passive bundled refresh before services)"
         )
+        print(
+            f"plan: radar={radar_plist_path} "
+            f"(authority-only RunAtLoad + every {radar_refresh_seconds}s; no authorization file is created)"
+        )
+        print("plan: radar refresh=" + " ".join(radar_config["refresh_command"]))
         print("plan: managed Code-as-Harness and Archify projections for Codex and Claude Code")
         return 0
 
     domain = f"gui/{run('id', '-u').stdout.strip()}"
-    service_labels = (LABEL, QUOTA_LABEL, CAPABILITY_LABEL)
+    service_labels = (LABEL, QUOTA_LABEL, CAPABILITY_LABEL, RADAR_LABEL)
     service_was_loaded = {
         label: run("launchctl", "print", f"{domain}/{label}", check=False).returncode == 0
         for label in service_labels
     }
     transaction = InstallTransaction(state_root)
-    for directory in (state_root, logs, runtime_root, codex_home, process_home, launch_agents):
+    for directory in (
+        state_root,
+        logs,
+        runtime_root,
+        codex_home,
+        process_home,
+        radar_state_root,
+        launch_agents,
+    ):
         if not directory.exists():
             transaction.track_created_directory(directory)
     for path, label in (
@@ -963,7 +1169,9 @@ def main() -> int:
         (plist_path, "service LaunchAgent"),
         (quota_plist_path, "quota LaunchAgent"),
         (capability_plist_path, "capability LaunchAgent"),
+        (radar_plist_path, "Radar LaunchAgent"),
         (quota_snapshot_file, "quota snapshot"),
+        (radar_state_root, "Radar state"),
         (Path.home() / ".codex" / "skills" / "code-as-harness", "Codex Code-as-Harness skill"),
         (Path.home() / ".codex" / "AGENTS.md", "Codex policy"),
         (Path.home() / ".codex" / "skills" / "archify", "Codex Archify skill"),
@@ -982,6 +1190,7 @@ def main() -> int:
         runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        radar_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         research_skill = install_research_skill(research_source, process_home)
         config_raw.update(
             {
@@ -997,6 +1206,7 @@ def main() -> int:
                 ),
                 "capability_refresh_seconds": capability_refresh_seconds,
                 "performance": performance_config,
+                "radar": radar_config,
                 "worktree_recovery": recovery_config,
             }
         )
@@ -1038,6 +1248,7 @@ def main() -> int:
                         "refresh_interval_seconds": capability_refresh_seconds,
                         "refresh_command": performance_config["refresh_command"],
                     },
+                    "radar": radar_config,
                     "worktree_recovery": recovery_config,
                     "research_skill": {
                         "name": "Research",
@@ -1140,6 +1351,16 @@ def main() -> int:
         capability_plist_path.write_text(capability_rendered)
         capability_plist_path.chmod(0o600)
 
+        radar_template = (source / "launchd" / f"{RADAR_LABEL}.plist.in").read_text()
+        radar_rendered = render_radar_plist(
+            radar_template,
+            app_root=app_root,
+            state_root=state_root,
+            refresh_seconds=radar_refresh_seconds,
+        )
+        radar_plist_path.write_text(radar_rendered)
+        radar_plist_path.chmod(0o600)
+
         initial_capability_refresh(
             app_root=app_root,
             state_root=state_root,
@@ -1159,6 +1380,7 @@ def main() -> int:
             if quota_plist_path.exists() or quota_plist_path.is_symlink():
                 remove_path(quota_plist_path)
         restart_launch_agent(domain, CAPABILITY_LABEL, capability_plist_path)
+        restart_launch_agent(domain, RADAR_LABEL, radar_plist_path)
         if tailscale_socket:
             configure_tailscale_serve(
                 tailscale,
@@ -1173,6 +1395,7 @@ def main() -> int:
                 (LABEL, plist_path),
                 (QUOTA_LABEL, quota_plist_path),
                 (CAPABILITY_LABEL, capability_plist_path),
+                (RADAR_LABEL, radar_plist_path),
             ):
                 try:
                     run("launchctl", "bootout", domain, str(path), check=False)
@@ -1187,6 +1410,7 @@ def main() -> int:
                 (LABEL, plist_path),
                 (QUOTA_LABEL, quota_plist_path),
                 (CAPABILITY_LABEL, capability_plist_path),
+                (RADAR_LABEL, radar_plist_path),
             ):
                 if not service_was_loaded[label] or not path.is_file():
                     continue

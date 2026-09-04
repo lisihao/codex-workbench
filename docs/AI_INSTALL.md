@@ -81,6 +81,25 @@ test -x "$WB_ROOT/scripts/python-runtime"
 
 记录 `git rev-parse HEAD` 的输出到安装工单或本地变更记录；不要把它替换成“最新”。
 
+### 1.1 两台机器的 Codex 500K 长上下文
+
+MacBook 与 Mac mini 的 Codex App 和用户 CLI 读取各自用户的 `~/.codex/config.toml`。保留
+文件中所有现有配置，只确保以下两个键位于 TOML 顶层：
+
+```toml
+model_context_window = 500000
+model_auto_compact_token_limit = 450000
+```
+
+不要为此删除其他模型、MCP、sandbox、plugin 或 profile 配置。修改后先运行当前 CLI 的
+只读解析命令（例如 `codex features list`）；若桌面 App 内含独立 Codex binary，也用该
+binary 运行同一解析检查。配置只在新进程/新任务建立上下文时生效，不能声称正在运行的
+旧任务被追溯扩容；保存工作后重启 App 并创建新任务。
+
+Workbench 的 planner/worker 使用 `--ignore-user-config`，所以不能依赖上述用户配置。
+1.9.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
+`500000/450000`；Spark 保持其自身模型合同。
+
 ## 2. Mac mini Authority
 
 ### 2.1 Authority 先决条件与只读预检
@@ -196,6 +215,17 @@ curl --ipv4 --fail --silent --show-error http://localhost:8766/health
 
 Authority 安装器会在主服务启动前，以已安装的 Codex runtime 生成一份 bundled capability catalog；只有存在明确的 Sol planner/verifier 和至少一个 Codex Worker 时才激活。随后 `com.lisihao.codex-workbench-capabilities` LaunchAgent 默认每 6 小时执行一次 live metadata refresh。刷新只调用 CLI 版本、帮助与模型目录命令，不登录、不发模型提示；未变化结果不会制造新 generation，失败会继续使用上一份完整目录。
 
+Authority 还会安装 `com.lisihao.codex-workbench-radar`，默认每 6 小时执行一次
+`codex-workbench ... radar refresh`。在 Codex Radar 尚未明确授权衍生集成时，安装器不会
+创建或伪造 `authorization.json`；sidecar 应稳定返回 `unauthorized`，并保证零网络请求。
+获得授权并写入不含秘密的 receipt 后，它才采集固定 JSON endpoints；断网继续使用
+last-known-good，7–31 天降权，31 天后回落随包 baseline。
+
+```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" radar status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" radar show
+```
+
 如果接入了 Claude，也只能查看被动快照；`unknown`、`unavailable` 或未登录都是正确的 fail-closed 结果，而不是让 AI 重试登录的理由。
 
 ```bash
@@ -235,6 +265,7 @@ MacBook 也需要同一已固定的 Workbench checkout。完成第 1 节的 clon
 command -v codex
 test -f "$WB_ROOT/.agents/plugins/marketplace.json"
 test -f "$WB_ROOT/plugins/codex-workbench/.codex-plugin/plugin.json"
+test -f "$WB_ROOT/plugins/codex-radar-provider/.codex-plugin/plugin.json"
 
 "$WB_ROOT/scripts/python-runtime" \
   "$WB_ROOT/scripts/install-code-as-harness.py" \
@@ -307,7 +338,9 @@ heartbeat 使用同一选路器把 `route`、`reason` 与新鲜观察时间送�
 
 ### 3.4 安装个人 Codex 插件并信任 Hook
 
-插件通过公开仓库的 marketplace 发行。当前发行 manifest 固定 marketplace 与 plugin 名均为 `codex-workbench`；添加结果若显示其他名称，停止并核对所选 ref，而不是把新名称写入配置。
+插件通过公开仓库的 marketplace 发行。marketplace 名为 `codex-workbench`，包含主
+`codex-workbench` 插件和通用 `codex-radar-provider` 插件；后者只提供 Skill/消费契约，
+不会在 MacBook 启动第二个采集 writer。
 
 ```bash
 codex plugin marketplace add "$WB_MARKETPLACE_SOURCE" --ref "$WB_REF" --json
@@ -315,6 +348,7 @@ codex plugin marketplace list --json
 
 codex plugin list --marketplace "$WB_MARKETPLACE" --available --json
 codex plugin add "codex-workbench@$WB_MARKETPLACE" --json
+codex plugin add "codex-radar-provider@$WB_MARKETPLACE" --json
 codex plugin list --json
 ```
 
@@ -355,6 +389,8 @@ codex plugin list --json
 | Authority 预检 | `install-macos.py ... --dry-run` | 目标、Research Skill、Codex runtime、Tailscale socket 可被安装器接受 | 模型登录、Claude 余额、客户端连通性 |
 | Authority 健康 | `doctor`、`harness health`、`curl ...:8766/health` | 本地服务、治理投影、回环健康端点 | 任一真实模型回合或任务已验收 |
 | 能力目录 | `capabilities status/show/diff` | 当前激活 generation、模型/Agent 版本与静态策略 | 某模型在真实任务上的质量优于另一模型 |
+| Radar Provider | `radar status/show`、`/api/radar` | 授权、缓存、快照 ID/digest、fresh/stale/expired 与归因；查看不联网 | 未授权时不能声称已有真实 Radar 数据；Radar 不是配额或本机成功率 |
+| 500K 上下文 | 两机用户配置解析、App 内嵌 CLI 解析、Workbench argv 测试 | 新 App/CLI/Workbench 任务会请求 500K/450K | 不能证明旧任务已追溯扩容，也不代表每回合使用满 500K |
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
 | 会话接管 | `WB_SYNC_RECEIPT` 的 `active` 状态 | Context Bundle 已被 Authority 持久绑定 | 任务已 accepted 或模型已调用 |
