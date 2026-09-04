@@ -1,6 +1,6 @@
 {
   "name": "codex-radar-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Offline-first Codex Radar data bridge for model capability and scheduling consumers.",
   "author": {
     "name": "Codex Workbench contributors"

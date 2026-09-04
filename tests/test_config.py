@@ -9,6 +9,19 @@ from codex_workbench.config import WorkbenchConfig
 
 
 class WorkbenchConfigTests(unittest.TestCase):
+    def test_radar_refresh_defaults_to_one_day(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = WorkbenchConfig(root)
+            configured.initialize()
+
+            loaded = WorkbenchConfig.load(root)
+            raw = json.loads(configured.config_file.read_text())
+
+            self.assertEqual(configured.radar_refresh_seconds, 24 * 60 * 60)
+            self.assertEqual(loaded.radar_refresh_seconds, 24 * 60 * 60)
+            self.assertEqual(raw["radar"]["refresh_interval_seconds"], 24 * 60 * 60)
+
     def test_spark_workers_defaults_to_a_bounded_lane_and_round_trips_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

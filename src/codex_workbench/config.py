@@ -28,7 +28,7 @@ class WorkbenchConfig:
     radar_enabled: bool = True
     radar_state_root: Path | None = None
     radar_authorization_file: Path | None = None
-    radar_refresh_seconds: int = 6 * 60 * 60
+    radar_refresh_seconds: int = 24 * 60 * 60
     radar_stale_after_seconds: int = 7 * 24 * 60 * 60
     radar_expire_after_seconds: int = 31 * 24 * 60 * 60
 
@@ -198,7 +198,7 @@ class WorkbenchConfig:
                 if radar.get("authorization_receipt")
                 else root / "radar" / "authorization.json",
                 radar_refresh_seconds=int(
-                    radar.get("refresh_interval_seconds", 6 * 60 * 60)
+                    radar.get("refresh_interval_seconds", 24 * 60 * 60)
                 ),
                 radar_stale_after_seconds=int(
                     radar.get("stale_after_seconds", 7 * 24 * 60 * 60)

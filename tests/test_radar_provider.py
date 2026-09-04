@@ -6,12 +6,14 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from codex_radar_provider import RadarRegistry, validate_radar_snapshot
-from codex_radar_provider.cli import main
+from codex_radar_provider.cli import _parser, main
 
 
 def authorization_receipt() -> dict[str, object]:
@@ -21,6 +23,19 @@ def authorization_receipt() -> dict[str, object]:
         "provider": "codex-radar",
         "status": "authorized",
         "scope": ["model-quality-json"],
+        "attribution": "数据来自 Codex 雷达 codexradar.com",
+    }
+
+
+def personal_use_receipt() -> dict[str, object]:
+    return {
+        "schema": "codex-radar-provider-authorization",
+        "version": 1,
+        "provider": "codex-radar",
+        "status": "consented",
+        "basis": "local_operator_consent",
+        "scope": ["public-json"],
+        "accepted_at": "2026-09-04T12:00:00Z",
         "attribution": "数据来自 Codex 雷达 codexradar.com",
     }
 
@@ -187,6 +202,134 @@ class RadarProviderTests(unittest.TestCase):
         self.assertNotIn("never-persist-this", json.dumps(raw))
         self.assertEqual(self.registry.load_generation(snapshot_id), snapshot)
 
+        database = self.registry.status()["database"]
+        self.assertTrue(database["ok"])  # type: ignore[index]
+        self.assertEqual(database["backend"], "sqlite")  # type: ignore[index]
+        self.assertEqual(database["schema_version"], 1)  # type: ignore[index]
+        self.assertEqual(database["path"], str(self.registry.database_path))  # type: ignore[index]
+        self.assertEqual(
+            database["row_counts"],  # type: ignore[index]
+            {
+                "radar_snapshots": 1,
+                "radar_raw_payloads": 4,
+                "radar_models": 2,
+                "radar_insights": 1,
+                "radar_active": 1,
+            },
+        )
+        self.assertEqual(stat.S_IMODE((self.root / "state").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.registry.database_path.stat().st_mode), 0o600)
+        with sqlite3.connect(self.registry.database_path) as connection:
+            persisted = "".join(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT snapshot_document FROM radar_snapshots
+                    UNION ALL SELECT payload_document FROM radar_raw_payloads
+                    UNION ALL SELECT model_document FROM radar_models
+                    UNION ALL SELECT insights_document FROM radar_insights
+                    """
+                )
+            )
+        self.assertNotIn("never-persist-this", persisted)
+
+        (self.root / "state" / "active.json").unlink()
+        (self.root / "state" / "raw" / f"{snapshot_id}.json").unlink()
+        (self.root / "state" / "generations" / f"{snapshot_id}.json").unlink()
+        self.assertEqual(self.registry.active(), snapshot)
+        self.assertEqual(self.registry.load_generation(snapshot_id), snapshot)
+
+    def test_identical_generation_is_idempotent_in_database(self) -> None:
+        first = self.registry.import_payloads(
+            payloads(),
+            self.receipt,
+            fetched_at="2026-09-04T12:30:00Z",
+        )
+        first_counts = self.registry.status()["database"]["row_counts"]  # type: ignore[index]
+
+        second = self.registry.import_payloads(
+            payloads(),
+            self.receipt,
+            fetched_at="2026-09-04T12:30:00Z",
+        )
+
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["snapshot_id"], first["snapshot_id"])
+        self.assertEqual(self.registry.status()["database"]["row_counts"], first_counts)  # type: ignore[index]
+
+    def test_legacy_json_projection_is_migrated_to_authoritative_database(self) -> None:
+        initial = self.registry.import_payloads(
+            payloads(),
+            self.receipt,
+            fetched_at="2026-09-04T12:30:00Z",
+        )
+        snapshot = self.registry.active()
+        assert snapshot is not None
+        for path in (
+            self.registry.database_path,
+            Path(f"{self.registry.database_path}-wal"),
+            Path(f"{self.registry.database_path}-shm"),
+        ):
+            if path.exists():
+                path.unlink()
+
+        upgraded = RadarRegistry(self.root / "state")
+
+        self.assertEqual(upgraded.active(), snapshot)
+        self.assertEqual(
+            upgraded.status()["database"]["row_counts"]["radar_snapshots"], 1  # type: ignore[index]
+        )
+        self.assertEqual(upgraded.active()["snapshot_id"], initial["snapshot_id"])  # type: ignore[index]
+
+    def test_personal_use_consent_is_explicit_secret_free_and_usable(self) -> None:
+        receipt = self.root / "personal-use.json"
+        result = self.registry.consent_personal_use(
+            receipt,
+            accepted_at=datetime(2026, 9, 4, 12, 0, tzinfo=UTC),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "consented")
+        self.assertFalse(result["network_requested"])
+        self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+        consent_status = self.registry.authorization_status(receipt)
+        self.assertTrue(consent_status["ok"])
+        self.assertEqual(consent_status["status"], "consented")
+        self.assertEqual(consent_status["receipt"]["basis"], "local_operator_consent")  # type: ignore[index]
+        self.assertNotIn("authorized", json.dumps(consent_status))
+
+        imported = self.registry.import_payloads(payloads(), receipt)
+        self.assertTrue(imported["ok"])
+        self.assertEqual(imported["snapshot"]["authorization"]["status"], "consented")  # type: ignore[index]
+
+    def test_malformed_personal_use_consent_does_not_replace_database_lkg(self) -> None:
+        initial = self.registry.import_payloads(payloads(), self.receipt)
+        malformed = self.root / "malformed-consent.json"
+        malformed.write_text(json.dumps(personal_use_receipt() | {"accepted_at": "not-a-time"}))
+
+        result = self.registry.import_payloads(payloads(), malformed)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["snapshot_id"], initial["snapshot_id"])
+        self.assertEqual(
+            self.registry.status()["database"]["row_counts"]["radar_snapshots"], 1  # type: ignore[index]
+        )
+
+    def test_projection_failure_keeps_database_generation_and_reports_degraded_projection(self) -> None:
+        with patch(
+            "codex_radar_provider.provider._atomic_write_document",
+            side_effect=PermissionError("projection denied"),
+        ):
+            result = self.registry.import_payloads(payloads(), self.receipt)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["generation_created"])
+        self.assertEqual(result["projection"]["state"], "degraded")  # type: ignore[index]
+        self.assertIsNotNone(self.registry.active())
+        self.assertEqual(
+            self.registry.status()["database"]["row_counts"]["radar_active"], 1  # type: ignore[index]
+        )
+
     def test_unknown_model_is_preserved_but_not_routing_eligible(self) -> None:
         self.registry.import_payloads(payloads(), self.receipt)
         snapshot = self.registry.active()
@@ -208,6 +351,9 @@ class RadarProviderTests(unittest.TestCase):
         self.assertEqual(result["state"], "fresh")
         self.assertEqual(result["snapshot_id"], first_id)
         self.assertIn("schema", result["last_error"])
+        self.assertEqual(
+            self.registry.status()["database"]["row_counts"]["radar_active"], 1  # type: ignore[index]
+        )
 
     def test_timestamp_regression_retains_last_known_good_cache(self) -> None:
         initial = self.registry.import_payloads(
@@ -222,6 +368,9 @@ class RadarProviderTests(unittest.TestCase):
         self.assertFalse(older["ok"])
         self.assertEqual(older["snapshot_id"], initial["snapshot_id"])
         self.assertIn("timestamp regressed", older["last_error"])
+        self.assertEqual(
+            self.registry.status()["database"]["row_counts"]["radar_snapshots"], 1  # type: ignore[index]
+        )
 
     def test_status_marks_expired_cache_stale(self) -> None:
         self.registry.import_payloads(
@@ -310,6 +459,19 @@ class RadarProviderTests(unittest.TestCase):
             for path in (self.root / "state").rglob("*.json")
         )
         self.assertNotIn("top-secret", state_contents)
+        with sqlite3.connect(self.registry.database_path) as connection:
+            database_contents = "".join(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT snapshot_document FROM radar_snapshots
+                    UNION ALL SELECT payload_document FROM radar_raw_payloads
+                    UNION ALL SELECT model_document FROM radar_models
+                    UNION ALL SELECT insights_document FROM radar_insights
+                    """
+                )
+            )
+        self.assertNotIn("top-secret", database_contents)
 
     def test_cli_import_and_status_emit_stable_json(self) -> None:
         payload_file = self.root / "payloads.json"
@@ -343,6 +505,54 @@ class RadarProviderTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(status["state"], "fresh")
         self.assertEqual(status["snapshot_id"], imported["snapshot_id"])
+
+    def test_cli_refresh_defaults_to_daily_rate_limit(self) -> None:
+        args = _parser().parse_args(
+            [
+                "--state-root",
+                str(self.root / "cli-refresh-default"),
+                "refresh",
+                "--authorization-file",
+                str(self.receipt),
+            ]
+        )
+        self.assertEqual(args.minimum_refresh_interval_seconds, 24 * 60 * 60)
+
+    def test_cli_consent_requires_explicit_personal_use_and_writes_receipt(self) -> None:
+        state_root = self.root / "cli-consent-state"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rejected_exit_code = main(
+                [
+                    "--state-root",
+                    str(state_root),
+                    "consent",
+                ]
+            )
+        rejected = json.loads(output.getvalue())
+        self.assertEqual(rejected_exit_code, 2)
+        self.assertFalse(rejected["ok"])
+        self.assertIn("--personal-use", rejected["error"])
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--state-root",
+                    str(state_root),
+                    "consent",
+                    "--personal-use",
+                ]
+            )
+
+        consent = json.loads(output.getvalue())
+        receipt = state_root / "authorization.json"
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(consent["ok"])
+        self.assertEqual(consent["status"], "consented")
+        self.assertFalse(consent["network_requested"])
+        self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(state_root.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,7 @@ binary 运行同一解析检查。配置只在新进程/新任务建立上下文
 旧任务被追溯扩容；保存工作后重启 App 并创建新任务。
 
 Workbench 的 planner/worker 使用 `--ignore-user-config`，所以不能依赖上述用户配置。
-1.9.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
+1.10.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
 `500000/450000`；Spark 保持其自身模型合同。
 
 ## 2. Mac mini Authority
@@ -215,16 +215,30 @@ curl --ipv4 --fail --silent --show-error http://localhost:8766/health
 
 Authority 安装器会在主服务启动前，以已安装的 Codex runtime 生成一份 bundled capability catalog；只有存在明确的 Sol planner/verifier 和至少一个 Codex Worker 时才激活。随后 `com.lisihao.codex-workbench-capabilities` LaunchAgent 默认每 6 小时执行一次 live metadata refresh。刷新只调用 CLI 版本、帮助与模型目录命令，不登录、不发模型提示；未变化结果不会制造新 generation，失败会继续使用上一份完整目录。
 
-Authority 还会安装 `com.lisihao.codex-workbench-radar`，默认每 24 小时执行一次
-`codex-workbench ... radar refresh`。在 Codex Radar 尚未明确授权衍生集成时，安装器不会
-创建或伪造 `authorization.json`；sidecar 应稳定返回 `unauthorized`，并保证零网络请求。
-获得授权并写入不含秘密的 receipt 后，它才采集固定 JSON endpoints；断网继续使用
-last-known-good，7–31 天降权，31 天后回落随包 baseline。
+Authority 还会安装 `com.lisihao.codex-workbench-radar`，默认每 86400 秒执行一次
+`codex-workbench ... radar refresh`。首次使用个人自用模式时，在 Authority 执行
+`radar consent-personal-use`；它只写入不含秘密的本地 receipt，不联网，也不表示获得站方
+许可。个人 receipt 必须同时包含 `consented`、`local_operator_consent`、`public-json` 和
+`accepted_at`。上游 `current.json` 仍声明完整 API/衍生集成需要站方授权；本地个人使用不能
+写成 `authorized`。通过 consent 后才采集固定公共 JSON endpoints；断网继续从
+`<WB_STATE_ROOT>/radar.sqlite3` 读取 last-known-good，7–31 天降权，31 天后回落随包 baseline。
+旧 JSON 投影会自动迁入 SQLite；JSON 仅为兼容投影。
 
 ```bash
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" radar consent-personal-use
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" radar status
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" radar show
 ```
+
+provider 插件 0.2.0 也提供等价的本地命令：
+
+```bash
+codex-radar-provider --state-root "$WB_STATE_ROOT/radar" consent --personal-use
+```
+
+`radar status` 和 `codex-radar-provider status` 会报告 SQLite backend、schema、path 与
+`radar_snapshots`、`radar_raw_payloads`、`radar_models`、`radar_insights`、`radar_active`
+的 row counts。Provider SQLite 与 Workbench task SQLite 是两个独立账本。
 
 如果接入了 Claude，也只能查看被动快照；`unknown`、`unavailable` 或未登录都是正确的 fail-closed 结果，而不是让 AI 重试登录的理由。
 
@@ -339,7 +353,7 @@ heartbeat 使用同一选路器把 `route`、`reason` 与新鲜观察时间送�
 ### 3.4 安装个人 Codex 插件并信任 Hook
 
 插件通过公开仓库的 marketplace 发行。marketplace 名为 `codex-workbench`，包含主
-`codex-workbench` 插件和通用 `codex-radar-provider` 插件；后者只提供 Skill/消费契约，
+`codex-workbench` 插件和通用 `codex-radar-provider` 0.2.0 插件；后者只提供 Skill/消费契约，
 不会在 MacBook 启动第二个采集 writer。
 
 ```bash
@@ -389,7 +403,7 @@ codex plugin list --json
 | Authority 预检 | `install-macos.py ... --dry-run` | 目标、Research Skill、Codex runtime、Tailscale socket 可被安装器接受 | 模型登录、Claude 余额、客户端连通性 |
 | Authority 健康 | `doctor`、`harness health`、`curl ...:8766/health` | 本地服务、治理投影、回环健康端点 | 任一真实模型回合或任务已验收 |
 | 能力目录 | `capabilities status/show/diff` | 当前激活 generation、模型/Agent 版本与静态策略 | 某模型在真实任务上的质量优于另一模型 |
-| Radar Provider | `radar status/show`、`/api/radar` | 授权、缓存、快照 ID/digest、fresh/stale/expired 与归因；查看不联网 | 未授权时不能声称已有真实 Radar 数据；Radar 不是配额或本机成功率 |
+| Radar Provider | `radar consent-personal-use`、`radar status/show`、`/api/radar` | 本地 consent 字段、SQLite backend/schema/path/row counts、缓存、快照 ID/digest、fresh/stale/expired 与归因；查看不联网 | personal-use consent 不是站方授权；未完成真实采集时不能声称已有生产 Radar 数据；Radar 不是配额或本机成功率 |
 | 500K 上下文 | 两机用户配置解析、App 内嵌 CLI 解析、Workbench argv 测试 | 新 App/CLI/Workbench 任务会请求 500K/450K | 不能证明旧任务已追溯扩容，也不代表每回合使用满 500K |
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
 | 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |

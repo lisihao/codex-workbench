@@ -23,7 +23,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 | 强模型被实现细节占满 | Sol 负责需求编译、跨模块判断和最终验收；边界明确的实现优先交给 Spark、Luna、Terra 或受配额约束的 Claude Worker。 |
 | Claude Code 订阅被后台任务耗尽 | Claude Worker 只在认证和新鲜配额快照可证明时启用；未知状态会 fail closed 并转交 Codex。系统保留至少 20% 的目标配额空间，并设有更早的调度门槛。 |
 | 不知道哪个模型在当前工作里更合适 | Workbench 使用按领域的公开 benchmark 冷启动先验，再用长期运行账本校准；它不把不同 benchmark 拼成一个排行榜，也不把公开分数冒充本机成功率。 |
-| 联网时能看到模型众测数据，断网后调度却失去依据 | 通用 `codex_radar_provider` 将获授权的 Codex Radar JSON 以内容寻址 generation 缓存；断网复用 last-known-good，过期后回落内置 baseline。 |
+| 联网时能看到模型众测数据，断网后调度却失去依据 | 通用 `codex_radar_provider` 将 personal-use consent 允许读取的 Codex Radar 公共 JSON 写入自己的 SQLite；断网复用数据库 last-known-good，过期后回落内置 baseline。 |
 | 验证反复运行、成本高且结论不清 | `code-as-harness/v1` 将 L0–L3 验证层级和 Evidence fingerprint 写入任务契约；相同输入闭包的已通过证据可复用。 |
 
 ## 运行模型
@@ -43,7 +43,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 │         │                       ├── optional Claude Code workers   │
 │         │                       └── deterministic build/test tools │
 │         │                                                          │
-│         ├── public baseline + authorized Radar offline cache       │
+│         ├── public baseline + consented Radar DB LKG               │
 │         │                         + runtime ledger ──► score policy │
 │         │                                                          │
 │         └──► independent Sol verifier ──► Evidence ──► accepted   │
@@ -63,7 +63,7 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 - **`wb` Codex 入口**：一个薄插件，将新会话或已有会话绑定到同一份持久任务。它同步经脱敏的会话摘要与受控 Git 上下文，而不持有第二份任务状态。
 - **Claude Code Worker**：可选的订阅型执行器，不承担规划或最终验收。认证、CLI 兼容性或配额状态不明确时不会猜测余额，也不会使用 API-key fallback。
 - **Claude 登录与配额采集**：Claude Code 原生订阅 OAuth 的凭据由官方 macOS CLI 保存在系统 Keychain；Workbench 不复制、导出或持久化 token，只调用 `auth status` 与受限的 `/usage` 观察。当前受支持的 collector 兼容锁定的 Claude CLI `2.1.239`，既接受对象也接受其真实数组 envelope；认证或解析失败会 fail closed，不循环重新登录。
-- **Codex Radar Provider**：独立于 Workbench/DSH 的标准库-only package/CLI。Mac mini 在授权成立后低频采集，原始响应脱敏、标准化快照原子落盘；MacBook 只读 Authority 状态。Radar 不是配额源，也不能绕过路由硬门禁。
+- **Codex Radar Provider**：独立于 Workbench/DSH 的标准库-only package/CLI（provider plugin 0.2.0）。Mac mini 在 personal-use consent 或官方 receipt 成立后低频采集；`<state_root>/radar.sqlite3` 是 snapshots/raw/models/insights/active 的权威真源，JSON 仅为兼容投影，MacBook 只读 Authority 状态。Radar 不是配额源，也不能绕过路由硬门禁。
 - **离线回落**：如果 Authority 不可达，已绑定会话继续在 MacBook 当前 checkout 上工作；系统不会在离线端静默创建第二个 Authority，下一次可用连接再重试同步。
 
 ## 核心能力与边界
@@ -114,11 +114,12 @@ Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方�
 创建任务时，当前 performance snapshot、能力目录 digest 和 policy version 会固定进 TaskContract/NodeSpec；刷新或升级不会重路由已运行任务。快照是可重建的派生缓存，不是第二份状态真相；`performance refresh` 只读本地账本与缓存，无模型调用和登录操作。
 
 可选的 Codex Radar 集成复用上游 `WineChord/codex-radar` 同步契约，但采集与缓存由通用
-`codex_radar_provider` 承担。没有官方数据授权时，它在网络请求前返回 `unauthorized`；有
-有效缓存时，Workbench 只接纳精确 model + reasoning effort、显式 pass rate 和正样本量，
-fresh 数据最多形成 5 个等效弱样本，stale 数据再乘 0.25，超过 31 天停止影响路由。IQ
-只保留为元数据，绝不转换成通过率。该 Provider 可由 DSH 后续独立安装和消费，本版本没有
-修改 DSH。
+`codex_radar_provider` 承担。个人自用 receipt 必须同时有 `consented`、
+`local_operator_consent`、`public-json` 和 `accepted_at`；这不是站方授权。上游
+`current.json` 仍声明完整 API/衍生集成需站方授权。有效缓存时，Workbench 只接纳精确
+model + reasoning effort、显式 pass rate 和正样本量，fresh 数据最多形成 2.0 个等效弱样本，
+stale 数据再乘 0.25，超过 31 天停止影响路由。IQ 只保留为元数据，绝不转换成通过率。该
+Provider 可由 DSH 后续独立安装和消费，本版本没有修改 DSH。
 
 常用观测入口：
 
@@ -126,9 +127,10 @@ fresh 数据最多形成 5 个等效弱样本，stale 数据再乘 0.25，超过
 codex-workbench performance status
 codex-workbench performance show
 codex-workbench performance refresh       # 只重放本地账本，不调用模型
-codex-workbench radar status               # 只读本地授权与缓存状态
+codex-workbench radar consent-personal-use # Authority；只写本地 personal-use receipt
+codex-workbench radar status               # 只读本地 consent 与缓存状态
 codex-workbench radar show                 # 只读 last-known-good 快照
-codex-workbench radar refresh              # Authority；无授权时零网络
+codex-workbench radar refresh              # Authority；无 consent/授权时零网络
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/performance
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/radar
 curl -H "Authorization: Bearer $WB_TOKEN" http://127.0.0.1:8766/api/scheduler
@@ -159,7 +161,7 @@ Workbench 将 `code-as-harness/v1` 投影到 Codex 与 Claude Code 的受控路�
 - **Archify**：仓库固定携带 Archify 的 stable core，并把它用于架构、设计、审核和需求类任务的 typed JSON IR、渲染与 receipt。渲染/Schema 通过只证明工件约束通过，不证明架构事实、运行时因果或推理质量；语义和视觉结论仍需要外部或人工 Evidence。
 
 详情请见 [原设计忠实度矩阵](docs/fidelity-matrix.md) 与 [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md)。
-Radar 的授权、离线缓存、保守权重与未来 DSH 消费协议见
+Radar 的 consent、SQLite 离线缓存、保守权重与未来 DSH 消费协议见
 [Codex Radar 通用 Provider 与 Workbench 集成](docs/codex-radar-integration.md)。
 
 ### Claude 配额保护
@@ -355,12 +357,12 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.9.1`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.9.1 包含通用 Codex Radar 离线 Provider（真实采集待授权，默认每 24 小时同步）、benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证、强制 Tailscale 远程归档，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
+当前源码版本为 `1.10.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.10.0 包含通用 Codex Radar Provider 0.2.0（personal-use consent、SQLite 权威真源、旧 JSON 自动迁移、默认每 86400 秒同步；Mac mini 真实生产采集 Evidence 待部署后补齐）、benchmark-backed 性能基线、长期运行校准、性能快照绑定、Spark P0 逻辑队列、可恢复 worktree 回收、NAS 完整恢复验证、强制 Tailscale 远程归档，以及受管 Sol/Terra/Luna 的 500K 显式长上下文覆盖；这些能力的生产质量结论仍需真实任务 Evidence 长期积累。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
-- [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、授权、断网缓存、Workbench 先验与未来 DSH 消费合同。
+- [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、personal-use consent、SQLite 断网缓存、Workbench 先验与未来 DSH 消费合同。
 - [Backlog](docs/backlog.md) — 已明确后置的真实外部 Evidence 与通知工作。
 
 ## 项目边界

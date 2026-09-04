@@ -1,7 +1,7 @@
 """Read-only Codex Radar integration for Workbench performance priors.
 
 The portable :mod:`codex_radar_provider` owns collection and durable cache
-semantics.  This module only classifies cache freshness and converts authorized,
+semantics.  This module only classifies cache freshness and converts authorized or consented,
 exact-model observations into weak Workbench benchmark priors.  It never makes
 a routing decision and never treats IQ as a pass rate.
 """
@@ -37,6 +37,7 @@ class WorkbenchRadar:
     state_root: Path
     authorization_file: Path
     enabled: bool = True
+    refresh_interval_seconds: int = 24 * 60 * 60
     stale_after_seconds: int = 7 * 24 * 60 * 60
     expire_after_seconds: int = 31 * 24 * 60 * 60
 
@@ -62,6 +63,7 @@ class WorkbenchRadar:
             return {
                 **self._empty_status(state, str(reason)),
                 "collector_authorization": authorization.get("status"),
+                "database": provider_status.get("database"),
             }
 
         age_seconds = int(provider_status.get("age_seconds", 0))
@@ -93,6 +95,7 @@ class WorkbenchRadar:
                 "collector_authorization": authorization.get("status"),
                 "snapshot_authorization": _snapshot_authorization_status(snapshot),
                 "snapshot": dict(snapshot),
+                "database": provider_status.get("database"),
                 "reason": authorization.get("error", "Radar authorization is unavailable."),
             }
         if age_seconds <= effective_stale_after:
@@ -130,6 +133,7 @@ class WorkbenchRadar:
             "collector_authorization": authorization.get("status"),
             "snapshot_authorization": _snapshot_authorization_status(snapshot),
             "snapshot": dict(snapshot),
+            "database": provider_status.get("database"),
         }
 
     def refresh(self) -> dict[str, Any]:
@@ -139,6 +143,7 @@ class WorkbenchRadar:
             return self._empty_status("disabled", "Radar integration is disabled.")
         result = self.registry.refresh(
             self.authorization_file,
+            minimum_refresh_interval_seconds=self.refresh_interval_seconds,
             stale_after_seconds=self.stale_after_seconds,
         )
         classified = self.status()
@@ -148,6 +153,7 @@ class WorkbenchRadar:
             "generation_created",
             "refresh_deferred",
             "last_error",
+            "projection",
         ):
             if key in result:
                 classified[key] = result[key]
@@ -184,8 +190,8 @@ def radar_prior_records(
         status.get("provider") != "codex-radar-provider"
         or status.get("routing_prior_eligible") is not True
         or status.get("state") not in {"fresh", "stale"}
-        or status.get("collector_authorization") != "authorized"
-        or status.get("snapshot_authorization") != "authorized"
+        or status.get("collector_authorization") not in {"authorized", "consented"}
+        or status.get("snapshot_authorization") not in {"authorized", "consented"}
     ):
         return []
     snapshot = status.get("snapshot")
@@ -305,13 +311,15 @@ def radar_prior_records(
                 "provider": provider,
                 "model_id": model_id,
                 "model_family": family if isinstance(family, str) else "unknown",
-                "agent_scaffold": "Codex Radar authorized community observations",
+                "agent_scaffold": "Codex Radar community observations",
                 "score": round(float(pass_rate), 8),
                 "score_kind": "resolved_rate",
                 "provenance": "community_observation",
                 "transfer_weight": 1.0,
                 "effective_sample_strength": round(strength, 8),
-                "quality_evidence": "authorized-external-prior",
+                "quality_evidence": f"{status['snapshot_authorization']}-external-prior",
+                "authorization_status": status["snapshot_authorization"],
+                "collector_authorization": status["collector_authorization"],
                 "reasoning_effort": effort,
                 "external_snapshot_id": snapshot_id,
                 "external_snapshot_digest": snapshot.get("digest"),
@@ -326,8 +334,11 @@ def radar_prior_records(
 
 def _snapshot_authorization_status(snapshot: Mapping[str, Any]) -> str:
     authorization = snapshot.get("authorization")
-    if isinstance(authorization, Mapping) and authorization.get("status") == "authorized":
-        return "authorized"
+    if isinstance(authorization, Mapping) and authorization.get("status") in {
+        "authorized",
+        "consented",
+    }:
+        return str(authorization["status"])
     return "invalid"
 
 

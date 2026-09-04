@@ -210,11 +210,67 @@ class FeatureCLITests(unittest.TestCase):
             self.assertEqual(refresh_code, 1)
             self.assertEqual(refresh_payload["state"], "unauthorized")
             self.assertFalse(refresh_payload["network_requested"])
+            self.assertEqual(refresh_payload["model_calls"], 0)
             self.assertTrue(refresh_payload["performance"]["ok"])
             self.assertEqual(refresh_payload["performance"]["radar_state"], "unauthorized")
             self.assertFalse(refresh_payload["performance"]["imported_radar_prior"])
             self.assertEqual(refresh_payload["performance"]["model_calls"], 0)
             network.assert_not_called()
+
+    def test_radar_personal_use_consent_is_authority_only(self) -> None:
+        parser = build_parser()
+        consent = parser.parse_args(
+            ["--home", "/tmp/workbench-cli", "radar", "consent-personal-use"]
+        )
+        self.assertEqual(consent.radar_action, "consent-personal-use")
+
+        with tempfile.TemporaryDirectory(prefix="radar-consent-cli-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(root).initialize()
+            code, payload = self._run(
+                command_radar,
+                parser.parse_args(
+                    ["--home", directory, "radar", "consent-personal-use"]
+                ),
+            )
+
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["state"], "forbidden")
+            self.assertFalse(payload["network_requested"])
+
+        with tempfile.TemporaryDirectory(prefix="radar-consent-authority-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(
+                root,
+                deployment_role="authority",
+                authority_host=socket.gethostname(),
+                authority_machine_id=authority_machine_id(),
+            ).initialize()
+            fake_registry = mock.Mock()
+            fake_registry.consent_personal_use.return_value = {
+                "ok": True,
+                "status": "consented",
+                "network_requested": False,
+                "receipt": {"basis": "local_operator_consent"},
+            }
+            with mock.patch(
+                "codex_workbench.radar.RadarRegistry", return_value=fake_registry
+            ):
+                code, payload = self._run(
+                    command_radar,
+                    parser.parse_args(
+                        ["--home", directory, "radar", "consent-personal-use"]
+                    ),
+                )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["status"], "consented")
+            self.assertEqual(payload["model_calls"], 0)
+            fake_registry.consent_personal_use.assert_called_once_with(
+                root / "radar" / "authorization.json"
+            )
 
     def test_capability_refresh_on_authority_refreshes_the_matching_performance_snapshot(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capability-performance-cli-") as directory:

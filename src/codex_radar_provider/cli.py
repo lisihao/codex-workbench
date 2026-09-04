@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from .provider import RadarRegistry
+from .provider import DEFAULT_MINIMUM_REFRESH_INTERVAL_SECONDS, RadarRegistry
 
 
 _PAYLOAD_FILE_NAMES = {
@@ -28,11 +28,19 @@ def _parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show")
     show.add_argument("--snapshot-id")
 
+    consent = subparsers.add_parser("consent")
+    consent.add_argument("--personal-use", action="store_true")
+    consent.add_argument("--authorization-file", type=Path)
+
     refresh = subparsers.add_parser("refresh")
     refresh.add_argument("--authorization-file", required=True, type=Path)
     refresh.add_argument("--timeout-seconds", type=int, default=15)
     refresh.add_argument("--stale-after-seconds", type=int, default=604800)
-    refresh.add_argument("--minimum-refresh-interval-seconds", type=int, default=600)
+    refresh.add_argument(
+        "--minimum-refresh-interval-seconds",
+        type=int,
+        default=DEFAULT_MINIMUM_REFRESH_INTERVAL_SECONDS,
+    )
     refresh.add_argument("--api-key-env")
     refresh.add_argument("--api-key-header")
 
@@ -67,7 +75,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     registry = RadarRegistry(args.state_root)
     try:
-        if args.command == "status":
+        if args.command == "consent":
+            if not args.personal_use:
+                raise ValueError("consent requires --personal-use")
+            result = registry.consent_personal_use(args.authorization_file)
+        elif args.command == "status":
             result = registry.status()
         elif args.command == "show":
             result = (

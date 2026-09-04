@@ -657,6 +657,7 @@ def _radar(config: WorkbenchConfig) -> WorkbenchRadar:
         state_root=config.effective_radar_state_root,
         authorization_file=config.effective_radar_authorization_file,
         enabled=config.radar_enabled,
+        refresh_interval_seconds=config.radar_refresh_seconds,
         stale_after_seconds=config.radar_stale_after_seconds,
         expire_after_seconds=config.radar_expire_after_seconds,
     )
@@ -863,6 +864,7 @@ def command_radar(args: argparse.Namespace) -> int:
     elif action == "refresh":
         store = _store(config)
         result = radar.refresh()
+        result["model_calls"] = 0
         usable = radar.status()
         # Rebuild for every deterministic Radar state.  Ineligible states add
         # no external records, which actively removes an expired, disabled, or
@@ -884,6 +886,23 @@ def command_radar(args: argparse.Namespace) -> int:
             "catalog": catalog_status,
             "model_calls": 0,
         }
+    elif action == "consent-personal-use":
+        try:
+            config.assert_authority()
+        except RuntimeError as error:
+            result = {
+                "ok": False,
+                "operation": "consent-personal-use",
+                "state": "forbidden",
+                "network_requested": False,
+                "model_calls": 0,
+                "error": str(error),
+            }
+        else:
+            result = radar.registry.consent_personal_use(
+                config.effective_radar_authorization_file
+            )
+            result["model_calls"] = 0
     else:
         raise ValueError(f"unsupported radar action: {action}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1268,7 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     radar = sub.add_parser(
         "radar",
-        help="inspect or refresh authorized Codex Radar data and its offline cache",
+        help="inspect or refresh authorized/consented Codex Radar data and its offline cache",
     )
     radar_sub = radar.add_subparsers(dest="radar_action", required=True)
     radar_sub.add_parser("status")
@@ -1276,7 +1295,11 @@ def build_parser() -> argparse.ArgumentParser:
     radar_show.add_argument("snapshot_id", nargs="?")
     radar_sub.add_parser(
         "refresh",
-        help="refresh authorized JSON data and update the advisory performance snapshot",
+        help="refresh authorized or locally consented JSON data and update the advisory performance snapshot",
+    )
+    radar_sub.add_parser(
+        "consent-personal-use",
+        help="write a local personal-use consent receipt (authority only; no network)",
     )
     radar.set_defaults(func=command_radar)
 

@@ -29,6 +29,8 @@ PERFORMANCE_BASELINE_RESOURCE = "codex_workbench.data/model-performance-baseline
 PERFORMANCE_STATE_DIRECTORY = "performance"
 RADAR_STATE_DIRECTORY = "radar"
 RADAR_AUTHORIZATION_FILENAME = "authorization.json"
+RADAR_DATABASE_FILENAME = "radar.sqlite3"
+RADAR_DATABASE_SCHEMA_VERSION = 1
 RADAR_PRODUCER = "codex-radar-provider"
 RADAR_UPSTREAM_REPOSITORY = "https://github.com/WineChord/codex-radar"
 RADAR_UPSTREAM_TAG = "v0.1.69"
@@ -589,12 +591,18 @@ def radar_installation_config(
         raise SystemExit("Radar attribution is invalid")
     radar_state_root = state_root / RADAR_STATE_DIRECTORY
     authorization_file = radar_state_root / RADAR_AUTHORIZATION_FILENAME
+    database_file = radar_state_root / RADAR_DATABASE_FILENAME
     radar.update(
         {
             "producer": RADAR_PRODUCER,
             "upstream": upstream_config,
             "state_root": str(radar_state_root),
             "authorization_receipt": str(authorization_file),
+            "database": {
+                "backend": "sqlite",
+                "path": str(database_file),
+                "schema_version": RADAR_DATABASE_SCHEMA_VERSION,
+            },
             "refresh_interval_seconds": refresh_seconds,
             "attribution": attribution,
             "refresh_command": [

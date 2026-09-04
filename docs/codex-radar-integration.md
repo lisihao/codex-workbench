@@ -1,6 +1,6 @@
 # Codex Radar 通用 Provider 与 Workbench 集成
 
-状态：`v1.9.1 已实现 / 真实数据采集待 Codex Radar 授权`
+状态：`v1.10.0 / codex-radar-provider 0.2.0 已实现；Mac mini 真实生产采集 Evidence 待部署后补齐`
 
 本集成固定使用 [WineChord/codex-radar](https://github.com/WineChord/codex-radar)
 `v0.1.69` / commit `4c83973df6b17e6b18b0b56e8735168580fea12b` 的公开 JSON
@@ -8,20 +8,20 @@
 IPC 或 server；因此本仓库提供一个独立、标准库-only 的 `codex_radar_provider` 包，而不是
 复制上游 GUI 或重写一套 benchmark 采集系统。
 
-软件 MIT 许可与数据使用授权是两件事。当前 Codex Radar 公共状态要求衍生集成先获得
-授权并保留归因；本实现因此在没有本地授权 receipt 时 fail closed，而且在发出任何网络
-请求之前返回 `unauthorized`。固定归因是：`数据来自 Codex 雷达 codexradar.com`。
+软件 MIT 许可、公开 JSON 阅读以及站方衍生集成许可是不同事项。上游 `current.json` 仍
+声明完整 API 与衍生集成需要站方授权。本版本的个人自用路径只记录操作者对公共 JSON 的
+本地使用决定，不是站方许可，也绝不把它标成 `authorized`。固定归因是：`数据来自 Codex
+雷达 codexradar.com`；没有有效的本地 consent 或官方 receipt 时，网络请求前 fail closed。
 
 ## 1. 组件与数据流
 
 ```text
-Codex Radar JSON endpoints
-          │  仅在本地授权 receipt 有效后；默认每 24 小时
+Codex Radar public JSON endpoints
+          │  仅在本地 personal-use consent 或官方 receipt 有效后；默认每 86400 秒
           ▼
-codex_radar_provider                     通用、无 Workbench/DSH 依赖
-  ├── raw/<snapshot-id>.json             原始响应，敏感字段脱敏
-  ├── generations/<snapshot-id>.json     规范化、内容寻址快照
-  └── active.json                        原子 last-known-good 指针
+codex_radar_provider 0.2.0               通用、无 Workbench/DSH 依赖
+  ├── radar.sqlite3                      权威真源（snapshot/raw/models/insights/active）
+  └── JSON projections                   raw/generations/active，仅兼容投影
           │
           ├──────────────► 任意消费者 / 未来 DSH adapter
           │                读取同一 schema，自行保留硬门禁
@@ -38,14 +38,18 @@ performance snapshot ──► routing-v3
 ```
 
 Provider 不读取 Codex 或 Claude 凭据，不触发模型调用，不保存 API key，也不判断任务应该
-路由到哪个模型。Workbench adapter 不拥有第二份任务账本；它只把有效 Provider 快照转换
-为 performance snapshot 中可追溯的外部弱先验。
+路由到哪个模型。`<state_root>/radar.sqlite3` 是 Provider 的权威状态；每次 ingest 在一笔
+事务中写入 snapshot、raw payload、models、insights 和 active。`raw/`、`generations/`、
+`active.json` 只是兼容投影。Workbench adapter 不拥有第二份任务账本；它只把有效 Provider
+快照转换为 performance snapshot 中可追溯的外部弱先验。
 
 ## 2. 通用 Provider 契约
 
-安装本仓库 Python 包后，可用四个命令：
+安装本仓库 Python 包后，可用以下命令：
 
 ```bash
+codex-radar-provider --state-root <RADAR_STATE> consent --personal-use \
+  [--authorization-file <RECEIPT>]
 codex-radar-provider --state-root <RADAR_STATE> status
 codex-radar-provider --state-root <RADAR_STATE> show [--snapshot-id <ID>]
 codex-radar-provider --state-root <RADAR_STATE> refresh \
@@ -55,9 +59,11 @@ codex-radar-provider --state-root <RADAR_STATE> import \
   --payload-dir <EXPORTED_JSON_DIRECTORY>
 ```
 
-`status` 与 `show` 只读本地文件。`refresh` 只访问上游 Skill 记录的四个 JSON endpoint；
-不做 HTML 抓取。`import` 允许另一个已获授权的采集端把四份 JSON 交给离线机器，仍会执行
-相同 schema、时间戳和授权检查。
+`status` 与 `show` 只访问本地 SQLite（必要时自动把有效旧 JSON 投影迁入数据库），不联网。
+`refresh` 只访问上游 Skill 记录的四个 JSON endpoint，不做 HTML 抓取；默认 86400 秒内
+再次调用会被节流。`import` 允许另一个采集端把四份 JSON 交给离线机器，仍会执行相同
+schema、时间戳和 consent/授权检查。`consent --personal-use` 只写入本地、无秘密的 receipt，
+不联网。
 
 规范化快照 schema version 为 `1`：
 
@@ -67,7 +73,7 @@ snapshot_id / digest
 upstream { name, repository, version, commit, json_contract }
 source_urls { current, intelligence_efficiency, model_ratings, radar_insights }
 attribution
-authorization { schema, version, provider, status, scope }
+authorization { schema, version, provider, status, scope, basis?, accepted_at? }
 ingest_mode
 fetched_at / source_updated_at / source_timestamps
 models[]
@@ -75,6 +81,13 @@ insights
 raw_payload_digest
 cache { state, stale_after_seconds }
 ```
+
+Provider 数据库位于 `<state_root>/radar.sqlite3`，schema version 为 `1`，包含
+`radar_snapshots`、`radar_raw_payloads`、`radar_models`、`radar_insights` 和
+`radar_active` 五张表。`status` 会暴露 `backend=sqlite`、schema、绝对路径和各表 row
+counts。数据库先提交；JSON 文件只作为兼容投影，投影失败不会回滚已提交的权威数据库。
+旧版本若只有有效的 `raw/`、`generations/`、`active.json`，首次读取会自动迁入 SQLite；
+迁移后仍保留 JSON 以兼容旧消费者。
 
 每个 `models[]` 记录包含：
 
@@ -91,17 +104,21 @@ community_rating / metric_sources
 
 ## 3. 授权、缓存与断网行为
 
-授权 receipt 只记录“授权已由外部事实授予”的元数据，不能包含 token、cookie、密码或
-API key。不要根据本说明自行伪造 receipt；只有拿到 Codex Radar 明确授权后，才把授权
-范围与归因写入 authority 的 `radar/authorization.json`。
+receipt 不能包含 token、cookie、密码或 API key。个人自用由以下四项同时表示：
+`status=consented`、`basis=local_operator_consent`、`scope` 包含 `public-json`、以及有效的
+`accepted_at`。它只是本地操作者承担责任的个人使用 consent，不是站方授权，不得写成
+`status=authorized`。上游 `current.json` 对完整 API/衍生集成仍要求站方授权；若以后获得站方
+明确授权，才可另行使用站方提供的 `status=authorized` receipt。
 
 ```json
 {
   "schema": "codex-radar-provider-authorization",
   "version": 1,
   "provider": "codex-radar",
-  "status": "authorized",
-  "scope": ["<exact-scope-granted-by-provider>"],
+  "status": "consented",
+  "basis": "local_operator_consent",
+  "scope": ["public-json"],
+  "accepted_at": "2026-09-04T00:00:00Z",
   "attribution": "数据来自 Codex 雷达 codexradar.com"
 }
 ```
@@ -110,16 +127,17 @@ Provider 的失败语义：
 
 | 状态 | 本地快照 | 网络行为 | 消费方式 |
 | --- | --- | --- | --- |
-| `unauthorized` | 无 | 0 请求 | 使用宿主内置 baseline，不使用 Radar |
+| `unauthorized` | 无有效本地 consent/官方 receipt | 0 请求 | 使用宿主内置 baseline，不使用 Radar |
 | `unavailable` | 无 | 刷新失败或尚未采集 | 使用宿主内置 baseline |
 | `fresh` | 有 | `status/show` 为 0 请求 | 可作为受限外部先验 |
 | `stale` | 有 | 刷新失败时保留 last-known-good | 消费者必须降权并显示原时间 |
 | `expired` | 有 | Workbench 的消费状态 | 保留用于审计，但不影响新路由 |
 
-写入顺序是 raw generation、normalized generation、最后原子替换 `active.json`。schema
-错误、时间戳倒退或网络失败不会覆盖 last-known-good。Workbench 默认 7 天内为 fresh，
-7–31 天为 stale，超过 31 天为 expired；这些是 Workbench 消费策略，不改变 Provider
-文件的通用 schema。
+写入先在 SQLite 一事务中提交 raw payload、normalized snapshot、models、insights 与
+active，再原子刷新 JSON 兼容投影；schema 错误、时间戳倒退或网络失败不会覆盖数据库中的
+last-known-good。Workbench 默认 7 天内为 fresh，7–31 天为 stale，超过 31 天为 expired；
+这些是消费策略，不改变 Provider 的稳定 JSON schema。断网时直接读取数据库 LKG，JSON
+投影缺失也不影响数据库读取。
 
 ## 4. Workbench 的保守校准
 
@@ -152,26 +170,30 @@ tool、Claude quota/concurrency 和质量门禁，Radar 只在合法候选之间
 常用入口：
 
 ```bash
+codex-workbench --home <WB_STATE_ROOT> radar consent-personal-use
 codex-workbench --home <WB_STATE_ROOT> radar status
 codex-workbench --home <WB_STATE_ROOT> radar show
 codex-workbench --home <WB_STATE_ROOT> radar refresh
 curl http://127.0.0.1:8766/api/radar
 ```
 
-`/health`、`/api/snapshot` 和 `/api/radar` 的 Radar 部分都是只读的，不会因为查看状态而
-联网。没有授权时显示 `unauthorized` 是正确运行状态，不是服务健康失败；即使磁盘仍有
-旧缓存，撤销/删除本地授权 receipt 也会立即把 Radar 先验从下一份 performance snapshot
-移除。Provider 与 Workbench 的 freshness 阈值取更严格者。
+`/health`、`/api/snapshot` 和 `/api/radar` 的 Radar 部分都不会联网。没有本地 consent 时
+显示 `unauthorized` 是正确运行状态，不是服务健康失败；撤销/删除 receipt 会立即把 Radar
+先验从下一份 performance snapshot 移除，数据库中的历史快照仍保留审计。`/api/radar` 和
+provider `status` 会显示 SQLite backend、schema、path 与 row counts。Provider 与 Workbench
+的 freshness 阈值取更严格者。
 
 ## 5. 未来 DSH 接入合同（本次不修改 DSH）
 
-DSH 后续有三种等价消费方式：安装本仓库发布的 provider Python 包、调用
-`codex-radar-provider ... show`，或只读 `generations/<snapshot-id>.json`。推荐使用包内
-`validate_radar_snapshot()`，避免自行复制 digest 与 schema 校验。
+DSH 后续通过安装本仓库发布的 provider Python 包、调用 `codex-radar-provider ... show`，
+或读取稳定 JSON 合同来消费；推荐使用包内 `validate_radar_snapshot()`，避免绑定 Provider
+内部表。Provider 的 `radar.sqlite3` 与 Workbench 的任务/事件 SQLite 是两套独立数据库，
+DSH 不应复制或写入 Workbench SQLite。
 
 DSH adapter 的最小责任：
 
-1. 读取并验证 schema version、snapshot ID/digest、授权和来源归因；
+1. 读取并验证 schema version、snapshot ID/digest、consent/授权字段和来源归因；个人自用
+   必须同时满足 `consented`、`local_operator_consent`、`public-json`、`accepted_at`；
 2. 将 Provider 快照 ID/digest 固定进新 Run/TaskGraph 的输入闭包；
 3. 只接受 exact provider/model/effort 和正样本 `pass_rate`；未知模型保持 observed-only；
 4. 自行定义 fresh/stale/expired 阈值，并在 stale 时保留原 `fetched_at`；
@@ -186,17 +208,18 @@ DSH adapter 的最小责任：
 
 ## 6. 当前可证明边界
 
-- 已实现：通用 package/CLI、授权前零网络、四端点 JSON、脱敏 raw、规范化 generation、
+- 已实现：通用 package/CLI、personal-use consent、授权/consent 前零网络、四端点 JSON、
+  SQLite 权威数据库与五表一事务、旧 JSON 自动迁移、兼容投影、脱敏 raw、规范化 generation、
   原子 active、last-known-good、时间戳回退保护、Workbench 状态/API/性能快照接入、
   authority-only 每日定时任务、插件 Skill 与上游 source lock。
 - 已验证：无网络 fixture 测试、installer rollback、plugin validation、Workbench 受影响
   测试与完整仓库 gate。
-- 未宣称：当前机器已经获得 Codex Radar 数据授权；当前缓存已有真实 Radar 记录；Radar
-  能证明某模型在本机项目上的真实成功率；DSH 已经完成接入。
+- 未宣称：个人 consent 等同站方授权；Mac mini 已经完成真实生产首采；Radar 能证明某模型
+  在本机项目上的真实成功率；DSH 已经完成接入。
 
-当前问题：真实 Radar 采集仍缺 Codex Radar 官方数据授权 receipt；在此之前 authority 会
-稳定显示 `unauthorized`，并继续使用内置公开 benchmark 与本地运行账本。
+当前问题：Mac mini 的真实生产采集 Evidence 需在 v1.10.0 部署后补齐；个人自用 consent
+不授予完整 API/衍生集成的站方许可。
 
-下一步：取得明确数据授权后，仅在 Mac mini 写入不含秘密的 receipt，执行一次
-`radar refresh`，核对归因、snapshot ID、model/effort 映射和 performance provenance；DSH
-接入另开任务，仅实现上述只读 adapter，不复制 Workbench 调度逻辑。
+下一步：主控部署后在 Mac mini 执行 `radar consent-personal-use` 与一次 `radar refresh`，
+核对 SQLite 路径/row counts、归因、snapshot ID、model/effort 映射和 performance provenance；
+DSH 接入另开任务，仅实现上述 CLI/JSON 只读 adapter，不修改 DSH 或复制 Workbench 调度逻辑。

@@ -56,7 +56,7 @@ class PluginDistributionTests(unittest.TestCase):
         self.assertEqual(manifest["version"], self._project_version())
         self.assertEqual(manifest["hooks"], "./hooks/hooks.json")
         self.assertEqual(provider_manifest["name"], "codex-radar-provider")
-        self.assertEqual(provider_manifest["version"], "0.1.0")
+        self.assertEqual(provider_manifest["version"], "0.2.0")
         self.assertEqual(provider_manifest["license"], "MIT")
 
         self.assertIsInstance(marketplace["plugins"], list)
@@ -179,7 +179,7 @@ class PluginDistributionTests(unittest.TestCase):
 
             installed_plugins = [
                 ("codex-workbench@codex-workbench", self._project_version()),
-                ("codex-radar-provider@codex-workbench", "0.1.0"),
+                ("codex-radar-provider@codex-workbench", "0.2.0"),
             ]
             installed_names = set()
             for plugin_id, expected_version in installed_plugins:

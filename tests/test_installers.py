@@ -218,6 +218,14 @@ class InstallerTests(unittest.TestCase):
             radar["authorization_receipt"],
             str(state_root / "radar" / "authorization.json"),
         )
+        self.assertEqual(
+            radar["database"],
+            {
+                "backend": "sqlite",
+                "path": str(state_root / "radar" / "radar.sqlite3"),
+                "schema_version": module.RADAR_DATABASE_SCHEMA_VERSION,
+            },
+        )
         self.assertEqual(radar["refresh_interval_seconds"], 1234)
         self.assertEqual(radar["attribution"], "数据来自 Codex 雷达 codexradar.com")
         self.assertEqual(
@@ -1780,6 +1788,11 @@ class InstallerTests(unittest.TestCase):
                     },
                     "state_root": str(state_root / "radar"),
                     "authorization_receipt": str(state_root / "radar" / "authorization.json"),
+                    "database": {
+                        "backend": "sqlite",
+                        "path": str(state_root / "radar" / "radar.sqlite3"),
+                        "schema_version": module.RADAR_DATABASE_SCHEMA_VERSION,
+                    },
                     "refresh_interval_seconds": module.DEFAULT_RADAR_REFRESH_SECONDS,
                     "attribution": module.RADAR_ATTRIBUTION,
                     "refresh_command": [

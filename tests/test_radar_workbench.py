@@ -5,21 +5,31 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from codex_radar_provider import RadarRegistry
 from codex_workbench.performance import PerformanceRegistry
 from codex_workbench.radar import WorkbenchRadar, radar_prior_records
 
 
-def _authorization() -> dict[str, object]:
-    return {
+def _authorization(status: str = "authorized") -> dict[str, object]:
+    receipt: dict[str, object] = {
         "schema": "codex-radar-provider-authorization",
         "version": 1,
         "provider": "codex-radar",
-        "status": "authorized",
+        "status": status,
         "scope": ["model-quality-json"],
         "attribution": "数据来自 Codex 雷达 codexradar.com",
     }
+    if status == "consented":
+        receipt.update(
+            {
+                "basis": "local_operator_consent",
+                "scope": ["public-json"],
+                "accepted_at": "2026-09-04T11:00:00Z",
+            }
+        )
+    return receipt
 
 
 def _payloads(*, passed: int = 9, valid_tasks: int = 12) -> dict[str, object]:
@@ -110,8 +120,11 @@ class WorkbenchRadarTests(unittest.TestCase):
         stale_after_seconds: int = 7 * 24 * 60 * 60,
         passed: int = 9,
         valid_tasks: int = 12,
+        authorization_status: str = "authorized",
     ) -> None:
-        self.authorization.write_text(json.dumps(_authorization()), encoding="utf-8")
+        self.authorization.write_text(
+            json.dumps(_authorization(authorization_status)), encoding="utf-8"
+        )
         result = RadarRegistry(self.state_root).import_payloads(
             _payloads(passed=passed, valid_tasks=valid_tasks),
             self.authorization,
@@ -127,6 +140,7 @@ class WorkbenchRadarTests(unittest.TestCase):
         self.assertEqual(status["state"], "unauthorized")
         self.assertFalse(status["routing_prior_eligible"])
         self.assertFalse(status["offline_cache_available"])
+        self.assertEqual(status["database"]["backend"], "sqlite")
 
     def test_cache_has_fresh_stale_and_expired_workbench_boundaries(self) -> None:
         self._import()
@@ -194,6 +208,58 @@ class WorkbenchRadarTests(unittest.TestCase):
         self.assertEqual(record["iq_metadata"], 101.25)
         self.assertNotEqual(record["score"], record["iq_metadata"])
         self.assertEqual(record["provenance"], "community_observation")
+
+    def test_consented_cache_is_eligible_and_preserves_consent_status(self) -> None:
+        self._import(authorization_status="consented")
+        status = WorkbenchRadar(
+            self.state_root,
+            self.authorization,
+            stale_after_seconds=24 * 60 * 60,
+            expire_after_seconds=2 * 24 * 60 * 60,
+        ).status(now=datetime(2026, 9, 4, 12, 1, tzinfo=UTC))
+
+        records = radar_prior_records(status, _catalog())
+
+        self.assertEqual(status["state"], "fresh")
+        self.assertTrue(status["routing_prior_eligible"])
+        self.assertEqual(status["collector_authorization"], "consented")
+        self.assertEqual(status["snapshot_authorization"], "consented")
+        self.assertEqual(status["database"]["row_counts"]["radar_active"], 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["authorization_status"], "consented")
+        self.assertEqual(records[0]["collector_authorization"], "consented")
+        self.assertEqual(records[0]["quality_evidence"], "consented-external-prior")
+
+        stale = WorkbenchRadar(
+            self.state_root,
+            self.authorization,
+            stale_after_seconds=60,
+            expire_after_seconds=180,
+        ).status(now=datetime(2026, 9, 4, 12, 2, tzinfo=UTC))
+        self.assertEqual(stale["state"], "stale")
+        self.assertTrue(radar_prior_records(stale, _catalog()))
+
+    def test_refresh_passes_the_daily_interval_to_provider(self) -> None:
+        registry = mock.Mock()
+        registry.refresh.return_value = {
+            "ok": False,
+            "network_requested": False,
+            "projection": {"ok": False, "state": "degraded"},
+        }
+        with mock.patch("codex_workbench.radar.RadarRegistry", return_value=registry):
+            radar = WorkbenchRadar(
+                self.state_root,
+                self.authorization,
+                refresh_interval_seconds=24 * 60 * 60,
+            )
+            result = radar.refresh()
+
+        registry.refresh.assert_called_once_with(
+            self.authorization,
+            minimum_refresh_interval_seconds=24 * 60 * 60,
+            stale_after_seconds=7 * 24 * 60 * 60,
+        )
+        self.assertEqual(result["projection"]["state"], "degraded")
 
     def test_status_and_snapshot_identity_must_remain_bound(self) -> None:
         self._import()

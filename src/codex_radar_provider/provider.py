@@ -1,4 +1,4 @@
-"""Durable JSON snapshots for the public Codex Radar data contract.
+"""SQLite-backed snapshots for the public Codex Radar data contract.
 
 This adapter intentionally consumes only the JSON endpoints documented by
 WineChord/codex-radar v0.1.69.  It does not scrape HTML, read Codex/Claude
@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sqlite3
 import tempfile
 from typing import Any, Mapping
 from urllib.error import URLError
@@ -21,6 +22,7 @@ from urllib.request import Request, urlopen
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 1
 AUTHORIZATION_SCHEMA = "codex-radar-provider-authorization"
 AUTHORIZATION_VERSION = 1
 UPSTREAM_NAME = "WineChord/codex-radar"
@@ -30,7 +32,9 @@ UPSTREAM_COMMIT = "4c83973df6b17e6b18b0b56e8735168580fea12b"
 ATTRIBUTION = "数据来自 Codex 雷达 codexradar.com"
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
-DEFAULT_MINIMUM_REFRESH_INTERVAL_SECONDS = 10 * 60
+DEFAULT_MINIMUM_REFRESH_INTERVAL_SECONDS = 24 * 60 * 60
+LOCAL_OPERATOR_CONSENT_BASIS = "local_operator_consent"
+PERSONAL_USE_SCOPE = "public-json"
 
 SOURCE_URLS = {
     "current": "https://codexradar.com/current.json",
@@ -264,23 +268,95 @@ def _authorization_metadata(authorization_file: Path) -> tuple[dict[str, object]
     status = _model_text(raw.get("status"))
     scope = _normalise_scope(raw.get("scope"))
     attribution = _text(raw.get("attribution"))
+    basis = _model_text(raw.get("basis"))
+    accepted_at = _text(raw.get("accepted_at"))
 
     if schema != AUTHORIZATION_SCHEMA or version != AUTHORIZATION_VERSION:
         return None, "authorization receipt schema is unsupported"
-    if provider != "codex-radar" or status != "authorized":
-        return None, "authorization receipt is not authorized for codex-radar"
+    if provider != "codex-radar" or status not in {"authorized", "consented"}:
+        return None, "authorization receipt is not valid for codex-radar"
     if scope is None:
         return None, "authorization receipt scope is invalid"
     if attribution is None or "codexradar.com" not in attribution.lower():
         return None, "authorization receipt attribution is invalid"
-    return {
+    metadata: dict[str, object] = {
         "schema": schema,
         "version": version,
         "provider": provider,
         "status": status,
         "scope": scope,
         "attribution": attribution,
-    }, None
+    }
+    if status == "consented":
+        if basis != LOCAL_OPERATOR_CONSENT_BASIS:
+            return None, "personal-use consent basis is invalid"
+        if PERSONAL_USE_SCOPE not in scope:
+            return None, "personal-use consent scope must include public-json"
+        parsed_accepted_at = _parse_timestamp(accepted_at)
+        if parsed_accepted_at is None:
+            return None, "personal-use consent accepted_at is invalid"
+        # Store one UTC spelling so the durable snapshot identity is stable.
+        metadata["basis"] = basis
+        metadata["accepted_at"] = _now_iso(parsed_accepted_at)
+    return metadata, None
+
+
+def write_personal_use_consent(
+    authorization_file: Path,
+    *,
+    accepted_at: datetime | None = None,
+) -> dict[str, object]:
+    """Write an explicit, secret-free local-operator consent receipt.
+
+    This receipt deliberately has ``status=consented`` rather than
+    ``status=authorized``: it records a local operator's decision to consume
+    public JSON endpoints and does not represent authorization from the data
+    publisher.
+    """
+
+    receipt = {
+        "schema": AUTHORIZATION_SCHEMA,
+        "version": AUTHORIZATION_VERSION,
+        "provider": "codex-radar",
+        "status": "consented",
+        "basis": LOCAL_OPERATOR_CONSENT_BASIS,
+        "scope": [PERSONAL_USE_SCOPE],
+        "accepted_at": _now_iso(accepted_at),
+        "attribution": ATTRIBUTION,
+    }
+    _atomic_write_document(Path(authorization_file), receipt, mode=0o600)
+    return receipt
+
+
+def _atomic_write_document(
+    path: Path,
+    document: Mapping[str, object],
+    *,
+    mode: int | None = None,
+) -> None:
+    """Atomically replace a JSON projection without retaining secret input."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        if mode is not None:
+            os.chmod(temporary, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(_canonical_json(document))
+            handle.write("\n")
+        os.replace(temporary, path)
+        if mode is not None:
+            os.chmod(path, mode)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _normalise_payloads(payloads: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
@@ -775,6 +851,14 @@ def _normalise_snapshot(
             "provider": str(authorization["provider"]),
             "status": str(authorization["status"]),
             "scope": list(authorization["scope"]),
+            **(
+                {
+                    "basis": str(authorization["basis"]),
+                    "accepted_at": str(authorization["accepted_at"]),
+                }
+                if authorization.get("status") == "consented"
+                else {}
+            ),
         },
         "ingest_mode": ingest_mode,
         "fetched_at": fetched_at,
@@ -838,8 +922,20 @@ def validate_radar_snapshot(snapshot: Mapping[str, object]) -> None:
     insights = snapshot.get("insights")
     if not isinstance(upstream, Mapping) or not isinstance(sources, Mapping):
         raise RadarProviderError("radar snapshot provenance is invalid")
-    if not isinstance(authorization, Mapping) or authorization.get("status") != "authorized":
+    if not isinstance(authorization, Mapping):
         raise RadarProviderError("radar snapshot authorization is invalid")
+    authorization_status = _model_text(authorization.get("status"))
+    if authorization_status not in {"authorized", "consented"}:
+        raise RadarProviderError("radar snapshot authorization is invalid")
+    if authorization_status == "consented":
+        authorization_scope = _normalise_scope(authorization.get("scope"))
+        if (
+            _model_text(authorization.get("basis")) != LOCAL_OPERATOR_CONSENT_BASIS
+            or authorization_scope is None
+            or PERSONAL_USE_SCOPE not in authorization_scope
+            or _parse_timestamp(authorization.get("accepted_at")) is None
+        ):
+            raise RadarProviderError("radar snapshot personal-use consent is invalid")
     if not isinstance(cache, Mapping) or cache.get("state") != "fresh":
         raise RadarProviderError("radar snapshot cache metadata is invalid")
     if not isinstance(cache.get("stale_after_seconds"), int) or cache["stale_after_seconds"] <= 0:
@@ -869,17 +965,177 @@ def validate_radar_snapshot(snapshot: Mapping[str, object]) -> None:
 
 
 class RadarRegistry:
-    """File-backed provider state that any local Python consumer can read."""
+    """SQLite-backed provider state with portable JSON compatibility projections."""
 
     def __init__(self, state_root: Path) -> None:
         self.state_root = Path(state_root)
         self._generations_root = self.state_root / "generations"
         self._raw_root = self.state_root / "raw"
         self._active_path = self.state_root / "active.json"
+        self._database_path = self.state_root / "radar.sqlite3"
 
-    def active(self) -> dict[str, object] | None:
-        """Return the valid last-known-good normalized snapshot, if one exists."""
+    @property
+    def database_path(self) -> Path:
+        """Path to the authoritative local SQLite state."""
 
+        return self._database_path
+
+    def _ensure_state_root(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.state_root, 0o700)
+
+    def _connection(self) -> sqlite3.Connection:
+        self._ensure_state_root()
+        connection = sqlite3.connect(str(self._database_path), timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            os.chmod(self._database_path, 0o600)
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+            current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if current_version > DATABASE_SCHEMA_VERSION:
+                raise RadarProviderError("radar database schema is newer than this provider")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS radar_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    digest TEXT NOT NULL UNIQUE,
+                    schema_version INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    source_updated_at TEXT,
+                    ingest_mode TEXT NOT NULL,
+                    attribution TEXT NOT NULL,
+                    authorization_status TEXT NOT NULL,
+                    authorization_basis TEXT,
+                    authorization_accepted_at TEXT,
+                    snapshot_document TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS radar_raw_payloads (
+                    snapshot_id TEXT NOT NULL REFERENCES radar_snapshots(snapshot_id) ON DELETE CASCADE,
+                    payload_name TEXT NOT NULL,
+                    payload_document TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, payload_name)
+                );
+                CREATE TABLE IF NOT EXISTS radar_models (
+                    snapshot_id TEXT NOT NULL REFERENCES radar_snapshots(snapshot_id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL,
+                    model_document TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, model, reasoning_effort)
+                );
+                CREATE TABLE IF NOT EXISTS radar_insights (
+                    snapshot_id TEXT PRIMARY KEY REFERENCES radar_snapshots(snapshot_id) ON DELETE CASCADE,
+                    insights_document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS radar_active (
+                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                    snapshot_id TEXT NOT NULL REFERENCES radar_snapshots(snapshot_id),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS radar_snapshots_source_updated_at_idx
+                    ON radar_snapshots(source_updated_at);
+                CREATE INDEX IF NOT EXISTS radar_models_model_effort_idx
+                    ON radar_models(model, reasoning_effort);
+                """
+            )
+            if current_version < DATABASE_SCHEMA_VERSION:
+                connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+            connection.commit()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+    def _database_status(self) -> dict[str, object]:
+        table_names = (
+            "radar_snapshots",
+            "radar_raw_payloads",
+            "radar_models",
+            "radar_insights",
+            "radar_active",
+        )
+        result: dict[str, object] = {
+            "backend": "sqlite",
+            "schema_version": DATABASE_SCHEMA_VERSION,
+            "path": str(self._database_path),
+            "row_counts": {name: 0 for name in table_names},
+        }
+        try:
+            connection = self._connection()
+            try:
+                row_counts = {
+                    name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+                    for name in table_names
+                }
+                result["row_counts"] = row_counts
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error, RadarProviderError) as exc:
+            result["ok"] = False
+            result["error"] = _safe_error(exc)
+        else:
+            result["ok"] = True
+        return result
+
+    @staticmethod
+    def _document_from_json(value: object) -> dict[str, object] | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            document = json.loads(value)
+            if not isinstance(document, dict):
+                return None
+            validate_radar_snapshot(document)
+            return document
+        except (UnicodeDecodeError, json.JSONDecodeError, RadarProviderError):
+            return None
+
+    def _database_generation(self, snapshot_id: str) -> dict[str, object] | None:
+        try:
+            connection = self._connection()
+            try:
+                row = connection.execute(
+                    "SELECT snapshot_document FROM radar_snapshots WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error, RadarProviderError):
+            return None
+        return self._document_from_json(row["snapshot_document"]) if row is not None else None
+
+    def _database_active(self) -> dict[str, object] | None:
+        try:
+            connection = self._connection()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT snapshots.snapshot_document
+                    FROM radar_active AS active
+                    JOIN radar_snapshots AS snapshots ON snapshots.snapshot_id = active.snapshot_id
+                    WHERE active.slot = 1
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error, RadarProviderError):
+            return None
+        return self._document_from_json(row["snapshot_document"]) if row is not None else None
+
+    def _projection_generation(self, snapshot_id: str) -> dict[str, object] | None:
+        path = self._generations_root / f"{snapshot_id}.json"
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                return None
+            validate_radar_snapshot(document)
+            return document
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, RadarProviderError):
+            return None
+
+    def _projection_active(self) -> tuple[dict[str, object], dict[str, object]] | None:
         try:
             pointer = json.loads(self._active_path.read_text(encoding="utf-8"))
             if not isinstance(pointer, Mapping):
@@ -887,9 +1143,58 @@ class RadarRegistry:
             snapshot_id = pointer.get("snapshot_id")
             if not isinstance(snapshot_id, str):
                 return None
-            return self.load_generation(snapshot_id)
+            snapshot = self._projection_generation(snapshot_id)
+            if snapshot is None:
+                return None
+            raw_path = self._raw_root / f"{snapshot_id}.json"
+            raw_generation = json.loads(raw_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_generation, dict):
+                return None
+            return snapshot, raw_generation
         except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
+
+    def _migrate_projection_active(self) -> dict[str, object] | None:
+        """Adopt a valid legacy JSON LKG into SQLite exactly once when needed."""
+
+        projection = self._projection_active()
+        if projection is None:
+            return None
+        snapshot, raw_generation = projection
+        try:
+            self._persist_database(snapshot, raw_generation)
+        except (OSError, sqlite3.Error, RadarProviderError, TypeError, ValueError):
+            return None
+        return self._database_active()
+
+    def active(self) -> dict[str, object] | None:
+        """Return the valid last-known-good normalized snapshot, if one exists."""
+
+        snapshot = self._database_active()
+        return snapshot if snapshot is not None else self._migrate_projection_active()
+
+    def consent_personal_use(
+        self,
+        authorization_file: Path | None = None,
+        *,
+        accepted_at: datetime | None = None,
+    ) -> dict[str, object]:
+        """Record explicit local personal-use consent without any network request."""
+
+        self._ensure_state_root()
+        target = Path(authorization_file) if authorization_file is not None else self.state_root / "authorization.json"
+        receipt = write_personal_use_consent(target, accepted_at=accepted_at)
+        return {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "provider": "codex-radar-provider",
+            "ok": True,
+            "operation": "consent-personal-use",
+            "state": "consented",
+            "status": "consented",
+            "network_requested": False,
+            "authorization_file": str(target),
+            "receipt": receipt,
+        }
 
     def authorization_status(self, authorization_file: Path) -> dict[str, object]:
         """Read and validate an authorization receipt without any network activity.
@@ -912,7 +1217,7 @@ class RadarRegistry:
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "provider": "codex-radar-provider",
             "ok": True,
-            "status": "authorized",
+            "status": authorization["status"],
             "receipt": dict(authorization),
         }
 
@@ -921,20 +1226,14 @@ class RadarRegistry:
 
         if not isinstance(snapshot_id, str) or not _SNAPSHOT_ID_RE.fullmatch(snapshot_id):
             return None
-        path = self._generations_root / f"{snapshot_id}.json"
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(document, dict):
-                return None
-            validate_radar_snapshot(document)
-            return document
-        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, RadarProviderError):
-            return None
+        document = self._database_generation(snapshot_id)
+        return document if document is not None else self._projection_generation(snapshot_id)
 
     def status(self, now: datetime | None = None) -> dict[str, object]:
         """Describe whether the active snapshot is usable fresh cache, stale cache, or absent."""
 
         snapshot = self.active()
+        database = self._database_status()
         if snapshot is None:
             return {
                 "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -945,6 +1244,7 @@ class RadarRegistry:
                 "snapshot_id": None,
                 "digest": None,
                 "snapshot": None,
+                "database": database,
             }
         checked_at = now or datetime.now(UTC)
         if checked_at.tzinfo is None:
@@ -974,6 +1274,7 @@ class RadarRegistry:
                 "status"
             ],
             "snapshot": snapshot,
+            "database": database,
         }
 
     def refresh(
@@ -1122,8 +1423,8 @@ class RadarRegistry:
             ):
                 raise RadarProviderError("source timestamp regressed; last-known-good snapshot was retained")
             validate_radar_snapshot(snapshot)
-            self._persist(snapshot, raw_generation)
-        except (OSError, TypeError, ValueError, RadarProviderError) as exc:
+            projection_error = self._persist(snapshot, raw_generation)
+        except (OSError, sqlite3.Error, TypeError, ValueError, RadarProviderError) as exc:
             return self._failure(ingest_mode, _safe_error(exc))
         result = self.status()
         result.update(
@@ -1131,44 +1432,149 @@ class RadarRegistry:
                 "operation": ingest_mode,
                 "network_requested": ingest_mode == "refresh",
                 "generation_created": True,
+                "projection": (
+                    {
+                        "ok": False,
+                        "state": "degraded",
+                        "error": projection_error,
+                    }
+                    if projection_error is not None
+                    else {"ok": True, "state": "current"}
+                ),
             }
         )
         return result
 
-    def _persist(self, snapshot: Mapping[str, object], raw_generation: Mapping[str, object]) -> None:
-        snapshot_id = str(snapshot["snapshot_id"])
-        self._generations_root.mkdir(parents=True, exist_ok=True)
-        self._raw_root.mkdir(parents=True, exist_ok=True)
-        self._atomic_write(self._raw_root / f"{snapshot_id}.json", raw_generation)
-        self._atomic_write(self._generations_root / f"{snapshot_id}.json", snapshot)
-        self._atomic_write(
-            self._active_path,
-            {
-                "schema_version": SNAPSHOT_SCHEMA_VERSION,
-                "snapshot_id": snapshot_id,
-                "updated_at": _now_iso(),
-            },
-        )
+    def _persist_database(
+        self,
+        snapshot: Mapping[str, object],
+        raw_generation: Mapping[str, object],
+    ) -> None:
+        """Commit raw, normalized, insight, and active state as one transaction."""
 
-    @staticmethod
-    def _atomic_write(path: Path, document: Mapping[str, object]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=str(path.parent),
-        )
+        validate_radar_snapshot(snapshot)
+        snapshot_id = str(snapshot["snapshot_id"])
+        authorization = _mapping(snapshot["authorization"], "radar snapshot authorization")
+        models = snapshot.get("models")
+        insights = _mapping(snapshot.get("insights"), "radar snapshot insights")
+        raw_payloads = _mapping(raw_generation.get("payloads"), "radar raw payloads")
+        if not isinstance(models, list):
+            raise RadarProviderError("radar snapshot models must be a list")
+
+        connection = self._connection()
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(_canonical_json(document))
-                handle.write("\n")
-            os.replace(temporary, path)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+            with connection:
+                existing = connection.execute(
+                    "SELECT digest FROM radar_snapshots WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                if existing is not None and existing["digest"] != snapshot["digest"]:
+                    raise RadarProviderError("radar snapshot ID conflicts with a different digest")
+                connection.execute(
+                    """
+                    INSERT INTO radar_snapshots (
+                        snapshot_id, digest, schema_version, fetched_at, source_updated_at,
+                        ingest_mode, attribution, authorization_status, authorization_basis,
+                        authorization_accepted_at, snapshot_document, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(snapshot_id) DO UPDATE SET
+                        digest = excluded.digest,
+                        schema_version = excluded.schema_version,
+                        fetched_at = excluded.fetched_at,
+                        source_updated_at = excluded.source_updated_at,
+                        ingest_mode = excluded.ingest_mode,
+                        attribution = excluded.attribution,
+                        authorization_status = excluded.authorization_status,
+                        authorization_basis = excluded.authorization_basis,
+                        authorization_accepted_at = excluded.authorization_accepted_at,
+                        snapshot_document = excluded.snapshot_document
+                    """,
+                    (
+                        snapshot_id,
+                        str(snapshot["digest"]),
+                        int(snapshot["schema_version"]),
+                        str(snapshot["fetched_at"]),
+                        snapshot.get("source_updated_at"),
+                        str(snapshot["ingest_mode"]),
+                        str(snapshot["attribution"]),
+                        str(authorization["status"]),
+                        authorization.get("basis"),
+                        authorization.get("accepted_at"),
+                        _canonical_json(snapshot),
+                        _now_iso(),
+                    ),
+                )
+                connection.execute("DELETE FROM radar_raw_payloads WHERE snapshot_id = ?", (snapshot_id,))
+                connection.executemany(
+                    """
+                    INSERT INTO radar_raw_payloads (snapshot_id, payload_name, payload_document)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (snapshot_id, str(name), _canonical_json(payload))
+                        for name, payload in sorted(raw_payloads.items())
+                    ],
+                )
+                connection.execute("DELETE FROM radar_models WHERE snapshot_id = ?", (snapshot_id,))
+                connection.executemany(
+                    """
+                    INSERT INTO radar_models (
+                        snapshot_id, model, reasoning_effort, model_document
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            snapshot_id,
+                            str(_mapping(model, "radar model")["model"]),
+                            str(_mapping(model, "radar model")["reasoning_effort"]),
+                            _canonical_json(model),
+                        )
+                        for model in models
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT INTO radar_insights (snapshot_id, insights_document)
+                    VALUES (?, ?)
+                    ON CONFLICT(snapshot_id) DO UPDATE SET
+                        insights_document = excluded.insights_document
+                    """,
+                    (snapshot_id, _canonical_json(insights)),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO radar_active (slot, snapshot_id, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(slot) DO UPDATE SET
+                        snapshot_id = excluded.snapshot_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (snapshot_id, _now_iso()),
+                )
+        finally:
+            connection.close()
+
+    def _persist(self, snapshot: Mapping[str, object], raw_generation: Mapping[str, object]) -> str | None:
+        """Commit SQLite first, then refresh non-authoritative JSON projections."""
+
+        snapshot_id = str(snapshot["snapshot_id"])
+        self._persist_database(snapshot, raw_generation)
+        try:
+            self._generations_root.mkdir(parents=True, exist_ok=True)
+            self._raw_root.mkdir(parents=True, exist_ok=True)
+            _atomic_write_document(self._raw_root / f"{snapshot_id}.json", raw_generation)
+            _atomic_write_document(self._generations_root / f"{snapshot_id}.json", snapshot)
+            _atomic_write_document(
+                self._active_path,
+                {
+                    "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                    "snapshot_id": snapshot_id,
+                    "updated_at": _now_iso(),
+                },
+            )
+        except OSError as exc:
+            return _safe_error(exc)
+        return None
 
     def _failure(
         self,
