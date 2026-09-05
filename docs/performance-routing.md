@@ -1,25 +1,90 @@
-# Workbench 性能路由：基线、账本与 Spark P0
+# Workbench 性能路由：1.13.0 候选合同、历史基线与 Spark P0
 
-状态：`v1.11.0 已实现 / 长期生产校准 Evidence 持续积累`
+状态：`1.13.0 本地源码候选（未发布）`
+正式服务基线：`v1.12.1 / 6848bf7`；本文不表示已切换正式服务，也不表示 Mac mini 已启用分类器。
 适用范围：Codex Workbench 的新任务路由、长期运行指标和 Spark 执行队列。本文不改变任务验收的权威性：Worker 结果永远不是验收结果，只有独立 verifier 的通过转换才能使任务 `accepted`。
 
 本文把“模型擅长什么”和“在 Workbench 里实际交付得怎样”分开建模。随包公开基准、本机
 personal-use consent 取得的 Codex Radar 公共 JSON 快照，以及 AI Frontier 公共 JSON 快照
-都只用于冷启动弱先验；本机持久事件用于长期校准；这些来源都不能绕过能力、权限、证据和
-质量门禁。
+都进入独立的 `public_evidence` 参考层；只有同 cohort、精确可比的记录，才可在硬门禁和
+声明质量等价带之后提供冷启动次级偏好。本机持久事件才用于 Beta 运行校准；这些来源都不能
+绕过能力、权限、证据和质量门禁。
 
-## 1. 目标与状态语义
+## 当前候选合同：1.13.0（未发布）
 
-Workbench 当前把公开 benchmark 先验与本地运行账本合成一个可重建的 advisory performance snapshot，但不能把外部排行榜伪装成本机实测。当前代码对校准上下文只报告以下两种状态：
+以下是 c7a0df4 源码候选的当前语义；旧版详述从第 2 节起仅作为 v1.11.0 历史基线保留，
+与本节冲突时以本节、README 和当前源码为准。
+
+### 快照、运行校准与精确分桶
+
+- 新性能快照使用 `source=local-outcomes-only-runtime-ledger-v2`、
+  `semantic_version=local-outcomes-only-v2`。`calibration_policy` 固定
+  `local_outcomes_only=true`、`external_evidence_updates_beta=false`、
+  `policy_prior_empirical=false`，并将 `public_evidence` 标为非校准证据。
+- Beta 只由可判定的本地真实运行结果更新：`conservative-policy-prior` 的冷启动参数是
+  非经验 policy prior；公开分数、Radar 和 AI Frontier 记录不转换成 Beta 伪样本，也不在
+  family、版本或邻近 task/complexity 之间借分。
+- 本地运行校准按精确 cohort 分桶：
+  `(provider, exact_model_id, agent_name, agent_version, reasoning_effort, task_type,
+  complexity, harness, score_kind)`。fixture、deterministic、verifier、Evidence reuse、
+  缺少 result/`actual_model`、不支持 provider、unattested Agent、非零/未知退出、
+  blocked 和 indeterminate 仍保留为排除或 unresolved，不进入质量成功/失败分母。
+- 旧 `benchmark-prior-plus-runtime-ledger-v1` 快照最多只能作为
+  `legacy-audit-only` 审计材料；刷新前不能进入 v2 calibrate 或作为可解释的当前 posterior。
+  不做旧快照的语义重解释、伪样本迁移或静默升级；已 pin 的运行任务也不因刷新而重路由。
+
+### 声明质量门禁与可比证据次级排序
+
+- 声明的 capability quality/quality floor 是路由的硬质量合同；先执行角色、task、复杂度、
+  工具/权限、结构化输出、scope、Agent/harness、Claude 认证配额和并发等硬门禁，再按风险
+  计算质量等价带。成本、速度或外部证据不能买回低于门禁的候选。
+- 本地 posterior lower bound、first-pass、返工和时延只在所有带内候选拥有相同精确本地
+  measurement cohort 且有可用样本时，作为 observational 的次级排序；缺少可比样本就
+  明确 abstain。它们不替代声明质量，也不是因果收益证明。
+- `public_evidence` 只有在 benchmark/version、metric、harness、reasoning effort、task
+  type、score kind、value/unit 及 exact provider/model 条件齐全时才可比。按 upstream/model/
+  metric/cohort 去重；同 source/cohort 无唯一 lineage、冲突、比较不完整或形成偏好环时弃权。
+  对通过率类指标，缺少样本分母或 Wilson 区间重叠也会弃权并保留 receipt。可比证据只在已硬门禁且位于声明质量等价带的
+  冷启动候选之间提供离散次级偏好，不是 Beta 样本、质量概率或全局排行榜。
+
+### OpenSquilla 新 DAG 的单调需求底线
+
+可选的本地 OpenSquilla V4 Phase 3 compatible subset 只在新 DAG 编译时对原始 worker
+title/prompt 批量调用一次 `advise_batch`；它输出 `c0`–`c3` 需求分类，不是成功率、模型排名、
+provider 选择或模型调用。planner 接线使用单调 floor：
+`c0 → low`、`c1 → standard`、`c2/c3 → high`，
+`effective_complexity = max(declared_complexity, demand_floor)`；因此分类只能抬高既有声明，
+不能降低规划器底线，也不能绕过 role、quality、quota 或 reasoning-effort 门禁。结果写入
+prompt-free `squilla_advice_receipt`；advisor 缺失、权重缺失或失败时保留声明策略并记录
+unavailable 原因。已有任务/冻结 NodeSpec 不重分类、不重路由；该接线是可选本地配置，不构成
+Mac mini 已启用或真实收益已验证的声明。
+
+### 尚未完成的真实收益与账本边界
+
+1. 真实生产 receipt 仍需持续积累 first-pass/final acceptance、返工、时延和吞吐；当前不能
+   声称 1.13.0 已带来交付周期或单位配额收益。
+2. 没有 `baseline`/`shadow`/`calibrated`/`stale` 晋级阈值或自动 promotion/drift 生命周期，
+   也没有同任务、同模型、同预算的随机对照或反事实证据；本地排序是观察性次级信号。
+3. 没有 pool/cost-unit reservation、release 或 reservation-failure admission ledger；
+   Codex/Spark 订阅余额没有可证明接口时仍为 `N/A`，Claude 只接受可信被动 quota snapshot。
+4. 没有完整 `failure_origin` 分类器；基础设施、认证/配额阻断和未知结果不能被强行归因给模型。
+
+## 1. 目标与当前状态语义
+
+Workbench 当前把本地运行账本与独立的公开证据参考层合成一个可重建的 advisory performance snapshot，但不能把外部排行榜伪装成本机实测。当前代码对校准上下文只报告以下两种状态：
 
 | 状态 | 含义 | 是否改变新任务路由 |
 |---|---|---|
-| `cold-start` | 没有活动 performance snapshot；`calibrate` 使用随包的公开 benchmark 先验 | 可以作为 advisory 候选信息，但不能降低质量门禁 |
-| `ok` | 存在有效的 content-addressed performance snapshot；候选同时带公开先验和已采集的运行统计（若有） | 只能在硬能力/角色/配额/作用域门禁之后作为 advisory 排序输入 |
+| `cold-start` | 没有活动 performance snapshot；使用非经验 policy prior，公开 benchmark 仅作为 `public_evidence` 参考 | 只有精确可比的证据可在硬门禁和声明质量等价带之后提供冷启动次级偏好 |
+| `ok` | 存在有效的 content-addressed `local-outcomes-only-v2` snapshot；候选带精确本地运行统计（若有）和独立公开证据参考 | 本地统计与公开证据都只能在硬能力/角色/配额/作用域门禁之后作 advisory 次级排序 |
 
-当前没有 `baseline`、`shadow`、`calibrated` 或 `stale` 的晋级、过期和回滚生命周期，也没有按有效样本量或稳定性自动晋级的阈值。它们是后续设计可采用的状态，不应当写成 v1.11.0 已实现能力。当前 posterior/lower-bound 仍只是 advisory 估计，不是模型质量已被证明。
+当前候选没有 `baseline`、`shadow`、`calibrated` 或 `stale` 的晋级、过期和回滚生命周期，也没有按有效样本量或稳定性自动晋级的阈值。它们是后续设计可采用的状态，不应当写成 1.13.0 已实现能力。当前 posterior/lower-bound 仍只是 advisory 估计，不是模型质量已被证明。
 
-非目标：把 Terminal-Bench、SWE-Bench Pro、HLE 的分数做一个全局平均；用成本或速度换取低于质量下界的候选；用一次成功回合宣称模型长期可靠；在没有真实配额证据时编造剩余百分比。
+非目标：把 Terminal-Bench、SWE-Bench Pro、HLE 的分数做一个全局平均或 Beta 样本；用成本或速度换取低于质量门禁的候选；用一次成功回合宣称模型长期可靠；在没有真实配额证据时编造剩余百分比。
+
+> **历史范围（非当前合同）**：以下第 2–9 节保留 v1.11.0 的来源、算法和 Spark 设计详述，
+> 仅用于审计旧快照与迁移语境。其中“当前实现”“当前代码”“v1.11.0 已实现”等表述均限定
+> 于该历史基线；不得据此推断 1.13.0 仍把公开数据并入 Beta、使用粗分桶或已启用旧晋级语义。
 
 ## 2. 冷启动基线：按领域使用公开证据
 
@@ -362,6 +427,6 @@ v1.11.0 当前的最小可证明闭环如下；实现状态与真实生产 Evide
 
 作为新鲜度与污染讨论的补充，可参阅 [SWE-rebench](https://arxiv.org/abs/2505.20411)；它不替代上述四个主来源，也不直接提供 Workbench 当前模型的本机质量证明。
 
-当前问题：v1.11.0 已实现公开 benchmark baseline、Radar 与 AI Frontier 两个独立 SQLite/LKG 外部先验源、append-only runtime ledger、advisory posterior、quality-equivalence efficiency 路由、content-addressed snapshot pinning 和 Spark logical lane；`performance calibrate` 仍只返回 `cold-start`/`ok`，没有 promotion lifecycle、quota reservation、failure_origin 或足够长期生产 receipt 可宣称动态质量校准完成。
+历史基线问题：v1.11.0 已实现公开 benchmark baseline、Radar 与 AI Frontier 两个独立 SQLite/LKG 外部先验源、append-only runtime ledger、advisory posterior、quality-equivalence efficiency 路由、content-addressed snapshot pinning 和 Spark logical lane；该段不描述当前 1.13.0 合同。
 
-下一步：在不触发模型调用的前提下，逐次部署核对两个 Provider 的数据库路径、row counts、snapshot/digest 和 performance provenance；随后持续收集真实任务的 actual model/Agent version、first-pass/final acceptance、rework、duration 与 Spark lane 指标。DSH 未来仅通过稳定 provider CLI/JSON 合同只读接入，不修改 DSH 或复制 Workbench task SQLite。
+历史基线后续：在不触发模型调用的前提下，逐次部署核对两个 Provider 的数据库路径、row counts、snapshot/digest 和 performance provenance；随后持续收集真实任务的 actual model/Agent version、first-pass/final acceptance、rework、duration 与 Spark lane 指标。DSH 未来仅通过稳定 provider CLI/JSON 合同只读接入，不修改 DSH 或复制 Workbench task SQLite。
