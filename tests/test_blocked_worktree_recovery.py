@@ -419,8 +419,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         peak_installs = 0
         errors: list[BaseException] = []
 
-        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             nonlocal active_installs, peak_installs
+            if args[0] == "/bin/cp":
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
             if args[-1] == "--version":
                 return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
             with guard:
@@ -428,6 +431,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
                 peak_installs = max(peak_installs, active_installs)
             started_install.set()
             release_install.wait(timeout=3)
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            (cwd / "node_modules").mkdir()
+            (cwd / "node_modules" / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            (cwd / "node_modules" / ".bin").mkdir()
             with guard:
                 active_installs -= 1
             return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
@@ -497,6 +505,15 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             timeout = kwargs["timeout"]
             assert isinstance(timeout, int)
             calls.append((tuple(args), timeout))
+            if args[0] == "/bin/cp":
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+            if args[-1] != "--version":
+                cwd = kwargs["cwd"]
+                assert isinstance(cwd, Path)
+                (cwd / "node_modules").mkdir()
+                (cwd / "node_modules" / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+                (cwd / "node_modules" / ".bin").mkdir()
             return subprocess.CompletedProcess(
                 args,
                 0,
@@ -512,7 +529,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
 
         self.assertEqual(receipt["materialization_timeout_seconds"], 360)
         self.assertEqual(receipt["store_dir"], str(store.resolve()))
-        self.assertEqual([timeout for _command, timeout in calls], [360, 360])
+        self.assertEqual([timeout for _command, timeout in calls], [360, 360, 360])
         self.assertIn("--pm-on-fail=ignore", calls[1][0])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
 
@@ -522,8 +539,9 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         first = self.root / "template-first"
         second = self.root / "template-second"
         changed = self.root / "template-changed"
+        interrupted = self.root / "template-interrupted"
         store.mkdir()
-        for worktree in (first, second, changed):
+        for worktree in (first, second, changed, interrupted):
             worktree.mkdir()
             (worktree / "packages" / "fixture").mkdir(parents=True)
             (worktree / "package.json").write_text(
@@ -549,6 +567,8 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             cwd = kwargs["cwd"]
             assert isinstance(cwd, Path)
             (cwd / "node_modules").mkdir()
+            (cwd / "node_modules" / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            (cwd / "node_modules" / ".bin").mkdir()
             (cwd / "node_modules" / "fixture.txt").write_text("ready\n", encoding="utf-8")
             (cwd / "node_modules" / "workspace").symlink_to("../packages/fixture")
             return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
@@ -561,13 +581,18 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         )
         first_receipt = materializer.materialize(first, timeout_seconds=5_400)
         second_receipt = materializer.materialize(second, timeout_seconds=5_400)
+        (interrupted / "node_modules" / ".pnpm").mkdir(parents=True)
+        interrupted_receipt = materializer.materialize(interrupted, timeout_seconds=5_400)
         changed_receipt = materializer.materialize(changed, timeout_seconds=5_400)
 
         self.assertEqual(installs, 2)
         self.assertEqual(first_receipt["template"]["state"], "seeded")
         self.assertEqual(second_receipt["template"]["state"], "hit")
+        self.assertEqual(interrupted_receipt["template"]["state"], "hit")
+        self.assertTrue(interrupted_receipt["template"]["replaced_interrupted_node_modules"])
         self.assertEqual(changed_receipt["template"]["state"], "seeded")
         self.assertEqual((second / "node_modules" / "fixture.txt").read_text(encoding="utf-8"), "ready\n")
+        self.assertTrue((interrupted / "node_modules" / ".modules.yaml").is_file())
         self.assertEqual((second / "node_modules" / "workspace").resolve(), (second / "packages" / "fixture").resolve())
         self.assertEqual(len(second_receipt["commands"]), 2)
 
@@ -583,8 +608,17 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
         calls: list[tuple[str, ...]] = []
 
-        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             calls.append(tuple(args))
+            if args[0] == "/bin/cp":
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+            if args[-1] != "--version":
+                cwd = kwargs["cwd"]
+                assert isinstance(cwd, Path)
+                (cwd / "node_modules").mkdir()
+                (cwd / "node_modules" / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+                (cwd / "node_modules" / ".bin").mkdir()
             return subprocess.CompletedProcess(
                 args,
                 0,

@@ -661,8 +661,27 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(os.access(shim, os.X_OK))
             self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(shims))
             self.assertEqual(environment["npm_config_pm_on_fail"], "ignore")
+            self.assertEqual(environment["npm_config_offline"], "true")
             self.assertIn(str(runtime), shim.read_text(encoding="utf-8"))
             self.assertIn("--pm-on-fail=ignore", shim.read_text(encoding="utf-8"))
+            self.assertIn("node_modules/.bin", shim.read_text(encoding="utf-8"))
+
+            worktree = root / "worktree"
+            local_bin = worktree / "node_modules" / ".bin"
+            local_bin.mkdir(parents=True)
+            fixture = local_bin / "fixture"
+            fixture.write_text("#!/bin/sh\nprintf 'fixture:%s\n' \"$*\"\n", encoding="utf-8")
+            fixture.chmod(0o755)
+            direct = subprocess.run(
+                [str(shim), "exec", "fixture", "--check"],
+                cwd=worktree,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(direct.returncode, 0)
+            self.assertEqual(direct.stdout, "fixture:--check\n")
 
     def test_contract_hash_is_deterministic(self) -> None:
         contract = TaskContract(

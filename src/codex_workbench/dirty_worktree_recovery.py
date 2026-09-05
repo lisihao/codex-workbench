@@ -86,6 +86,7 @@ class PnpmOfflineMaterializer:
     LOCK_FILENAME = ".codex-workbench-pnpm-materialization.lock"
     TEMPLATE_DIRECTORY_NAME = ".codex-workbench-pnpm-linker-templates"
     TEMPLATE_METADATA_FILENAME = "materialization.json"
+    TEMPLATE_MARKER_FILENAME = ".codex-workbench-template-key"
 
     def __init__(
         self,
@@ -219,6 +220,7 @@ class PnpmOfflineMaterializer:
                     template_directory, template_signature, worktree, deadline
                 )
                 if cached_clone is not None:
+                    clone, replaced_interrupted_node_modules = cached_clone
                     return {
                         "schema_version": 1,
                         "kind": "pnpm-offline-materialization",
@@ -235,9 +237,11 @@ class PnpmOfflineMaterializer:
                             "state": "hit",
                             "key": template_signature["key"],
                             "path": str(template_directory),
+                            "replaced_interrupted_node_modules": replaced_interrupted_node_modules,
                         },
-                        "commands": [version.to_dict(), cached_clone.to_dict()],
+                        "commands": [version.to_dict(), clone.to_dict()],
                     }
+            self._discard_incomplete_node_modules(worktree)
             install = self._run(
                 install_command,
                 worktree,
@@ -250,6 +254,7 @@ class PnpmOfflineMaterializer:
                     f"{install.stderr.strip() or install.stdout.strip()}"
                 )
             if template_directory is not None and template_signature is not None:
+                self._write_template_marker(worktree / "node_modules", template_signature["key"])
                 template_publish = self._publish_template(
                     template_directory, template_signature, worktree / "node_modules", deadline
                 )
@@ -311,7 +316,7 @@ class PnpmOfflineMaterializer:
                 digest.update(b"<missing>")
             digest.update(b"\0")
         payload = {
-            "schema_version": "1",
+            "schema_version": "2",
             "package_manager": package_manager,
             "pnpm_version": pnpm_version,
             "platform": platform.system().lower(),
@@ -329,7 +334,7 @@ class PnpmOfflineMaterializer:
         signature: Mapping[str, str],
         worktree: Path,
         deadline: float,
-    ) -> CommandOutcome | None:
+    ) -> tuple[CommandOutcome, bool] | None:
         if not template_directory.exists():
             return None
         metadata_path = template_directory / self.TEMPLATE_METADATA_FILENAME
@@ -348,10 +353,30 @@ class PnpmOfflineMaterializer:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency template is missing node_modules: {template_directory}"
             )
+        if not self._has_template_marker(source, signature["key"]):
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template is incomplete or stale: {template_directory}"
+            )
         destination = worktree / "node_modules"
-        if destination.exists():
-            return None
-        return self._clone_directory(source, destination, deadline)
+        if destination.exists() or destination.is_symlink():
+            if self._has_template_marker(destination, signature["key"]):
+                return (
+                    CommandOutcome(
+                        ("pnpm-template", "reuse", str(destination)),
+                        0,
+                        "reused complete worktree-local pnpm linker\n",
+                        "",
+                    ),
+                    False,
+                )
+            self._remove_node_modules(destination)
+            replaced_interrupted_node_modules = True
+        else:
+            replaced_interrupted_node_modules = False
+        return (
+            self._clone_directory(source, destination, deadline),
+            replaced_interrupted_node_modules,
+        )
 
     def _publish_template(
         self,
@@ -379,6 +404,54 @@ class PnpmOfflineMaterializer:
                 shutil.rmtree(staging, ignore_errors=True)
             raise
         return outcome
+
+    def _discard_incomplete_node_modules(self, worktree: Path) -> None:
+        """Remove only an interrupted linker tree before a fresh offline seed.
+
+        Recovery targets are newly allocated worktrees. A directory without
+        pnpm's two completion markers can only be an interrupted prior
+        materialization; retaining it makes pnpm rebuild the whole graph.
+        """
+
+        destination = worktree / "node_modules"
+        if (destination.exists() or destination.is_symlink()) and not self._node_modules_is_complete(
+            destination
+        ):
+            self._remove_node_modules(destination)
+
+    @classmethod
+    def _has_template_marker(cls, node_modules: Path, key: str) -> bool:
+        if not cls._node_modules_is_complete(node_modules):
+            return False
+        try:
+            return (node_modules / cls.TEMPLATE_MARKER_FILENAME).read_text(
+                encoding="utf-8"
+            ).strip() == key
+        except (OSError, UnicodeError):
+            return False
+
+    @classmethod
+    def _write_template_marker(cls, node_modules: Path, key: str) -> None:
+        if not cls._node_modules_is_complete(node_modules):
+            raise DirtyWorktreeRecoveryError(
+                f"offline pnpm materialization did not produce a complete linker: {node_modules}"
+            )
+        (node_modules / cls.TEMPLATE_MARKER_FILENAME).write_text(key + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _node_modules_is_complete(node_modules: Path) -> bool:
+        return (
+            node_modules.is_dir()
+            and (node_modules / ".modules.yaml").is_file()
+            and (node_modules / ".bin").is_dir()
+        )
+
+    @staticmethod
+    def _remove_node_modules(node_modules: Path) -> None:
+        if node_modules.is_symlink() or node_modules.is_file():
+            node_modules.unlink()
+        else:
+            shutil.rmtree(node_modules)
 
     def _clone_directory(
         self, source: Path, destination: Path, deadline: float

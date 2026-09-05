@@ -222,7 +222,9 @@ def codex_subscription_environment(
     The user's interactive pnpm launcher then re-selects that version and can
     attempt a registry download from inside a worker turn.  When Workbench has
     a qualified pnpm runtime, expose a tiny process-local ``pnpm`` shim ahead
-    of PATH so every worker command uses that same runtime offline.
+    of PATH so every worker command uses that same runtime. The shim also
+    resolves the ordinary ``pnpm exec <already-installed-bin>`` form directly
+    from the worktree linker, avoiding pnpm's redundant install reconciliation.
     """
     environment = subscription_environment()
     process_home = environment.get("CODEX_WORKBENCH_PROCESS_HOME")
@@ -234,6 +236,20 @@ def codex_subscription_environment(
         shim = pnpm_shim_directory / "pnpm"
         shim.write_text(
             "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"exec\" ]; then\n"
+            "  executable=\"${2:-}\"\n"
+            "  case \"$executable\" in\n"
+            "    \"\"|*[!A-Za-z0-9._-]*) ;;\n"
+            "    *)\n"
+            "      local_bin=\"$PWD/node_modules/.bin/$executable\"\n"
+            "      if [ -x \"$local_bin\" ]; then\n"
+            "        shift 2\n"
+            "        export PATH=\"$PWD/node_modules/.bin:$PATH\"\n"
+            "        exec \"$local_bin\" \"$@\"\n"
+            "      fi\n"
+            "      ;;\n"
+            "  esac\n"
+            "fi\n"
             f'exec {shlex.quote(pnpm_binary)} --pm-on-fail=ignore \"$@\"\n',
             encoding="utf-8",
         )
@@ -243,6 +259,7 @@ def codex_subscription_environment(
         # the initial command.  This is intentionally scoped to Codex workers,
         # never the user's global shell configuration.
         environment["npm_config_pm_on_fail"] = "ignore"
+        environment["npm_config_offline"] = "true"
     return environment
 
 
