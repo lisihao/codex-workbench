@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import shlex
 import shutil
 import subprocess
@@ -65,10 +66,10 @@ def _bounded(text: str, *, limit: int = 1_000_000) -> str:
 class PnpmOfflineMaterializer:
     """Materialize a worktree-local pnpm linker without network access.
 
-    A shared ``node_modules`` directory is deliberately not reused: pnpm's
-    workspace links can otherwise resolve source imports back into another
-    worktree.  The package manager's existing local store is used in offline
-    mode while each worktree receives its own linker directory.
+    Each recovered worktree retains an independent ``node_modules`` directory.
+    A verified template is cloned into the target rather than shared or
+    symlinked, so workspace links remain local to the target source tree.
+    On APFS this is copy-on-write and avoids repeated pnpm linker work.
     """
 
     # pnpm 11 verifies a loaded lockfile against registry publish metadata by
@@ -79,20 +80,25 @@ class PnpmOfflineMaterializer:
     # becoming an unbounded worker lease.
     MINIMUM_PNPM_11_VERSION = (11, 25, 0)
     MAX_MATERIALIZATION_SECONDS = 120
+    MAX_TEMPLATE_SEED_SECONDS = 360
     BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
     STORE_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM_STORE"
     LOCK_FILENAME = ".codex-workbench-pnpm-materialization.lock"
+    TEMPLATE_DIRECTORY_NAME = ".codex-workbench-pnpm-linker-templates"
+    TEMPLATE_METADATA_FILENAME = "materialization.json"
 
     def __init__(
         self,
         *,
         binary: str | None = None,
         store_dir: Path | None = None,
+        template_dir: Path | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
         self.binary = binary or os.environ.get(self.BINARY_ENVIRONMENT_VARIABLE, "pnpm")
         configured_store = os.environ.get(self.STORE_ENVIRONMENT_VARIABLE)
         self.store_dir = store_dir or (Path(configured_store).expanduser() if configured_store else None)
+        self.template_dir = template_dir
         self.runner = runner
 
     def materialize(self, worktree: Path, *, timeout_seconds: int) -> dict[str, object]:
@@ -120,7 +126,13 @@ class PnpmOfflineMaterializer:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary:
             raise DirtyWorktreeRecoveryError("pnpm is unavailable on the Workbench authority")
-        effective_timeout = min(timeout_seconds, self.MAX_MATERIALIZATION_SECONDS)
+        cache_root = self._template_root()
+        maximum_seconds = (
+            self.MAX_TEMPLATE_SEED_SECONDS
+            if cache_root is not None
+            else self.MAX_MATERIALIZATION_SECONDS
+        )
+        effective_timeout = min(timeout_seconds, maximum_seconds)
         if effective_timeout <= 0:
             raise DirtyWorktreeRecoveryError("pnpm recovery timeout must be positive")
         environment = os.environ.copy()
@@ -163,6 +175,17 @@ class PnpmOfflineMaterializer:
                 f"pnpm {actual_version} is unsupported for offline recovery; pnpm 11 must be at least "
                 f"{minimum}. Configure {self.BINARY_ENVIRONMENT_VARIABLE} to the Workbench-managed runtime."
             )
+        template_signature = (
+            self._template_signature(worktree, declared, actual_version)
+            if cache_root is not None
+            else None
+        )
+        template_directory = (
+            cache_root / template_signature["key"]
+            if cache_root is not None and template_signature is not None
+            else None
+        )
+
         install_command: tuple[str, ...] = (
             binary,
             "install",
@@ -181,21 +204,49 @@ class PnpmOfflineMaterializer:
                 )
             install_command += ("--store-dir", str(store_dir))
         # pnpm writes shared store metadata while materializing a worktree-local
-        # linker. Parallel workers still run concurrently after preparation, but
-        # concurrent linkers against one store have repeatedly exceeded the
-        # bounded recovery lease on the Mac mini.
+        # linker. The same lock also protects cache publication so no recovery
+        # can observe a partially copied template.
+        template_publish: CommandOutcome | None = None
         with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
+            if template_directory is not None and template_signature is not None:
+                cached_clone = self._clone_cached_template(
+                    template_directory, template_signature, worktree, deadline
+                )
+                if cached_clone is not None:
+                    return {
+                        "schema_version": 1,
+                        "kind": "pnpm-offline-materialization",
+                        "package_manager": declared,
+                        "pnpm_version": actual_version,
+                        "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
+                        "materialization_timeout_seconds": effective_timeout,
+                        "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
+                        "shared_store_lock": {
+                            "path": str(lock_path),
+                            "wait_seconds": lock_wait_seconds,
+                        },
+                        "template": {
+                            "state": "hit",
+                            "key": template_signature["key"],
+                            "path": str(template_directory),
+                        },
+                        "commands": [version.to_dict(), cached_clone.to_dict()],
+                    }
             install = self._run(
                 install_command,
                 worktree,
                 environment,
                 self._remaining_seconds(deadline),
             )
-        if install.exit_code != 0:
-            raise DirtyWorktreeRecoveryError(
-                "offline pnpm materialization failed: "
-                f"{install.stderr.strip() or install.stdout.strip()}"
-            )
+            if install.exit_code != 0:
+                raise DirtyWorktreeRecoveryError(
+                    "offline pnpm materialization failed: "
+                    f"{install.stderr.strip() or install.stdout.strip()}"
+                )
+            if template_directory is not None and template_signature is not None:
+                template_publish = self._publish_template(
+                    template_directory, template_signature, worktree / "node_modules", deadline
+                )
         return {
             "schema_version": 1,
             "kind": "pnpm-offline-materialization",
@@ -208,8 +259,141 @@ class PnpmOfflineMaterializer:
                 "path": str(lock_path),
                 "wait_seconds": lock_wait_seconds,
             },
+            "template": (
+                {
+                    "state": "seeded",
+                    "key": template_signature["key"],
+                    "path": str(template_directory),
+                    "clone": template_publish.to_dict(),
+                }
+                if template_publish is not None
+                and template_signature is not None
+                and template_directory is not None
+                else {"state": "disabled" if cache_root is None else "not-created"}
+            ),
             "commands": [version.to_dict(), install.to_dict()],
         }
+
+    def _template_root(self) -> Path | None:
+        if self.template_dir is not None:
+            return self.template_dir.expanduser().resolve(strict=False)
+        if self.store_dir is None:
+            return None
+        return self.store_dir.resolve(strict=False).parent / self.TEMPLATE_DIRECTORY_NAME
+
+    def _template_signature(
+        self, worktree: Path, package_manager: str, pnpm_version: str
+    ) -> dict[str, str]:
+        input_paths = {Path("pnpm-lock.yaml"), Path("pnpm-workspace.yaml"), Path(".npmrc")}
+        for manifest in worktree.rglob("package.json"):
+            relative = manifest.relative_to(worktree)
+            if "node_modules" not in relative.parts and ".git" not in relative.parts:
+                input_paths.add(relative)
+        digest = sha256()
+        for relative in sorted(input_paths, key=str):
+            path = worktree / relative
+            digest.update(str(relative).encode("utf-8"))
+            digest.update(b"\0")
+            if path.is_file():
+                try:
+                    digest.update(path.read_bytes())
+                except OSError as error:
+                    raise DirtyWorktreeRecoveryError(
+                        f"cannot read pnpm template input {path}: {error}"
+                    ) from error
+            else:
+                digest.update(b"<missing>")
+            digest.update(b"\0")
+        payload = {
+            "schema_version": "1",
+            "package_manager": package_manager,
+            "pnpm_version": pnpm_version,
+            "platform": platform.system().lower(),
+            "machine": platform.machine(),
+            "workspace_input_sha256": digest.hexdigest(),
+        }
+        key = sha256(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {**payload, "key": key}
+
+    def _clone_cached_template(
+        self,
+        template_directory: Path,
+        signature: Mapping[str, str],
+        worktree: Path,
+        deadline: float,
+    ) -> CommandOutcome | None:
+        if not template_directory.exists():
+            return None
+        metadata_path = template_directory / self.TEMPLATE_METADATA_FILENAME
+        source = template_directory / "node_modules"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template metadata is unreadable: {metadata_path}: {error}"
+            ) from error
+        if not isinstance(metadata, dict) or metadata.get("signature") != dict(signature):
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template signature does not match recovery inputs: {template_directory}"
+            )
+        if not source.is_dir():
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template is missing node_modules: {template_directory}"
+            )
+        destination = worktree / "node_modules"
+        if destination.exists():
+            return None
+        return self._clone_directory(source, destination, deadline)
+
+    def _publish_template(
+        self,
+        template_directory: Path,
+        signature: Mapping[str, str],
+        source: Path,
+        deadline: float,
+    ) -> CommandOutcome | None:
+        if not source.is_dir() or template_directory.exists():
+            return None
+        template_directory.parent.mkdir(parents=True, exist_ok=True)
+        staging = template_directory.parent / (
+            f".{template_directory.name}.staging-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        try:
+            staging.mkdir()
+            outcome = self._clone_directory(source, staging / "node_modules", deadline)
+            metadata = {"schema_version": 1, "signature": dict(signature)}
+            (staging / self.TEMPLATE_METADATA_FILENAME).write_text(
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+            )
+            staging.replace(template_directory)
+        except BaseException:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
+        return outcome
+
+    def _clone_directory(
+        self, source: Path, destination: Path, deadline: float
+    ) -> CommandOutcome:
+        if destination.exists():
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency clone destination already exists: {destination}"
+            )
+        clone_option = "-cR" if platform.system() == "Darwin" else "-R"
+        outcome = self._run(
+            ("/bin/cp", clone_option, str(source), str(destination)),
+            source.parent,
+            os.environ.copy(),
+            self._remaining_seconds(deadline),
+        )
+        if outcome.exit_code != 0:
+            raise DirtyWorktreeRecoveryError(
+                "pnpm dependency template clone failed: "
+                f"{outcome.stderr.strip() or outcome.stdout.strip()}"
+            )
+        return outcome
 
     @staticmethod
     def _remaining_seconds(deadline: float) -> int:

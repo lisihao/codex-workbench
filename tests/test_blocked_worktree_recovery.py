@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -509,10 +510,65 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             runner=runner,
         ).materialize(worktree, timeout_seconds=5_400)
 
-        self.assertEqual(receipt["materialization_timeout_seconds"], 120)
+        self.assertEqual(receipt["materialization_timeout_seconds"], 360)
         self.assertEqual(receipt["store_dir"], str(store.resolve()))
-        self.assertEqual([timeout for _command, timeout in calls], [120, 120])
+        self.assertEqual([timeout for _command, timeout in calls], [360, 360])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
+
+    def test_offline_materializer_reuses_isolated_template_for_matching_inputs(self) -> None:
+        store = self.root / "template-store"
+        template_root = self.root / "template-root"
+        first = self.root / "template-first"
+        second = self.root / "template-second"
+        changed = self.root / "template-changed"
+        store.mkdir()
+        for worktree in (first, second, changed):
+            worktree.mkdir()
+            (worktree / "packages" / "fixture").mkdir(parents=True)
+            (worktree / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.7.0"}),
+                encoding="utf-8",
+            )
+            (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: 9.0\n", encoding="utf-8")
+        (changed / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.7.0", "name": "changed-input"}),
+            encoding="utf-8",
+        )
+        installs = 0
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal installs
+            command = tuple(args)
+            if command[0] == "/bin/cp":
+                shutil.copytree(Path(command[-2]), Path(command[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            installs += 1
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            (cwd / "node_modules").mkdir()
+            (cwd / "node_modules" / "fixture.txt").write_text("ready\n", encoding="utf-8")
+            (cwd / "node_modules" / "workspace").symlink_to("../packages/fixture")
+            return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=store,
+            template_dir=template_root,
+            runner=runner,
+        )
+        first_receipt = materializer.materialize(first, timeout_seconds=5_400)
+        second_receipt = materializer.materialize(second, timeout_seconds=5_400)
+        changed_receipt = materializer.materialize(changed, timeout_seconds=5_400)
+
+        self.assertEqual(installs, 2)
+        self.assertEqual(first_receipt["template"]["state"], "seeded")
+        self.assertEqual(second_receipt["template"]["state"], "hit")
+        self.assertEqual(changed_receipt["template"]["state"], "seeded")
+        self.assertEqual((second / "node_modules" / "fixture.txt").read_text(encoding="utf-8"), "ready\n")
+        self.assertEqual((second / "node_modules" / "workspace").resolve(), (second / "packages" / "fixture").resolve())
+        self.assertEqual(len(second_receipt["commands"]), 2)
 
     def test_offline_materializer_reads_authority_runtime_environment(self) -> None:
         worktree = self.root / "authority-runtime-fixture"
