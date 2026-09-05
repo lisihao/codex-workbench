@@ -639,6 +639,31 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
 
+    def test_codex_worker_environment_pins_the_qualified_pnpm_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "pnpm.mjs"
+            runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            shims = root / "worker-bin"
+            with patch.dict(
+                os.environ,
+                {
+                    "CODEX_WORKBENCH_PNPM": str(runtime),
+                    "PATH": "/usr/bin",
+                },
+                clear=False,
+            ):
+                environment = codex_subscription_environment(pnpm_shim_directory=shims)
+
+            shim = shims / "pnpm"
+            self.assertTrue(shim.is_file())
+            self.assertTrue(os.access(shim, os.X_OK))
+            self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(shims))
+            self.assertEqual(environment["npm_config_pm_on_fail"], "ignore")
+            self.assertIn(str(runtime), shim.read_text(encoding="utf-8"))
+            self.assertIn("--pm-on-fail=ignore", shim.read_text(encoding="utf-8"))
+
     def test_contract_hash_is_deterministic(self) -> None:
         contract = TaskContract(
             task_id="task-1",

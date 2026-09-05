@@ -212,11 +212,37 @@ def subscription_environment() -> dict[str, str]:
     return environment
 
 
-def codex_subscription_environment() -> dict[str, str]:
+def codex_subscription_environment(
+    *, pnpm_shim_directory: Path | None = None
+) -> dict[str, str]:
+    """Return the isolated environment for a managed Codex worker.
+
+    A recovered Node worktree owns its own ``node_modules`` graph, but a
+    project can still declare an older compatible pnpm via ``packageManager``.
+    The user's interactive pnpm launcher then re-selects that version and can
+    attempt a registry download from inside a worker turn.  When Workbench has
+    a qualified pnpm runtime, expose a tiny process-local ``pnpm`` shim ahead
+    of PATH so every worker command uses that same runtime offline.
+    """
     environment = subscription_environment()
     process_home = environment.get("CODEX_WORKBENCH_PROCESS_HOME")
     if process_home:
         environment["HOME"] = process_home
+    pnpm_binary = environment.get("CODEX_WORKBENCH_PNPM")
+    if pnpm_shim_directory is not None and pnpm_binary and Path(pnpm_binary).is_file():
+        pnpm_shim_directory.mkdir(parents=True, exist_ok=True)
+        shim = pnpm_shim_directory / "pnpm"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f'exec {shlex.quote(pnpm_binary)} --pm-on-fail=ignore \"$@\"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        environment["PATH"] = str(pnpm_shim_directory) + os.pathsep + environment.get("PATH", "")
+        # Keep subprocesses launched by pnpm on the same qualified runtime as
+        # the initial command.  This is intentionally scoped to Codex workers,
+        # never the user's global shell configuration.
+        environment["npm_config_pm_on_fail"] = "ignore"
     return environment
 
 
@@ -1501,8 +1527,9 @@ class CodexExecutor(ProcessExecutor):
             else self._worker_schema(archify_required=archify_required)
         )
         with tempfile.TemporaryDirectory(prefix="codex-workbench-turn-") as directory:
-            schema_path = Path(directory) / "schema.json"
-            output_path = Path(directory) / "result.json"
+            temporary_directory = Path(directory)
+            schema_path = temporary_directory / "schema.json"
+            output_path = temporary_directory / "result.json"
             schema_path.write_text(json.dumps(schema))
             command = self._command(self.binary, request, schema_path, output_path)
             try:
@@ -1511,7 +1538,9 @@ class CodexExecutor(ProcessExecutor):
                     cwd=request.worktree,
                     timeout=int(request.contract["timeout_seconds"]),
                     input_text=prompt,
-                    environment=codex_subscription_environment(),
+                    environment=codex_subscription_environment(
+                        pnpm_shim_directory=temporary_directory / "bin"
+                    ),
                 )
             except subprocess.TimeoutExpired:
                 return NodeResult(
