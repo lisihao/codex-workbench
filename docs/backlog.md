@@ -6,9 +6,12 @@
 
 唯一继续后置的是页面关闭后的 Web Push：需要单独决定推送提供方、设备 token 生命周期、权限提示与撤销策略。在此之前，页面打开期间的浏览器通知可以使用，但不能冒充后台 Push。
 
-## v1.11.0 生产证据积累（evidence backlog）
+## v1.12.0 生产证据积累（evidence backlog）
 
 本版本的性能闭环已经实现，但以下项目需要真实、获准的长期运行数据，不能用 fixture、静态健康检查或公开 benchmark 代替：
+
+- Astra 已加入精确控制面型号目录；质量 benchmark 仍缺失。生产实际使用后的型号/Agent 回执与同类型任务对照才可用于校准，不继承 Sol 的测评分数。
+- performance evaluate 已提供目录基线、去除 AI Frontier、完整输入的离线路由比较；当前选择变化只能证明数据参与了决策。正常任务的策略分组、质量非退步与真实时间/消耗改善仍需后续样本证明。
 
 - 让真实模型/Agent/verifier receipt 按精确版本、harness、effort 和任务领域持续积累，用于校准当前 advisory posterior；当前接口只报告 `cold-start`/`ok`，尚无 `baseline`/`shadow`/`calibrated` 晋级阈值。
 - 观察 Spark P0 的依赖就绪 `queue_depth`、`dependency_blocked`、`inflight`、`started`、`accepted`、`failed`、`blocked`、`indeterminate`、`retry`、`rework`、`busy_seconds`、`utilization` 和 `accepted_per_hour`；first-pass/final acceptance 与 duration 在 performance ledger 中另行观察，没有样本时显示 `N/A`。

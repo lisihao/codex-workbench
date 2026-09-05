@@ -19,6 +19,7 @@ from .model import (
     canonical_json,
     codex_model_profile,
     codex_model_reasoning_effort,
+    is_codex_control_plane_model,
     now_iso,
     retry_model,
 )
@@ -739,10 +740,18 @@ class WorkbenchStore:
             return
         if contract.verifier_model == "fixture" and verifier.model == "fixture":
             return
-        if verifier.executor != "codex" or "sol" not in verifier.model.lower():
-            raise ValueError("verifier must be a Codex Sol node")
-        if verifier.model != contract.verifier_model or "sol" not in contract.verifier_model.lower():
-            raise ValueError("verifier must match the contract's Codex Sol verifier_model")
+        if (
+            verifier.executor != "codex"
+            or not is_codex_control_plane_model(verifier.model)
+        ):
+            raise ValueError("verifier must be an exact Codex control-plane node")
+        if (
+            verifier.model != contract.verifier_model
+            or not is_codex_control_plane_model(contract.verifier_model)
+        ):
+            raise ValueError(
+                "verifier must match the exact Codex control-plane verifier_model in the contract"
+            )
 
     def transition_task(
         self,
@@ -3049,8 +3058,10 @@ class WorkbenchStore:
             if result.result_kind != "verifier":
                 raise ValueError("verifier result must declare result_kind=verifier")
             WorkbenchStore._validate_actual_model(row, result)
-            if "sol" not in str(row["effective_model"] or "").lower():
-                raise ValueError("only a Codex Sol verifier may settle the verifier node")
+            if not is_codex_control_plane_model(row["effective_model"] or ""):
+                raise ValueError(
+                    "only an exact Codex control-plane verifier may settle the verifier node"
+                )
             expected = {
                 "succeeded": "accepted",
                 "failed": "needs_fix",

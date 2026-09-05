@@ -650,12 +650,16 @@ def _v3_request(
     # exploration control work rather than every worker task type.  Planning
     # and verification therefore use its control-plane contract, not the
     # worker's task type.
-    task_type = "architecture" if role in {"planner", "verifier"} else strategy.task_type
+    task_type = "architecture" if is_control_plane else strategy.task_type
     low = strategy.complexity == "low"
     bounded = bool(contract.allowed_scope) and strategy.complexity in {"low", "standard"}
     independent = strategy.parallelizable and bool(contract.allowed_scope)
     return {
         "role": role,
+        "control_plane_model": (
+            (contract.verifier_model if role == "verifier" else contract.planner_model)
+            or CODEX_SOL_MODEL
+        ) if is_control_plane else None,
         "task_type": task_type,
         "complexity": strategy.complexity,
         "quality_floor": 60 if low and mechanical else 80,
@@ -971,9 +975,9 @@ def route_task(
         return RoutingDecision(
             role=role,
             executor="codex",
-            model=CODEX_SOL_MODEL,
+            model=(contract.verifier_model if role == "verifier" else contract.planner_model) or CODEX_SOL_MODEL,
             strategy_version=version,
-            reason=f"{role} role is fixed to the independent Codex Sol control plane",
+            reason=f"{role} role uses the exact control-plane model in the task contract",
             **_contract_performance_kwargs(contract),
         )
 
@@ -981,9 +985,9 @@ def route_task(
         return RoutingDecision(
             role=role,
             executor="codex",
-            model=CODEX_SOL_MODEL,
+            model=contract.planner_model or CODEX_SOL_MODEL,
             strategy_version=version,
-            reason="control role is fixed to the Codex Sol cross-module control plane",
+            reason="control role uses the exact cross-module model in the task contract",
             **_contract_performance_kwargs(contract),
         )
 

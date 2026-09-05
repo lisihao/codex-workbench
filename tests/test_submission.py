@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from codex_radar_provider import RadarRegistry
+from ai_frontier_provider import AIFrontierRegistry
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.claude_quota import (
     COMPATIBLE_SOURCE,
@@ -379,6 +380,13 @@ class SubmissionTests(unittest.TestCase):
             config = WorkbenchConfig(root / "state")
             config.initialize()
             install_fresh_radar(config)
+            frontier = AIFrontierRegistry(config.effective_ai_frontier_state_root)
+            frontier.consent_personal_use(config.effective_ai_frontier_authorization_file)
+            imported = frontier.import_payloads({
+                "reliability_leaderboard": [{"Executor": "openai/gpt-5.6-sol", "Quality": 0.8, "Cost": 1.0, "Consistency": 0.9}],
+                "cost_comparison": [{"LLMs": "openai/gpt-5.6-sol", "Real Cost": 1.0, "Quoted Cost": 1.0, "Cost Surprise": 0.0}],
+            }, config.effective_ai_frontier_authorization_file)
+            self.assertTrue(imported["ok"])
             store = WorkbenchStore(config.database)
             store.initialize()
             planned = [
@@ -456,6 +464,10 @@ class SubmissionTests(unittest.TestCase):
             radar_provenance = active_performance["source_provenance"]["external_priors"]["codex_radar"]
             self.assertEqual(radar_provenance["state"], "fresh")
             self.assertEqual(radar_provenance["imported_record_count"], 1)
+            frontier_provenance = active_performance["source_provenance"]["external_priors"]["ai_frontier"]
+            self.assertEqual(frontier_provenance["snapshot_id"], imported["snapshot_id"])
+            self.assertGreater(frontier_provenance["imported_record_count"], 0)
+            self.assertEqual(result["performance"]["external_priors"]["ai_frontier"], frontier_provenance)
             self.assertTrue(
                 any(
                     record.get("provenance") == "community_observation"

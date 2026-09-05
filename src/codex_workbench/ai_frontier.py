@@ -495,7 +495,9 @@ def _known_catalog_models(catalog: Mapping[str, Any]) -> dict[tuple[str, str], M
         if not isinstance(candidate, Mapping) or candidate.get("routable") is not True:
             continue
         provider = _normalise_provider(candidate.get("provider"))
-        model_id = _text(candidate.get("model_id"))
+        identity = candidate.get("identity")
+        canonical_id = identity.get("canonical_model_id") if isinstance(identity, Mapping) else None
+        model_id = _text(canonical_id) or _text(candidate.get("model_id"))
         if provider and model_id:
             known[(provider, model_id.lower())] = candidate
     return known

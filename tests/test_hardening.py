@@ -673,7 +673,7 @@ class WorkbenchHardeningTests(unittest.TestCase):
             objective="fenced settlement",
             allowed_scope=("src",),
         )
-        with self.assertRaisesRegex(ValueError, "Codex Sol"):
+        with self.assertRaisesRegex(ValueError, "exact Codex control-plane"):
             self.store.create_task(
                 contract,
                 [

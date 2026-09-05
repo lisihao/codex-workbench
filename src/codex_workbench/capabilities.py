@@ -122,6 +122,18 @@ KNOWN_FAMILY_POLICIES: dict[str, dict[str, dict[str, Any]]] = {
             "features": {"delegated_worker": True, "research": True},
             "control_plane": True,
         },
+        "astra": {
+            "roles": ["planner", "verifier", "architecture", "research"],
+            "task_types": ["architecture", "review", "exploration"],
+            "quality": {"floor": "frontier", "preference": "cross-module-decision"},
+            "cost": {"unit_class": "subscription", "relative": "highest"},
+            "latency": {"class": "deliberate"},
+            "concurrency": {"weight": 3, "class": "control-plane"},
+            "reasoning": {"preferred_effort": "max"},
+            "tools": {"code_mode": True, "structured_output": True},
+            "features": {"delegated_worker": True, "research": True},
+            "control_plane": True,
+        },
     },
     "claude": {
         "sonnet": {
@@ -163,9 +175,10 @@ KNOWN_FAMILY_POLICIES: dict[str, dict[str, dict[str, Any]]] = {
     },
 }
 
-# Current exact Sol is deliberately named; a later Sol identifier is not given
-# planner/verifier authority merely because its family name contains "sol".
-_CONTROL_PLANE_EXACT_IDS = {"gpt-5.6-sol"}
+# Exact control-plane IDs are deliberately named. A later Sol or Astra
+# identifier is observed first and never inherits planner/verifier authority.
+_CONTROL_PLANE_FAMILIES = frozenset({"sol", "astra"})
+_CONTROL_PLANE_EXACT_IDS = {"gpt-5.6-sol", "gpt-6-astra"}
 
 
 def model_family(provider: str, model_id: str) -> str | None:
@@ -174,7 +187,7 @@ def model_family(provider: str, model_id: str) -> str | None:
     normalized_provider = provider.strip().lower()
     normalized_model = model_id.strip().lower()
     if normalized_provider == "codex":
-        for family in ("spark", "luna", "terra", "sol"):
+        for family in ("spark", "luna", "terra", "sol", "astra"):
             if re.search(rf"(?:^|[-_.]){re.escape(family)}(?:$|[-_.])", normalized_model):
                 return family
     elif normalized_provider == "claude":
@@ -268,9 +281,9 @@ def _record(
         reasoning = dict(policy["reasoning"])
         tools = dict(policy["tools"])
         features = dict(policy["features"])
-        if provider == "codex" and family == "sol" and model_id not in _CONTROL_PLANE_EXACT_IDS:
-            # A discovered next-generation Sol is useful evidence, not an
-            # automatic transfer of control-plane authority.
+        if provider == "codex" and family in _CONTROL_PLANE_FAMILIES and model_id not in _CONTROL_PLANE_EXACT_IDS:
+            # A discovered next-generation control-plane model is useful
+            # evidence, not an automatic transfer of control-plane authority.
             roles = [role for role in roles if role not in {"planner", "verifier"}]
             policy_origin = "family-inherited-control-plane-pending"
         else:
@@ -288,7 +301,7 @@ def _record(
     routable = (
         status == "available"
         and policy is not None
-        and not (provider == "codex" and family == "sol" and model_id not in _CONTROL_PLANE_EXACT_IDS)
+        and not (provider == "codex" and family in _CONTROL_PLANE_FAMILIES and model_id not in _CONTROL_PLANE_EXACT_IDS)
     )
     return {
         "provider": provider,
@@ -765,7 +778,7 @@ class CapabilityRegistry:
             item
             for item in models
             if item["provider"] == "codex"
-            and item["model_id"] in _CONTROL_PLANE_EXACT_IDS
+            and item["model_id"] == "gpt-5.6-sol"
             and is_routable_model(item, role="planner")
             and is_routable_model(item, role="verifier")
             and item["control_plane_eligible"] is True

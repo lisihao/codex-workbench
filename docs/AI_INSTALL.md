@@ -97,7 +97,7 @@ binary 运行同一解析检查。配置只在新进程/新任务建立上下文
 旧任务被追溯扩容；保存工作后重启 App 并创建新任务。
 
 Workbench 的 planner/worker 使用 `--ignore-user-config`，所以不能依赖上述用户配置。
-1.11.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 进程额外显式传入同一
+1.12.0 会对受管 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 与 `gpt-6-astra` 进程额外显式传入同一
 `500000/450000`；Spark 保持其自身模型合同。
 
 ## 2. Mac mini Authority
@@ -251,6 +251,8 @@ Authority 还会安装 `com.lisihao.codex-workbench-ai-frontier`，默认每 259
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier refresh
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" ai-frontier show
 "$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" performance status
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" performance identities
+"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" performance list --format json
 ```
 
 该 receipt 固定包含 `not_official_authorization=true` 和 Martian Terms URL；它只记录本地操作者

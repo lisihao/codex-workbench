@@ -21,6 +21,7 @@ from .archify import (
 )
 from .governance import governance_directive
 from .model import (
+    CODEX_ASTRA_MODEL,
     CODEX_SOL_MODEL,
     DEFAULT_QUOTA_TTL_SECONDS,
     NodeSpec,
@@ -32,8 +33,9 @@ from .model import (
     codex_model_reasoning_effort,
     derive_execution_lane,
     derive_quota_pool_id,
+    is_codex_control_plane_model,
 )
-from .routing import route_node, strategy_for_node
+from .routing import route_node, route_task, strategy_for_node
 from .research import research_planner_directive
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
@@ -737,10 +739,14 @@ def normalize_and_validate_plan(
         )
         if verifier_directive not in verifier_prompt:
             verifier_prompt = verifier_prompt.rstrip() + "\n\n" + verifier_directive
+    verifier_executor = "fixture" if contract.verifier_model == "fixture" else "codex"
+    selected_verifier_model = (
+        "fixture" if verifier_executor == "fixture" else contract.verifier_model
+    )
     normalized_verifier = replace(
         verifier,
-        executor="fixture" if contract.verifier_model == "fixture" else "codex",
-        model="fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL,
+        executor=verifier_executor,
+        model=selected_verifier_model,
         depends_on=tuple(node.node_id for node in workers),
         read_scopes=tuple(sorted(verifier_reads)),
         write_scopes=(),
@@ -752,21 +758,17 @@ def normalize_and_validate_plan(
         complexity=verifier_strategy.complexity,
         parallelizable=verifier_strategy.parallelizable,
         claude_allowed=verifier_strategy.claude_allowed,
-        model_profile=codex_model_profile(
-            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL
-        ),
-        model_reasoning_effort=codex_model_reasoning_effort(
-            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL
-        ),
+        model_profile=codex_model_profile(selected_verifier_model),
+        model_reasoning_effort=codex_model_reasoning_effort(selected_verifier_model),
         execution_lane=derive_execution_lane(
-            "fixture" if contract.verifier_model == "fixture" else "codex",
-            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL,
+            verifier_executor,
+            selected_verifier_model,
             verifier=True,
             role="verifier",
         ),
         quota_pool_id=derive_quota_pool_id(
-            "fixture" if contract.verifier_model == "fixture" else "codex",
-            "fixture" if contract.verifier_model == "fixture" else CODEX_SOL_MODEL,
+            verifier_executor,
+            selected_verifier_model,
             verifier=True,
             role="verifier",
         ),
@@ -795,7 +797,11 @@ normalize_plan = normalize_and_validate_plan
 class CodexPlanner:
     def __init__(self, binary: str = "codex", model: str = "gpt-5.6-sol"):
         self.binary = binary
-        self.model = CODEX_SOL_MODEL
+        self.model = (
+            str(model).strip().lower()
+            if is_codex_control_plane_model(model)
+            else CODEX_SOL_MODEL
+        )
 
     @staticmethod
     def normalize_and_validate_plan(
@@ -849,6 +855,10 @@ class CodexPlanner:
             "--model",
             model,
         ]
+        if str(model).strip().lower() == CODEX_ASTRA_MODEL:
+            effort = codex_model_reasoning_effort(model)
+            if effort is not None:
+                command.extend(("--config", f"model_reasoning_effort={effort}"))
         for override in codex_model_long_context_overrides(model):
             command.extend(("--config", override))
         command.extend((
@@ -887,6 +897,35 @@ class CodexPlanner:
         process_home = environment.get("CODEX_WORKBENCH_PROCESS_HOME")
         if process_home:
             environment["HOME"] = process_home
+        planner_model = (
+            contract.planner_model
+            if is_codex_control_plane_model(contract.planner_model)
+            else self.model
+        )
+        if capability_snapshot is not None:
+            try:
+                planner_route = route_task(
+                    contract,
+                    claude_models_available,
+                    role="planner",
+                    quota_snapshot=quota_snapshot,
+                    max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS,
+                    strategy=strategy,
+                    capability_snapshot=capability_snapshot,
+                    provider_capacity=provider_capacity,
+                    performance_calibration=performance_calibration,
+                )
+            except ValueError as error:
+                raise PlannerError(
+                    f"planner model {planner_model!r} is not admitted by the pinned capability catalog: {error}"
+                ) from error
+            if (
+                planner_route.executor != "codex"
+                or planner_route.model != planner_model
+            ):
+                raise PlannerError(
+                    f"planner route did not preserve explicit model {planner_model!r}"
+                )
         prompt = self._prompt(
             contract,
             claude_models_available=claude_models_available,
@@ -902,7 +941,7 @@ class CodexPlanner:
             result = subprocess.run(
                 self._command(
                     binary,
-                    self.model,
+                    planner_model,
                     contract.repository,
                     schema_path,
                     output_path,
@@ -947,7 +986,9 @@ class CodexPlanner:
         context_excerpt: str | None = None,
         capability_snapshot: Mapping[str, Any] | None = None,
     ) -> str:
-        archify_block = archify_directive(contract, actor="Sol planner")
+        archify_block = archify_directive(
+            contract, actor=f"Codex {contract.planner_model} planner"
+        )
         archify_rule = (
             "- Apply the Archify directive only to architecture/design/review/requirements nodes that create or update an architecture-class artifact; ordinary implementation nodes that do not need a diagram must remain free of Archify work.\n"
             if archify_block

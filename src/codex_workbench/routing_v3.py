@@ -45,6 +45,7 @@ _WORKER_TASK_TYPES = frozenset(
 )
 _ARCHITECTURE_TASK_TYPES = frozenset({"architecture", "review", "research", "creative"})
 _VALID_ROLES = frozenset({"planner", "worker", "verifier", "challenge", "control"})
+_EXACT_CODEX_CONTROL_PLANE_MODELS = frozenset({"gpt-5.6-sol", "gpt-6-astra"})
 
 # Catalogs may report qualitative policy classes before there is enough local
 # benchmark evidence for a measured value.  These are *ordering ordinals*, not
@@ -289,6 +290,9 @@ def route_capability_snapshot(
             raise ValueError("conflicting performance calibrations were supplied")
         requested["performance_calibration"] = dict(performance_calibration)
     role = _request_role(requested)
+    control_plane_model = _optional_text(requested.get("control_plane_model"))
+    if control_plane_model is not None and role not in {"planner", "verifier", "control"}:
+        raise ValueError("control_plane_model is only supported for control-plane roles")
     task_type = _text(requested.get("task_type"), default="implementation")
     complexity = _text(requested.get("complexity"), default="standard")
     performance = _performance_context(
@@ -312,6 +316,16 @@ def route_capability_snapshot(
     for raw_record in capabilities:
         record = _as_mapping(raw_record, label="capability record")
         provider, model, capability_id = _identity(record)
+        if control_plane_model is not None and model != control_plane_model:
+            rejected.append(
+                RejectedCandidate(
+                    provider=provider,
+                    model=model,
+                    capability_id=capability_id,
+                    reasons=(f"capability does not match control_plane_model {control_plane_model!r}",),
+                )
+            )
+            continue
         reasons = _hard_gate_reasons(
             catalog,
             record,
@@ -552,8 +566,8 @@ def _require_role_support(
         "planner": {"planner"},
         "verifier": {"verifier"},
         # Current capability observations call cross-module control work
-        # architecture/research.  Tier policy below still restricts this to
-        # Sol, so this alias cannot widen another provider's authority.
+        # architecture/research. Tier policy below restricts this to exact
+        # Codex control-plane models, so this alias cannot widen authority.
         "control": {"control", "architecture", "research"},
         "worker": {"worker", "reviewer"},
         "challenge": {"challenge", "architecture_challenge", "reviewer", "research"},
@@ -632,12 +646,26 @@ def _tier_policy_reasons(
     if tier is None:
         reasons.append("unknown model family has no routing-v3 policy")
         return
-    if tier == "sol":
+    if tier in {"sol", "astra"}:
+        provider, _, _ = _identity(record)
+        if (
+            provider.lower() != "codex"
+            or model.lower() not in _EXACT_CODEX_CONTROL_PLANE_MODELS
+        ):
+            reasons.append("model is not an exact admitted Codex control-plane ID")
+            return
         if role not in {"planner", "verifier", "control"}:
-            reasons.append("Sol is reserved for planner, cross-module control, and final verifier roles")
+            if tier == "sol":
+                reasons.append(
+                    "Sol is reserved for planner, cross-module control, and final verifier roles"
+                )
+            else:
+                reasons.append(
+                    "Astra is reserved for planner, cross-module control, and final verifier roles"
+                )
         return
     if role in {"planner", "verifier", "control"}:
-        reasons.append(f"{tier} cannot replace the Sol {role} control-plane role")
+        reasons.append(f"{tier} cannot replace the Codex {role} control-plane role")
         return
     if tier == "spark":
         if role != "worker":
@@ -1661,7 +1689,7 @@ def _number(value: Any) -> float | None:
 
 def _model_tier(model: str) -> str | None:
     lower = model.lower()
-    for tier in ("spark", "luna", "terra", "sol", "fable", "opus", "sonnet"):
+    for tier in ("spark", "luna", "terra", "sol", "astra", "fable", "opus", "sonnet"):
         if tier in lower:
             return tier
     return None

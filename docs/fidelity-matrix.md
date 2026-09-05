@@ -1,6 +1,6 @@
 # Codex Workbench 原设计忠实度矩阵
 
-基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.11.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
+基线：用户提供的 578 行《Codex 工作台完整设计方案》及后续范围变更。本矩阵描述 1.12.0 代码候选，不把接口、fixture 或一次进程启动等同于真实端到端完成。
 
 状态语义：
 
@@ -9,7 +9,7 @@
 - `external-pending`：代码和证据入口已存在，仍需真实设备、时间窗口或用户产品旅程。
 - `not-implemented`：尚无对应实现。
 
-| 原设计能力 | 状态 | 1.11.0 实现与证据 | 明确差距 |
+| 原设计能力 | 状态 | 1.12.0 实现与证据 | 明确差距 |
 |---|---|---|---|
 | Mac mini 单一 24×7 权威 | implemented | SQLite authority machine ID、排他进程锁、coordinator epoch、node lease epoch、launchd | 真实整机重启仍由 A3 验收 |
 | MacBook/手机只消费同一总账 | implemented | snapshot + cursor event API；客户端不写第二份 SQLite | 无 |
@@ -19,6 +19,8 @@
 | 多场景必经 Research Skill | compatible-subset | Authority 安装器将一份完整 Research Skill 复制到隔离 planner HOME；`research-skill/v2` 先用可测试路由判定架构/探索、高复杂度、论文/上游、选型/迁移、性能/基准、最佳实践、兼容性/安全、竞品/可行性等场景，再向 Sol planner 注入强制 `$Research` directive | 默认由单一 Sol planner 执行 Standard 方法，只有用户明确要求深度、广泛或并行研究时才扩展多研究节点；当前可证明 Skill 安装与 prompt wiring，尚无 host-side runtime research receipt |
 | Sol 规划、分层执行、Sol 验收 | implemented | routing-v3 固定 Sol planner/verifier/control；低风险机械任务进入独立 Spark 池，标准生产按任务角色选择 Luna/Sonnet，较大独立切片选择 Terra，Opus/Fable 承担架构/审核/研究挑战；通过硬门禁后才参考性能下界 | routing-v1/v2 仅为无能力目录的旧合同兼容；公开 benchmark 只是按领域的弱先验，质量/成本/时延尚无长期本机生产证明 |
 | 版本化模型与 Agent 能力目录 | implemented | 安装时 bundled safe refresh；LaunchAgent 每 6 小时被动读取 Codex/Claude Code 版本、帮助和模型元数据；无变化 generation 去重；新任务固定 catalog ID/digest；支持 status/show/diff/activate/rollback | Claude alias 背后的精确服务端模型只能在正常任务返回的 actual model receipt 中观察；未知和新 Sol 默认不获路由权限 |
+| GPT-6 Astra 显式控制面选择 | implemented | 精确 gpt-6-astra 目录准入、独立 astra_control_plane profile、max effort、planner/verifier/control 合同传递与显式型号约束；默认仍为 Sol，普通 worker 与重试链不扩大到 Astra | 公开基线性能缺失明确 N/A；本机元数据可用不等于已完成真实模型交付质量评估 |
+| 身份与路由效果可观察性 | implemented | 原生 Claude receipt 按选择器/实际型号/CLI 版本/观察时间形成有界绑定；固定入性能快照；新任务同时保留 Radar/AI Frontier；报告实际导入数量与匹配覆盖；performance identities/list/evaluate 提供零模型调用的 JSON/CSV/HTML 清单与三种离线路由对照 | 没有合法原生 receipt 时别名保持 unresolved；离线选择变化不证明实际收益；自动随机分流和统计晋级尚未实现 |
 | benchmark-backed 性能基线与运行账本校准 | implemented | `performance.py` 和 `data/model-performance-baseline-v1.json` 保存按领域的 Terminal-Bench 2.1、SWE-Bench Pro、GPT-5.6 官方表与 HLE 迁移先验；融合 Radar 与 AI Frontier 的独立来源 provenance；从 append-only `events`/`tasks` 统计 first-pass/final acceptance、返工、时延、吞吐和池指标；Beta 正态近似保守下界、content-addressed snapshot、TaskContract/NodeSpec pinning、CLI/API 观测已接入；calibrate 当前只返回 advisory `cold-start`/`ok` | 不把不同 benchmark 合成统一排行榜；尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值；运行桶尚未按 harness/tool contract 隔离，也没有可宣称的长期生产校准结论 |
 | Codex Radar 通用离线 Provider | implemented | 独立 `codex_radar_provider` 0.2.0 package/CLI 固定 WineChord/codex-radar v0.1.69；`<state_root>/radar.sqlite3` 以五张表一事务保存 snapshots/raw payloads/models/insights/active，旧 JSON 自动迁入，raw/generations/active 仅为兼容投影；personal-use receipt 需 `consented` + `local_operator_consent` + `public-json` + `accepted_at`，授权/consent 前零网络，四端点 JSON、脱敏 raw、last-known-good 与时间回退保护；Workbench 只把 exact model/effort + pass rate + 正样本作为有界弱先验（上限 2.0），7–31 天降权、31 天后失效；API/CLI/authority-only 24 小时 sidecar 与插件已接入 | Mac mini 真实生产快照仍待部署后 Evidence；个人 consent 不等同站方授权；上游 `current.json` 仍声明完整 API/衍生集成需站方授权；IQ 不用于通过率，Radar 不用于 quota；DSH 仅有可复用 CLI/JSON 消费合同，本次未改 DSH |
 | AI Frontier 通用离线 Provider | implemented | 独立 `ai_frontier_provider` 0.1.0 package/CLI；`<state_root>/ai-frontier/ai-frontier.sqlite3` 以 snapshots/raw/models/categories/active 五表事务保存 LKG；个人自用 consent 前零网络；默认 72 小时且硬性不低于 24 小时，只采两个聚合 JSON 与最多八个 exact model 分类；未知模型仅保存或跳过，绝不猜测映射；7–31 天降权、31 天后失效；Authority-only LaunchAgent、CLI/API、跨来源 performance provenance 与每模型最多 2 个等效外部样本已接入 | 当前公开榜单没有 GPT-5.6 Sol/Terra/Luna exact ID，因此不会把旧 OpenAI 型号映射为 5.6；外部 Quality/Consistency/relative cost 不是本机通过率、quota 或 Agent 证明；运行证据必须按每次正式部署核验；本次未改 DSH |

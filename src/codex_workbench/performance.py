@@ -25,6 +25,7 @@ import tempfile
 from typing import Any, Iterable
 
 from .ai_frontier import ai_frontier_prior_records
+from .model_identities import catalog_with_model_identities, derive_model_identities
 from .radar import radar_prior_records
 from .store import WorkbenchStore
 
@@ -505,8 +506,12 @@ def build_performance_snapshot(
     active_baseline = validate_benchmark_baseline(
         baseline if baseline is not None else load_benchmark_baseline()
     )
-    radar_records = radar_prior_records(radar_status or {}, catalog)
-    ai_frontier_records = ai_frontier_prior_records(ai_frontier_status or {}, catalog)
+    events = list(events)
+    tasks = list(tasks)
+    identities = derive_model_identities(events, tasks, catalog)
+    observed_catalog = catalog_with_model_identities(catalog, identities)
+    radar_records = radar_prior_records(radar_status or {}, observed_catalog)
+    ai_frontier_records = ai_frontier_prior_records(ai_frontier_status or {}, observed_catalog)
     external_records = [*radar_records, *ai_frontier_records]
     if external_records:
         active_baseline = validate_benchmark_baseline(
@@ -534,6 +539,7 @@ def build_performance_snapshot(
         for record in active_baseline["records"]
     ]
     source_provenance: dict[str, Any] = {
+        "model_identities": identities,
         "benchmark_records": sources,
         "runtime_ledger": {
             "kind": "append-only-events-and-current-task-contracts",
@@ -551,6 +557,20 @@ def build_performance_snapshot(
             ai_frontier_status,
             len(ai_frontier_records),
         )
+        imported_ids = {str(record["model_id"]) for record in ai_frontier_records}
+        routable = [record for record in observed_catalog.get("models", []) if record.get("routable") is True]
+        matched = [
+            str(record["model_id"])
+            for record in routable
+            if str(record.get("identity", {}).get("canonical_model_id") or record["model_id"]) in imported_ids
+        ]
+        source_provenance["external_priors"]["ai_frontier"].update({
+            "imported_model_count": len(imported_ids),
+            "matched_selection_ids": matched,
+            "routable_model_count": len(routable),
+            "model_coverage_rate": len(matched) / len(routable) if routable else None,
+            "used_for_prior": bool(ai_frontier_records),
+        })
     body = {
         "schema_version": PERFORMANCE_SNAPSHOT_SCHEMA_VERSION,
         "producer": PERFORMANCE_SNAPSHOT_PRODUCER,
@@ -845,6 +865,10 @@ class PerformanceRegistry:
                     ] = metric
 
         candidates: list[dict[str, Any]] = []
+        if snapshot is not None:
+            catalog = catalog_with_model_identities(
+                catalog, snapshot["source_provenance"].get("model_identities", {})
+            )
         models = catalog.get("models", ()) if isinstance(catalog, Mapping) else ()
         agents = catalog.get("agents", {}) if isinstance(catalog, Mapping) else {}
         for record in models if isinstance(models, list) else ():
@@ -861,9 +885,12 @@ class PerformanceRegistry:
                     agent_version = _text(agent.get("cli_version"))
             agent_version = agent_version or "unattested"
             reasoning_effort = _preferred_effort(record)
+            canonical_model_id = (
+                _text(record.get("identity", {}).get("canonical_model_id")) or model_id
+            )
             key = (
                 provider,
-                model_id,
+                canonical_model_id,
                 agent_version,
                 reasoning_effort or "unspecified",
                 task_type,
@@ -873,7 +900,7 @@ class PerformanceRegistry:
             prior = _prior_for(
                 active_baseline,
                 provider=provider,
-                model_id=model_id,
+                model_id=canonical_model_id,
                 model_family=_text(record.get("model_family")) or _model_family(model_id),
                 task_type=task_type,
                 reasoning_effort=reasoning_effort,
@@ -920,6 +947,7 @@ class PerformanceRegistry:
                 {
                     "provider": provider,
                     "model_id": model_id,
+                    "canonical_model_id": canonical_model_id,
                     "model_family": _text(record.get("model_family")) or _model_family(model_id),
                     "reasoning_effort": reasoning_effort,
                     "agent_version": agent_version,
@@ -1128,7 +1156,11 @@ def _prior_for(
                 declarative.append(record)
             elif record.get("routing_prior_eligible", True) is True:
                 exact.append(record)
-        elif model_family is not None and record["model_family"] == model_family:
+        elif (
+            model_family is not None
+            and record["model_family"] == model_family
+            and record.get("external_snapshot_id") is None
+        ):
             if record.get("score") is None:
                 declarative.append(record)
             elif record.get("routing_prior_eligible", True) is True:

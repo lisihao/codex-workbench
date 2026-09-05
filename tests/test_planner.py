@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
-from codex_workbench.model import NodeSpec, TaskContract
+from codex_workbench.model import CODEX_ASTRA_MODEL, NodeSpec, TaskContract
 from codex_workbench.planner import PLAN_SCHEMA, CodexPlanner, PlannerError
 
 
@@ -110,6 +111,47 @@ class PlannerRoutingTests(unittest.TestCase):
             ],
         )
 
+    def test_astra_planner_command_pins_max_effort_without_changing_sol(self) -> None:
+        command = CodexPlanner._command(
+            "codex",
+            CODEX_ASTRA_MODEL,
+            "/tmp/example",
+            Path("schema.json"),
+            Path("plan.json"),
+        )
+        configs = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
+        self.assertEqual(
+            configs,
+            [
+                "model_reasoning_effort=max",
+                "model_context_window=500000",
+                "model_auto_compact_token_limit=450000",
+            ],
+        )
+        self.assertEqual(CodexPlanner(model=CODEX_ASTRA_MODEL).model, CODEX_ASTRA_MODEL)
+
+    def test_compile_rejects_unavailable_astra_before_subprocess(self) -> None:
+        contract = make_contract(
+            planner_model=CODEX_ASTRA_MODEL,
+            verifier_model=CODEX_ASTRA_MODEL,
+        )
+        planner = CodexPlanner(binary="/bin/echo", model=CODEX_ASTRA_MODEL)
+        with patch("codex_workbench.planner.subprocess.run") as run:
+            with self.assertRaisesRegex(PlannerError, "planner model 'gpt-6-astra' is not admitted"):
+                planner.compile(
+                    contract,
+                    claude_models_available=(),
+                    default_executor_model="gpt-5.6-luna",
+                    verifier_model=CODEX_ASTRA_MODEL,
+                    capability_snapshot=catalog(),
+                    provider_capacity={"codex": {"capacity": 4}},
+                )
+        run.assert_not_called()
+
     def test_normalization_accepts_nodes_serialized_with_archify_metadata(self) -> None:
         contract = make_contract()
         worker = NodeSpec(
@@ -142,6 +184,44 @@ class PlannerRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual([node.node_id for node in planned], ["worker", "verify"])
+
+    def test_normalization_preserves_an_explicit_astra_verifier(self) -> None:
+        contract = make_contract(
+            planner_model=CODEX_ASTRA_MODEL,
+            verifier_model=CODEX_ASTRA_MODEL,
+        )
+        raw = {
+            "summary": "Astra verifier",
+            "nodes": [
+                node("worker", write_scope="src/worker"),
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("worker",),
+                    verifier=True,
+                ),
+            ],
+        }
+        planned = CodexPlanner.normalize_and_validate_plan(
+            contract,
+            raw,
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model=CODEX_ASTRA_MODEL,
+        )
+        verifier = planned[-1]
+        self.assertEqual(
+            (
+                verifier.model,
+                verifier.model_profile,
+                verifier.model_reasoning_effort,
+                verifier.execution_lane,
+                verifier.quota_pool_id,
+            ),
+            (CODEX_ASTRA_MODEL, "astra_control_plane", "max", "control", "codex-control"),
+        )
 
     def test_normalization_keeps_disjoint_workers_parallel_and_routes_them(self) -> None:
         raw = {

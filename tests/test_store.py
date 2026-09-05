@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from codex_workbench.model import NodeResult, NodeSpec, TaskContract
+from codex_workbench.model import CODEX_ASTRA_MODEL, NodeResult, NodeSpec, TaskContract
 from codex_workbench.planner import archify_internal_directive
 from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
@@ -725,6 +725,61 @@ class StoreTests(unittest.TestCase):
         started = [event for event in self.store.read_events(task_id="task-1") if event["event_type"] == "node.started"]
         self.assertEqual(started[-1]["payload"]["model_profile"], "luna_worker")
         self.assertEqual(started[-1]["payload"]["model_reasoning_effort"], "max")
+
+    def test_exact_astra_verifier_is_claimed_and_can_settle(self) -> None:
+        contract = TaskContract(
+            task_id="astra-store",
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="Astra final verification",
+            allowed_scope=("src",),
+            required_artifacts=(),
+            planner_model=CODEX_ASTRA_MODEL,
+            verifier_model=CODEX_ASTRA_MODEL,
+        )
+        nodes = [
+            NodeSpec("worker", contract.task_id, "worker", "fixture", "fixture", "ok"),
+            NodeSpec(
+                "verify",
+                contract.task_id,
+                "verify",
+                "codex",
+                CODEX_ASTRA_MODEL,
+                "independently verify",
+                depends_on=("worker",),
+                verifier=True,
+            ),
+        ]
+        self.store.create_task(contract, nodes, "cmd-astra-verifier")
+        self.store.queue_task(contract.task_id)
+        worker = self.store.claim_ready_node("fixture-worker", self.epoch)
+        self.store.settle_claimed(worker, NodeResult("succeeded", "worker complete"))
+
+        verifier = self.store.claim_ready_node("astra-verifier", self.epoch)
+        self.assertEqual(
+            (
+                verifier["spec"]["model"],
+                verifier["spec"]["model_profile"],
+                verifier["spec"]["model_reasoning_effort"],
+                verifier["spec"]["execution_lane"],
+                verifier["spec"]["quota_pool_id"],
+            ),
+            (CODEX_ASTRA_MODEL, "astra_control_plane", "max", "control", "codex-control"),
+        )
+        evidence = self.store.artifacts.put_text("Astra verifier evidence", "astra-verifier.json")
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "succeeded",
+                "Astra accepted",
+                actual_model=CODEX_ASTRA_MODEL,
+                result_kind="verifier",
+                checks=("focused verifier check",),
+                evidence=(evidence,),
+                verdict="accepted",
+            ),
+        )
+        self.assertEqual(self.store.get_task(contract.task_id)["state"], "accepted")
 
     def test_retry_after_codex_fallback_keeps_codex_route(self) -> None:
         contract = TaskContract(

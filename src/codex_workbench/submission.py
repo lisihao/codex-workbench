@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Mapping, get_args
 
 from .artifacts import ArtifactStore
+from .ai_frontier import WorkbenchAIFrontier
 from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .config import WorkbenchConfig
 from .executors import ClaudeExecutor
@@ -139,7 +140,19 @@ def _performance_calibration_for_submission(
             stale_after_seconds=config.radar_stale_after_seconds,
             expire_after_seconds=config.radar_expire_after_seconds,
         ).status()
-        refreshed = registry.refresh(store, catalog, radar_status=radar_status)
+        ai_frontier_status = WorkbenchAIFrontier(
+            state_root=config.effective_ai_frontier_state_root,
+            authorization_file=config.effective_ai_frontier_authorization_file,
+            enabled=config.ai_frontier_enabled,
+            stale_after_seconds=config.ai_frontier_stale_after_seconds,
+            expire_after_seconds=config.ai_frontier_expire_after_seconds,
+        ).status()
+        refreshed = registry.refresh(
+            store,
+            catalog,
+            radar_status=radar_status,
+            ai_frontier_status=ai_frontier_status,
+        )
         snapshot = refreshed["snapshot"]
         calibration = registry.calibrate(catalog, task_type, complexity)
         calibration_matrix = registry.calibrate_matrix(
@@ -205,6 +218,7 @@ def _performance_calibration_for_submission(
         "activated": bool(refreshed["activated"]),
         "unchanged": bool(refreshed["unchanged"]),
         "event_cursor": snapshot["event_cursor"],
+        "external_priors": snapshot["source_provenance"].get("external_priors", {}),
         "advisory_only": True,
         "hard_capability_gates_required": True,
     }

@@ -23,6 +23,51 @@ from codex_workbench.config import WorkbenchConfig
 
 
 class FeatureCLITests(unittest.TestCase):
+    def test_performance_list_exports_missing_astra_without_task_store_or_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = build_parser().parse_args(["--home", directory, "performance", "list", "--format", "json"])
+            catalog = {"models": [{"provider": "codex", "model_id": "gpt-6-astra", "routable": True}]}
+            with (
+                mock.patch("codex_workbench.cli._store", side_effect=AssertionError("list must not initialize task store")),
+                mock.patch("codex_workbench.cli._performance_catalog", return_value=(catalog, {})),
+                mock.patch("codex_workbench.cli._radar") as radar,
+                mock.patch("codex_workbench.cli._ai_frontier") as frontier,
+                mock.patch("codex_workbench.cli.PerformanceRegistry") as registry,
+            ):
+                radar.return_value.status.return_value = {}
+                frontier.return_value.status.return_value = {}
+                registry.return_value.active.return_value = None
+                code, report = self._run(command_performance, args)
+                registry.return_value.refresh.assert_not_called()
+            self.assertEqual(code, 0)
+            astra = next(item for item in report["models"] if item["model_id"] == "gpt-6-astra")
+            self.assertFalse(astra["performance_available"])
+
+    def test_performance_evaluate_does_not_activate_snapshot_or_claim_real_savings(self) -> None:
+        from tests.test_routing import v3_catalog
+        with tempfile.TemporaryDirectory() as directory:
+            WorkbenchConfig(Path(directory), deployment_role="authority", authority_host=socket.gethostname(), authority_machine_id=authority_machine_id()).initialize()
+            requests = Path(directory) / "requests.json"
+            requests.write_text(json.dumps([{
+                "request_id": "scenario", "sample_type": "scenario", "role": "worker",
+                "task_type": "implementation", "complexity": "standard", "quality_floor": 80,
+                "bounded": True, "independent_slice": True,
+                "claude_quota": {"auth_ok": False},
+            }]))
+            args = build_parser().parse_args(["--home", directory, "performance", "evaluate", "--requests", str(requests)])
+            with (
+                mock.patch("codex_workbench.cli._performance_catalog", return_value=(v3_catalog(), {})),
+                mock.patch("codex_workbench.cli._radar") as radar,
+                mock.patch("codex_workbench.cli._ai_frontier") as frontier,
+            ):
+                radar.return_value.status.return_value = {}
+                frontier.return_value.status.return_value = {}
+                code, result = self._run(command_performance, args)
+            self.assertEqual(code, 0)
+            self.assertFalse(result["delivery_improvement_proven"])
+            self.assertIsNone(result["actual_savings"])
+            self.assertFalse((Path(directory) / "performance" / "active.json").exists())
+
     def _run(self, function, args) -> tuple[int, dict]:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -356,6 +401,9 @@ class FeatureCLITests(unittest.TestCase):
                 "active_generation_id": "performance-after-frontier",
                 "activated": True,
                 "unchanged": False,
+                "snapshot": {"source_provenance": {"external_priors": {
+                    "ai_frontier": {"imported_record_count": 0, "used_for_prior": False},
+                }}},
             }
             with (
                 mock.patch(
@@ -383,6 +431,7 @@ class FeatureCLITests(unittest.TestCase):
             )
             self.assertEqual(payload["model_calls"], 0)
             self.assertTrue(payload["performance"]["ok"])
+            self.assertFalse(payload["performance"]["imported_ai_frontier_prior"])
             fake_frontier.refresh.assert_called_once_with(
                 source_ids=["openai/gpt-5.6-luna", "anthropic/claude-opus-4-6"]
             )

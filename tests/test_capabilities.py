@@ -40,8 +40,15 @@ class CapabilityRegistryTests(unittest.TestCase):
                     "display_name": slug,
                     "visibility": "list",
                     "supported_in_api": True,
-                    "default_reasoning_level": "max",
-                    "supported_reasoning_levels": [{"effort": "high"}, {"effort": "max"}],
+                    "default_reasoning_level": "medium" if slug == "gpt-6-astra" else "max",
+                    "supported_reasoning_levels": [
+                        {"effort": effort}
+                        for effort in (
+                            ("low", "medium", "high", "xhigh", "max", "ultra")
+                            if slug == "gpt-6-astra"
+                            else ("high", "max")
+                        )
+                    ],
                     "shell_type": "shell_command",
                     "tool_mode": "tools",
                     "supports_search_tool": True,
@@ -161,18 +168,42 @@ class CapabilityRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(CapabilityCatalogError, "not available but is routable"):
             validate_catalog(deprecated)
 
-    def test_new_worker_family_inherits_policy_but_new_sol_never_receives_control_plane(self) -> None:
-        registry = self._registry(models=("gpt-5.6-sol", "gpt-5.7-luna", "gpt-5.7-sol"))
+    def test_exact_astra_is_a_control_peer_while_future_control_families_stay_observed_only(self) -> None:
+        registry = self._registry(
+            models=(
+                "gpt-5.6-sol",
+                "gpt-5.7-luna",
+                "gpt-5.7-sol",
+                "gpt-6-astra",
+                "gpt-6.1-astra",
+            )
+        )
         catalog = registry.refresh()["catalog"]
         luna = next(item for item in catalog["models"] if item["model_id"] == "gpt-5.7-luna")
+        astra = next(item for item in catalog["models"] if item["model_id"] == "gpt-6-astra")
         future_sol = next(item for item in catalog["models"] if item["model_id"] == "gpt-5.7-sol")
+        future_astra = next(item for item in catalog["models"] if item["model_id"] == "gpt-6.1-astra")
+
         self.assertTrue(luna["routable"])
         self.assertEqual(luna["policy_origin"], "family-inherited")
         self.assertTrue(is_routable_model(luna, role="worker"))
-        self.assertFalse(future_sol["routable"])
-        self.assertFalse(future_sol["control_plane_eligible"])
-        self.assertNotIn("planner", future_sol["roles"])
-        self.assertEqual(future_sol["policy_origin"], "family-inherited-control-plane-pending")
+        self.assertTrue(astra["control_plane_eligible"])
+        self.assertTrue(is_routable_model(astra, role="planner"))
+        self.assertTrue(is_routable_model(astra, role="verifier"))
+        self.assertFalse(is_routable_model(astra, role="worker"))
+        self.assertEqual(astra["policy_origin"], "exact-policy")
+        self.assertEqual(astra["reasoning"]["default_effort"], "medium")
+        self.assertEqual(
+            astra["reasoning"]["supported_efforts"],
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
+        )
+        self.assertTrue(astra["features"]["supported_in_api"])
+
+        for future in (future_sol, future_astra):
+            self.assertFalse(future["routable"])
+            self.assertFalse(future["control_plane_eligible"])
+            self.assertNotIn("planner", future["roles"])
+            self.assertEqual(future["policy_origin"], "family-inherited-control-plane-pending")
 
     def test_failed_refresh_reuses_immutable_active_catalog_and_records_error(self) -> None:
         good = self._registry()

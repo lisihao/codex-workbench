@@ -30,7 +30,13 @@ from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
 from .mobile import MobileRemote, MobileRemoteError
-from .performance import PerformanceRegistry, PerformanceRegistryError
+from .performance import (
+    PerformanceRegistry, PerformanceRegistryError, build_performance_snapshot,
+    load_benchmark_baseline, read_all_events, read_all_tasks,
+)
+from .model_identities import catalog_with_model_identities, derive_model_identities
+from .performance_report import build_model_performance_report, report_to_csv, report_to_html
+from .routing_evaluation import calibration_for_requests, evaluate_routes
 from .planner import PlannerError
 from .radar import WorkbenchRadar
 from .research import managed_research_skill_status
@@ -713,6 +719,11 @@ def _ai_frontier_source_ids(config: WorkbenchConfig) -> list[str]:
         return []
     if not isinstance(catalog, dict):
         return []
+    if any(record.get("identity", {}).get("kind") == "cli-alias" for record in catalog.get("models", [])):
+        store = _store(config)
+        events = read_all_events(store)
+        identities = derive_model_identities(events, read_all_tasks(store, events), catalog)
+        catalog = catalog_with_model_identities(catalog, identities)
     models = catalog.get("models")
     if not isinstance(models, list):
         return []
@@ -721,7 +732,7 @@ def _ai_frontier_source_ids(config: WorkbenchConfig) -> list[str]:
         if not isinstance(model, dict) or model.get("routable") is not True:
             continue
         provider = model.get("provider")
-        model_id = model.get("model_id")
+        model_id = model.get("identity", {}).get("canonical_model_id") or model.get("model_id")
         if not isinstance(model_id, str) or not model_id:
             continue
         source_id: str | None = None
@@ -880,7 +891,6 @@ def command_performance(args: argparse.Namespace) -> int:
     """
 
     config = _config(args)
-    store = _store(config)
     registry = PerformanceRegistry(config.state_root)
     try:
         if args.performance_action == "status":
@@ -898,6 +908,7 @@ def command_performance(args: argparse.Namespace) -> int:
                 **({} if snapshot is not None else {"error": "no active performance snapshot"}),
             }
         elif args.performance_action == "refresh":
+            store = _store(config)
             catalog, catalog_status = _performance_catalog(config)
             ai_frontier_status = _ai_frontier(config).status()
             result = registry.refresh(
@@ -909,9 +920,60 @@ def command_performance(args: argparse.Namespace) -> int:
             result["catalog"] = catalog_status
             result["ai_frontier"] = ai_frontier_status
             result["model_calls"] = 0
+        elif args.performance_action == "list":
+            catalog, _ = _performance_catalog(config)
+            result = build_model_performance_report(
+                catalog=catalog,
+                baseline=load_benchmark_baseline(),
+                radar_status=_radar(config).status(),
+                ai_frontier_status=_ai_frontier(config).status(),
+                performance_snapshot=registry.active(),
+            )
+            if args.format == "csv":
+                print(report_to_csv(result), end="")
+                return 0
+            if args.format == "html":
+                print(report_to_html(result))
+                return 0
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        elif args.performance_action in {"identities", "evaluate"}:
+            store = _store(config)
+            catalog, catalog_status = _performance_catalog(config)
+            events = read_all_events(store)
+            tasks = read_all_tasks(store, events)
+            if args.performance_action == "identities":
+                result = {
+                    "ok": True,
+                    **derive_model_identities(events, tasks, catalog),
+                    "model_calls": 0,
+                    "network_requested": False,
+                }
+            else:
+                requests = json.loads(Path(args.requests).expanduser().read_text(encoding="utf-8"))
+                if not isinstance(requests, list) or any(not isinstance(request, dict) for request in requests):
+                    raise ValueError("evaluation requests must be a JSON array of request objects")
+                radar_status = _radar(config).status()
+                frontier_status = _ai_frontier(config).status()
+                quota = store.latest_quota()
+                current = build_performance_snapshot(
+                    events, tasks, catalog, quota=quota,
+                    radar_status=radar_status, ai_frontier_status=frontier_status,
+                )
+                without_frontier = build_performance_snapshot(
+                    events, tasks, catalog, quota=quota, radar_status=radar_status,
+                )
+                result = evaluate_routes(catalog, requests, calibrations={
+                    "declared_baseline": None,
+                    "without_ai_frontier": calibration_for_requests(without_frontier, catalog, requests),
+                    "current": calibration_for_requests(current, catalog, requests),
+                })
+                result["source_provenance"] = current["source_provenance"]
+                result["catalog"] = catalog_status
+                result["ok"] = True
         else:
             raise ValueError(f"unsupported performance action: {args.performance_action}")
-    except PerformanceRegistryError as error:
+    except (PerformanceRegistryError, ValueError, OSError) as error:
         result = {"ok": False, "error": str(error)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1
@@ -1071,10 +1133,10 @@ def command_ai_frontier(args: argparse.Namespace) -> int:
                     "activated": performance["activated"],
                     "unchanged": performance["unchanged"],
                     "ai_frontier_state": usable.get("state"),
-                    "imported_ai_frontier_prior": usable.get(
-                        "routing_prior_eligible"
-                    )
-                    is True,
+                    "imported_ai_frontier_prior": performance["snapshot"]["source_provenance"]
+                        ["external_priors"]["ai_frontier"]["imported_record_count"] > 0,
+                    "ai_frontier_coverage": performance["snapshot"]["source_provenance"]
+                        ["external_priors"]["ai_frontier"],
                     "radar_state": radar_status.get("state"),
                     "catalog": catalog_status,
                     "model_calls": 0,
@@ -1472,6 +1534,11 @@ def build_parser() -> argparse.ArgumentParser:
     performance_sub.add_parser("status")
     performance_show = performance_sub.add_parser("show")
     performance_show.add_argument("snapshot_id", nargs="?")
+    performance_list = performance_sub.add_parser("list", help="export every cached model performance observation; no network")
+    performance_list.add_argument("--format", choices=("json", "csv", "html"), default="json")
+    performance_sub.add_parser("identities", help="show receipt-proven model aliases and unresolved identities")
+    performance_evaluate = performance_sub.add_parser("evaluate", help="compare routing decisions offline; does not prove delivery improvement")
+    performance_evaluate.add_argument("--requests", required=True, help="JSON array of routing requests to compare")
     performance_sub.add_parser(
         "refresh",
         help="replay local SQLite events/tasks into a content-addressed snapshot; never calls a model",

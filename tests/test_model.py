@@ -21,6 +21,7 @@ from codex_workbench.claude_quota import (
     SUPPORTED_USAGE_VERSION,
 )
 from codex_workbench.model import (
+    CODEX_ASTRA_MODEL,
     NodeResult,
     NodeSpec,
     QuotaSnapshot,
@@ -29,6 +30,7 @@ from codex_workbench.model import (
     codex_model_profile,
     codex_model_reasoning_effort,
     derive_execution_lane,
+    is_codex_control_plane_model,
     now_iso,
     retry_model,
 )
@@ -59,12 +61,20 @@ class ModelTests(unittest.TestCase):
             "general",
         )
 
+    def test_astra_is_an_exact_control_plane_profile_without_repair_escalation(self) -> None:
+        self.assertEqual(codex_model_profile(CODEX_ASTRA_MODEL), "astra_control_plane")
+        self.assertEqual(codex_model_reasoning_effort(CODEX_ASTRA_MODEL), "max")
+        self.assertTrue(is_codex_control_plane_model(CODEX_ASTRA_MODEL))
+        self.assertFalse(is_codex_control_plane_model("gpt-6-astra-evil"))
+        self.assertEqual(derive_execution_lane("codex", CODEX_ASTRA_MODEL), "control")
+        self.assertEqual(retry_model(CODEX_ASTRA_MODEL, 2), CODEX_ASTRA_MODEL)
+
     def test_long_context_overrides_require_exact_supported_model_ids(self) -> None:
         expected = (
             "model_context_window=500000",
             "model_auto_compact_token_limit=450000",
         )
-        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", CODEX_ASTRA_MODEL):
             self.assertEqual(codex_model_long_context_overrides(model), expected)
         self.assertEqual(codex_model_long_context_overrides("gpt-5.3-codex-spark"), ())
         self.assertEqual(codex_model_long_context_overrides("gpt-5.6-luna-evil"), ())
@@ -86,6 +96,29 @@ class ModelTests(unittest.TestCase):
             ),
             "gpt-5.3-codex-spark",
         )
+
+    def test_task_contract_preserves_explicit_astra_controls_and_sol_defaults(self) -> None:
+        explicit = TaskContract(
+            task_id="astra-control",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="bounded control-plane work",
+            allowed_scope=("src",),
+            planner_model=CODEX_ASTRA_MODEL,
+            verifier_model=CODEX_ASTRA_MODEL,
+        )
+        self.assertEqual(explicit.planner_model, CODEX_ASTRA_MODEL)
+        self.assertEqual(explicit.verifier_model, CODEX_ASTRA_MODEL)
+
+        defaulted = TaskContract(
+            task_id="sol-default",
+            repository="/tmp/example",
+            base_sha="abc123",
+            objective="default control-plane work",
+            allowed_scope=("src",),
+        )
+        self.assertEqual(defaulted.planner_model, "gpt-5.6-sol")
+        self.assertEqual(defaulted.verifier_model, "gpt-5.6-sol")
 
     def test_capability_snapshot_roundtrips_on_contract_and_node(self) -> None:
         digest = "sha256:" + "a" * 64
@@ -306,6 +339,20 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(verifier.execution_lane, "control")
         self.assertEqual(verifier.quota_pool_id, "codex-control")
 
+        astra_verifier = NodeSpec(
+            "astra-verify",
+            "lane-contract",
+            "Astra verifier",
+            "codex",
+            CODEX_ASTRA_MODEL,
+            "inspect the result",
+            verifier=True,
+        )
+        self.assertEqual(astra_verifier.model_profile, "astra_control_plane")
+        self.assertEqual(astra_verifier.model_reasoning_effort, "max")
+        self.assertEqual(astra_verifier.execution_lane, "control")
+        self.assertEqual(astra_verifier.quota_pool_id, "codex-control")
+
         with self.assertRaisesRegex(ValueError, "execution_lane"):
             NodeSpec(
                 "forged-lane",
@@ -495,6 +542,38 @@ class ModelTests(unittest.TestCase):
         )
         self.assertIn("Execution profile: luna_worker", CodexExecutor._prompt(request))
         self.assertIn("Model reasoning effort: max", CodexExecutor._prompt(request))
+
+    def test_astra_verifier_command_emits_max_effort_and_long_context(self) -> None:
+        request = ExecutionRequest(
+            task_id="astra-verifier",
+            node_id="verify",
+            attempt=1,
+            contract={"objective": "verify", "allowed_scope": ["src"], "forbidden_scope": [], "acceptance_commands": []},
+            spec={
+                "title": "verify",
+                "prompt": "inspect",
+                "model": CODEX_ASTRA_MODEL,
+                "model_profile": "astra_control_plane",
+                "model_reasoning_effort": "max",
+                "verifier": True,
+            },
+            worktree=Path("/tmp/worktree"),
+        )
+        command = CodexExecutor._command("codex", request, Path("schema.json"), Path("result.json"))
+        configs = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
+        self.assertEqual(
+            configs,
+            [
+                "model_reasoning_effort=max",
+                "model_context_window=500000",
+                "model_auto_compact_token_limit=450000",
+            ],
+        )
+        self.assertIn("Execution profile: astra_control_plane", CodexExecutor._prompt(request))
 
     def test_spark_command_does_not_emit_long_context_overrides(self) -> None:
         request = ExecutionRequest(

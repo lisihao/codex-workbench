@@ -366,13 +366,14 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.11.0`。这是一个正在演进的自托管系统：实现、自动化测试与外部真实旅程的验收状态被有意区分。请不要将 fixture、静态健康检查或单次进程启动当作生产端到端证明。1.11.0 新增通用 AI Frontier Provider 0.1.0、72 小时离线优先采集、跨来源弱先验融合，以及 `quality-equivalence-efficiency-v1` 路由；它继承 1.10.0 的 Codex Radar、长期运行账本、Spark P0 逻辑队列、可恢复 worktree/NAS 生命周期和 Sol/Terra/Luna 500K 上下文。外部榜单只用于冷启动，真实模型质量仍需本机任务 Evidence 长期校准。
+当前源码版本为 `1.12.0`。新增 GPT-6 Astra 显式控制面选择（默认仍为 Sol）、原生结果回执驱动的 Claude 精确型号映射、所有模型性能的 JSON/CSV/HTML 清单和离线路由对照；修复新任务创建时遗漏 AI Frontier 输入的问题。Astra 性能缺失保持 N/A；效果评估分别报告数据覆盖、选择变化和真实交付证据，不能用测试通过或路由分数声称实际提速。继承 1.11.0 的两个独立离线 Provider 和 1.10.0 的运行账本、Spark 调度、worktree/NAS 生命周期及 500K 上下文策略。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
 - [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、personal-use consent、SQLite 断网缓存、Workbench 先验与未来 DSH 消费合同。
 - [AI Frontier 集成](docs/ai-frontier-integration.md) — 自动采集白名单、SQLite LKG、字段语义、质量等价带算法与未来通用消费合同。
+- [型号与效果验收](docs/model-performance-evaluation.md) — Astra、精确型号绑定、全模型清单和离线路由对照。
 - [Backlog](docs/backlog.md) — 已明确后置的真实外部 Evidence 与通知工作。
 
 ## 项目边界

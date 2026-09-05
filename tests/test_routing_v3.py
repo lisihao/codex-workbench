@@ -214,6 +214,72 @@ class RoutingV3Tests(unittest.TestCase):
                 self.assertEqual(decision.catalog_snapshot_id, "catalog-2026-09-02-a")
                 self.assertEqual(decision.catalog_digest, "catalog-digest-a")
 
+    def test_control_plane_model_selects_exact_astra_and_rejects_unavailable_or_worker_use(self) -> None:
+        sol = capability(
+            "codex",
+            "gpt-5.6-sol",
+            roles=("planner", "verifier", "control"),
+            task_types=("*",),
+            complexities=("*",),
+            quality=100,
+        )
+        astra = capability(
+            "codex",
+            "gpt-6-astra",
+            roles=("planner", "verifier", "control"),
+            task_types=("*",),
+            complexities=("*",),
+            quality=100,
+        )
+        control_request = request(
+            role="planner",
+            task_type="architecture",
+            complexity="high",
+            control_plane_model="gpt-6-astra",
+        )
+
+        selected = route_capability_snapshot(snapshot(sol, astra), control_request)
+        self.assertTrue(selected.accepted)
+        self.assertEqual(selected.model, "gpt-6-astra")
+        sol_rejection = next(item for item in selected.rejected_candidates if item.model == "gpt-5.6-sol")
+        self.assertIn("control_plane_model", sol_rejection.reasons[0])
+
+        unavailable = route_capability_snapshot(snapshot(sol), control_request)
+        self.assertFalse(unavailable.accepted)
+        self.assertIn("control_plane_model", unavailable.rejected_candidates[0].reasons[0])
+
+        future_astra = capability(
+            "codex",
+            "gpt-6.1-astra",
+            roles=("planner", "verifier", "control"),
+            task_types=("*",),
+            complexities=("*",),
+            quality=100,
+        )
+        forged = route_capability_snapshot(
+            snapshot(future_astra),
+            request(
+                role="planner",
+                task_type="architecture",
+                complexity="high",
+                control_plane_model="gpt-6.1-astra",
+            ),
+        )
+        self.assertFalse(forged.accepted)
+        self.assertIn(
+            "exact admitted Codex control-plane ID",
+            " ".join(forged.rejected_candidates[0].reasons),
+        )
+
+        worker = route_capability_snapshot(snapshot(astra), request())
+        self.assertFalse(worker.accepted)
+        self.assertIn(
+            "Astra is reserved for planner, cross-module control, and final verifier roles",
+            worker.rejected_candidates[0].reasons,
+        )
+        with self.assertRaisesRegex(ValueError, "control_plane_model"):
+            route_capability_snapshot(snapshot(astra), request(control_plane_model="gpt-6-astra"))
+
     def test_parallel_provider_candidates_are_opt_in_and_keep_one_per_provider(self) -> None:
         luna = capability("codex", "gpt-5.6-luna", quality=88, cost=3)
         sonnet = capability("claude", "sonnet", quality=90, cost=4)

@@ -60,12 +60,15 @@ DEFAULT_QUOTA_TTL_SECONDS = 15 * 60
 LEGACY_ROUTING_STRATEGY_VERSION = "model-routing-v1"
 ROUTING_STRATEGY_VERSION = "model-routing-v2"
 CODEX_SOL_MODEL = "gpt-5.6-sol"
+CODEX_ASTRA_MODEL = "gpt-6-astra"
+CODEX_CONTROL_PLANE_MODELS = frozenset({CODEX_SOL_MODEL, CODEX_ASTRA_MODEL})
 CODEX_LONG_CONTEXT_WINDOW = 500_000
 CODEX_LONG_CONTEXT_AUTO_COMPACT_TOKEN_LIMIT = 450_000
 CODEX_LONG_CONTEXT_MODELS = frozenset({
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    CODEX_ASTRA_MODEL,
 })
 
 
@@ -85,6 +88,7 @@ RoutingProfile = Literal[
     "luna_worker",
     "terra_worker",
     "sol_control_plane",
+    "astra_control_plane",
 ]
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 ExecutionLane = Literal["spark", "general", "control", "deterministic", "fixture"]
@@ -105,13 +109,21 @@ CODEX_MODEL_PROFILES: dict[str, RoutingProfile] = {
     "gpt-5.6-luna": "luna_worker",
     "gpt-5.6-terra": "terra_worker",
     "gpt-5.6-sol": "sol_control_plane",
+    CODEX_ASTRA_MODEL: "astra_control_plane",
 }
 CODEX_MODEL_REASONING_EFFORTS: dict[str, ReasoningEffort] = {
     "gpt-5.3-codex-spark": "xhigh",
     "gpt-5.6-luna": "max",
     "gpt-5.6-terra": "max",
     "gpt-5.6-sol": "max",
+    CODEX_ASTRA_MODEL: "max",
 }
+
+
+def is_codex_control_plane_model(model: object) -> bool:
+    """Return whether ``model`` is an exact admitted Codex control-plane ID."""
+
+    return str(model).strip().lower() in CODEX_CONTROL_PLANE_MODELS
 
 
 def codex_model_profile(model: object) -> str | None:
@@ -129,7 +141,7 @@ def codex_model_reasoning_effort(model: object) -> str | None:
 
 
 def codex_model_long_context_overrides(model: object) -> tuple[str, ...]:
-    """Return explicit long-context overrides for supported GPT-5.6 models."""
+    """Return the configured long-context policy for exact compatible Codex IDs."""
 
     value = str(model).strip().lower()
     if value not in CODEX_LONG_CONTEXT_MODELS:
@@ -167,7 +179,7 @@ def derive_execution_lane(
     if normalized_executor == "codex":
         if codex_model_profile(normalized_model) == "spark_worker":
             return "spark"
-        if codex_model_profile(normalized_model) == "sol_control_plane":
+        if is_codex_control_plane_model(normalized_model):
             return "control"
     return "general"
 
@@ -438,12 +450,25 @@ class TaskContract:
     performance_status: str | None = None
 
     def __post_init__(self) -> None:
-        # Sol is a role invariant.  ``fixture`` remains available for the
-        # repository's offline demonstrations and tests.
+        # Sol remains the default control-plane model.  Astra is an explicit
+        # peer selection; all other values retain the historic Sol fallback.
+        # ``fixture`` remains available for offline demonstrations and tests.
         if self.planner_model != "fixture":
-            object.__setattr__(self, "planner_model", CODEX_SOL_MODEL)
+            object.__setattr__(
+                self,
+                "planner_model",
+                str(self.planner_model).strip().lower()
+                if is_codex_control_plane_model(self.planner_model)
+                else CODEX_SOL_MODEL,
+            )
         if self.verifier_model != "fixture":
-            object.__setattr__(self, "verifier_model", CODEX_SOL_MODEL)
+            object.__setattr__(
+                self,
+                "verifier_model",
+                str(self.verifier_model).strip().lower()
+                if is_codex_control_plane_model(self.verifier_model)
+                else CODEX_SOL_MODEL,
+            )
         if isinstance(self.routing_strategy, dict):
             strategy = RoutingStrategy.from_dict(self.routing_strategy)
             object.__setattr__(self, "routing_strategy", strategy.version)
