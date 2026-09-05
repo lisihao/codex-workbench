@@ -99,6 +99,11 @@ class RoutingV3Tests(unittest.TestCase):
             "status": "ok",
             "snapshot_id": "performance-" + "a" * 16,
             "digest": "b" * 64,
+            "semantic_version": "local-outcomes-only-v2",
+            "calibration_policy": {
+                "local_outcomes_only": True,
+                "external_evidence_updates_beta": False,
+            },
             "task_type": "implementation",
             "complexity": "standard",
             "candidates": list(candidates),
@@ -131,6 +136,16 @@ class RoutingV3Tests(unittest.TestCase):
             "model_id": model_id,
             "agent_version": agent_version,
             "quality": quality,
+            "calibration_cohort": {
+                "task_type": "implementation",
+                "complexity": "standard",
+                "harness": "workbench-verifier-v1",
+                "score_kind": "verified-task-acceptance",
+                "reasoning_effort": reasoning_effort or "unspecified",
+                "agent_name": f"{provider}-cli",
+                "agent_version": agent_version,
+            },
+
         }
         if reasoning_effort is not None:
             result["reasoning_effort"] = reasoning_effort
@@ -375,20 +390,15 @@ class RoutingV3Tests(unittest.TestCase):
 
         decision = route_capability_snapshot(catalog, request(independent_slice=True))
 
-        self.assertEqual(decision.ranked_candidates[0].ranking_quality_score, 70)
-        self.assertEqual(decision.ranked_candidates[1].ranking_quality_score, 70)
-        self.assertEqual(decision.ranked_candidates[0].external_quality_mean, 0.99)
-        self.assertEqual(decision.ranked_candidates[1].external_quality_mean, 0.10)
-        self.assertEqual(decision.ranked_candidates[0].external_observed_cost_mean, 0.01)
-        self.assertNotIn(
-            "external_observed_cost_usd_mean",
-            decision.ranked_candidates[0].to_dict(),
-        )
-        self.assertNotEqual(
-            decision.ranked_candidates[0].performance_consistency_risk,
-            decision.ranked_candidates[1].performance_consistency_risk,
-        )
+        self.assertEqual(decision.ranked_candidates[0].ranking_quality_score, 80)
+        self.assertEqual(decision.ranked_candidates[1].ranking_quality_score, 80)
+        self.assertIsNone(decision.ranked_candidates[0].external_quality_mean)
+        self.assertIsNone(decision.ranked_candidates[1].external_quality_mean)
+        self.assertIsNone(decision.ranked_candidates[0].external_observed_cost_mean)
+        self.assertIsNone(decision.ranked_candidates[0].performance_consistency_risk)
+        self.assertIsNone(decision.ranked_candidates[1].performance_consistency_risk)
         self.assertEqual(decision.ranked_candidates[0].performance_p_first_rate, 0.70)
+        self.assertEqual(decision.ranked_candidates[0].quality_source, "local-runtime")
 
     def test_efficiency_receipt_is_serializable_and_deterministic(self) -> None:
         luna = capability("codex", "gpt-5.6-luna", quality=80, cost=2)
@@ -580,9 +590,9 @@ class RoutingV3Tests(unittest.TestCase):
 
         first = route_capability_snapshot(catalog, request(independent_slice=True))
         self.assertEqual(first.model, "gpt-5.6-terra")
-        self.assertEqual(first.selected.quality_source, "calibrated")  # type: ignore[union-attr]
+        self.assertEqual(first.selected.quality_source, "local-runtime")  # type: ignore[union-attr]
         self.assertEqual(first.selected.quality_score, 80)  # type: ignore[union-attr]
-        self.assertEqual(first.selected.ranking_quality_score, 75)  # type: ignore[union-attr]
+        self.assertEqual(first.selected.ranking_quality_score, 80)  # type: ignore[union-attr]
         self.assertEqual(first.selected.runtime_sample_count, 5)  # type: ignore[union-attr]
 
         catalog["performance_calibration"] = self._calibration(
@@ -593,6 +603,30 @@ class RoutingV3Tests(unittest.TestCase):
         self.assertEqual(second.model, "gpt-5.6-luna")
         self.assertEqual(second.performance_snapshot_id, "performance-" + "a" * 16)
         self.assertEqual(second.performance_digest, "b" * 64)
+
+    def test_sampled_and_unknown_declared_policy_peers_do_not_mix_quality_scales(self) -> None:
+        unknown = capability("codex", "gpt-5.6-luna", quality=90, cost=1)
+        sampled = capability("codex", "gpt-5.6-terra", quality=90, cost=100)
+        catalog = snapshot(unknown, sampled)
+        catalog["performance_calibration"] = self._calibration(
+            self._calibrated_candidate("codex", "gpt-5.6-luna", 0.10, runtime_samples=0),
+            self._calibrated_candidate("codex", "gpt-5.6-terra", 0.95, runtime_samples=1),
+        )
+
+        decision = route_capability_snapshot(catalog, request(independent_slice=True))
+
+        self.assertEqual(decision.model, "gpt-5.6-luna")
+        self.assertEqual(
+            [candidate.ranking_quality_score for candidate in decision.ranked_candidates],
+            [90, 90],
+        )
+        sampled_candidate = next(item for item in decision.ranked_candidates if item.model == "gpt-5.6-terra")
+        self.assertEqual(sampled_candidate.empirical_ranking_status, "abstained")
+        self.assertIn(
+            "not every declared quality-equivalence candidate has usable local runtime outcomes",
+            sampled_candidate.empirical_ranking_reason,
+        )
+
 
     def test_performance_candidate_requires_exact_reasoning_effort(self) -> None:
         luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1, efforts=("high", "max"))
@@ -611,7 +645,7 @@ class RoutingV3Tests(unittest.TestCase):
         self.assertEqual(decision.model, "gpt-5.6-luna")
         luna_candidate = decision.selected
         self.assertIsNotNone(luna_candidate)
-        self.assertEqual(luna_candidate.quality_source, "declared")
+        self.assertEqual(luna_candidate.quality_source, "declared-policy")
         self.assertIsNone(luna_candidate.performance_lower_bound_95)
 
     def test_runtime_first_pass_rework_and_latency_break_equal_quality_bounds(self) -> None:
@@ -698,7 +732,7 @@ class RoutingV3Tests(unittest.TestCase):
         )
 
         self.assertEqual(decision.model, "gpt-5.3-codex-spark")
-        self.assertEqual(decision.selected.quality_source, "declared")  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.quality_source, "declared-policy")  # type: ignore[union-attr]
         self.assertIsNone(decision.selected.performance_lower_bound_95)  # type: ignore[union-attr]
 
     def test_performance_contexts_select_exact_dag_bucket(self) -> None:
@@ -751,9 +785,9 @@ class RoutingV3Tests(unittest.TestCase):
             request(task_type="docs", complexity="low"),
         )
 
-        self.assertEqual(decision.model, "sonnet")
-        self.assertEqual(decision.selected.quality_source, "calibrated")  # type: ignore[union-attr]
-        self.assertEqual(decision.selected.performance_lower_bound_95, 0.90)  # type: ignore[union-attr]
+        self.assertEqual(decision.model, "gpt-5.6-luna")
+        self.assertEqual(decision.selected.quality_source, "local-runtime")  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.performance_lower_bound_95, 0.20)  # type: ignore[union-attr]
         self.assertEqual(decision.performance_snapshot_id, "performance-" + "a" * 16)
         self.assertEqual(decision.performance_digest, "b" * 64)
 
@@ -795,7 +829,7 @@ class RoutingV3Tests(unittest.TestCase):
         )
 
         self.assertEqual(decision.model, "sonnet")
-        self.assertEqual(decision.selected.quality_source, "declared")  # type: ignore[union-attr]
+        self.assertEqual(decision.selected.quality_source, "declared-policy")  # type: ignore[union-attr]
         self.assertIsNone(decision.selected.performance_lower_bound_95)  # type: ignore[union-attr]
         self.assertEqual(decision.performance_snapshot_id, "performance-" + "a" * 16)
         self.assertEqual(decision.performance_digest, "b" * 64)

@@ -1,4 +1,4 @@
-"""Read-only AI Frontier integration for Workbench performance priors.
+"""Read-only AI Frontier integration for Workbench public metric evidence.
 
 The portable :mod:`ai_frontier_provider` owns collection and its durable
 last-known-good cache.  This module is the Workbench policy boundary:
@@ -265,6 +265,7 @@ class WorkbenchAIFrontier:
                 "enabled": True,
                 "ok": False,
                 "state": "unauthorized",
+                "reference_eligible": False,
                 "routing_prior_eligible": False,
                 "offline_cache_available": True,
                 "snapshot_id": snapshot.get("snapshot_id"),
@@ -300,7 +301,11 @@ class WorkbenchAIFrontier:
             "enabled": True,
             "ok": state in {"fresh", "stale"},
             "state": state,
-            "routing_prior_eligible": state in {"fresh", "stale"},
+            # Public evidence may be fresh enough to display or compare inside
+            # a declared external cohort, but it never becomes a local-outcome
+            # routing prior in Workbench.
+            "reference_eligible": state in {"fresh", "stale"},
+            "routing_prior_eligible": False,
             "offline_cache_available": True,
             "snapshot_id": snapshot.get("snapshot_id"),
             "digest": snapshot.get("digest"),
@@ -360,6 +365,7 @@ class WorkbenchAIFrontier:
             "enabled": state != "disabled",
             "ok": False,
             "state": state,
+            "reference_eligible": False,
             "routing_prior_eligible": False,
             "offline_cache_available": False,
             "snapshot_id": None,
@@ -372,17 +378,21 @@ class WorkbenchAIFrontier:
         }
 
 
-def ai_frontier_prior_records(
+def ai_frontier_public_evidence_records(
     status: Mapping[str, Any],
     catalog: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Convert eligible observations into weak, exact-model benchmark records."""
+    """Convert eligible observations into exact-model public references.
+
+    The legacy ``ai_frontier_prior_records`` alias remains for callers that
+    import it, but every returned record is explicitly non-calibrating.
+    """
 
     if not isinstance(status, Mapping) or not isinstance(catalog, Mapping):
         return []
     if (
         status.get("provider") != AI_FRONTIER_PROVIDER
-        or status.get("routing_prior_eligible") is not True
+        or status.get("reference_eligible") is not True
         or status.get("state") not in {"fresh", "stale"}
         or status.get("collector_authorization") not in _AUTHORIZED_STATUSES
         or status.get("snapshot_authorization") not in _AUTHORIZED_STATUSES
@@ -483,8 +493,17 @@ def ai_frontier_prior_records(
                 ),
             )
         )
-    return _cap_and_sort_records(records)
+    return _deduplicate_and_sort_records(records)
 
+
+def ai_frontier_prior_records(
+    status: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compatibility alias for public evidence, never a calibration prior."""
+
+
+    return ai_frontier_public_evidence_records(status, catalog)
 
 def _known_catalog_models(catalog: Mapping[str, Any]) -> dict[tuple[str, str], Mapping[str, Any]]:
     models = catalog.get("models")
@@ -632,13 +651,6 @@ def _records_for_observation(
         _first(observed, "observed_cost_usd", "real_cost", "Real Cost", "cost", "Cost")
     )
     cost_surprise = _number(_first(observed, "cost_surprise", "Cost Surprise"))
-    if consistency is None:
-        consistency_factor = 0.75
-    else:
-        consistency_factor = 0.5 + 0.5 * consistency
-    if consistency_std is not None:
-        consistency_factor *= max(0.5, 1.0 - 0.25 * consistency_std)
-    consistency_factor = min(1.0, max(0.25, consistency_factor))
     common = {
         "provider": provider,
         "model_id": model_id,
@@ -648,7 +660,7 @@ def _records_for_observation(
         "consistency_std": consistency_std,
         "cost": cost,
         "cost_surprise": cost_surprise,
-        "consistency_factor": consistency_factor,
+        "harness": _text(_first(observed, "harness", "evaluation_harness")),
         "source_id": _text(observed.get("source_id")) or AI_FRONTIER_PROVIDER,
         "lineage_id": _text(observed.get("lineage_id")) or f"{snapshot_id}:{model_id}",
         "correlation_group": _text(observed.get("correlation_group"))
@@ -717,10 +729,6 @@ def _make_record(
     source_updated: str,
     freshness_state: str,
 ) -> dict[str, Any]:
-    strength = min(
-        strength_cap,
-        strength_cap * multiplier * float(common["consistency_factor"]),
-    )
     task_types = (
         AI_FRONTIER_OVERALL_TASK_TYPES
         if category is None
@@ -744,26 +752,32 @@ def _make_record(
         "task_types": list(task_types),
         "provider": common["provider"],
         "model_id": common["model_id"],
+        "canonical_model_id": common["model_id"],
         "model_family": common["model_family"],
         "agent_scaffold": (
             "Martian AI Frontier public evaluation harness; not local Workbench first-pass"
         ),
         "score": round(quality, 8),
         "score_kind": "accuracy_pseudo_evidence",
+        "value": round(quality, 8),
+        "unit": "proportion",
+        "sample_count": None,
+        "observed_at": source_updated,
+        "harness": common.get("harness"),
+        "harness_description": "Martian AI Frontier public evaluation harness; exact harness version is not disclosed",
+        "metric_kind": "accuracy",
         "provenance": "vendor_report",
-        "transfer_weight": AI_FRONTIER_TRANSFER_WEIGHT,
-        "effective_sample_strength": round(strength, 8),
-        "quality_evidence": (
-            "publisher AI Frontier accuracy; weak pseudo-evidence only, not local first-pass"
-        ),
-        "routing_prior_eligible": True,
+        "quality_evidence": "publisher AI Frontier accuracy; reference-only, not local first-pass",
+        "source": "ai-frontier",
+        "reference_eligible": True,
+        "calibration_eligible": False,
+        "routing_prior_eligible": False,
         "authorization_status": "consented",
         "freshness_state": freshness_state,
         "external_snapshot_id": snapshot_id,
         "external_snapshot_digest": snapshot.get("digest"),
         "source_id": common["source_id"],
         "lineage_id": common["lineage_id"],
-        "metric_kind": "accuracy",
         "correlation_group": common["correlation_group"],
         "external_signals": external_signals,
         "cost_signal_kind": (
@@ -779,29 +793,18 @@ def _make_record(
     return record
 
 
-def _cap_and_sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Bound public prior per exact model. Local successes/failures are added
-    # by PerformanceRegistry and naturally dominate this weak prior.
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for record in records:
-        grouped.setdefault((str(record["provider"]), str(record["model_id"])), []).append(record)
-    capped: list[dict[str, Any]] = []
-    for key in sorted(grouped):
-        items = sorted(grouped[key], key=lambda item: (item["domain"], item["record_id"]))
-        total = sum(float(item["effective_sample_strength"]) for item in items)
-        scale = (
-            min(1.0, AI_FRONTIER_MAX_MODEL_STRENGTH / total)
-            if total > 0
-            else 0.0
-        )
-        for item in items:
-            strength = float(item["effective_sample_strength"]) * scale
-            if strength <= 0:
-                continue
-            item = dict(item)
-            item["effective_sample_strength"] = round(strength, 8)
-            capped.append(item)
-    return sorted(capped, key=lambda item: (item["model_id"], item["domain"], item["record_id"]))
+def _deduplicate_and_sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one publisher observation per exact source/model/category.
+
+    This is presentation deduplication only.  No returned field is a weight or
+    pseudo-observation, so duplicate upstream rows cannot affect calibration.
+    """
+
+    unique = {str(record["record_id"]): record for record in records}
+    return sorted(
+        unique.values(),
+        key=lambda item: (item["model_id"], item["domain"], item["record_id"]),
+    )
 
 
 def _round_or_none(value: object) -> float | None:
@@ -830,5 +833,6 @@ __all__ = [
     "AI_FRONTIER_REFRESH_INTERVAL_SECONDS",
     "AI_FRONTIER_STALE_TRANSFER_MULTIPLIER",
     "WorkbenchAIFrontier",
+    "ai_frontier_public_evidence_records",
     "ai_frontier_prior_records",
 ]

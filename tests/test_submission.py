@@ -419,7 +419,7 @@ class SubmissionTests(unittest.TestCase):
             contract = store.get_task("task-performance")["contract"]
             self.assertTrue(contract["performance_snapshot_id"].startswith("performance-"))
             self.assertEqual(len(contract["performance_digest"]), 64)
-            self.assertEqual(contract["performance_policy"], "benchmark-prior-plus-runtime-ledger-v1")
+            self.assertEqual(contract["performance_policy"], "local-outcomes-only-v2")
             self.assertEqual(contract["performance_status"], "ok")
             self.assertEqual(
                 result["routing_policy"]["performance_snapshot_id"],
@@ -463,17 +463,21 @@ class SubmissionTests(unittest.TestCase):
             self.assertIsNotNone(active_performance)
             radar_provenance = active_performance["source_provenance"]["external_priors"]["codex_radar"]
             self.assertEqual(radar_provenance["state"], "fresh")
-            self.assertEqual(radar_provenance["imported_record_count"], 1)
+            self.assertEqual(radar_provenance["reference_record_count"], 1)
             frontier_provenance = active_performance["source_provenance"]["external_priors"]["ai_frontier"]
             self.assertEqual(frontier_provenance["snapshot_id"], imported["snapshot_id"])
-            self.assertGreater(frontier_provenance["imported_record_count"], 0)
+            self.assertGreater(frontier_provenance["reference_record_count"], 0)
             self.assertEqual(result["performance"]["external_priors"]["ai_frontier"], frontier_provenance)
-            self.assertTrue(
-                any(
-                    record.get("provenance") == "community_observation"
-                    for record in active_performance["baseline"]["records"]
-                )
-            )
+            radar_references = [
+                record for record in active_performance["public_evidence"]
+                if record["source"] == "codex-radar"
+            ]
+            self.assertEqual(len(radar_references), 1)
+            self.assertIs(radar_references[0]["calibration_eligible"], False)
+            self.assertFalse(any(
+                record.get("source") == "codex-radar"
+                for record in active_performance["baseline"]["records"]
+            ))
 
     def test_failed_first_capability_refresh_reports_legacy_v2_without_pinning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

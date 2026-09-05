@@ -89,6 +89,7 @@ def command_init(args: argparse.Namespace) -> int:
             ai_frontier_refresh_seconds=config.ai_frontier_refresh_seconds,
             ai_frontier_stale_after_seconds=config.ai_frontier_stale_after_seconds,
             ai_frontier_expire_after_seconds=config.ai_frontier_expire_after_seconds,
+            squilla_advisor=config.squilla_advisor,
         )
         config.initialize()
     _store(config)
@@ -128,6 +129,7 @@ def command_serve(args: argparse.Namespace) -> int:
             ai_frontier_refresh_seconds=config.ai_frontier_refresh_seconds,
             ai_frontier_stale_after_seconds=config.ai_frontier_stale_after_seconds,
             ai_frontier_expire_after_seconds=config.ai_frontier_expire_after_seconds,
+            squilla_advisor=config.squilla_advisor,
         )
     store = _store(config)
     lease = CoordinatorAuthorityLease(config.state_root / "coordinator.lock")
@@ -1152,8 +1154,8 @@ def command_ai_frontier(args: argparse.Namespace) -> int:
                     "activated": performance["activated"],
                     "unchanged": performance["unchanged"],
                     "ai_frontier_state": usable.get("state"),
-                    "imported_ai_frontier_prior": performance["snapshot"]["source_provenance"]
-                        ["external_priors"]["ai_frontier"]["imported_record_count"] > 0,
+                    "referenced_ai_frontier_prior": performance["snapshot"]["source_provenance"]
+                        ["external_priors"]["ai_frontier"]["reference_record_count"] > 0,
                     "ai_frontier_coverage": performance["snapshot"]["source_provenance"]
                         ["external_priors"]["ai_frontier"],
                     "radar_state": radar_status.get("state"),
@@ -1563,7 +1565,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     performance = sub.add_parser(
         "performance",
-        help="inspect or calibrate the local benchmark-prior and runtime performance ledger",
+        help="inspect comparable public evidence and exact local outcome calibration",
     )
     performance_sub = performance.add_subparsers(dest="performance_action", required=True)
     performance_sub.add_parser("status")

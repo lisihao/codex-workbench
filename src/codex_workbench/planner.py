@@ -37,6 +37,13 @@ from .model import (
 )
 from .routing import route_node, route_task, strategy_for_node
 from .research import research_planner_directive
+from .squilla_advisor import (
+    ADVISOR_SCHEMA_VERSION,
+    CLASSIFICATION_SEMANTICS,
+    SquillaAdvice,
+    SquillaAdvisor,
+    SquillaAdvisorRequest,
+)
 from .worktrees import normalize_scope, scope_access_conflicts, scope_allows, scopes_overlap
 
 
@@ -108,6 +115,113 @@ PLAN_SCHEMA: dict[str, Any] = {
 
 class PlannerError(RuntimeError):
     pass
+
+_SQUILLA_DERIVED_NODE_FIELDS = frozenset({
+    "declared_complexity",
+    "effective_complexity",
+    "squilla_advice_receipt",
+})
+_TRUSTED_DERIVED_NODE_FIELDS = _SQUILLA_DERIVED_NODE_FIELDS | frozenset({
+    "performance_routing_receipt",
+})
+_SQUILLA_MAX_REQUEST_CHARS = 16_000
+_SQUILLA_TIER_FLOORS = {"c0": "low", "c1": "standard", "c2": "high", "c3": "high"}
+_SQUILLA_COMPLEXITY_RANK = {"low": 0, "standard": 1, "high": 2}
+
+
+def _squilla_unavailable_receipt(request_id: str, diagnostic: str) -> dict[str, Any]:
+    return {
+        "schema_version": ADVISOR_SCHEMA_VERSION,
+        "request_id": request_id,
+        "status": "unavailable",
+        "demand_tier": None,
+        "confidence": None,
+        "classification_semantics": CLASSIFICATION_SEMANTICS,
+        "route_class": None,
+        "thinking_hint": None,
+        "prompt_hint": None,
+        "prompt_policy": None,
+        "source": {},
+        "runtime": {"mode": "not_invoked"},
+        "diagnostic": diagnostic,
+    }
+
+
+
+
+def _prompt_free_squilla_receipt(advice: SquillaAdvice) -> dict[str, Any]:
+    receipt = dict(advice.to_receipt())
+    # Hints are neither trusted routing inputs nor necessary provenance.
+    # Drop them to make the persisted receipt strictly prompt-free.
+    receipt.update(
+        thinking_hint=None,
+        prompt_hint=None,
+        prompt_policy=None,
+    )
+
+    return receipt
+
+def _effective_squilla_complexity(
+    declared_complexity: str,
+    receipt: Mapping[str, object],
+) -> str:
+    if receipt.get("status") != "available":
+        return declared_complexity
+    floor = _SQUILLA_TIER_FLOORS.get(str(receipt.get("demand_tier")))
+    if floor is None:
+        return declared_complexity
+    return max(
+        (declared_complexity, floor),
+        key=lambda value: _SQUILLA_COMPLEXITY_RANK[value],
+    )
+
+
+def _squilla_advice_for_new_plan(
+    raw_nodes: list[Any],
+    advisor: SquillaAdvisor | None,
+) -> dict[int, dict[str, Any]]:
+    """Batch only bounded original worker title/prompt text before directives."""
+
+    pending: list[tuple[int, str, SquillaAdvisorRequest]] = []
+    receipts: dict[int, dict[str, Any]] = {}
+    for index, raw in enumerate(raw_nodes):
+        source = raw.to_dict() if isinstance(raw, NodeSpec) else raw
+        if (
+            not isinstance(source, dict)
+            or source.get("verifier") is not False
+            or source.get("executor") not in {"codex", "claude"}
+        ):
+            continue
+        title = source.get("title")
+        prompt = source.get("prompt")
+        if not isinstance(title, str) or not isinstance(prompt, str):
+            continue
+        request_id = f"planner-worker-{index}"
+        original_text = f"{title}\n\n{prompt}"
+        if len(original_text) > _SQUILLA_MAX_REQUEST_CHARS:
+            receipts[index] = _squilla_unavailable_receipt(
+                request_id, "advisor_input_too_large"
+            )
+            continue
+        pending.append((index, request_id, SquillaAdvisorRequest(request_id, original_text)))
+
+    if not pending:
+        return receipts
+    if advisor is None:
+        for index, request_id, _ in pending:
+            receipts[index] = _squilla_unavailable_receipt(request_id, "advisor_disabled")
+        return receipts
+    answers = advisor.advise_batch([request for _, _, request in pending])
+    if len(answers) != len(pending):
+        for index, request_id, _ in pending:
+            receipts[index] = _squilla_unavailable_receipt(
+                request_id, "advisor_batch_invalid"
+            )
+        return receipts
+    for (index, request_id, _), advice in zip(pending, answers, strict=True):
+        receipts[index] = _prompt_free_squilla_receipt(advice)
+    return receipts
+
 
 
 _NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -525,7 +639,9 @@ def normalize_and_validate_plan(
     capability_snapshot: Mapping[str, Any] | None = None,
     provider_capacity: Mapping[str, Any] | None = None,
     performance_calibration: Mapping[str, Any] | None = None,
-) -> list[NodeSpec]:
+    squilla_advisor: SquillaAdvisor | None = None,
+    apply_squilla_advice: bool = False,
+    ) -> list[NodeSpec]:
     """Normalize a Sol-generated DAG and enforce the routing contract.
 
     The graph (including independent branches) is retained.  Only provider and
@@ -541,14 +657,43 @@ def normalize_and_validate_plan(
     if not isinstance(raw_nodes, list) or len(raw_nodes) < 2:
         raise PlannerError("planner output must contain at least one worker and one verifier")
 
+    # Only a newly compiled DAG reaches this branch from ``compile``. Existing
+    # persisted NodeSpecs are never resubmitted here by task execution, so a
+    # frozen receipt cannot trigger another local classification or reroute.
+    should_apply_squilla_advice = apply_squilla_advice or squilla_advisor is not None
+    for raw in raw_nodes:
+        if isinstance(raw, dict):
+            supplied = {
+                name for name in _TRUSTED_DERIVED_NODE_FIELDS
+                if raw.get(name) is not None
+            }
+            if supplied:
+                raise PlannerError(
+                    "plan node derived routing metadata cannot be supplied"
+                )
+    if should_apply_squilla_advice:
+        squilla_receipts = _squilla_advice_for_new_plan(
+            raw_nodes, squilla_advisor
+        )
+    else:
+        squilla_receipts: dict[int, dict[str, Any]] = {}
+
     parsed: list[NodeSpec] = []
     seen_ids: set[str] = set()
     for index, raw in enumerate(raw_nodes):
-        if isinstance(raw, NodeSpec):
+        trusted_nodespec = isinstance(raw, NodeSpec)
+        if trusted_nodespec:
             raw = raw.to_dict()
         if not isinstance(raw, dict):
             raise PlannerError(f"plan node {index + 1} must be an object")
+        if not trusted_nodespec:
+            raw = {
+                name: value for name, value in raw.items()
+                if name not in _TRUSTED_DERIVED_NODE_FIELDS or value is not None
+            }
         unknown = set(raw) - _NODE_KEYS
+        if trusted_nodespec:
+            unknown -= _TRUSTED_DERIVED_NODE_FIELDS
         if unknown:
             raise PlannerError(f"plan node {index + 1} has unknown fields: {sorted(unknown)}")
         missing = _REQUIRED_NODE_KEYS - set(raw)
@@ -602,6 +747,40 @@ def normalize_and_validate_plan(
             "parallelizable": raw.get("parallelizable"),
             "claude_allowed": raw.get("claude_allowed"),
         }
+        if (
+            should_apply_squilla_advice
+            and not verifier
+            and executor in {"codex", "claude"}
+        ):
+            try:
+                declared_strategy = strategy_for_node(contract, source, strategy)
+            except (TypeError, ValueError) as error:
+                raise PlannerError(
+                    f"invalid routing metadata for node {node_id}: {error}"
+                ) from error
+            receipt = squilla_receipts.get(index)
+            if receipt is None:
+                receipt = _squilla_unavailable_receipt(
+                    f"planner-worker-{index}", "advisor_response_missing"
+                )
+            declared_complexity = declared_strategy.complexity
+            effective_complexity = _effective_squilla_complexity(
+                declared_complexity, receipt
+            )
+            # This is deliberately before managed prompt directives and before
+            # route_node, so it can only raise the strategy floor that the
+            # existing role, capability, quota, and quality gates consume.
+            source["complexity"] = effective_complexity
+            source["declared_complexity"] = declared_complexity
+            source["effective_complexity"] = effective_complexity
+            source["squilla_advice_receipt"] = receipt
+        elif trusted_nodespec:
+            # A caller that explicitly re-normalizes a frozen NodeSpec without
+            # an advisor retains its original receipt; task execution itself
+            # never enters this planner path for an existing DAG.
+            for field_name in _TRUSTED_DERIVED_NODE_FIELDS:
+                source[field_name] = raw.get(field_name)
+
         if verifier and not prompt.strip():
             source["prompt"] = "Independently inspect the composed diff and run acceptance commands."
         node_text = f"{title}\n{source['prompt']}"
@@ -680,6 +859,7 @@ def normalize_and_validate_plan(
         source["performance_policy"] = contract.performance_policy
         source["performance_status"] = expected_performance_status
         source["performance_quality_source"] = decision.quality_source
+        source["performance_routing_receipt"] = decision.performance_routing_receipt
         source["performance_lower_bound_95"] = decision.performance_lower_bound_95
         source["performance_runtime_sample_count"] = decision.runtime_sample_count
         source["performance_first_pass_rate"] = decision.performance_first_pass_rate
@@ -868,8 +1048,14 @@ normalize_plan = normalize_and_validate_plan
 
 
 class CodexPlanner:
-    def __init__(self, binary: str = "codex", model: str = "gpt-5.6-sol"):
+    def __init__(
+        self,
+        binary: str = "codex",
+        model: str = "gpt-5.6-sol",
+        squilla_advisor: SquillaAdvisor | None = None,
+    ):
         self.binary = binary
+        self.squilla_advisor = squilla_advisor
         self.model = (
             str(model).strip().lower()
             if is_codex_control_plane_model(model)
@@ -889,6 +1075,8 @@ class CodexPlanner:
         capability_snapshot: Mapping[str, Any] | None = None,
         provider_capacity: Mapping[str, Any] | None = None,
         performance_calibration: Mapping[str, Any] | None = None,
+        squilla_advisor: SquillaAdvisor | None = None,
+        apply_squilla_advice: bool = False,
     ) -> list[NodeSpec]:
         return normalize_and_validate_plan(
             contract,
@@ -901,6 +1089,8 @@ class CodexPlanner:
             capability_snapshot=capability_snapshot,
             provider_capacity=provider_capacity,
             performance_calibration=performance_calibration,
+            squilla_advisor=squilla_advisor,
+            apply_squilla_advice=apply_squilla_advice,
         )
 
     validate_and_normalize_plan = normalize_and_validate_plan
@@ -1047,6 +1237,8 @@ class CodexPlanner:
             capability_snapshot=capability_snapshot,
             provider_capacity=provider_capacity,
             performance_calibration=performance_calibration,
+            squilla_advisor=self.squilla_advisor,
+            apply_squilla_advice=True,
         )
 
     @staticmethod

@@ -78,6 +78,7 @@ class WorkbenchRadar:
                 "enabled": True,
                 "ok": False,
                 "state": "unauthorized",
+                "reference_eligible": False,
                 "routing_prior_eligible": False,
                 "offline_cache_available": True,
                 "snapshot_id": snapshot.get("snapshot_id"),
@@ -116,7 +117,8 @@ class WorkbenchRadar:
             "enabled": True,
             "ok": state in {"fresh", "stale"},
             "state": state,
-            "routing_prior_eligible": state in {"fresh", "stale"},
+            "reference_eligible": state in {"fresh", "stale"},
+            "routing_prior_eligible": False,
             "offline_cache_available": True,
             "snapshot_id": snapshot.get("snapshot_id"),
             "digest": snapshot.get("digest"),
@@ -169,6 +171,7 @@ class WorkbenchRadar:
             "enabled": state != "disabled",
             "ok": False,
             "state": state,
+            "reference_eligible": False,
             "routing_prior_eligible": False,
             "offline_cache_available": False,
             "snapshot_id": None,
@@ -180,15 +183,19 @@ class WorkbenchRadar:
         }
 
 
-def radar_prior_records(
+def radar_public_evidence_records(
     status: Mapping[str, Any],
     catalog: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Convert usable exact-model Radar observations into weak prior records."""
+    """Convert usable exact-model Radar observations into public references.
+
+    They remain available for declared external-cohort comparison, but never
+    enter the local Workbench Beta calibration.
+    """
 
     if (
         status.get("provider") != "codex-radar-provider"
-        or status.get("routing_prior_eligible") is not True
+        or status.get("reference_eligible") is not True
         or status.get("state") not in {"fresh", "stale"}
         or status.get("collector_authorization") not in {"authorized", "consented"}
         or status.get("snapshot_authorization") not in {"authorized", "consented"}
@@ -250,7 +257,9 @@ def radar_prior_records(
         if not isinstance(candidate, Mapping) or candidate.get("routable") is not True:
             continue
         provider = candidate.get("provider")
-        model_id = candidate.get("model_id")
+        identity = candidate.get("identity")
+        canonical_model_id = identity.get("canonical_model_id") if isinstance(identity, Mapping) else None
+        model_id = canonical_model_id if isinstance(canonical_model_id, str) else candidate.get("model_id")
         if isinstance(provider, str) and isinstance(model_id, str):
             known[(provider, model_id)] = candidate
 
@@ -286,12 +295,6 @@ def radar_prior_records(
         capability = known.get((provider, model_id))
         if capability is None or not _effort_supported(capability, effort):
             continue
-        strength = min(
-            RADAR_MAX_EFFECTIVE_SAMPLE_STRENGTH,
-            sample_count * RADAR_SAMPLE_STRENGTH_RATE,
-        ) * multiplier
-        if strength <= 0:
-            continue
         family = capability.get("model_family")
         source_url = sources.get("intelligence_efficiency") or sources.get("current")
         if not isinstance(source_url, str) or not source_url.startswith("https://"):
@@ -310,19 +313,31 @@ def radar_prior_records(
                 "task_types": list(RADAR_PRIOR_TASK_TYPES),
                 "provider": provider,
                 "model_id": model_id,
+                "canonical_model_id": model_id,
                 "model_family": family if isinstance(family, str) else "unknown",
                 "agent_scaffold": "Codex Radar community observations",
                 "score": round(float(pass_rate), 8),
                 "score_kind": "resolved_rate",
+                "metric_kind": "pass_rate",
+                "value": round(float(pass_rate), 8),
+                "unit": "proportion",
+                "observed_at": str(snapshot.get("source_updated_at") or snapshot.get("fetched_at") or "snapshot-v1"),
+                "harness": observed.get("harness") if isinstance(observed.get("harness"), str) else None,
+                "harness_description": "Codex Radar community observations; exact evaluation harness is not disclosed",
                 "provenance": "community_observation",
-                "transfer_weight": 1.0,
-                "effective_sample_strength": round(strength, 8),
-                "quality_evidence": f"{status['snapshot_authorization']}-external-prior",
+                "quality_evidence": f"{status['snapshot_authorization']}-external-reference",
+                "source": "codex-radar",
+                "reference_eligible": True,
+                "calibration_eligible": False,
+                "routing_prior_eligible": False,
                 "authorization_status": status["snapshot_authorization"],
                 "collector_authorization": status["collector_authorization"],
                 "reasoning_effort": effort,
                 "external_snapshot_id": snapshot_id,
                 "external_snapshot_digest": snapshot.get("digest"),
+                "source_id": observed.get("source_id") if isinstance(observed.get("source_id"), str) else "codex-radar",
+                "lineage_id": observed.get("lineage_id") if isinstance(observed.get("lineage_id"), str) else f"{snapshot_id}:{provider}:{model_id}:{effort}",
+                "correlation_group": observed.get("correlation_group") if isinstance(observed.get("correlation_group"), str) else f"codex-radar:{snapshot_id}:{provider}:{model_id}:{effort}:pass-rate",
                 "sample_count": sample_count,
                 "iq_metadata": observed.get("iq"),
                 "freshness_state": status.get("state"),
@@ -330,6 +345,15 @@ def radar_prior_records(
             }
         )
     return sorted(records, key=lambda item: (item["model_id"], item["reasoning_effort"]))
+
+def radar_prior_records(
+    status: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compatibility alias for public evidence, never a calibration prior."""
+
+    return radar_public_evidence_records(status, catalog)
+
 
 
 def _snapshot_authorization_status(snapshot: Mapping[str, Any]) -> str:

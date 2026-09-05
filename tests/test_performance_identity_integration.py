@@ -45,8 +45,9 @@ class PerformanceIdentityIntegrationTests(unittest.TestCase):
     def test_unbound_source_reports_zero_actual_coverage(self):
         snapshot = build_performance_snapshot([], [], self.catalog, ai_frontier_status=self.status)
         source = snapshot["source_provenance"]["external_priors"]["ai_frontier"]
-        self.assertTrue(source["routing_prior_eligible"])
-        self.assertEqual(source["imported_record_count"], 0)
+        self.assertTrue(source["reference_eligible"])
+        self.assertFalse(source["routing_prior_eligible"])
+        self.assertEqual(source["reference_record_count"], 0)
         self.assertEqual(source["model_coverage_rate"], 0)
         self.assertFalse(source["used_for_prior"])
 
@@ -54,13 +55,13 @@ class PerformanceIdentityIntegrationTests(unittest.TestCase):
         snapshot = build_performance_snapshot(self.events, self.tasks, self.catalog, ai_frontier_status=self.status)
         source = snapshot["source_provenance"]["external_priors"]["ai_frontier"]
         self.assertEqual(source["matched_selection_ids"], ["opus"])
-        self.assertGreater(source["imported_record_count"], 0)
+        self.assertGreater(source["reference_record_count"], 0)
         calibration = PerformanceRegistry._calibrate_context(snapshot, self.catalog, snapshot["baseline"], task_type="architecture", complexity="high")
         candidate = calibration["candidates"][0]
         self.assertEqual(candidate["model_id"], "opus")
         self.assertEqual(candidate["canonical_model_id"], "claude-opus-4-8")
         self.assertEqual(candidate["quality"]["posterior"]["runtime_sample_count"], 1)
-        self.assertTrue(any(item["record_id"].startswith("ai-frontier-") for item in candidate["quality"]["prior"]["evidence"]))
+        self.assertTrue(any(item["record_id"].startswith("ai-frontier-") for item in candidate["public_evidence"]))
 
     def test_external_exact_model_does_not_leak_through_family_fallback(self):
         snapshot = build_performance_snapshot(self.events, self.tasks, self.catalog, ai_frontier_status=self.status)

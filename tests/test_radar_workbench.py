@@ -9,7 +9,7 @@ from unittest import mock
 
 from codex_radar_provider import RadarRegistry
 from codex_workbench.performance import PerformanceRegistry
-from codex_workbench.radar import WorkbenchRadar, radar_prior_records
+from codex_workbench.radar import WorkbenchRadar, radar_public_evidence_records
 
 
 def _authorization(status: str = "authorized") -> dict[str, object]:
@@ -186,9 +186,9 @@ class WorkbenchRadarTests(unittest.TestCase):
         self.assertEqual(status["state"], "unauthorized")
         self.assertTrue(status["offline_cache_available"])
         self.assertFalse(status["routing_prior_eligible"])
-        self.assertEqual(radar_prior_records(status, _catalog()), [])
+        self.assertEqual(radar_public_evidence_records(status, _catalog()), [])
 
-    def test_only_exact_routable_model_and_effort_becomes_a_weak_prior(self) -> None:
+    def test_only_exact_routable_model_and_effort_becomes_public_reference(self) -> None:
         self._import()
         status = WorkbenchRadar(
             self.state_root,
@@ -197,14 +197,18 @@ class WorkbenchRadarTests(unittest.TestCase):
             expire_after_seconds=2 * 24 * 60 * 60,
         ).status(now=datetime(2026, 9, 4, 12, 1, tzinfo=UTC))
 
-        records = radar_prior_records(status, _catalog())
+        records = radar_public_evidence_records(status, _catalog())
 
         self.assertEqual(len(records), 1)
         record = records[0]
         self.assertEqual(record["model_id"], "gpt-5.6-luna")
         self.assertEqual(record["reasoning_effort"], "max")
         self.assertEqual(record["score"], 0.75)
-        self.assertEqual(record["effective_sample_strength"], 0.6)
+        self.assertEqual(record["value"], 0.75)
+        self.assertEqual(record["unit"], "proportion")
+        self.assertEqual(record["metric_kind"], "pass_rate")
+        self.assertFalse(record["calibration_eligible"])
+        self.assertNotIn("effective_sample_strength", record)
         self.assertEqual(record["iq_metadata"], 101.25)
         self.assertNotEqual(record["score"], record["iq_metadata"])
         self.assertEqual(record["provenance"], "community_observation")
@@ -218,17 +222,18 @@ class WorkbenchRadarTests(unittest.TestCase):
             expire_after_seconds=2 * 24 * 60 * 60,
         ).status(now=datetime(2026, 9, 4, 12, 1, tzinfo=UTC))
 
-        records = radar_prior_records(status, _catalog())
+        records = radar_public_evidence_records(status, _catalog())
 
         self.assertEqual(status["state"], "fresh")
-        self.assertTrue(status["routing_prior_eligible"])
+        self.assertTrue(status["reference_eligible"])
+        self.assertFalse(status["routing_prior_eligible"])
         self.assertEqual(status["collector_authorization"], "consented")
         self.assertEqual(status["snapshot_authorization"], "consented")
         self.assertEqual(status["database"]["row_counts"]["radar_active"], 1)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["authorization_status"], "consented")
         self.assertEqual(records[0]["collector_authorization"], "consented")
-        self.assertEqual(records[0]["quality_evidence"], "consented-external-prior")
+        self.assertEqual(records[0]["quality_evidence"], "consented-external-reference")
 
         stale = WorkbenchRadar(
             self.state_root,
@@ -237,7 +242,7 @@ class WorkbenchRadarTests(unittest.TestCase):
             expire_after_seconds=180,
         ).status(now=datetime(2026, 9, 4, 12, 2, tzinfo=UTC))
         self.assertEqual(stale["state"], "stale")
-        self.assertTrue(radar_prior_records(stale, _catalog()))
+        self.assertTrue(radar_public_evidence_records(stale, _catalog()))
 
     def test_refresh_passes_the_daily_interval_to_provider(self) -> None:
         registry = mock.Mock()
@@ -276,7 +281,7 @@ class WorkbenchRadarTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 forged = {**status, **mutation}
-                self.assertEqual(radar_prior_records(forged, _catalog()), [])
+                self.assertEqual(radar_public_evidence_records(forged, _catalog()), [])
 
         stale = WorkbenchRadar(
             self.state_root,
@@ -285,9 +290,9 @@ class WorkbenchRadarTests(unittest.TestCase):
             expire_after_seconds=180,
         ).status(now=datetime(2026, 9, 4, 12, 2, tzinfo=UTC))
         forged_fresh = {**stale, "state": "fresh", "transfer_multiplier": 1.0}
-        self.assertEqual(radar_prior_records(forged_fresh, _catalog()), [])
+        self.assertEqual(radar_public_evidence_records(forged_fresh, _catalog()), [])
 
-    def test_large_external_sample_is_capped_below_the_static_exact_baseline(self) -> None:
+    def test_fresh_and_stale_external_samples_remain_reference_only(self) -> None:
         self._import(passed=90, valid_tasks=100)
         radar = WorkbenchRadar(
             self.state_root,
@@ -299,8 +304,11 @@ class WorkbenchRadarTests(unittest.TestCase):
         fresh = radar.status(now=datetime(2026, 9, 4, 12, 0, 30, tzinfo=UTC))
         stale = radar.status(now=datetime(2026, 9, 4, 12, 2, tzinfo=UTC))
 
-        self.assertEqual(radar_prior_records(fresh, _catalog())[0]["effective_sample_strength"], 2.0)
-        self.assertEqual(radar_prior_records(stale, _catalog())[0]["effective_sample_strength"], 0.5)
+        fresh_record = radar_public_evidence_records(fresh, _catalog())[0]
+        stale_record = radar_public_evidence_records(stale, _catalog())[0]
+        self.assertTrue(fresh["reference_eligible"])
+        self.assertEqual(fresh_record["value"], stale_record["value"])
+        self.assertFalse(fresh_record["calibration_eligible"])
 
     def test_performance_snapshot_pins_radar_provenance_and_keeps_it_advisory(self) -> None:
         self._import()
@@ -326,16 +334,17 @@ class WorkbenchRadarTests(unittest.TestCase):
         refreshed = registry.refresh(EmptyStore(), _catalog(), radar_status=radar_status)  # type: ignore[arg-type]
         calibration = registry.calibrate(_catalog(), "implementation", "standard")
         luna = calibration["candidates"][0]
-        evidence = luna["quality"]["prior"]["evidence"]
+        evidence = luna["public_evidence"]
         radar_evidence = [item for item in evidence if item["benchmark"] == "Codex Radar community tasks"]
-        static_evidence = [item for item in evidence if item["benchmark"] != "Codex Radar community tasks"]
         provenance = refreshed["snapshot"]["source_provenance"]["external_priors"]["codex_radar"]
 
         self.assertEqual(len(radar_evidence), 1)
         self.assertEqual(radar_evidence[0]["reasoning_effort"], "max")
-        self.assertTrue(all("reasoning_effort" not in item for item in static_evidence))
-        self.assertEqual(provenance["imported_record_count"], 1)
+        self.assertTrue(all(item["comparability"]["status"] == "reference_only" for item in radar_evidence))
+        self.assertEqual(provenance["reference_record_count"], 1)
         self.assertTrue(provenance["offline_last_known_good"])
+        self.assertTrue(provenance["reference_eligible"])
+        self.assertFalse(provenance["routing_prior_eligible"])
         self.assertFalse(provenance["iq_used_as_pass_rate"])
         self.assertTrue(refreshed["snapshot"]["advisory_policy"]["hard_capability_gates_required"])
         self.assertFalse(refreshed["snapshot"]["advisory_policy"]["routing_override_permitted"])
@@ -366,7 +375,7 @@ class WorkbenchRadarTests(unittest.TestCase):
         fresh = radar.status(now=datetime(2026, 9, 4, 12, 0, 30, tzinfo=UTC))
         first = registry.refresh(EmptyStore(), _catalog(), radar_status=fresh)  # type: ignore[arg-type]
         self.assertEqual(
-            first["snapshot"]["source_provenance"]["external_priors"]["codex_radar"]["imported_record_count"],
+            first["snapshot"]["source_provenance"]["external_priors"]["codex_radar"]["reference_record_count"],
             1,
         )
 
@@ -374,11 +383,11 @@ class WorkbenchRadarTests(unittest.TestCase):
         second = registry.refresh(EmptyStore(), _catalog(), radar_status=expired)  # type: ignore[arg-type]
         provenance = second["snapshot"]["source_provenance"]["external_priors"]["codex_radar"]
         calibration = registry.calibrate(_catalog(), "implementation", "standard")
-        evidence = calibration["candidates"][0]["quality"]["prior"]["evidence"]
+        evidence = calibration["candidates"][0]["public_evidence"]
 
         self.assertNotEqual(first["active_generation_id"], second["active_generation_id"])
         self.assertEqual(provenance["state"], "expired")
-        self.assertEqual(provenance["imported_record_count"], 0)
+        self.assertEqual(provenance["reference_record_count"], 0)
         self.assertFalse(provenance["routing_prior_eligible"])
         self.assertFalse(
             any(item["benchmark"] == "Codex Radar community tasks" for item in evidence)

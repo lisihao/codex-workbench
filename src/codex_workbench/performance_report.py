@@ -418,7 +418,7 @@ def report_to_html(report: Mapping[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>模型性能证据账本</title>
+<title>分来源性能证据账本（非统一排行榜）</title>
 <style>
 :root { color-scheme: light; --canvas: #f5f3ec; --surface: #fff; --ink: #252821; --forest: #355941; --amber: #9a6a16; --line: #d9d7ce; }
 * { box-sizing: border-box; }
@@ -457,8 +457,8 @@ code, .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; }
 <a href="#ledger" class="skip">跳到证据表</a>
 <main>
 <header>
-<h1>模型性能证据账本</h1>
-<p class="lede">来源隔离的技术参考记录。缺失值显示为 N/A；本页不把不同来源平均，也不据此推断模型优劣或路由结论。</p>
+<h1>分来源性能证据账本（非统一排行榜）</h1>
+<p class="lede">本页按来源分账，不形成统一排行榜；不同 benchmark、推理档位、harness 及成本单位不可直接横向比较；行数不等于独立质量样本数；N/A 代表未知或不适用，不是 0；采集/型号匹配不等于实测路由收益。</p>
 </header>
 <section class="meta" aria-labelledby="meta-title">
 <h2 id="meta-title">报告时间与范围</h2>

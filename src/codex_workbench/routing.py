@@ -61,7 +61,8 @@ class RoutingDecision:
     performance_snapshot_id: str | None = None
     performance_digest: str | None = None
     performance_status: str | None = None
-    quality_source: str = "declared"
+    quality_source: str = "declared-policy"
+    performance_routing_receipt: dict[str, Any] | None = None
     performance_lower_bound_95: float | None = None
     runtime_sample_count: int = 0
     performance_first_pass_rate: float | None = None
@@ -745,6 +746,17 @@ def _decision_from_v3(
     if provider not in {"codex", "claude"}:
         raise ValueError(f"routing-v3 selected unsupported executor provider {selected.provider!r}")
     agent_name, agent_version = _agent_identity(snapshot, provider)
+    performance_routing_receipt = {
+        "policy_version": decision.policy_version,
+        "ranking_algorithm_version": decision.ranking_algorithm_version,
+        "performance_semantic_status": selected.performance_semantic_status,
+        "empirical_ranking_status": selected.empirical_ranking_status,
+        "empirical_ranking_reason": selected.empirical_ranking_reason,
+        "public_evidence_summary": dict(decision.public_evidence_summary),
+        # Existing v3 source labels are intentionally preserved: local-runtime
+        # is observed evidence; declared-policy is a policy-only fallback.
+        "source": selected.quality_source,
+    }
     return RoutingDecision(
         role=role,
         executor=provider,
@@ -766,6 +778,7 @@ def _decision_from_v3(
         performance_digest=(decision.performance_digest or contract.performance_digest),
         performance_status=(decision.performance_status or contract.performance_status),
         quality_source=selected.quality_source,
+        performance_routing_receipt=performance_routing_receipt,
         performance_lower_bound_95=selected.performance_lower_bound_95,
         runtime_sample_count=selected.runtime_sample_count,
         performance_first_pass_rate=selected.performance_first_pass_rate,

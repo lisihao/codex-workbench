@@ -21,11 +21,16 @@ from .model import (
     RoutingTaskType,
     TaskContract,
 )
-from .performance import PerformanceRegistry, PerformanceRegistryError
+from .performance import (
+    PERFORMANCE_SEMANTIC_VERSION,
+    PerformanceRegistry,
+    PerformanceRegistryError,
+)
 from .planner import CodexPlanner
 from .radar import WorkbenchRadar
 from .research import route_research
 from .store import WorkbenchStore
+from .squilla_advisor import SquillaAdvisor
 
 
 _PERFORMANCE_CALIBRATION_TASK_TYPES = tuple(
@@ -128,7 +133,7 @@ def _performance_calibration_for_submission(
             "status": "unavailable",
             "snapshot_id": None,
             "digest": None,
-            "policy": "benchmark-prior-plus-runtime-ledger-v1",
+            "policy": PERFORMANCE_SEMANTIC_VERSION,
             "reason": "no active capability catalog to bind performance calibration",
         }
     registry = PerformanceRegistry(config.state_root)
@@ -207,14 +212,14 @@ def _performance_calibration_for_submission(
             "status": "unavailable",
             "snapshot_id": None,
             "digest": None,
-            "policy": "benchmark-prior-plus-runtime-ledger-v1",
+            "policy": PERFORMANCE_SEMANTIC_VERSION,
             "reason": str(error),
         }
     return calibration, {
         "status": str(calibration["status"]),
         "snapshot_id": snapshot["snapshot_id"],
         "digest": snapshot["digest"],
-        "policy": "benchmark-prior-plus-runtime-ledger-v1",
+        "policy": PERFORMANCE_SEMANTIC_VERSION,
         "activated": bool(refreshed["activated"]),
         "unchanged": bool(refreshed["unchanged"]),
         "event_cursor": snapshot["event_cursor"],
@@ -222,6 +227,22 @@ def _performance_calibration_for_submission(
         "advisory_only": True,
         "hard_capability_gates_required": True,
     }
+def _squilla_advisor_for_submission(config: WorkbenchConfig) -> SquillaAdvisor | None:
+    """Create only an explicitly enabled local advisor; never install assets here."""
+
+    advisor_config = config.effective_squilla_advisor_config
+    if not advisor_config.enabled:
+        return None
+    return SquillaAdvisor(
+        runtime_python=advisor_config.runtime_python,
+        source_root=advisor_config.source_root,
+        bundle_dir=advisor_config.bundle_dir,
+        # The configured 45-second default leaves a bounded margin for the
+        # observed cold native load; warm runs remain local and batched.
+        timeout_seconds=advisor_config.timeout_seconds,
+    )
+
+
 
 
 def submit_natural_language_request(
@@ -357,9 +378,11 @@ def submit_natural_language_request(
     claude_models_available = tuple(
         model for model in quota_admitted_models if claude_authenticated
     )
+    squilla_advisor = _squilla_advisor_for_submission(config)
     nodes = CodexPlanner(
         os.environ.get("CODEX_WORKBENCH_CODEX", "codex"),
         model=planner_model,
+        squilla_advisor=squilla_advisor,
     ).compile(
         contract,
         claude_models_available=claude_models_available,

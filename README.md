@@ -109,10 +109,10 @@ codex-workbench worktree restore <archive-id> --destination <local-path>
 
 ### Benchmark 基线、长期校准与快照绑定
 
-Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam) 等公开资料建立按领域的冷启动先验。Terminal、SWE 和 HLE 衡量的事情不同，因此不会被合并成一个“总分”；每条先验都保留来源、模型/Agent 配对和迁移折扣，不能替代本机验收。
-同时可选接入 [Martian AI Frontier](https://aifrontier.withmartian.com/) 公共 JSON。它的 Quality、Consistency、Real Cost 和分类 benchmark 只作为带来源与新鲜度的外部弱先验；frontier/oracle 不绑定单模型，且不会改变本机验收、Claude 配额或质量门禁。
+Workbench 保留版本化的公开性能证据目录，包括 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam)。新快照使用 `local-outcomes-only-v2`：外部评测只作为独立 `public_evidence`，不再转换为 Beta 伪样本，也不在模型家族或版本之间借分。
+同时可选接入 [Martian AI Frontier](https://aifrontier.withmartian.com/) 公共 JSON。Quality、Consistency、Real Cost 与本地完成率不是同一指标。只有 benchmark/version、指标、harness、推理档位、任务类型、score kind 和单位一致，且模型身份精确匹配时，公开证据才可在声明质量门禁之后提供冷启动次级偏好；重复来源去重，冲突、缺失或比较不完整时弃权。frontier/oracle 不绑定单模型。收集到数据不等于数据可比，也不等于已验证调度收益。
 
-长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率，并按 provider/model/Agent version/reasoning effort/task/complexity 精确分桶。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 仍保留为运行证据，但只记作 unresolved，不进入模型质量成功/失败分母。当前尚无更细的 `failure_origin` 分类器，不能进一步区分网络、主机、harness 或模型自身原因。Beta 后验的保守排名信号与声明质量门禁分开记录，只在硬门禁之后参与 advisory 排序；当前校准接口仅报告 `cold-start`（无活动快照）或 `ok`（有活动快照），尚未实现 `baseline`/`shadow`/`calibrated` 晋级状态或阈值。
+长期运行时，Workbench 从 append-only SQLite `events`/`tasks` 重建 first-pass acceptance、最终 acceptance、返工、时延、吞吐和池利用率，并按 provider/model/Agent name/version/reasoning effort/task/complexity/harness/score kind 精确分桶。fixture、deterministic、verifier、Evidence reuse、缺少 result、缺少 `actual_model` 和不支持 provider 的 terminal attempt 会被排除；`agent_version=unattested`、非零/未知进程退出、`blocked` 与 `indeterminate` 只记作 unresolved，不进入模型质量成功/失败分母。Beta 只由这些本地结果更新，冷启动参数明确标为非经验 policy prior。声明能力分数与实测概率不混排：声明分数决定质量门禁和等价区间，本地经验只在可比且有样本的候选组中作次级排序，未知不冒充零分。账本是观察数据，尚无细分 `failure_origin` 或随机对照，因此不能据此声称因果提速。
 
 创建任务时，当前 performance snapshot、能力目录 digest 和 policy version 会固定进 TaskContract/NodeSpec；刷新或升级不会重路由已运行任务。快照是可重建的派生缓存，不是第二份状态真相；`performance refresh` 只读本地账本与缓存，无模型调用和登录操作。
 
@@ -120,9 +120,15 @@ Workbench 交付了一个版本化的性能目录：以 [OpenAI GPT-5.6 官方�
 `codex_radar_provider` 承担。个人自用 receipt 必须同时有 `consented`、
 `local_operator_consent`、`public-json` 和 `accepted_at`；这不是站方授权。上游
 `current.json` 仍声明完整 API/衍生集成需站方授权。有效缓存时，Workbench 只接纳精确
-model + reasoning effort、显式 pass rate 和正样本量，fresh 数据最多形成 2.0 个等效弱样本，
-stale 数据再乘 0.25，超过 31 天停止影响路由。IQ 只保留为元数据，绝不转换成通过率。该
+model + reasoning effort，并保留原指标、样本量和新鲜度；这些记录不再形成等效弱样本，
+缺少可比测量条件时只供参考，超过 31 天停止影响路由。IQ 只保留为元数据，绝不转换成通过率。该
 Provider 可由 DSH 后续独立安装和消费，本版本没有修改 DSH。
+
+### 本地预训练需求分类（可选）
+
+[OpenSquilla 适配器与离线安装指南](docs/opensquilla-advisor.md) 使用固定源码和真实模型权重，在本地对子任务需求分为 c0–c3。它只在新 DAG 编译时批量运行；已有任务不重路由。建议可以提高复杂度底线，但不能降低规划器声明的底线，也不能绕过模型角色、质量、配额或推理档位限制。未配置、权重缺失或分类失败时保留原策略，并明确记录不可用原因。
+
+这是预训练需求分类器的 `compatible subset`，不包括 OpenSquilla 网关、集成推理或自学习训练器；分类置信信号不是任务成功概率。安装器只使用本地离线 wheelhouse，保存原安装备份和实际分类回执，不自动重启服务。真实成功率和返工率仍由 Workbench 本地结果账本逐步校准；尚未证明真实交付周期或单位配额收益。
 
 常用观测入口：
 

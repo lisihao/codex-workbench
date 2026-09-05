@@ -291,6 +291,123 @@ def _validate_performance_metadata(
             raise ValueError(f"{owner} {name} must be a non-empty string when supplied")
 
 
+_SQUILLA_CLASSIFICATION_SEMANTICS = (
+    "demand_classification_not_task_success_or_model_success_ranking"
+)
+_SQUILLA_COMPLEXITY_RANK = {"low": 0, "standard": 1, "high": 2}
+_SQUILLA_TIER_FLOORS = {"c0": "low", "c1": "standard", "c2": "high", "c3": "high"}
+_SQUILLA_RECEIPT_KEYS = frozenset({
+    "schema_version",
+    "request_id",
+    "status",
+    "demand_tier",
+    "confidence",
+    "classification_semantics",
+    "route_class",
+    "thinking_hint",
+    "prompt_hint",
+    "prompt_policy",
+    "source",
+    "runtime",
+    "diagnostic",
+})
+_SQUILLA_RAW_INPUT_KEYS = frozenset({
+    "prompt",
+    "history_user_texts",
+    "routing_history",
+    "previous_public_summary",
+    "previous_public_usage",
+    "state_flags",
+})
+
+
+def _contains_squilla_raw_input(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if not isinstance(key, str) or key in _SQUILLA_RAW_INPUT_KEYS:
+                return True
+            if _contains_squilla_raw_input(nested):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_squilla_raw_input(item) for item in value)
+    return False
+
+
+def _validate_squilla_advice_metadata(
+    declared_complexity: RoutingComplexity | None,
+    effective_complexity: RoutingComplexity | None,
+    receipt: dict[str, Any] | None,
+) -> None:
+    metadata_supplied = (
+        declared_complexity is not None
+        or effective_complexity is not None
+        or receipt is not None
+    )
+    if not metadata_supplied:
+        return
+    if (
+        declared_complexity not in _SQUILLA_COMPLEXITY_RANK
+        or effective_complexity not in _SQUILLA_COMPLEXITY_RANK
+        or not isinstance(receipt, dict)
+    ):
+        raise ValueError(
+            "node Squilla advice requires declared_complexity, effective_complexity, and receipt"
+        )
+    if set(receipt) != _SQUILLA_RECEIPT_KEYS:
+        raise ValueError("node squilla_advice_receipt has invalid fields")
+    if receipt.get("schema_version") != 1 or isinstance(receipt.get("schema_version"), bool):
+        raise ValueError("node squilla_advice_receipt has unsupported schema_version")
+    request_id = receipt.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("node squilla_advice_receipt has invalid request_id")
+    if receipt.get("classification_semantics") != _SQUILLA_CLASSIFICATION_SEMANTICS:
+        raise ValueError("node squilla_advice_receipt has invalid classification semantics")
+    status = receipt.get("status")
+    if status not in {"available", "unavailable"}:
+        raise ValueError("node squilla_advice_receipt has invalid status")
+    route_class = receipt.get("route_class")
+    if route_class not in {None, "R0", "R1", "R2", "R3"}:
+        raise ValueError("node squilla_advice_receipt has invalid route_class")
+    if any(receipt.get(name) is not None for name in ("thinking_hint", "prompt_hint", "prompt_policy")):
+        raise ValueError("node squilla_advice_receipt must not retain advisor prompt hints")
+    if not isinstance(receipt.get("source"), dict) or not isinstance(receipt.get("runtime"), dict):
+        raise ValueError("node squilla_advice_receipt must include source and runtime objects")
+    if _contains_squilla_raw_input(receipt):
+        raise ValueError("node squilla_advice_receipt must be prompt-free")
+    diagnostic = receipt.get("diagnostic")
+    if diagnostic is not None and not isinstance(diagnostic, str):
+        raise ValueError("node squilla_advice_receipt has invalid diagnostic")
+    try:
+        json.dumps(receipt, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("node squilla_advice_receipt must be JSON-safe") from error
+
+    demand_tier = receipt.get("demand_tier")
+    confidence = receipt.get("confidence")
+    if status == "available":
+        if demand_tier not in _SQUILLA_TIER_FLOORS:
+            raise ValueError("node squilla_advice_receipt has invalid demand_tier")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise ValueError("node squilla_advice_receipt has invalid confidence")
+        required_rank = max(
+            _SQUILLA_COMPLEXITY_RANK[declared_complexity],
+            _SQUILLA_COMPLEXITY_RANK[_SQUILLA_TIER_FLOORS[demand_tier]],
+        )
+        if _SQUILLA_COMPLEXITY_RANK[effective_complexity] != required_rank:
+            raise ValueError("node effective_complexity does not match Squilla demand floor")
+        return
+    if demand_tier is not None or confidence is not None:
+        raise ValueError("unavailable Squilla advice cannot supply demand confidence")
+    if effective_complexity != declared_complexity:
+        raise ValueError("unavailable Squilla advice cannot change complexity")
+
+
 @dataclass(frozen=True)
 class RoutingStrategy:
     """Versioned, serializable inputs that control model selection.
@@ -652,6 +769,12 @@ class NodeSpec:
     parallelizable: bool | None = None
     claude_allowed: bool | None = None
     # Effective Codex invocation metadata.  These values are derived from the
+    # Squilla is advisory-only. The normalized planner records its prompt-free
+    # receipt and the monotonic complexity adjustment beside the final route.
+    # Legacy/final-verifier nodes intentionally leave all three fields absent.
+    declared_complexity: RoutingComplexity | None = None
+    effective_complexity: RoutingComplexity | None = None
+    squilla_advice_receipt: dict[str, Any] | None = None
     # selected model and make Luna's max-effort/profile semantics inspectable.
     model_profile: str | None = None
     model_reasoning_effort: str | None = None
@@ -672,6 +795,9 @@ class NodeSpec:
     performance_first_pass_rate: float | None = None
     performance_rework_rate: float | None = None
     performance_latency_ms: float | None = None
+    # Exact v3 routing provenance. This is derived from RoutingDecision, not
+    # a planner-controlled performance score or a task-success probability.
+    performance_routing_receipt: dict[str, Any] | None = None
     model_capability_id: str | None = None
     agent_capability_id: str | None = None
     agent_name: str | None = None
@@ -732,6 +858,11 @@ class NodeSpec:
             raise ValueError("node parallelizable must be a boolean")
         if self.claude_allowed is not None and not isinstance(self.claude_allowed, bool):
             raise ValueError("node claude_allowed must be a boolean")
+        _validate_squilla_advice_metadata(
+            self.declared_complexity,
+            self.effective_complexity,
+            self.squilla_advice_receipt,
+        )
         _validate_capability_snapshot_binding(
             self.capability_snapshot_id,
             self.capability_digest,
@@ -754,6 +885,14 @@ class NodeSpec:
             raise ValueError(
                 "node performance_quality_source must be a non-empty string when supplied"
             )
+        if self.performance_routing_receipt is not None:
+            if not isinstance(self.performance_routing_receipt, dict):
+                raise ValueError("node performance_routing_receipt must be an object")
+            try:
+                json.dumps(self.performance_routing_receipt, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise ValueError("node performance_routing_receipt must be JSON-safe") from error
+
         if (
             not isinstance(self.performance_runtime_sample_count, int)
             or isinstance(self.performance_runtime_sample_count, bool)

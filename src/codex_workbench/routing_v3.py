@@ -16,11 +16,12 @@ ordering is satisfied.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from hashlib import sha256
 import json
 import math
 from typing import Any, Literal
+from .public_evidence_ranking import rank_comparable_public_evidence
 
 
 ROUTING_V3_POLICY_VERSION = "model-routing-v3"
@@ -122,7 +123,10 @@ class RankedCandidate:
     # absence.  ``None`` is intentional for unmeasured models such as Spark.
     performance_snapshot_id: str | None = None
     performance_digest: str | None = None
-    quality_source: str = "declared"
+    quality_source: str = "declared-policy"
+    performance_semantic_status: str = "no-performance-calibration"
+    empirical_ranking_status: str = "abstained"
+    empirical_ranking_reason: str = "no comparable local runtime cohort"
     performance_lower_bound_95: float | None = None
     runtime_sample_count: int = 0
     performance_first_pass_rate: float | None = None
@@ -143,6 +147,10 @@ class RankedCandidate:
     expected_attempts: float | None = None
     expected_completion_units: float | None = None
     efficiency_score: float | None = None
+    # Public benchmark data remains a non-calibrating reference.  This receipt
+    # names exactly which source/cohort helped, conflicted, or abstained.
+    public_evidence_preference_rank: int = 0
+    public_evidence_summary: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def lower_bound_95(self) -> float | None:
@@ -179,6 +187,9 @@ class RankedCandidate:
             "performance_snapshot_id": self.performance_snapshot_id,
             "performance_digest": self.performance_digest,
             "quality_source": self.quality_source,
+            "performance_semantic_status": self.performance_semantic_status,
+            "empirical_ranking_status": self.empirical_ranking_status,
+            "empirical_ranking_reason": self.empirical_ranking_reason,
             "performance_lower_bound_95": self.performance_lower_bound_95,
             # Keep the short posterior spelling in receipts for consumers that
             # read PerformanceRegistry.calibrate directly.
@@ -202,6 +213,8 @@ class RankedCandidate:
             "expected_attempts": self.expected_attempts,
             "expected_completion_units": self.expected_completion_units,
             "efficiency_score": self.efficiency_score,
+            "public_evidence_preference_rank": self.public_evidence_preference_rank,
+            "public_evidence_summary": dict(self.public_evidence_summary),
         }
 
 
@@ -222,6 +235,7 @@ class RoutingV3Decision:
     performance_digest: str | None = None
     performance_status: str | None = None
     ranking_algorithm_version: str = RANKING_ALGORITHM_VERSION
+    public_evidence_summary: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (self.performance_snapshot_id is None) != (self.performance_digest is None):
@@ -252,6 +266,7 @@ class RoutingV3Decision:
             "performance_snapshot_id": self.performance_snapshot_id,
             "performance_digest": self.performance_digest,
             "performance_status": self.performance_status,
+            "public_evidence_summary": dict(self.public_evidence_summary),
         }
 
 
@@ -379,6 +394,70 @@ def route_capability_snapshot(
             highest_quality=highest_quality,
             quality_tolerance=quality_tolerance,
         )
+    _apply_local_empirical_ranking(admitted)
+    admitted.sort(key=_candidate_sort_key)
+    in_band_candidates = [candidate for candidate in admitted if candidate["quality_equivalence_band"]]
+    public_cold_start_enabled = bool(in_band_candidates) and all(
+        candidate["quality_source"] == "declared-policy"
+        for candidate in in_band_candidates
+    )
+
+    eligible_public_candidates = [
+        {
+            "candidate_id": candidate["capability_id"],
+            "provider": candidate["provider"],
+            "model": candidate["model"],
+            "reasoning_effort": candidate["_reasoning_effort"],
+            "public_evidence": candidate["_public_evidence"],
+        }
+        for candidate in in_band_candidates
+    ] if public_cold_start_enabled else []
+    public_evidence_result = (
+        rank_comparable_public_evidence(eligible_public_candidates, task_type=task_type)
+        if eligible_public_candidates
+        else {
+            "status": "not-applicable",
+            "reason": "no declared-policy candidate is inside the quality-equivalence band",
+            "preference_ranks": {},
+            "candidate_summaries": {},
+            "conflicts": [],
+            "cohorts": [],
+        }
+    )
+    public_summaries = public_evidence_result["candidate_summaries"]
+    public_ranks = public_evidence_result["preference_ranks"]
+    for candidate in admitted:
+        candidate_id = candidate["capability_id"]
+        public_summary = public_summaries.get(candidate_id)
+        if public_summary is None:
+            if not candidate["quality_equivalence_band"]:
+                public_reason = "outside the quality-equivalence band; public reference not applied"
+            elif candidate["quality_source"] != "declared-policy":
+                public_reason = "local runtime evidence retained; public reference not applied"
+            else:
+                public_reason = "no comparable public evidence; baseline deterministic ordering retained"
+            public_summary = {
+                "candidate_id": candidate_id,
+                "status": "not-applicable",
+                "reason": public_reason,
+                "preference_rank": 0,
+                "supporting_sources": [],
+                "conflicting_sources": [],
+                "abstained_sources": [],
+                "cohorts": [],
+            }
+        public_rank = int(public_ranks.get(candidate_id, 0))
+        candidate["public_evidence_preference_rank"] = public_rank
+        candidate["public_evidence_summary"] = public_summary
+        score = list(candidate["score"])
+        score[4] = public_rank
+        candidate["score"] = tuple(score)
+        candidate["reasons"] = tuple(candidate["reasons"]) + (
+            f"public evidence: {public_summary['reason']}",
+        )
+        candidate.pop("_public_evidence", None)
+        candidate.pop("_reasoning_effort", None)
+        candidate.pop("_calibration_cohort", None)
     admitted.sort(key=_candidate_sort_key)
     ranked = tuple(
         RankedCandidate(rank=index, **candidate)
@@ -410,6 +489,7 @@ def route_capability_snapshot(
         performance_snapshot_id=performance[1],
         performance_digest=performance[2],
         performance_status=performance[3],
+        public_evidence_summary=public_evidence_result,
     )
 
 
@@ -985,7 +1065,14 @@ def _performance_context(
         # A task-level calibration can contain several exact DAG buckets.  The
         # top-level task_type/complexity describes the calibration call, not a
         # neighboring node; only the selected context may contribute scores.
-        calibration = selected_context
+        if selected_context is None:
+            calibration = None
+        else:
+            resolved_context = dict(selected_context)
+            for key in ("semantic_version", "calibration_policy", "policy", "local_outcomes_only", "external_evidence_updates_beta"):
+                if key not in resolved_context and key in calibration:
+                    resolved_context[key] = calibration[key]
+            calibration = resolved_context
     elif calibration is not None:
         cal_task_type = _optional_text(calibration.get("task_type"))
         cal_complexity = _optional_text(calibration.get("complexity"))
@@ -1098,15 +1185,36 @@ def _performance_candidate(
         return dict(raw)
     return None
 
+def _performance_semantic_status(calibration: Mapping[str, Any] | None) -> str:
+    """Classify calibration semantics before any posterior can affect routing."""
+
+    if calibration is None:
+        return "no-performance-calibration"
+    if calibration.get("semantic_version") != "local-outcomes-only-v2":
+        return "legacy-audit-only"
+    policy = _first(calibration, "calibration_policy", "policy")
+    if not isinstance(policy, Mapping):
+        policy = calibration
+    if (
+        policy.get("local_outcomes_only") is True
+        and policy.get("external_evidence_updates_beta") is False
+    ):
+        return "local-outcomes-only-v2"
+    return "legacy-audit-only"
+
+
 
 def _performance_inputs(
     candidate: Mapping[str, Any] | None,
+    *,
+    semantic_status: str,
 ) -> dict[str, Any]:
     """Extract only measured/prior-backed values, never a synthetic Spark score."""
 
     empty = {
-        "quality_source": "declared",
+        "quality_source": "declared-policy",
         "lower_bound_95": None,
+        "performance_semantic_status": semantic_status,
         "runtime_sample_count": 0,
         "first_pass_rate": None,
         "rework_rate": None,
@@ -1117,10 +1225,17 @@ def _performance_inputs(
         "external_observed_cost_mean": None,
         "external_cost_surprise_mean": None,
         "external_source_count": 0,
+        "calibration_cohort": None,
         "consistency_risk": None,
+        "public_evidence": (),
     }
     if candidate is None:
         return empty
+    if semantic_status != "local-outcomes-only-v2":
+        return {
+            **empty,
+            "performance_semantic_status": "legacy-audit-only",
+        }
     quality = candidate.get("quality")
     quality_mapping = quality if isinstance(quality, Mapping) else {}
     posterior = quality_mapping.get("posterior")
@@ -1131,7 +1246,7 @@ def _performance_inputs(
     if not isinstance(prior, Mapping):
         prior = candidate.get("prior")
     prior = prior if isinstance(prior, Mapping) else {}
-    external = prior.get("external_signals")
+    external: Mapping[str, Any] = {}
     if not isinstance(external, Mapping):
         external = candidate.get("external_signals")
     external = external if isinstance(external, Mapping) else {}
@@ -1169,7 +1284,7 @@ def _performance_inputs(
     # A generic-conservative prior is not evidence and must not masquerade as a
     # Spark quality estimate.  Runtime observations remain valid even for a
     # model with no public benchmark score.
-    usable = lower is not None and 0 <= lower <= 1 and (samples > 0 or prior_available)
+    usable = lower is not None and 0 <= lower <= 1 and samples > 0
     runtime = candidate.get("runtime")
     runtime = runtime if isinstance(runtime, Mapping) else {}
     first_pass = _rate_value(
@@ -1190,18 +1305,17 @@ def _performance_inputs(
         if rework_count is not None and denominator is not None and denominator > 0:
             rework = max(0.0, rework_count / denominator)
     latency = _runtime_latency_ms(candidate, runtime)
+    if not usable:
+        first_pass = None
+        rework = None
+        latency = None
     consistency_risk = _external_consistency_risk(
         external_consistency,
         external_consistency_std,
     )
     return {
-        "quality_source": (
-            "calibrated"
-            if usable
-            else "external"
-            if external_quality is not None
-            else "declared"
-        ),
+        "quality_source": "local-runtime" if usable else "declared-policy",
+        "performance_semantic_status": semantic_status,
         "lower_bound_95": lower if usable else None,
         "runtime_sample_count": samples if usable else 0,
         "first_pass_rate": first_pass,
@@ -1215,8 +1329,23 @@ def _performance_inputs(
         "external_source_count": source_count,
         # Consistency is deliberately exposed as uncertainty/rework risk; it
         # is never used as a success probability or quality score.
+        "calibration_cohort": _calibration_cohort(candidate),
         "consistency_risk": consistency_risk,
+        "public_evidence": _public_evidence_records(candidate),
     }
+
+
+def _public_evidence_records(candidate: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    raw = candidate.get("public_evidence")
+    if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes, Mapping)):
+        return ()
+    return tuple(item for item in raw if isinstance(item, Mapping))
+
+
+def _calibration_cohort(candidate: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    cohort = candidate.get("calibration_cohort")
+    return dict(cohort) if isinstance(cohort, Mapping) else None
+
 
 
 def _nonnegative_int(value: Any) -> int:
@@ -1332,19 +1461,17 @@ def _candidate_inputs(
         task_type=task_type,
         complexity=complexity,
     )
-    performance_values = _performance_inputs(performance_candidate)
+    semantic_status = _performance_semantic_status(performance_calibration)
+    performance_values = _performance_inputs(
+        performance_candidate,
+        semantic_status=semantic_status,
+    )
     quality_source = performance_values["quality_source"]
     performance_lower_bound = performance_values["lower_bound_95"]
     external_quality = performance_values["external_quality_mean"]
-    # A raw public quality mean is not a local pass-rate observation.  It may
-    # be used by the performance adapter when constructing a conservative
-    # posterior, but routing itself only trusts that posterior (or the
-    # catalog-declared quality when no posterior exists).
-    quality_for_ranking = (
-        performance_lower_bound * 100
-        if performance_lower_bound is not None
-        else quality
-    )
+    # Declared policy quality is the only cross-candidate quality scale.  A
+    # local posterior is an empirical secondary signal, never this scale.
+    quality_for_ranking = quality
     preferred_families = tuple(_ordered_strings(request.get("preferred_families", ())))
     family = _model_tier(model) or model
     preference_rank = (
@@ -1399,10 +1526,9 @@ def _candidate_inputs(
                 f"{performance_lower_bound:g}"
                 if performance_lower_bound is not None
                 else (
-                    f"ranking quality source declared; external quality_mean="
-                    f"{external_quality:g} is advisory only"
-                    if external_quality is not None
-                    else "quality source declared; no exact calibrated posterior was available"
+                    "quality source declared-policy; legacy calibration is audit-only"
+                    if performance_values["performance_semantic_status"] == "legacy-audit-only"
+                    else "quality source declared-policy; no exact local runtime samples were available"
                 )
             ),
             "quality-equivalence-v1 keeps quality gates authoritative; efficiency only competes inside the risk-specific band",
@@ -1410,6 +1536,7 @@ def _candidate_inputs(
         "performance_snapshot_id": performance_snapshot_id,
         "performance_digest": performance_digest,
         "quality_source": quality_source,
+        "performance_semantic_status": performance_values["performance_semantic_status"],
         "performance_lower_bound_95": performance_lower_bound,
         "runtime_sample_count": performance_values["runtime_sample_count"],
         "performance_first_pass_rate": performance_values["first_pass_rate"],
@@ -1426,6 +1553,9 @@ def _candidate_inputs(
         "expected_attempts": expected_attempts,
         "expected_completion_units": expected_completion_units,
         "efficiency_score": efficiency_score,
+        "_public_evidence": performance_values["public_evidence"],
+        "_reasoning_effort": reasoning_effort,
+        "_calibration_cohort": performance_values["calibration_cohort"],
     }
 
 
@@ -1485,10 +1615,10 @@ def _finalize_candidate_ranking(
     if latency is None:
         latency = candidate.get("estimated_latency_ms")
     consistency_risk = candidate.get("performance_consistency_risk")
-    external_quality = candidate.get("external_quality_mean")
-    observed_cost = candidate.get("external_observed_cost_mean")
-    cost_surprise = candidate.get("external_cost_surprise_mean")
     completion_units = candidate.get("expected_completion_units")
+    public_evidence_preference_rank = _nonnegative_int(
+        candidate.get("public_evidence_preference_rank")
+    )
     candidate["quality_gap"] = round(gap, 8)
     candidate["quality_equivalence_tolerance"] = quality_tolerance
     candidate["quality_equivalence_band"] = in_band
@@ -1504,23 +1634,17 @@ def _finalize_candidate_ranking(
         # solely on cost; strictly interior candidates remain fully
         # efficiency-comparable (e.g. 89 vs 90 at standard risk).
         boundary_rank,
-        expected_attempts
-        if expected_attempts is not None
-        else _MISSING_RANKING_VALUE,
-        rework_rate if rework_rate is not None else _MISSING_RANKING_VALUE,
-        latency if latency is not None else _MISSING_RANKING_VALUE,
-        # Consistency is uncertainty/rework risk only; it never enters the
-        # quality position above or the p_first calculation.
-        consistency_risk if consistency_risk is not None else _MISSING_RANKING_VALUE,
-        # A raw external quality mean is advisory only and is considered after
-        # the quality band, preference, and local efficiency observations.
-        -external_quality if external_quality is not None else _MISSING_RANKING_VALUE,
-        # External observed cost is a relative signal inside the quality band;
-        # its unit is intentionally not asserted.  Catalog cost remains a
-        # separate subscription/capacity signal below.
-        observed_cost if observed_cost is not None else _MISSING_RANKING_VALUE,
-        cost_surprise if cost_surprise is not None else _MISSING_RANKING_VALUE,
-        completion_units if completion_units is not None else _MISSING_RANKING_VALUE,
+        # Public evidence is a discrete, same-cohort reference only; it never
+        # becomes a quality score, probability, or cross-unit weighted value.
+        public_evidence_preference_rank,
+        # Filled only after every in-band candidate has a shared local cohort;
+        # all missing values are equal so unknown observations get no penalty.
+        _MISSING_RANKING_VALUE,
+        _MISSING_RANKING_VALUE,
+        _MISSING_RANKING_VALUE,
+        _MISSING_RANKING_VALUE,
+        _MISSING_RANKING_VALUE,
+        _MISSING_RANKING_VALUE,
         candidate["estimated_cost_units"],
         -candidate["estimated_throughput"],
         candidate["concurrency_utilization"],
@@ -1547,6 +1671,109 @@ def _finalize_candidate_ranking(
         f"{expected_text}, expected_completion_units={completion_text}, "
         f"efficiency_score={efficiency_text}",
     )
+
+
+def _apply_local_empirical_ranking(candidates: list[dict[str, Any]]) -> None:
+    """Use local observations only when every declared-quality peer is comparable."""
+
+    in_band = [candidate for candidate in candidates if candidate["quality_equivalence_band"]]
+    in_band_ids = {candidate["capability_id"] for candidate in in_band}
+    usable_local = bool(in_band) and all(
+        candidate["quality_source"] == "local-runtime"
+        and candidate["runtime_sample_count"] > 0
+        for candidate in in_band
+    )
+    cohort_keys = [_local_measurement_cohort_key(candidate) for candidate in in_band]
+    shared_cohort = (
+        usable_local
+        and all(key is not None for key in cohort_keys)
+        and len(set(cohort_keys)) == 1
+    )
+    if not usable_local:
+        status = "abstained"
+        reason = (
+            "local empirical ranking abstained: not every declared quality-equivalence "
+            "candidate has usable local runtime outcomes"
+        )
+    elif not shared_cohort:
+        status = "abstained"
+        reason = (
+            "local empirical ranking abstained: local measurement conditions differ "
+            "or omit task_type, complexity, harness, score_kind, reasoning_effort, "
+            "agent_name, or agent_version"
+        )
+    else:
+        status = "used"
+        reason = ""
+
+    metric_specs = (
+        ("posterior_lower_bound_95", "performance_lower_bound_95", True),
+        ("expected_attempts", "expected_attempts", False),
+        ("rework_rate", "performance_rework_rate", False),
+        ("latency_ms", "performance_latency_ms", False),
+        ("consistency_risk", "performance_consistency_risk", False),
+        ("expected_completion_units", "expected_completion_units", False),
+    )
+    enabled_metrics: list[str] = []
+    if status == "used":
+        for offset, (label, field, higher_is_better) in enumerate(metric_specs):
+            values = [_number(candidate.get(field)) for candidate in in_band]
+            if any(value is None for value in values):
+                continue
+            enabled_metrics.append(label)
+            for candidate, value in zip(in_band, values, strict=True):
+                score = list(candidate["score"])
+                score[5 + offset] = -float(value) if higher_is_better else float(value)
+                candidate["score"] = tuple(score)
+        if not enabled_metrics:
+            status = "abstained"
+            reason = "local empirical ranking abstained: no finite common local metric"
+        else:
+            reason = (
+                "local empirical ranking used for a shared measurement cohort; "
+                "observational correlation, not causal gain; metrics="
+                + ",".join(enabled_metrics)
+            )
+
+    for candidate in candidates:
+        score = list(candidate["score"])
+        if candidate["capability_id"] not in in_band_ids or status != "used":
+            for index in range(5, 11):
+                score[index] = _MISSING_RANKING_VALUE
+        candidate["score"] = tuple(score)
+        if candidate["capability_id"] not in in_band_ids:
+            candidate["empirical_ranking_status"] = "abstained"
+            candidate["empirical_ranking_reason"] = (
+                "outside declared quality-equivalence band; local empirical ranking not applied"
+            )
+        else:
+            candidate["empirical_ranking_status"] = status
+            candidate["empirical_ranking_reason"] = reason
+        candidate["reasons"] = tuple(candidate["reasons"]) + (
+            candidate["empirical_ranking_reason"],
+        )
+
+
+def _local_measurement_cohort_key(candidate: Mapping[str, Any]) -> str | None:
+    cohort = candidate.get("_calibration_cohort")
+    if not isinstance(cohort, Mapping):
+        return None
+    conditions: dict[str, str] = {}
+    for field in (
+        "task_type",
+        "complexity",
+        "harness",
+        "score_kind",
+        "reasoning_effort",
+        "agent_name",
+        "agent_version",
+    ):
+        value = cohort.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        conditions[field] = value.strip()
+    return json.dumps(conditions, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
 
 
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[float | str, ...]:

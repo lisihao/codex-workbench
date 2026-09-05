@@ -402,7 +402,7 @@ class FeatureCLITests(unittest.TestCase):
                 "activated": True,
                 "unchanged": False,
                 "snapshot": {"source_provenance": {"external_priors": {
-                    "ai_frontier": {"imported_record_count": 0, "used_for_prior": False},
+                    "ai_frontier": {"reference_record_count": 0, "used_for_prior": False},
                 }}},
             }
             with (
@@ -431,7 +431,7 @@ class FeatureCLITests(unittest.TestCase):
             )
             self.assertEqual(payload["model_calls"], 0)
             self.assertTrue(payload["performance"]["ok"])
-            self.assertFalse(payload["performance"]["imported_ai_frontier_prior"])
+            self.assertFalse(payload["performance"]["referenced_ai_frontier_prior"])
             fake_frontier.refresh.assert_called_once_with(
                 source_ids=["openai/gpt-5.6-luna", "anthropic/claude-opus-4-6"]
             )

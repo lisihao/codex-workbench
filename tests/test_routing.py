@@ -186,7 +186,7 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(decision.performance_snapshot_id, contract.performance_snapshot_id)
         self.assertEqual(decision.performance_digest, contract.performance_digest)
         self.assertEqual(decision.performance_status, "cold-start")
-        self.assertEqual(decision.quality_source, "declared")
+        self.assertEqual(decision.quality_source, "declared-policy")
         self.assertIsNone(decision.performance_lower_bound_95)
 
     def test_low_risk_split_implementation_uses_the_independent_codex_spark_pool(self) -> None:

@@ -13,6 +13,8 @@ from codex_workbench.claude_quota import (
 )
 from codex_workbench.model import QuotaSnapshot
 from codex_workbench.performance import (
+    canonical_hash,
+    validate_performance_snapshot,
     PerformanceRegistry,
     build_performance_snapshot,
     load_benchmark_baseline,
@@ -208,19 +210,25 @@ class PerformanceRegistryTests(unittest.TestCase):
         self.assertEqual(snapshot["pools"]["claude"]["remaining"], None)
 
         luna_coding = next(item for item in coding["candidates"] if item["model_id"] == "gpt-5.6-luna")
-        self.assertEqual(luna_coding["quality"]["prior"]["kind"], "benchmark-backed-weak-prior")
+        self.assertEqual(snapshot["semantic_version"], "local-outcomes-only-v2")
+        self.assertTrue(snapshot["calibration_policy"]["local_outcomes_only"])
+        self.assertFalse(snapshot["calibration_policy"]["external_evidence_updates_beta"])
+        self.assertEqual(luna_coding["quality"]["prior"]["kind"], "conservative-policy-prior")
         self.assertEqual(
-            {item["benchmark"] for item in luna_coding["quality"]["prior"]["evidence"]},
+            {item["benchmark"] for item in luna_coding["public_evidence"]},
             {"SWE-Bench Pro", "Terminal-Bench"},
         )
         luna_reasoning = next(item for item in reasoning["candidates"] if item["model_id"] == "gpt-5.6-luna")
         self.assertEqual(
-            {item["benchmark"] for item in luna_reasoning["quality"]["prior"]["evidence"]},
+            {item["benchmark"] for item in luna_reasoning["public_evidence"]},
             {"Agents' Last Exam"},
         )
         spark = next(item for item in coding["candidates"] if item["model_id"] == "gpt-5.3-codex-spark")
-        self.assertEqual(spark["quality"]["prior"]["kind"], "declarative-conservative-prior")
-        self.assertEqual(spark["quality"]["prior"]["evidence_status"], "unavailable")
+        self.assertFalse(luna_coding["quality"]["prior"]["empirical"])
+        self.assertEqual(luna_coding["quality"]["posterior"]["alpha"], 1.0)
+        self.assertEqual(luna_coding["quality"]["posterior"]["beta"], 2.0)
+        self.assertTrue(all(item["comparability"]["status"] == "reference_only" for item in luna_coding["public_evidence"]))
+        self.assertEqual(spark["quality"]["prior"]["kind"], "conservative-policy-prior")
         self.assertEqual(spark["quality"]["posterior"]["runtime_sample_count"], 0)
         self.assertEqual(spark["runtime"]["attempt_count"], 0)
         self.assertEqual(spark["runtime"]["first_pass"]["rate"], None)
@@ -231,6 +239,127 @@ class PerformanceRegistryTests(unittest.TestCase):
             "p50": None,
         })
 
+    def test_public_evidence_is_reference_only_and_deduplicated(self) -> None:
+        baseline = load_benchmark_baseline()
+        source = next(
+            record
+            for record in baseline["records"]
+            if record["record_id"] == "openai-gpt-5-6-luna-swe-bench-pro"
+        )
+        source = {
+            **source,
+            "source_id": "publisher-primary",
+            "correlation_group": "publisher-luna-swe-bench-pro-v1",
+        }
+        duplicate = {**source, "record_id": "duplicate-luna-swe-bench-pro", "source_id": "publisher-mirror"}
+        snapshot = build_performance_snapshot(
+            [],
+            [],
+            catalog(),
+            baseline={
+                **baseline,
+                "records": [record for record in baseline["records"] if record["record_id"] != source["record_id"]] + [source, duplicate],
+            },
+        )
+        evidence = next(
+            item
+            for item in snapshot["public_evidence"]
+            if item["duplicate_count"] == 2
+        )
+
+        required_fields = {
+            "source", "source_url", "source_id", "lineage_id", "correlation_group",
+            "provider", "model_id", "canonical_model_id", "reasoning_effort",
+            "metric_kind", "score_kind", "value", "unit", "sample_count", "observed_at",
+            "benchmark", "benchmark_version", "harness", "domain", "task_type", "task_types",
+            "cohort_key", "comparability",
+        }
+        self.assertTrue(required_fields <= set(evidence))
+        self.assertFalse(evidence["calibration_eligible"])
+        self.assertEqual(evidence["duplicate_count"], 2)
+        self.assertEqual(evidence["duplicate_record_ids"], ["openai-gpt-5-6-luna-swe-bench-pro"])
+        self.assertEqual(evidence["comparability"]["status"], "reference_only")
+        self.assertIsNone(evidence["cohort_key"])
+
+    def test_comparable_public_fixture_uses_six_field_cohort_key(self) -> None:
+        baseline = load_benchmark_baseline()
+        record = {
+            **baseline["records"][0],
+            "record_id": "comparable-fixture-luna",
+            "model_id": "gpt-5.6-luna",
+            "model_family": "luna",
+            "task_types": ["implementation"],
+            "task_type": "implementation",
+            "reasoning_effort": "max",
+            "harness": "fixture-harness",
+            "metric_kind": "pass_rate",
+            "score_kind": "resolved_rate",
+            "score": 0.75,
+            "value": 0.75,
+            "unit": "proportion",
+            "sample_count": 40,
+            "source_id": "fixture-source",
+            "lineage_id": "fixture-luna",
+            "correlation_group": "fixture-source-v1",
+        }
+        snapshot = build_performance_snapshot([], [], catalog(), baseline={**baseline, "records": [record]})
+        evidence = snapshot["public_evidence"][0]
+
+        self.assertEqual(evidence["comparability"]["status"], "comparable")
+        self.assertEqual(evidence["score_kind"], "resolved_rate")
+        self.assertNotIn("score_kind", evidence["cohort_key"])
+        self.assertEqual(
+            evidence["cohort_key"],
+            "{\"benchmark\":\"SWE-Bench Pro\",\"benchmark_version\":\"reported-on-gpt-5-6-page\",\"harness\":\"fixture-harness\",\"metric_kind\":\"pass_rate\",\"reasoning_effort\":\"max\",\"task_type\":\"implementation\"}",
+        )
+        incompatible_score_kind = {
+            **record,
+            "record_id": "comparable-fixture-luna-first-pass",
+            "score_kind": "first_pass_rate",
+        }
+        distinct_score_snapshot = build_performance_snapshot(
+            [],
+            [],
+            catalog(),
+            baseline={**baseline, "records": [record, incompatible_score_kind]},
+        )
+        self.assertEqual(
+            {item["score_kind"] for item in distinct_score_snapshot["public_evidence"]},
+            {"resolved_rate", "first_pass_rate"},
+        )
+
+    def test_legacy_snapshot_is_audit_only_and_cannot_calibrate_as_v2(self) -> None:
+        snapshot = build_performance_snapshot([], [], catalog())
+        legacy_fields = (
+            "schema_version",
+            "producer",
+            "source",
+            "event_cursor",
+            "catalog",
+            "baseline",
+            "ledger",
+            "metrics",
+            "pools",
+            "source_provenance",
+            "advisory_policy",
+        )
+        legacy_body = {key: snapshot[key] for key in legacy_fields}
+        legacy_body["source"] = "benchmark-prior-plus-runtime-ledger-v1"
+        digest = canonical_hash(legacy_body)
+        legacy = {
+            **legacy_body,
+            "snapshot_id": f"performance-{digest[:16]}",
+            "digest": digest,
+        }
+        validated = validate_performance_snapshot(legacy)
+        registry = PerformanceRegistry(self.root)
+        registry._write_generation(validated)
+        registry._activate(validated["snapshot_id"])
+
+        self.assertEqual(validated["semantic_version"], "benchmark-prior-plus-runtime-ledger-v1")
+        self.assertEqual(validated["calibration_compatibility"], "legacy-audit-only")
+        with self.assertRaisesRegex(ValueError, "legacy-audit-only"):
+            registry.calibrate(catalog(), "implementation", "standard")
     def test_refresh_reads_the_full_paginated_event_ledger_and_recovers_tasks_by_event_id(self) -> None:
         events = [
             event(1, "task.created", task_id="task-a"),
@@ -332,6 +461,54 @@ class PerformanceRegistryTests(unittest.TestCase):
         self.assertEqual(luna["quality"]["posterior"]["runtime_successes"], 1)
         self.assertEqual(luna["quality"]["posterior"]["runtime_failures"], 0)
 
+    def test_runtime_quality_isolated_by_harness_and_score_kind(self) -> None:
+        external_harness_result = result("succeeded")
+        external_harness_result["evaluation_harness"] = "other-verifier-v1"
+        external_harness_result["score_kind"] = "other-acceptance"
+        events = [
+            event(1, "node.started", task_id="other-harness", node_id="work", payload={"attempt": 1}),
+            event(
+                2,
+                "node.accepted",
+                task_id="other-harness",
+                node_id="work",
+                payload={"attempt": 1, "result": external_harness_result},
+            ),
+            event(3, "task.state_changed", task_id="other-harness", payload={"to": "accepted"}),
+        ]
+        registry = PerformanceRegistry(self.root)
+        refreshed = registry.refresh(FakeStore(events, [task("other-harness")]), catalog())
+        metric = refreshed["snapshot"]["metrics"][0]
+        candidate = next(
+            item
+            for item in registry.calibrate(catalog(), "implementation", "standard")["candidates"]
+            if item["model_id"] == "gpt-5.6-luna"
+        )
+
+        self.assertEqual(metric["key"]["harness"], "other-verifier-v1")
+        self.assertEqual(metric["key"]["score_kind"], "other-acceptance")
+        self.assertEqual(metric["key"]["agent_name"], "codex")
+        self.assertEqual(candidate["calibration_cohort"]["agent_name"], "codex")
+        self.assertEqual(metric["runtime"]["quality_calibration"]["sample_count"], 1)
+        self.assertEqual(candidate["quality"]["posterior"]["runtime_sample_count"], 0)
+    def test_runtime_quality_isolated_by_agent_name(self) -> None:
+        alpha = result("succeeded")
+        alpha["agent_name"] = "codex-alpha"
+        beta = result("succeeded")
+        beta["agent_name"] = "codex-beta"
+        events = [
+            event(1, "node.started", task_id="agent-alpha", node_id="work", payload={"attempt": 1}),
+            event(2, "node.accepted", task_id="agent-alpha", node_id="work", payload={"attempt": 1, "result": alpha}),
+            event(3, "task.state_changed", task_id="agent-alpha", payload={"to": "accepted"}),
+            event(4, "node.started", task_id="agent-beta", node_id="work", payload={"attempt": 1}),
+            event(5, "node.accepted", task_id="agent-beta", node_id="work", payload={"attempt": 1, "result": beta}),
+            event(6, "task.state_changed", task_id="agent-beta", payload={"to": "accepted"}),
+        ]
+        snapshot = PerformanceRegistry(self.root).refresh(FakeStore(events, [task("agent-alpha"), task("agent-beta")]), catalog())["snapshot"]
+        metrics = snapshot["metrics"]
+
+        self.assertEqual({metric["key"]["agent_name"] for metric in metrics}, {"codex-alpha", "codex-beta"})
+        self.assertTrue(all(metric["runtime"]["quality_calibration"]["sample_count"] == 1 for metric in metrics))
     def test_retry_uses_the_effective_started_effort_instead_of_the_original_node_spec(self) -> None:
         events = [
             event(
@@ -488,21 +665,11 @@ class PerformanceRegistryTests(unittest.TestCase):
         sonnet = next(item for item in calibration["candidates"] if item["model_id"] == "sonnet")
         opus = next(item for item in calibration["candidates"] if item["model_id"] == "claude-opus-4-8")
 
-        self.assertEqual(sonnet["quality"]["prior"]["kind"], "benchmark-backed-weak-prior")
-        sonnet_evidence = sonnet["quality"]["prior"]["evidence"]
-        self.assertEqual(
-            [item["record_id"] for item in sonnet_evidence],
-            ["terminal-bench-claude-code-sonnet-4-6-2-1"],
-        )
-        self.assertEqual(sonnet_evidence[0]["match_kind"], "family-transfer")
-        self.assertEqual(sonnet_evidence[0]["effective_sample_strength"], 0.125)
-        self.assertNotIn(
-            "terminal-bench-claude-code-opus-4-6-2-1",
-            [item["record_id"] for item in opus["quality"]["prior"]["evidence"]],
-        )
-        self.assertTrue(
-            all(item["match_kind"] == "exact-model" for item in opus["quality"]["prior"]["evidence"])
-        )
+        self.assertEqual(sonnet["quality"]["prior"]["kind"], "conservative-policy-prior")
+        self.assertEqual(sonnet["public_evidence"], [])
+        self.assertTrue(opus["public_evidence"])
+        self.assertTrue(all(item["canonical_model_id"] == "claude-opus-4-8" for item in opus["public_evidence"]))
+        self.assertEqual(opus["quality"]["posterior"]["alpha"], 1.0)
 
     def test_fixture_deterministic_verifier_reused_and_unattested_samples_are_excluded(self) -> None:
         events = [

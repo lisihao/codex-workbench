@@ -468,7 +468,7 @@ class PlannerRoutingTests(unittest.TestCase):
                 self.assertEqual(item.performance_digest, performance_digest)
                 self.assertEqual(item.performance_policy, "quality-first-v1")
                 self.assertEqual(item.performance_status, "cold-start")
-                self.assertEqual(item.performance_quality_source, "declared")
+                self.assertEqual(item.performance_quality_source, "declared-policy")
                 self.assertIsNone(item.performance_lower_bound_95)
 
     def test_planner_rejects_forged_performance_receipt(self) -> None:

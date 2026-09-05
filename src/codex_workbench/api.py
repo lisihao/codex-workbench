@@ -16,7 +16,7 @@ from .capabilities import CapabilityRegistry
 from .config import WorkbenchConfig
 from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
-from .performance import PerformanceRegistry
+from .performance import PERFORMANCE_SEMANTIC_VERSION, PerformanceRegistry
 from .quota_productivity import build_quota_productivity
 from .radar import WorkbenchRadar
 from .scheduler_metrics import build_scheduler_metrics
@@ -418,9 +418,27 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         status = self._performance_registry().status()
         active = status.get("active")
+        read_ok = bool(status.get("ok"))
+        active_semantic_version = status.get("active_semantic_version")
+        active_calibration_compatibility = status.get(
+            "active_calibration_compatibility"
+        )
+        calibration_usable = bool(
+            active is not None
+            and active_semantic_version == PERFORMANCE_SEMANTIC_VERSION
+            and active_calibration_compatibility != "legacy-audit-only"
+        )
         if not isinstance(active, dict):
             return {
-                "ok": bool(status.get("ok")),
+                # ``ok`` remains the backwards-compatible read/availability
+                # result.  Calibration usability is reported separately so a
+                # readable legacy audit snapshot is not surfaced as a
+                # transport failure.
+                "ok": read_ok,
+                "read_ok": read_ok,
+                "calibration_usable": False,
+                "calibration_eligible": False,
+                "routing_eligible": False,
                 "active_generation_id": status.get("active_generation_id"),
                 "generation_count": status.get("generation_count", 0),
                 "error": status.get("error"),
@@ -428,8 +446,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             }
         baseline = active.get("baseline")
         ledger = active.get("ledger")
+        calibration_compatibility = active.get(
+            "calibration_compatibility",
+            active_calibration_compatibility
+            or ("v2" if calibration_usable else "legacy-audit-only"),
+        )
         return {
-            "ok": bool(status.get("ok")),
+            # Preserve the existing ``ok`` meaning for clients that only need
+            # to know whether the snapshot was readable.
+            "ok": read_ok,
+            "read_ok": read_ok,
+            "calibration_usable": calibration_usable,
+            "calibration_eligible": calibration_usable,
+            "routing_eligible": calibration_usable,
             "active_generation_id": status.get("active_generation_id"),
             "generation_count": status.get("generation_count", 0),
             "error": status.get("error"),
@@ -437,6 +466,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "snapshot_id": active.get("snapshot_id"),
                 "digest": active.get("digest"),
                 "event_cursor": active.get("event_cursor"),
+                "semantic_version": active.get("semantic_version"),
+                "calibration_policy": active.get("calibration_policy"),
+                "calibration_compatibility": calibration_compatibility,
+                "public_evidence": active.get("public_evidence")
+                if isinstance(active.get("public_evidence"), list)
+                else [],
+                "calibration_usable": calibration_usable,
+                "calibration_eligible": calibration_usable,
+                "routing_eligible": calibration_usable,
                 "catalog": active.get("catalog"),
                 "baseline": {
                     "baseline_id": baseline.get("baseline_id"),

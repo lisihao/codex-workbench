@@ -8,10 +8,9 @@ import unittest
 from ai_frontier_provider import AIFrontierRegistry
 from codex_workbench.ai_frontier import (
     AI_FRONTIER_CATEGORY_TASK_TYPES,
-    AI_FRONTIER_MAX_MODEL_STRENGTH,
     AI_FRONTIER_REFRESH_INTERVAL_SECONDS,
     WorkbenchAIFrontier,
-    ai_frontier_prior_records,
+    ai_frontier_public_evidence_records,
 )
 from codex_workbench.performance import PerformanceRegistry, build_performance_snapshot
 
@@ -138,19 +137,20 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
         self.assertEqual(status["snapshot_authorization"], "consented")
         self.assertTrue(status["offline_cache_available"])
         self.assertFalse(status["routing_prior_eligible"])
-        self.assertEqual(ai_frontier_prior_records(status, catalog()), [])
+        self.assertEqual(ai_frontier_public_evidence_records(status, catalog()), [])
 
     def test_exact_routable_model_enters_but_unknown_and_non_routable_do_not(self) -> None:
         status = self._status()
-        records = ai_frontier_prior_records(status, catalog())
+        records = ai_frontier_public_evidence_records(status, catalog())
 
         self.assertEqual({record["model_id"] for record in records}, {"gpt-5.6-luna"})
         self.assertEqual({record["domain"] for record in records}, {"coding", "overall"})
         self.assertTrue(all(record["provider"] == "codex" for record in records))
-        self.assertTrue(all(record["effective_sample_strength"] <= 0.75 for record in records))
-        self.assertTrue(
-            all(record["transfer_weight"] <= 0.15 for record in records)
-        )
+        self.assertTrue(all(record["reference_eligible"] for record in records))
+        self.assertTrue(all(record["calibration_eligible"] is False for record in records))
+        self.assertTrue(all("effective_sample_strength" not in record for record in records))
+        self.assertTrue(all(record["metric_kind"] == "accuracy" for record in records))
+        self.assertTrue(all(record["unit"] == "proportion" for record in records))
 
     def test_category_mapping_and_medical_exclusion_are_explicit(self) -> None:
         categories = [
@@ -172,14 +172,14 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
         status = WorkbenchAIFrontier(self.state_root, self.receipt).status(
             now=datetime(2026, 9, 4, 12, 0, 30, tzinfo=UTC)
         )
-        records = ai_frontier_prior_records(status, catalog())
+        records = ai_frontier_public_evidence_records(status, catalog())
         by_domain = {record["domain"]: record for record in records}
 
         self.assertNotIn("medical", by_domain)
         for category, task_types in AI_FRONTIER_CATEGORY_TASK_TYPES.items():
             self.assertEqual(tuple(by_domain[category]["task_types"]), task_types)
 
-    def test_consistency_is_a_strength_penalty_not_a_success_rate(self) -> None:
+    def test_consistency_is_reference_metadata_not_a_local_success_rate(self) -> None:
         low_consistency = payloads()
         low_consistency["reliability_leaderboard"][0]["Consistency"] = 0.1  # type: ignore[index]
         self.registry.import_payloads(
@@ -192,13 +192,14 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
         )
         coding = next(
             record
-            for record in ai_frontier_prior_records(status, catalog())
+            for record in ai_frontier_public_evidence_records(status, catalog())
             if record["domain"] == "coding"
         )
 
         self.assertEqual(coding["score"], 0.84)
         self.assertNotEqual(coding["score"], coding["external_signals"]["consistency_mean"])
-        self.assertLess(coding["effective_sample_strength"], 0.75)
+        self.assertFalse(coding["calibration_eligible"])
+        self.assertFalse(coding["routing_prior_eligible"])
         self.assertEqual(coding["external_signals"]["observed_cost_mean"], 1.7)
         self.assertEqual(coding["external_signals"]["cost_surprise_mean"], -0.2)
 
@@ -211,11 +212,14 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
         self.assertEqual(stale["state"], "stale")
         self.assertEqual(expired["state"], "expired")
         self.assertTrue(fresh["offline_cache_available"])
-        self.assertGreater(
-            sum(float(item["effective_sample_strength"]) for item in ai_frontier_prior_records(fresh, catalog())),
-            sum(float(item["effective_sample_strength"]) for item in ai_frontier_prior_records(stale, catalog())),
+        self.assertTrue(fresh["reference_eligible"])
+        self.assertTrue(stale["reference_eligible"])
+        self.assertFalse(expired["reference_eligible"])
+        self.assertEqual(
+            len(ai_frontier_public_evidence_records(fresh, catalog())),
+            len(ai_frontier_public_evidence_records(stale, catalog())),
         )
-        self.assertEqual(ai_frontier_prior_records(expired, catalog()), [])
+        self.assertEqual(ai_frontier_public_evidence_records(expired, catalog()), [])
         self.assertEqual(AI_FRONTIER_REFRESH_INTERVAL_SECONDS, 72 * 60 * 60)
 
     def test_performance_snapshot_keeps_ai_frontier_provenance_and_old_radar_argument(self) -> None:
@@ -230,24 +234,22 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
 
         external = snapshot["source_provenance"]["external_priors"]
         self.assertIn("codex_radar", external)
-        self.assertEqual(external["ai_frontier"]["imported_record_count"], 2)
-        self.assertTrue(external["ai_frontier"]["quality_is_accuracy_pseudo_evidence"])
+        self.assertEqual(external["ai_frontier"]["reference_record_count"], 2)
+        self.assertTrue(external["ai_frontier"]["reference_eligible"])
+        self.assertFalse(external["ai_frontier"]["routing_prior_eligible"])
+        self.assertFalse(external["ai_frontier"]["used_for_calibration"])
+        self.assertTrue(external["ai_frontier"]["quality_is_external_metric"])
+        self.assertFalse(external["ai_frontier"]["quality_is_local_probability"])
+        self.assertFalse(external["ai_frontier"]["quality_is_pseudo_observation"])
         self.assertFalse(external["ai_frontier"]["quality_is_local_first_pass"])
         self.assertFalse(external["ai_frontier"]["consistency_is_success_rate"])
         self.assertFalse(external["ai_frontier"]["cost_is_quota_admission"])
-        self.assertLessEqual(
-            sum(
-                float(record["effective_sample_strength"])
-                for record in snapshot["baseline"]["records"]
-                if record.get("benchmark") == "AI Frontier reliability leaderboard"
-            ),
-            AI_FRONTIER_MAX_MODEL_STRENGTH,
-        )
+        ai_evidence = [item for item in snapshot["public_evidence"] if item["source"] == "ai-frontier"]
 
         old_snapshot = build_performance_snapshot([], [], catalog())
         self.assertNotIn("external_priors", old_snapshot["source_provenance"])
 
-    def test_selected_prior_exposes_weighted_external_signals_without_changing_local_runtime_counts(self) -> None:
+    def test_candidate_exposes_reference_only_external_evidence_without_changing_beta(self) -> None:
         status = self._status()
 
         class EmptyStore:
@@ -276,16 +278,16 @@ class WorkbenchAIFrontierTests(unittest.TestCase):
         )
         prior = candidate["quality"]["prior"]
 
-        self.assertAlmostEqual(prior["external_signals"]["quality_mean"], 0.835, places=3)
-        self.assertEqual(prior["external_signals"]["consistency_mean"], 0.94)
-        self.assertEqual(prior["external_signals"]["source_count"], 1)
+        self.assertEqual(prior["kind"], "conservative-policy-prior")
+        self.assertFalse(prior["empirical"])
+        self.assertEqual(prior["external_signals"]["source_count"], 0)
         evidence = [
-            item for item in prior["evidence"]
-            if item["benchmark"] == "AI Frontier reliability leaderboard"
+            item for item in candidate["public_evidence"]
+            if item["source"] == "ai-frontier"
         ]
-        self.assertTrue(evidence)
+        self.assertEqual(len(evidence), 2)
         self.assertEqual(evidence[0]["source_id"], "openai/gpt-5.6-luna")
-        self.assertIn("lineage_id", evidence[0])
-        self.assertIn("metric_kind", evidence[0])
-        self.assertIn("correlation_group", evidence[0])
+        self.assertTrue(all(item["comparability"]["status"] == "reference_only" for item in evidence))
+        self.assertEqual(candidate["quality"]["posterior"]["alpha"], 1.0)
+        self.assertEqual(candidate["quality"]["posterior"]["beta"], 2.0)
         self.assertEqual(candidate["runtime"]["attempt_count"], 0)

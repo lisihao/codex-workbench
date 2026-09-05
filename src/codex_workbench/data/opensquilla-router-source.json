@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "project": "OpenSquilla",
+    "expected_source_revision": "94ac35eb99a564e15fa651abf8300c89f21efa0f",
+    "source_revision_kind": "git_commit",
+    "source_revision_runtime_verification": "Git HEAD is verified by the local worker before import; archive-only source installs are unsupported.",
+    "strategy_module": "opensquilla.squilla_router.v4_phase3",
+    "strategy_class": "V4Phase3Strategy",
+    "strategy_source_label": "v4_phase3",
+    "classify_contract": {
+      "inputs": [
+        "message",
+        "valid_tiers",
+        "routing_history",
+        "prev_assistant_text",
+        "prev_assistant_usage",
+        "history_user_texts",
+        "flags_text_override"
+      ],
+      "output": [
+        "tier",
+        "confidence",
+        "source",
+        "extra"
+      ],
+      "async": true
+    },
+    "python_requires": ">=3.12",
+    "bundle": {
+      "relative_path": "src/opensquilla/squilla_router/models/v4.2_phase3_inference",
+      "artifact_manifest_schema_version": 1,
+      "inference_bundle_version": 1,
+      "source_model_version": "v4",
+      "feature_dim": 390,
+      "feature_schema_version": 2,
+      "route_classes": [
+        "R0",
+        "R1",
+        "R2",
+        "R3"
+      ],
+      "demand_tiers": [
+        "c0",
+        "c1",
+        "c2",
+        "c3"
+      ],
+      "inference_heads": [
+        "LightGBM main",
+        "LightGBM auxiliary",
+        "ONNX MLP"
+      ]
+    },
+    "recommended_runtime_dependencies": [
+      "numpy>=1.26",
+      "lightgbm>=4.0",
+      "joblib>=1.3",
+      "scikit-learn>=1.3",
+      "onnxruntime>=1.17",
+      "tokenizers>=0.15"
+    ]
+  },
+  "classification_semantics": "demand_classification_not_task_success_or_model_success_ranking",
+  "quality": {
+    "status": "not_assessed_by_codex_workbench",
+    "native_inference_acceptance": "reported_per_installation_receipt_not_static",
+    "claim": "The adapter preserves upstream classification output only; it makes no quality, task-success, provider-selection, or model-success claim."
+  },
+  "delivery": {
+    "network": "Python socket APIs are blocked during upstream initialization and classification; this is not an OS-level network sandbox.",
+    "providers": "not_instantiated",
+    "assets": "deployment_supplied_not_bundled",
+    "reviewed_snapshot_asset_state": "This describes the reviewed research snapshot only: it contained Git LFS pointers and no weights were loaded during adapter implementation. A runtime installation requires separately supplied real assets."
+  }
+}

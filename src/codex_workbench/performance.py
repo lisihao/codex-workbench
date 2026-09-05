@@ -1,4 +1,4 @@
-"""Benchmark-backed, conservative performance calibration for Workbench routing.
+"""Local-outcome calibration plus public benchmark evidence for Workbench routing.
 
 This module intentionally owns no scheduler or SQLite schema.  The durable
 Workbench event log is the raw runtime ledger; this module materializes
@@ -24,18 +24,22 @@ from statistics import median
 import tempfile
 from typing import Any, Iterable
 
-from .ai_frontier import ai_frontier_prior_records
+from .ai_frontier import ai_frontier_public_evidence_records
 from .model_identities import catalog_with_model_identities, derive_model_identities
-from .radar import radar_prior_records
+from .radar import radar_public_evidence_records
 from .store import WorkbenchStore
 
 
 PERFORMANCE_SNAPSHOT_SCHEMA_VERSION = 1
 PERFORMANCE_SNAPSHOT_PRODUCER = "codex-workbench.performance"
-PERFORMANCE_SNAPSHOT_SOURCE = "benchmark-prior-plus-runtime-ledger-v1"
+PERFORMANCE_SNAPSHOT_SOURCE = "local-outcomes-only-runtime-ledger-v2"
+LEGACY_PERFORMANCE_SNAPSHOT_SOURCE = "benchmark-prior-plus-runtime-ledger-v1"
+PERFORMANCE_SEMANTIC_VERSION = "local-outcomes-only-v2"
+LEGACY_PERFORMANCE_SEMANTIC_VERSION = "benchmark-prior-plus-runtime-ledger-v1"
+LOCAL_OUTCOME_HARNESS = "workbench-verifier-v1"
 BASELINE_RESOURCE_PACKAGE = "codex_workbench.data"
+LOCAL_OUTCOME_SCORE_KIND = "verified-task-acceptance"
 BASELINE_RESOURCE_NAME = "model-performance-baseline-v1.json"
-_FAMILY_TRANSFER_MULTIPLIER = 0.25
 _CONSERVATIVE_Z = 1.96
 _GENERATION_ID = re.compile(r"^performance-[0-9a-f]{16,64}$")
 _CODING_TASK_TYPES = frozenset({"implementation", "debugging", "tests", "docs"})
@@ -45,6 +49,17 @@ _TERMINAL_EVENTS = frozenset(
 )
 _FINAL_TASK_STATES = frozenset({"accepted", "needs_fix"})
 _PERFORMANCE_TASK_STATES = frozenset({"accepted", "needs_fix", "blocked", "cancelled"})
+_PUBLIC_COMPARISON_FIELDS = (
+    "benchmark",
+    "benchmark_version",
+    "metric_kind",
+    "harness",
+    "reasoning_effort",
+    "task_type",
+)
+_PUBLIC_COMPARISON_REQUIRED_FIELDS = (
+    *_PUBLIC_COMPARISON_FIELDS, "score_kind", "value", "unit"
+)
 
 
 class PerformanceRegistryError(ValueError):
@@ -240,6 +255,8 @@ class _Attempt:
     reasoning_effort: str
     task_type: str
     complexity: str
+    harness: str
+    score_kind: str
     task_state: str | None
     duration_seconds: float | None
     quality_outcome_eligible: bool
@@ -373,6 +390,20 @@ def compute_runtime_metrics(
             or _text(spec.get("model_reasoning_effort"))
             or "unspecified"
         )
+        harness = (
+            _text(result.get("evaluation_harness"))
+            or _text(result.get("harness"))
+            or _text(spec.get("evaluation_harness"))
+            or _text(spec.get("harness"))
+            or _text(contract.get("evaluation_harness"))
+            or LOCAL_OUTCOME_HARNESS
+        )
+        score_kind = (
+            _text(result.get("score_kind"))
+            or _text(spec.get("score_kind"))
+            or _text(contract.get("score_kind"))
+            or LOCAL_OUTCOME_SCORE_KIND
+        )
         attempts.append(
             _Attempt(
                 task_id=task_id,
@@ -387,6 +418,8 @@ def compute_runtime_metrics(
                 reasoning_effort=reasoning_effort,
                 task_type=task_type,
                 complexity=complexity,
+                harness=harness,
+                score_kind=score_kind,
                 task_state=task_states.get(task_id),
                 duration_seconds=_duration_seconds(start, event),
                 # A successful process can still produce a semantically bad
@@ -405,7 +438,7 @@ def compute_runtime_metrics(
             )
         )
 
-    grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str, str, str], dict[str, Any]] = {}
     logical: dict[tuple[str, str], list[_Attempt]] = defaultdict(list)
     for attempt in attempts:
         group = grouped.setdefault(_attempt_group_key(attempt), _empty_group(attempt))
@@ -461,7 +494,7 @@ def compute_runtime_metrics(
                 group["quality_unresolved"] += 1
 
     metrics = [
-        _finish_group(group, active_baseline)
+        _finish_group(group)
         for _, group in sorted(grouped.items(), key=lambda item: item[0])
     ]
     relevant = [event for event in ordered if _is_performance_relevant_event(event)]
@@ -510,16 +543,13 @@ def build_performance_snapshot(
     tasks = list(tasks)
     identities = derive_model_identities(events, tasks, catalog)
     observed_catalog = catalog_with_model_identities(catalog, identities)
-    radar_records = radar_prior_records(radar_status or {}, observed_catalog)
-    ai_frontier_records = ai_frontier_prior_records(ai_frontier_status or {}, observed_catalog)
+    radar_records = radar_public_evidence_records(radar_status or {}, observed_catalog)
+    ai_frontier_records = ai_frontier_public_evidence_records(ai_frontier_status or {}, observed_catalog)
     external_records = [*radar_records, *ai_frontier_records]
-    if external_records:
-        active_baseline = validate_benchmark_baseline(
-            {
-                **active_baseline,
-                "records": [*active_baseline["records"], *external_records],
-            }
-        )
+    public_evidence = _deduplicate_public_evidence([
+        *_public_evidence_from_records(active_baseline["records"], default_source="benchmark-baseline"),
+        *_public_evidence_from_records(external_records, default_source="external"),
+    ])
     runtime = compute_runtime_metrics(events, tasks, baseline=active_baseline)
     catalog_identity = {
         "catalog_id": _text(catalog.get("catalog_id")) if isinstance(catalog, Mapping) else None,
@@ -545,6 +575,11 @@ def build_performance_snapshot(
             "kind": "append-only-events-and-current-task-contracts",
             "event_cursor": runtime["event_cursor"],
         },
+        "public_evidence": {
+            "schema_version": 1,
+            "record_count": len(public_evidence),
+            "calibration_eligible_count": 0,
+        },
     }
     if radar_status is not None:
         source_provenance["external_priors"] = {
@@ -569,12 +604,23 @@ def build_performance_snapshot(
             "matched_selection_ids": matched,
             "routable_model_count": len(routable),
             "model_coverage_rate": len(matched) / len(routable) if routable else None,
-            "used_for_prior": bool(ai_frontier_records),
+            "reference_record_count": len(ai_frontier_records),
+            "used_for_prior": False,
+            "used_for_calibration": False,
         })
     body = {
         "schema_version": PERFORMANCE_SNAPSHOT_SCHEMA_VERSION,
         "producer": PERFORMANCE_SNAPSHOT_PRODUCER,
         "source": PERFORMANCE_SNAPSHOT_SOURCE,
+        "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+        "calibration_policy": {
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "local_outcomes_only": True,
+            "external_evidence_updates_beta": False,
+            "policy_prior_kind": "conservative-policy-prior",
+            "policy_prior_empirical": False,
+            "existing_pinned_routes_reassigned": False,
+        },
         "event_cursor": runtime["event_cursor"],
         "catalog": catalog_identity,
         "baseline": {
@@ -585,6 +631,7 @@ def build_performance_snapshot(
         "metrics": runtime["metrics"],
         "pools": _quota_pools(quota),
         "source_provenance": source_provenance,
+        "public_evidence": public_evidence,
         "advisory_policy": {
             "quality_first": True,
             "hard_capability_gates_required": True,
@@ -615,8 +662,14 @@ def validate_performance_snapshot(raw: Mapping[str, Any] | object) -> dict[str, 
         raise PerformanceRegistryError("unsupported performance snapshot schema version")
     if raw.get("producer") != PERFORMANCE_SNAPSHOT_PRODUCER:
         raise PerformanceRegistryError("invalid performance snapshot producer")
-    if raw.get("source") != PERFORMANCE_SNAPSHOT_SOURCE:
+    source = raw.get("source")
+    if source not in {PERFORMANCE_SNAPSHOT_SOURCE, LEGACY_PERFORMANCE_SNAPSHOT_SOURCE}:
         raise PerformanceRegistryError("invalid performance snapshot source")
+    current_semantics = source == PERFORMANCE_SNAPSHOT_SOURCE
+    if current_semantics and raw.get("semantic_version") != PERFORMANCE_SEMANTIC_VERSION:
+        raise PerformanceRegistryError("performance snapshot is missing local-outcomes-only-v2 semantics")
+    if not current_semantics and raw.get("semantic_version") not in {None, LEGACY_PERFORMANCE_SEMANTIC_VERSION}:
+        raise PerformanceRegistryError("legacy performance snapshot has an invalid semantic version")
     snapshot_id = _require_text(raw.get("snapshot_id"), "snapshot_id")
     if _GENERATION_ID.fullmatch(snapshot_id) is None:
         raise PerformanceRegistryError("invalid performance snapshot generation ID")
@@ -628,6 +681,21 @@ def validate_performance_snapshot(raw: Mapping[str, Any] | object) -> dict[str, 
             raise PerformanceRegistryError(f"performance snapshot {field} must be an object")
     if not isinstance(raw.get("metrics"), list):
         raise PerformanceRegistryError("performance snapshot metrics must be a list")
+    if current_semantics:
+        calibration_policy = raw.get("calibration_policy")
+        if not isinstance(calibration_policy, Mapping):
+            raise PerformanceRegistryError("v2 performance snapshot calibration_policy must be an object")
+        if (
+            calibration_policy.get("semantic_version") != PERFORMANCE_SEMANTIC_VERSION
+            or calibration_policy.get("local_outcomes_only") is not True
+            or calibration_policy.get("external_evidence_updates_beta") is not False
+            or calibration_policy.get("policy_prior_empirical") is not False
+        ):
+            raise PerformanceRegistryError("v2 performance snapshot has invalid calibration policy")
+        evidence = raw.get("public_evidence")
+        if not isinstance(evidence, list):
+            raise PerformanceRegistryError("v2 performance snapshot public_evidence must be a list")
+        _validate_public_evidence(evidence)
     if not isinstance(raw.get("event_cursor"), int) or int(raw["event_cursor"]) < 0:
         raise PerformanceRegistryError("performance snapshot event_cursor must be non-negative")
     if "scan_progress" in raw and not isinstance(raw["scan_progress"], Mapping):
@@ -636,27 +704,39 @@ def validate_performance_snapshot(raw: Mapping[str, Any] | object) -> dict[str, 
     baseline_digest = _require_text(raw["baseline"].get("digest"), "baseline digest")
     if baseline_digest != canonical_hash(baseline):
         raise PerformanceRegistryError("performance snapshot baseline digest does not match its contents")
-    body = {
-        key: raw[key]
-        for key in (
-            "schema_version",
-            "producer",
-            "source",
-            "event_cursor",
-            "catalog",
-            "baseline",
-            "ledger",
-            "metrics",
-            "pools",
-            "source_provenance",
-            "advisory_policy",
-        )
-    }
+    body_keys = (
+        "schema_version",
+        "producer",
+        "source",
+        "event_cursor",
+        "catalog",
+        "baseline",
+        "ledger",
+        "metrics",
+        "pools",
+        "source_provenance",
+        "advisory_policy",
+    )
+    if current_semantics:
+        body_keys += ("semantic_version", "calibration_policy", "public_evidence")
+    body = {key: raw[key] for key in body_keys}
     expected = canonical_hash(body)
     if expected != digest or snapshot_id != f"performance-{digest[:16]}":
         raise PerformanceRegistryError("performance snapshot digest does not match its contents")
-    return json.loads(json.dumps(dict(raw)))
+    snapshot = json.loads(json.dumps(dict(raw)))
+    if not current_semantics:
+        snapshot.setdefault("semantic_version", LEGACY_PERFORMANCE_SEMANTIC_VERSION)
+        snapshot["calibration_compatibility"] = "legacy-audit-only"
+    return snapshot
 
+
+
+def _require_current_semantics(snapshot: Mapping[str, Any] | None) -> None:
+    if snapshot is None or snapshot.get("semantic_version") == PERFORMANCE_SEMANTIC_VERSION:
+        return
+    raise PerformanceRegistryError(
+        "active performance snapshot is legacy-audit-only; refresh before v2 calibration"
+    )
 
 @dataclass(frozen=True)
 class PerformanceRegistry:
@@ -751,6 +831,8 @@ class PerformanceRegistry:
             "ok": active is not None and error is None,
             "active_generation_id": active["snapshot_id"] if active is not None else None,
             "active": active,
+            "active_semantic_version": active.get("semantic_version") if active is not None else None,
+            "active_calibration_compatibility": active.get("calibration_compatibility", "v2") if active is not None else None,
             "generation_count": len(generations),
             "generations": generations,
             "error": error,
@@ -764,12 +846,13 @@ class PerformanceRegistry:
     ) -> dict[str, Any]:
         """Return conservative per-candidate advisory quality, never a route.
 
-        A new CLI version is deliberately isolated from metrics observed under
-        an older version.  It gets its weak public prior until enough locally
-        attested executions accumulate in its own bucket.
+        A new CLI version is isolated from older-version metrics.  It begins
+        with a clearly labeled policy prior; public evidence remains reference
+        material until same-cohort local executions accumulate.
         """
 
         snapshot = self.active()
+        _require_current_semantics(snapshot)
         active_baseline = (
             validate_benchmark_baseline(snapshot["baseline"])
             if snapshot is not None
@@ -812,6 +895,7 @@ class PerformanceRegistry:
                 "performance calibration matrix requires task_types and complexities"
             )
         snapshot = self.active()
+        _require_current_semantics(snapshot)
         active_baseline = (
             validate_benchmark_baseline(snapshot["baseline"])
             if snapshot is not None
@@ -831,6 +915,12 @@ class PerformanceRegistry:
         return {
             "status": "ok" if snapshot is not None else "cold-start",
             "snapshot_id": snapshot["snapshot_id"] if snapshot is not None else None,
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "calibration_policy": {
+                "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                "local_outcomes_only": True,
+                "external_evidence_updates_beta": False,
+            },
             "task_types": normalized_task_types,
             "complexities": normalized_complexities,
             "contexts": contexts,
@@ -848,7 +938,8 @@ class PerformanceRegistry:
         task_type: str,
         complexity: str,
     ) -> dict[str, Any]:
-        metric_index: dict[tuple[str, str, str, str, str, str], Mapping[str, Any]] = {}
+        _require_current_semantics(snapshot)
+        metric_index: dict[tuple[str, str, str, str, str, str, str, str, str], Mapping[str, Any]] = {}
         if snapshot is not None:
             for metric in snapshot["metrics"]:
                 key = metric.get("key")
@@ -857,10 +948,13 @@ class PerformanceRegistry:
                         (
                             str(key.get("provider")),
                             str(key.get("model_id")),
+                            str(key.get("agent_name") or key.get("provider")),
                             str(key.get("agent_version")),
                             _text(key.get("reasoning_effort")) or "unspecified",
                             str(key.get("task_type")),
                             str(key.get("complexity")),
+                            _text(key.get("harness")) or LOCAL_OUTCOME_HARNESS,
+                            _text(key.get("score_kind")) or LOCAL_OUTCOME_SCORE_KIND,
                         )
                     ] = metric
 
@@ -869,6 +963,13 @@ class PerformanceRegistry:
             catalog = catalog_with_model_identities(
                 catalog, snapshot["source_provenance"].get("model_identities", {})
             )
+        context_public_evidence = (
+            [dict(item) for item in snapshot.get("public_evidence", ()) if isinstance(item, Mapping)]
+            if snapshot is not None
+            else _deduplicate_public_evidence(
+                _public_evidence_from_records(active_baseline["records"], default_source="benchmark-baseline")
+            )
+        )
         models = catalog.get("models", ()) if isinstance(catalog, Mapping) else ()
         agents = catalog.get("agents", {}) if isinstance(catalog, Mapping) else {}
         for record in models if isinstance(models, list) else ():
@@ -884,6 +985,12 @@ class PerformanceRegistry:
                 if isinstance(agent, Mapping):
                     agent_version = _text(agent.get("cli_version"))
             agent_version = agent_version or "unattested"
+            agent_name = _text(record.get("agent_name"))
+            if agent_name is None and isinstance(agents, Mapping):
+                agent = agents.get(provider)
+                if isinstance(agent, Mapping):
+                    agent_name = _text(agent.get("agent_name"))
+            agent_name = agent_name or provider
             reasoning_effort = _preferred_effort(record)
             canonical_model_id = (
                 _text(record.get("identity", {}).get("canonical_model_id")) or model_id
@@ -891,20 +998,19 @@ class PerformanceRegistry:
             key = (
                 provider,
                 canonical_model_id,
+                agent_name,
                 agent_version,
                 reasoning_effort or "unspecified",
                 task_type,
                 complexity,
+                LOCAL_OUTCOME_HARNESS,
+                LOCAL_OUTCOME_SCORE_KIND,
             )
             metric = metric_index.get(key)
-            prior = _prior_for(
-                active_baseline,
-                provider=provider,
-                model_id=canonical_model_id,
-                model_family=_text(record.get("model_family")) or _model_family(model_id),
-                task_type=task_type,
-                reasoning_effort=reasoning_effort,
+            candidate_public_evidence = _candidate_public_evidence(
+                context_public_evidence, provider, canonical_model_id, task_type, reasoning_effort
             )
+            prior = _policy_prior(candidate_public_evidence)
             if metric is None:
                 posterior = _posterior(prior["alpha"], prior["beta"])
                 quality = {
@@ -914,6 +1020,10 @@ class PerformanceRegistry:
                         "runtime_sample_count": 0,
                         "runtime_successes": 0,
                         "runtime_failures": 0,
+                        "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                        "local_outcomes_only": True,
+                        "harness": LOCAL_OUTCOME_HARNESS,
+                        "score_kind": LOCAL_OUTCOME_SCORE_KIND,
                     },
                 }
                 runtime = _empty_runtime_metrics()
@@ -941,6 +1051,10 @@ class PerformanceRegistry:
                         "runtime_sample_count": successes + failures,
                         "runtime_successes": successes,
                         "runtime_failures": failures,
+                        "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                        "local_outcomes_only": True,
+                        "harness": LOCAL_OUTCOME_HARNESS,
+                        "score_kind": LOCAL_OUTCOME_SCORE_KIND,
                     },
                 }
             candidates.append(
@@ -950,7 +1064,20 @@ class PerformanceRegistry:
                     "canonical_model_id": canonical_model_id,
                     "model_family": _text(record.get("model_family")) or _model_family(model_id),
                     "reasoning_effort": reasoning_effort,
+                    "agent_name": agent_name,
                     "agent_version": agent_version,
+                    "calibration_cohort": {
+                        "provider": provider,
+                        "canonical_model_id": canonical_model_id,
+                        "agent_name": agent_name,
+                        "agent_version": agent_version,
+                        "reasoning_effort": reasoning_effort,
+                        "task_type": task_type,
+                        "complexity": complexity,
+                        "harness": LOCAL_OUTCOME_HARNESS,
+                        "score_kind": LOCAL_OUTCOME_SCORE_KIND,
+                    },
+                    "public_evidence": candidate_public_evidence,
                     "routable": record.get("routable") is True,
                     "quality": quality,
                     "runtime": runtime,
@@ -961,6 +1088,12 @@ class PerformanceRegistry:
         return {
             "status": "ok" if snapshot is not None else "cold-start",
             "snapshot_id": snapshot["snapshot_id"] if snapshot is not None else None,
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "calibration_policy": {
+                "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                "local_outcomes_only": True,
+                "external_evidence_updates_beta": False,
+            },
             "task_type": task_type,
             "complexity": complexity,
             "candidates": candidates,
@@ -1037,14 +1170,17 @@ class PerformanceRegistry:
             raise
 
 
-def _attempt_group_key(attempt: _Attempt) -> tuple[str, str, str, str, str, str]:
+def _attempt_group_key(attempt: _Attempt) -> tuple[str, str, str, str, str, str, str, str, str]:
     return (
         attempt.provider,
         attempt.model_id,
+        attempt.agent_name,
         attempt.agent_version,
         attempt.reasoning_effort,
         attempt.task_type,
         attempt.complexity,
+        attempt.harness,
+        attempt.score_kind,
     )
 
 
@@ -1058,6 +1194,8 @@ def _empty_group(attempt: _Attempt) -> dict[str, Any]:
             "reasoning_effort": attempt.reasoning_effort,
             "task_type": attempt.task_type,
             "complexity": attempt.complexity,
+            "harness": attempt.harness,
+            "score_kind": attempt.score_kind,
         },
         "attempt_count": 0,
         "failed_count": 0,
@@ -1077,20 +1215,9 @@ def _empty_group(attempt: _Attempt) -> dict[str, Any]:
     }
 
 
-def _finish_group(group: Mapping[str, Any], baseline: Mapping[str, Any]) -> dict[str, Any]:
+def _finish_group(group: Mapping[str, Any]) -> dict[str, Any]:
     key = group["key"]
-    prior = _prior_for(
-        baseline,
-        provider=str(key["provider"]),
-        model_id=str(key["model_id"]),
-        model_family=_model_family(str(key["model_id"])),
-        task_type=str(key["task_type"]),
-        reasoning_effort=(
-            None
-            if str(key.get("reasoning_effort", "unspecified")) == "unspecified"
-            else str(key["reasoning_effort"])
-        ),
-    )
+    prior = _policy_prior(())
     successes = int(group["quality_successes"])
     failures = int(group["quality_failures"])
     posterior = _posterior(prior["alpha"] + successes, prior["beta"] + failures)
@@ -1120,6 +1247,9 @@ def _finish_group(group: Mapping[str, Any], baseline: Mapping[str, Any]) -> dict
                 "failures": failures,
                 "unresolved": int(group["quality_unresolved"]),
                 "sample_count": successes + failures,
+                "local_outcomes_only": True,
+                "harness": key["harness"],
+                "score_kind": key["score_kind"],
             },
             "duration_seconds": _duration_summary(durations),
         },
@@ -1129,7 +1259,40 @@ def _finish_group(group: Mapping[str, Any], baseline: Mapping[str, Any]) -> dict
             "runtime_sample_count": successes + failures,
             "runtime_successes": successes,
             "runtime_failures": failures,
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "local_outcomes_only": True,
+            "harness": key["harness"],
+            "score_kind": key["score_kind"],
         },
+    }
+
+
+
+def _empty_external_signals() -> dict[str, float | int | None]:
+    return {
+        "quality_mean": None,
+        "consistency_mean": None,
+        "consistency_std_mean": None,
+        "observed_cost_mean": None,
+        "cost_surprise_mean": None,
+        "source_count": 0,
+    }
+
+
+def _policy_prior(public_evidence: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return an explicit non-empirical cold-start policy prior."""
+
+    references = [dict(item) for item in public_evidence]
+    return {
+        "kind": "conservative-policy-prior",
+        "policy": "local-outcomes-only-v2-cold-start",
+        "empirical": False,
+        "evidence_status": "reference_only" if references else "unavailable",
+        "alpha": 1.0,
+        "beta": 2.0,
+        "evidence": [],
+        "reference_evidence_count": len(references),
+        "external_signals": _empty_external_signals(),
     }
 
 
@@ -1142,161 +1305,19 @@ def _prior_for(
     task_type: str,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    exact: list[Mapping[str, Any]] = []
-    family: list[Mapping[str, Any]] = []
-    declarative: list[Mapping[str, Any]] = []
-    for record in baseline["records"]:
-        if record["provider"] != provider or task_type not in record["task_types"]:
-            continue
-        record_effort = _text(record.get("reasoning_effort"))
-        if record_effort is not None and record_effort != reasoning_effort:
-            continue
-        if record["model_id"] == model_id:
-            if record.get("score") is None:
-                declarative.append(record)
-            elif record.get("routing_prior_eligible", True) is True:
-                exact.append(record)
-        elif (
-            model_family is not None
-            and record["model_family"] == model_family
-            and record.get("external_snapshot_id") is None
-        ):
-            if record.get("score") is None:
-                declarative.append(record)
-            elif record.get("routing_prior_eligible", True) is True:
-                family.append(record)
+    """Return v2 policy prior plus exact-model public references only."""
 
-    selected: list[tuple[Mapping[str, Any], float, str]] = [
-        (record, float(record["transfer_weight"]), "exact-model")
-        for record in exact
-    ]
-    if not selected:
-        selected = [
-            (
-                record,
-                float(record["transfer_weight"]) * _FAMILY_TRANSFER_MULTIPLIER,
-                "family-transfer",
-            )
-            for record in family
-        ]
-    if selected:
-        alpha = 1.0
-        beta = 1.0
-        evidence: list[dict[str, Any]] = []
-        signal_sums: dict[str, float] = defaultdict(float)
-        signal_weights: dict[str, float] = defaultdict(float)
-        signal_sources: set[str] = set()
-        for record, multiplier, match_kind in selected:
-            selected_effort = _text(record.get("reasoning_effort"))
-            strength = float(record["effective_sample_strength"]) * multiplier
-            score = float(record["score"])
-            alpha += score * strength
-            beta += (1 - score) * strength
-            evidence_item: dict[str, Any] = {
-                "record_id": record["record_id"],
-                "source_url": record["source_url"],
-                "benchmark": record["benchmark"],
-                "benchmark_version": record["benchmark_version"],
-                "domain": record["domain"],
-                "provenance": record["provenance"],
-                "match_kind": match_kind,
-                "effective_sample_strength": round(strength, 6),
-                "agent_scaffold": record["agent_scaffold"],
-                **(
-                    {"reasoning_effort": selected_effort}
-                    if selected_effort is not None
-                    else {}
-                ),
-            }
-            for field in ("source_id", "lineage_id", "metric_kind", "correlation_group"):
-                if _text(record.get(field)) is not None:
-                    evidence_item[field] = record[field]
-            evidence.append(evidence_item)
-
-            external = record.get("external_signals")
-            if not isinstance(external, Mapping) or strength <= 0:
-                continue
-            source_id = _text(record.get("source_id")) or _text(record.get("lineage_id"))
-            if source_id is not None:
-                signal_sources.add(source_id)
-            for field in (
-                "quality_mean",
-                "consistency_mean",
-                "consistency_std_mean",
-                "observed_cost_mean",
-                "cost_surprise_mean",
-            ):
-                value = external.get(field)
-                if field == "observed_cost_mean" and value is None:
-                    # Read old snapshots produced before the neutral cost
-                    # field name was adopted; never emit that legacy label.
-                    value = external.get("observed_cost_usd_mean")
-                value = _external_signal_number(value, field)
-                if value is not None:
-                    signal_sums[field] += value * strength
-                    signal_weights[field] += strength
-        external_signals = {
-            field: (
-                round(signal_sums[field] / signal_weights[field], 8)
-                if signal_weights[field] > 0
-                else None
-            )
-            for field in (
-                "quality_mean",
-                "consistency_mean",
-                "consistency_std_mean",
-                "observed_cost_mean",
-                "cost_surprise_mean",
-            )
-        }
-        external_signals["source_count"] = len(signal_sources)
-        return {
-            "kind": "benchmark-backed-weak-prior",
-            "evidence_status": "available",
-            "alpha": round(alpha, 8),
-            "beta": round(beta, 8),
-            "evidence": evidence,
-            "external_signals": external_signals,
-        }
-
-    if declarative:
-        return {
-            "kind": "declarative-conservative-prior",
-            "evidence_status": "unavailable",
-            "alpha": 1.0,
-            "beta": 3.0,
-            "evidence": [
-                {
-                    "record_id": record["record_id"],
-                    "source_url": record["source_url"],
-                    "benchmark": record["benchmark"],
-                    "provenance": record["provenance"],
-                    "quality_evidence": record["quality_evidence"],
-                    "note": "No published quality score was converted into a pass-rate prior.",
-                }
-                for record in declarative
-            ],
-            "external_signals": _empty_external_signals(),
-        }
-    return {
-        "kind": "generic-conservative-prior",
-        "evidence_status": "unavailable",
-        "alpha": 1.0,
-        "beta": 2.0,
-        "evidence": [],
-        "external_signals": _empty_external_signals(),
-    }
-
-
-def _empty_external_signals() -> dict[str, float | int | None]:
-    return {
-        "quality_mean": None,
-        "consistency_mean": None,
-        "consistency_std_mean": None,
-        "observed_cost_mean": None,
-        "cost_surprise_mean": None,
-        "source_count": 0,
-    }
+    del model_family
+    evidence = _candidate_public_evidence(
+        _deduplicate_public_evidence(
+            _public_evidence_from_records(baseline["records"], default_source="benchmark-baseline")
+        ),
+        provider,
+        model_id,
+        task_type,
+        reasoning_effort,
+    )
+    return _policy_prior(evidence)
 
 
 def _external_signal_number(value: object, field: str) -> float | None:
@@ -1347,6 +1368,204 @@ def _validate_external_signals(value: object, record_id: str) -> None:
         )
 
 
+def _public_evidence_from_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    default_source: str,
+) -> list[dict[str, Any]]:
+    """Normalize static and collected metrics without making them Beta samples."""
+
+    evidence: list[dict[str, Any]] = []
+    for raw in records:
+        record_id = _text(raw.get("record_id"))
+        if record_id is None:
+            continue
+        task_types: list[str] = []
+        raw_task_types = raw.get("task_types")
+        if isinstance(raw_task_types, list):
+            for value in raw_task_types:
+                task_type = _text(value)
+                if task_type is not None:
+                    task_types.append(task_type)
+        task_types = sorted(set(task_types))
+        source = _text(raw.get("source")) or default_source
+        model_id = _text(raw.get("model_id"))
+        canonical_model_id = _text(raw.get("canonical_model_id")) or model_id
+        metric_kind = _text(raw.get("metric_kind")) or _text(raw.get("score_kind"))
+        score_kind = _text(raw.get("score_kind"))
+        value = _external_signal_number(raw.get("value"), "metric_value")
+        if value is None:
+            value = _external_signal_number(raw.get("score"), "metric_value")
+        unit = _text(raw.get("unit")) or ("proportion" if value is not None else None)
+        source_id = _text(raw.get("source_id")) or source
+        lineage_id = _text(raw.get("lineage_id")) or f"{source}:{record_id}"
+        correlation_group = _text(raw.get("correlation_group")) or (
+            f"{source}:{lineage_id}:{metric_kind or 'unknown'}"
+        )
+        raw_sample_count = raw.get("sample_count")
+        sample_count = (
+            raw_sample_count
+            if isinstance(raw_sample_count, int)
+            and not isinstance(raw_sample_count, bool)
+            and raw_sample_count > 0
+            else None
+        )
+        item: dict[str, Any] = {
+            "evidence_id": f"{source}:{record_id}",
+            "record_id": record_id,
+            "source": source,
+            "source_url": _text(raw.get("source_url")),
+            "source_id": source_id,
+            "lineage_id": lineage_id,
+            "correlation_group": correlation_group,
+            "provider": _text(raw.get("provider")),
+            "model_id": model_id,
+            "canonical_model_id": canonical_model_id,
+            "model_family": _text(raw.get("model_family")),
+            "reasoning_effort": _text(raw.get("reasoning_effort")),
+            "metric_kind": metric_kind,
+            "score_kind": score_kind,
+            "value": value,
+            "unit": unit,
+            "sample_count": sample_count,
+            "observed_at": _text(raw.get("observed_at")),
+            "benchmark": _text(raw.get("benchmark")),
+            "benchmark_version": _text(raw.get("benchmark_version")),
+            "harness": _text(raw.get("harness")),
+            "harness_description": _text(raw.get("harness_description"))
+            or _text(raw.get("agent_scaffold")),
+            "domain": _text(raw.get("domain")),
+            "task_type": _text(raw.get("task_type")),
+            "task_types": task_types,
+            "provenance": _text(raw.get("provenance")),
+            "calibration_eligible": False,
+        }
+        missing = [field for field in _PUBLIC_COMPARISON_REQUIRED_FIELDS if item.get(field) is None]
+        if missing:
+            item["cohort_key"] = None
+            item["comparability"] = {
+                "status": "reference_only",
+                "required_conditions": list(_PUBLIC_COMPARISON_REQUIRED_FIELDS),
+                "missing_conditions": missing,
+                "reference_only_reason": "missing exact cohort conditions",
+            }
+        else:
+            cohort = {field: item[field] for field in _PUBLIC_COMPARISON_FIELDS}
+            item["cohort_key"] = canonical_json(cohort)
+            item["comparability"] = {
+                "status": "comparable",
+                "required_conditions": list(_PUBLIC_COMPARISON_REQUIRED_FIELDS),
+                "missing_conditions": [],
+                "reference_only_reason": None,
+            }
+        external_signals = raw.get("external_signals")
+        if isinstance(external_signals, Mapping):
+            item["external_signals"] = dict(external_signals)
+        evidence.append(item)
+    return evidence
+
+
+def _public_evidence_dedupe_key(item: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None, str | None, str]:
+    upstream = _text(item.get("correlation_group")) or _text(item.get("source_id")) or _text(item.get("lineage_id")) or _text(item.get("source")) or "unknown"
+    reference_fingerprint = canonical_json({
+        "benchmark": item.get("benchmark"),
+        "benchmark_version": item.get("benchmark_version"),
+        "metric_kind": item.get("metric_kind"),
+        "score_kind": item.get("score_kind"),
+        "harness": item.get("harness"),
+        "reasoning_effort": item.get("reasoning_effort"),
+        "task_type": item.get("task_type"),
+        "task_types": item.get("task_types"),
+    })
+    return (
+        upstream,
+        _text(item.get("provider")),
+        _text(item.get("canonical_model_id")),
+        _text(item.get("metric_kind")),
+        _text(item.get("score_kind")),
+        _text(item.get("cohort_key")) or reference_fingerprint,
+    )
+
+
+def _deduplicate_public_evidence(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Retain one metric per upstream/model/metric/cohort without averaging."""
+
+    grouped: dict[tuple[str, str | None, str | None, str | None, str | None, str], list[dict[str, Any]]] = defaultdict(list)
+    for raw in records:
+        item = dict(raw)
+        grouped[_public_evidence_dedupe_key(item)].append(item)
+    retained: list[dict[str, Any]] = []
+    for items in grouped.values():
+        ordered = sorted(items, key=lambda item: str(item.get("record_id", "")))
+        item = dict(ordered[0])
+        item["duplicate_count"] = len(ordered)
+        item["duplicate_record_ids"] = [
+            str(duplicate["record_id"])
+            for duplicate in ordered[1:]
+            if duplicate.get("record_id") is not None
+        ]
+        retained.append(item)
+    return sorted(retained, key=lambda item: str(item.get("evidence_id", "")))
+
+
+def _candidate_public_evidence(
+    records: Iterable[Mapping[str, Any]],
+    provider: str,
+    canonical_model_id: str,
+    task_type: str,
+    reasoning_effort: str | None,
+) -> list[dict[str, Any]]:
+    """Select only exact model/version references applicable to the task type."""
+
+    selected: list[dict[str, Any]] = []
+    for raw in records:
+        if (
+            _text(raw.get("provider")) != provider
+            or _text(raw.get("canonical_model_id")) != canonical_model_id
+        ):
+            continue
+        evidence_task_type = _text(raw.get("task_type"))
+        task_types = raw.get("task_types")
+        if evidence_task_type is not None and evidence_task_type != task_type:
+            continue
+        if isinstance(task_types, list) and task_types and task_type not in task_types:
+            continue
+        evidence_effort = _text(raw.get("reasoning_effort"))
+        if evidence_effort is not None and evidence_effort != reasoning_effort:
+            continue
+        selected.append(dict(raw))
+    return selected
+
+
+def _validate_public_evidence(records: Iterable[object]) -> None:
+    required = ("evidence_id", "source", "provider", "canonical_model_id", "comparability")
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise PerformanceRegistryError("public evidence record must be an object")
+        for field in required:
+            if field == "comparability":
+                continue
+            if _text(record.get(field)) is None:
+                raise PerformanceRegistryError(f"public evidence {field} must be a non-empty string")
+        if record.get("calibration_eligible") is not False:
+            raise PerformanceRegistryError("public evidence must be non-calibrating")
+        comparability = record.get("comparability")
+        if not isinstance(comparability, Mapping):
+            raise PerformanceRegistryError("public evidence comparability must be an object")
+        status = comparability.get("status")
+        if status not in {"comparable", "reference_only"}:
+            raise PerformanceRegistryError("public evidence comparability status is invalid")
+        missing = comparability.get("missing_conditions")
+        if not isinstance(missing, list):
+            raise PerformanceRegistryError("public evidence missing_conditions must be a list")
+        if status == "comparable":
+            expected = canonical_json({field: record.get(field) for field in _PUBLIC_COMPARISON_FIELDS})
+            if record.get("cohort_key") != expected or missing:
+                raise PerformanceRegistryError("public evidence comparable cohort is invalid")
+        elif record.get("cohort_key") is not None:
+            raise PerformanceRegistryError("reference-only public evidence cannot claim a cohort key")
+
+
 def _preferred_effort(record: Mapping[str, Any]) -> str | None:
     reasoning = record.get("reasoning")
     if not isinstance(reasoning, Mapping):
@@ -1365,13 +1584,15 @@ def _radar_provenance(status: Mapping[str, Any], imported_records: int) -> dict[
     return {
         "provider": "codex-radar-provider",
         "state": status.get("state"),
-        "routing_prior_eligible": status.get("routing_prior_eligible") is True,
+        "reference_eligible": status.get("reference_eligible") is True,
+        "routing_prior_eligible": False,
         "snapshot_id": status.get("snapshot_id"),
         "digest": status.get("digest"),
         "fetched_at": status.get("fetched_at"),
         "source_updated_at": status.get("source_updated_at"),
         "transfer_multiplier": status.get("transfer_multiplier", 0.0),
-        "imported_record_count": imported_records,
+        "reference_record_count": imported_records,
+        "used_for_calibration": False,
         "attribution": status.get("attribution"),
         "offline_last_known_good": status.get("offline_cache_available") is True,
         "iq_used_as_pass_rate": False,
@@ -1387,16 +1608,20 @@ def _ai_frontier_provenance(
     return {
         "provider": "ai-frontier-provider",
         "state": status.get("state"),
-        "routing_prior_eligible": status.get("routing_prior_eligible") is True,
+        "reference_eligible": status.get("reference_eligible") is True,
+        "routing_prior_eligible": False,
         "snapshot_id": status.get("snapshot_id"),
         "digest": status.get("digest"),
         "fetched_at": status.get("fetched_at"),
         "source_updated_at": status.get("source_updated_at"),
         "transfer_multiplier": status.get("transfer_multiplier", 0.0),
-        "imported_record_count": imported_records,
+        "reference_record_count": imported_records,
+        "used_for_calibration": False,
         "offline_last_known_good": status.get("offline_cache_available") is True,
         "authorization_status": status.get("snapshot_authorization"),
-        "quality_is_accuracy_pseudo_evidence": True,
+        "quality_is_external_metric": True,
+        "quality_is_local_probability": False,
+        "quality_is_pseudo_observation": False,
         "quality_is_local_first_pass": False,
         "consistency_is_success_rate": False,
         "cost_is_quota_admission": False,

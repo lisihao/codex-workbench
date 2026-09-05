@@ -2,12 +2,114 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import secrets
 import socket
 
 from .authority import authority_machine_id
+
+
+@dataclass(frozen=True)
+class SquillaAdvisorConfig:
+    """Explicit local-only configuration for the optional Squilla advisor.
+
+    The classifier is opt-in. Its runtime, source checkout, and inference
+    bundle stay below the Workbench state root so task submission never has to
+    fetch, install, or discover a global Python environment.
+    """
+
+    enabled: bool = False
+    runtime_python: Path | None = None
+    source_root: Path | None = None
+    bundle_dir: Path | None = None
+    timeout_seconds: float = 45.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("squilla advisor enabled must be a boolean")
+        for field_name in ("runtime_python", "source_root", "bundle_dir"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, Path):
+                raise ValueError(f"squilla advisor {field_name} must be a path")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(float(self.timeout_seconds))
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("squilla advisor timeout_seconds must be positive")
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, object]) -> "SquillaAdvisorConfig":
+        if not isinstance(raw, dict):
+            raise ValueError("squilla_advisor config must be an object")
+
+        def path_value(name: str) -> Path | None:
+            value = raw.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"squilla advisor {name} must be a non-empty path")
+            return Path(value).expanduser()
+
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("squilla advisor enabled must be a boolean")
+        timeout_seconds = raw.get("timeout_seconds", 45.0)
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ValueError("squilla advisor timeout_seconds must be a number")
+        return cls(
+            enabled=enabled,
+            runtime_python=path_value("runtime_python"),
+            source_root=path_value("source_root"),
+            bundle_dir=path_value("bundle_dir"),
+            timeout_seconds=float(timeout_seconds),
+        )
+
+    def resolve_under(self, root: Path) -> "SquillaAdvisorConfig":
+        """Resolve paths inside the bounded local advisor installation root."""
+
+        configured_root = root.expanduser().absolute()
+        bounded_root = configured_root.resolve(strict=False)
+
+        def bounded_path(name: str, value: Path | None, default: Path) -> Path:
+            candidate = default if value is None else value
+            if not candidate.is_absolute():
+                candidate = configured_root / candidate
+            resolved = candidate.expanduser().resolve(strict=False)
+            if resolved != bounded_root and bounded_root not in resolved.parents:
+                raise ValueError(
+                    f"squilla advisor {name} must stay within {bounded_root}"
+                )
+            return resolved
+        def bounded_runtime_python(value: Path | None, default: Path) -> Path:
+            candidate = default if value is None else value
+            if not candidate.is_absolute():
+                candidate = configured_root / candidate
+            parent = candidate.expanduser().parent.resolve(strict=False)
+            if parent != bounded_root and bounded_root not in parent.parents:
+                raise ValueError(
+                    f"squilla advisor runtime_python must stay within {bounded_root}"
+                )
+            return candidate.expanduser()
+
+
+        return SquillaAdvisorConfig(
+            enabled=self.enabled,
+            runtime_python=bounded_runtime_python(
+                self.runtime_python,
+                configured_root / "venv" / "bin" / "python",
+            ),
+            source_root=bounded_path(
+                "source_root", self.source_root, configured_root / "source"
+            ),
+            bundle_dir=bounded_path(
+                "bundle_dir", self.bundle_dir, configured_root / "bundle"
+            ),
+            timeout_seconds=float(self.timeout_seconds),
+        )
 
 
 @dataclass(frozen=True)
@@ -37,6 +139,7 @@ class WorkbenchConfig:
     ai_frontier_refresh_seconds: int = 3 * 24 * 60 * 60
     ai_frontier_stale_after_seconds: int = 7 * 24 * 60 * 60
     ai_frontier_expire_after_seconds: int = 31 * 24 * 60 * 60
+    squilla_advisor: SquillaAdvisorConfig | None = None
 
     def __post_init__(self) -> None:
         if self.max_workers < 1:
@@ -61,6 +164,10 @@ class WorkbenchConfig:
             raise ValueError(
                 "ai_frontier_expire_after_seconds must be at least ai_frontier_stale_after_seconds"
             )
+        if self.squilla_advisor is not None:
+            if not isinstance(self.squilla_advisor, SquillaAdvisorConfig):
+                raise ValueError("squilla_advisor must be a SquillaAdvisorConfig")
+            self.effective_squilla_advisor_config
 
     @property
     def effective_spark_workers(self) -> int:
@@ -92,6 +199,18 @@ class WorkbenchConfig:
         return (
             self.ai_frontier_authorization_file
             or self.effective_ai_frontier_state_root / "authorization.json"
+        )
+
+    @property
+    def squilla_advisor_root(self) -> Path:
+        return self.state_root / "advisors" / "opensquilla"
+
+    @property
+    def effective_squilla_advisor_config(self) -> SquillaAdvisorConfig:
+        """Return the bounded advisor config without implying an installation exists."""
+
+        return (self.squilla_advisor or SquillaAdvisorConfig()).resolve_under(
+            self.squilla_advisor_root
         )
 
     @property
@@ -129,6 +248,11 @@ class WorkbenchConfig:
             existing_ai_frontier = {}
         if not isinstance(existing_ai_frontier, dict):
             raise ValueError("ai_frontier config must be an object")
+        existing_squilla_advisor = raw.get("squilla_advisor")
+        if existing_squilla_advisor is None:
+            existing_squilla_advisor = {}
+        if not isinstance(existing_squilla_advisor, dict):
+            raise ValueError("squilla_advisor config must be an object")
         desired = {
             **raw,
             "host": self.host,
@@ -165,6 +289,16 @@ class WorkbenchConfig:
                 "authority_only": True,
             },
         }
+        if self.squilla_advisor is not None:
+            advisor = self.effective_squilla_advisor_config
+            desired["squilla_advisor"] = {
+                **existing_squilla_advisor,
+                "enabled": advisor.enabled,
+                "runtime_python": str(advisor.runtime_python),
+                "source_root": str(advisor.source_root),
+                "bundle_dir": str(advisor.bundle_dir),
+                "timeout_seconds": advisor.timeout_seconds,
+            }
         if desired != raw:
             self.config_file.write_text(json.dumps(desired, indent=2) + "\n")
             self.config_file.chmod(0o600)
@@ -211,6 +345,9 @@ class WorkbenchConfig:
                 ai_frontier = {}
             if not isinstance(ai_frontier, dict):
                 raise ValueError("ai_frontier config must be an object")
+            squilla_advisor_raw = raw.get("squilla_advisor")
+            if squilla_advisor_raw is not None and not isinstance(squilla_advisor_raw, dict):
+                raise ValueError("squilla_advisor config must be an object")
             inferred_authority = bool(os.environ.get("CODEX_WORKBENCH_PROCESS_HOME"))
             role = raw.get("deployment_role") or (
                 "authority" if inferred_authority else "client"
@@ -270,6 +407,11 @@ class WorkbenchConfig:
                 ),
                 ai_frontier_expire_after_seconds=int(
                     ai_frontier.get("expire_after_seconds", 31 * 24 * 60 * 60)
+                ),
+                squilla_advisor=(
+                    SquillaAdvisorConfig.from_dict(squilla_advisor_raw)
+                    if squilla_advisor_raw is not None
+                    else None
                 ),
             )
         inferred_authority = bool(os.environ.get("CODEX_WORKBENCH_PROCESS_HOME"))
