@@ -26,6 +26,7 @@ from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_quota
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
+from .dependency_inputs import load_recorded_dependency_input
 from .dirty_worktree_recovery import DirtyWorktreeRecovery
 from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
@@ -335,6 +336,41 @@ def _load_blocked_worktree_recovery(path: str) -> dict[str, object]:
     return value
 
 
+def _recorded_dependency_input_for_blocked_node(
+    task: dict[str, object],
+    *,
+    task_id: str,
+    node_id: str,
+    base_sha: str,
+    artifacts: ArtifactStore,
+) -> tuple[str, str] | None:
+    raw_nodes = task.get("nodes")
+    if not isinstance(raw_nodes, list):
+        raise ValueError("blocked-worktree recovery task nodes are invalid")
+    node = next(
+        (candidate for candidate in raw_nodes if isinstance(candidate, dict) and candidate.get("node_id") == node_id),
+        None,
+    )
+    if not isinstance(node, dict) or not isinstance(node.get("result"), dict):
+        raise ValueError("blocked-worktree recovery source result is invalid")
+    raw_artifacts = node["result"].get("artifacts")
+    if not isinstance(raw_artifacts, dict):
+        raise ValueError("blocked-worktree recovery source artifacts are invalid")
+    ref = raw_artifacts.get("dependency-input")
+    if ref is None:
+        return None
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("blocked-worktree recovery dependency input ref is invalid")
+    dependency_input = load_recorded_dependency_input(
+        artifacts,
+        ref,
+        task_id=task_id,
+        node_id=node_id,
+        base_sha=base_sha,
+    )
+    return ref, dependency_input.input_tree_sha
+
+
 def _capture_blocked_worktree_recovery(
     config: WorkbenchConfig,
     store: WorkbenchStore,
@@ -357,7 +393,24 @@ def _capture_blocked_worktree_recovery(
     contract = task.get("contract")
     if not isinstance(contract, dict) or not isinstance(contract.get("repository"), str):
         raise ValueError("blocked-worktree recovery task contract is invalid")
+    base_sha = str(source["base_sha"])
     artifact_root = config.state_root / "artifacts"
+    dependency_input = _recorded_dependency_input_for_blocked_node(
+        task,
+        task_id=task_id,
+        node_id=node_id,
+        base_sha=base_sha,
+        artifacts=ArtifactStore(artifact_root),
+    )
+    capture_kwargs: dict[str, str] = {}
+    if dependency_input is not None:
+        dependency_input_ref, input_tree_sha = dependency_input
+        capture_kwargs = {
+            "task_id": task_id,
+            "node_id": node_id,
+            "input_tree_sha": input_tree_sha,
+            "dependency_input_ref": dependency_input_ref,
+        }
     if dry_run:
         with tempfile.TemporaryDirectory(prefix="codex-workbench-recovery-dry-run-") as directory:
             recovery = DirtyWorktreeRecovery(
@@ -365,11 +418,12 @@ def _capture_blocked_worktree_recovery(
                 WorktreeManager(config.state_root / "worktrees"),
             ).capture(
                 repository=contract["repository"],
-                base_sha=str(source["base_sha"]),
+                base_sha=base_sha,
                 worktree=str(source["worktree"]),
                 branch=str(source["branch"]),
                 attempt=expected_attempt,
                 expected_changed_paths=tuple(source["changed_paths"]),
+                **capture_kwargs,
             )
             _validate_blocked_worktree_recovery_receipt(
                 recovery,
@@ -392,11 +446,12 @@ def _capture_blocked_worktree_recovery(
         WorktreeManager(config.state_root / "worktrees"),
     ).capture(
         repository=contract["repository"],
-        base_sha=str(source["base_sha"]),
+        base_sha=base_sha,
         worktree=str(source["worktree"]),
         branch=str(source["branch"]),
         attempt=expected_attempt,
         expected_changed_paths=tuple(source["changed_paths"]),
+        **capture_kwargs,
     )
     return {
         **store.resume_blocked_worktree(
@@ -418,7 +473,7 @@ def _validate_blocked_worktree_recovery_receipt(
     *,
     expected_attempt: int,
 ) -> None:
-    required = {
+    common = {
         "schema_version",
         "source_attempt",
         "source_worktree",
@@ -428,13 +483,26 @@ def _validate_blocked_worktree_recovery_receipt(
         "patch_ref",
         "patch_sha256",
     }
+    schema_version = recovery.get("schema_version")
+    if schema_version == 1:
+        required = common
+    elif schema_version == 2:
+        required = common | {
+            "source_task_id",
+            "source_node_id",
+            "input_tree_sha",
+            "dependency_input_ref",
+        }
+    else:
+        raise ValueError("blocked-worktree recovery receipt schema is unsupported")
     if set(recovery) != required:
         raise ValueError("blocked-worktree recovery receipt has an invalid shape")
-    if recovery["schema_version"] != 1:
-        raise ValueError("blocked-worktree recovery receipt schema is unsupported")
     if recovery["source_attempt"] != expected_attempt:
         raise ValueError("blocked-worktree recovery receipt source attempt is invalid")
-    for field in ("source_worktree", "source_branch", "base_sha", "patch_ref", "patch_sha256"):
+    fields = ["source_worktree", "source_branch", "base_sha", "patch_ref", "patch_sha256"]
+    if schema_version == 2:
+        fields.extend(["source_task_id", "source_node_id", "input_tree_sha", "dependency_input_ref"])
+    for field in fields:
         if not isinstance(recovery[field], str) or not recovery[field]:
             raise ValueError(f"blocked-worktree recovery receipt field {field!r} is invalid")
     changed_paths = recovery["changed_paths"]

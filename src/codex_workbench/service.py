@@ -666,10 +666,13 @@ class Coordinator:
                 **governance_receipt_fields(contract),
             )
 
+        artifacts["patch"] = str(recovery["patch_ref"])
+        if isinstance(recovery.get("dependency_input_ref"), str):
+            artifacts["dependency-input"] = recovery["dependency_input_ref"]
         binding_ref = self.artifacts.put_text(
             canonical_json(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "blocked-worktree-recovery-binding",
                     "source": {
                         "allocation_id": binding["source_allocation_id"],
@@ -677,6 +680,8 @@ class Coordinator:
                         "worktree": source_worktree,
                         "branch": recovery["source_branch"],
                         "base_sha": recovery["base_sha"],
+                        "input_tree_sha": recovery.get("input_tree_sha"),
+                        "dependency_input_ref": recovery.get("dependency_input_ref"),
                         "patch_ref": recovery["patch_ref"],
                         "patch_sha256": recovery["patch_sha256"],
                     },
@@ -708,6 +713,16 @@ class Coordinator:
             contract=contract,
             spec=spec,
             worktree=target,
+            input_tree_sha=(
+                recovery["input_tree_sha"]
+                if isinstance(recovery.get("input_tree_sha"), str)
+                else None
+            ),
+            input_receipt_ref=(
+                recovery["dependency_input_ref"]
+                if isinstance(recovery.get("dependency_input_ref"), str)
+                else None
+            ),
         )
         result = validate_worker_scope(self.worktrees, request, result)
         if result.status != "succeeded":

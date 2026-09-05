@@ -11,9 +11,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.cli import build_parser, command_task
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.dependency_inputs import (
+    apply_accepted_ancestor_patches,
+    load_recorded_dependency_input,
+)
 from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecovery
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
@@ -155,6 +160,177 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             recovery=recovery,
         )
 
+    def _blocked_dependent_task(self) -> tuple[TaskContract, dict, Path, str, bytes]:
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/schema.txt').read_text() == 'schema\\n'; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'\""
+        )
+        contract = TaskContract(
+            task_id="blocked-dependent-worktree",
+            repository=str(self.repository),
+            base_sha=self.base_sha,
+            objective="recover one dependent dirty worker from its recorded input",
+            allowed_scope=("src",),
+            acceptance_commands=(command,),
+            executor_model="fixture",
+            verifier_model="fixture",
+        )
+        schema = NodeSpec(
+            "schema",
+            contract.task_id,
+            "create accepted ancestor patch",
+            "fixture",
+            "fixture",
+            "create schema source",
+            write_scopes=("src",),
+        )
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "recover dependent worker patch",
+            "fixture",
+            "fixture",
+            "change only worker source",
+            depends_on=("schema",),
+            write_scopes=("src",),
+        )
+        verifier = NodeSpec(
+            "verify",
+            contract.task_id,
+            "compose accepted closure",
+            "fixture",
+            "fixture",
+            "verify",
+            depends_on=("schema", "worker"),
+            verifier=True,
+        )
+        self.store.create_task(contract, [schema, worker, verifier], "blocked-dependent-create")
+        self.store.queue_task(contract.task_id)
+        artifacts = ArtifactStore(self.state_root / "artifacts")
+
+        claimed_schema = self.store.claim_ready_node("schema-worker", self.epoch)
+        assert claimed_schema is not None
+        schema_worktree = self.worktrees.prepare(
+            contract.repository,
+            contract.base_sha,
+            contract.task_id,
+            schema.node_id,
+            int(claimed_schema["attempt"]),
+        )
+        self.store.assign_worktree(
+            contract.task_id,
+            schema.node_id,
+            str(schema_worktree),
+            attempt=int(claimed_schema["attempt"]),
+            coordinator_epoch=int(claimed_schema["coordinator_epoch"]),
+            lease_epoch=int(claimed_schema["lease_epoch"]),
+        )
+        (schema_worktree / "src" / "schema.txt").write_text("schema\n", encoding="utf-8")
+        schema_patch = self.worktrees.diff_patch(schema_worktree, self.base_sha)
+        self.store.settle_claimed(
+            claimed_schema,
+            NodeResult(
+                "succeeded",
+                "accepted ancestor completed",
+                artifacts={"patch": artifacts.put_bytes(schema_patch, "patch")},
+                actual_model="fixture",
+                result_kind="worker",
+                changed_paths=("src/schema.txt",),
+                checks=("fixture ancestor patch",),
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+
+        claimed_worker = self.store.claim_ready_node("dependent-worker", self.epoch)
+        assert claimed_worker is not None
+        source = self.worktrees.prepare(
+            contract.repository,
+            contract.base_sha,
+            contract.task_id,
+            worker.node_id,
+            int(claimed_worker["attempt"]),
+        )
+        self.store.assign_worktree(
+            contract.task_id,
+            worker.node_id,
+            str(source),
+            attempt=int(claimed_worker["attempt"]),
+            coordinator_epoch=int(claimed_worker["coordinator_epoch"]),
+            lease_epoch=int(claimed_worker["lease_epoch"]),
+        )
+        dependency_input = apply_accepted_ancestor_patches(
+            self.store.get_task(contract.task_id),
+            worker.node_id,
+            source,
+            artifacts,
+            self.worktrees,
+        )
+        assert dependency_input is not None
+        dependency_input_ref = artifacts.put_text(
+            json.dumps(dependency_input.receipt, ensure_ascii=False, sort_keys=True),
+            "dependency-input.json",
+        )
+        (source / "src" / "value.txt").write_text("patched\n", encoding="utf-8")
+        source_worker_patch = self.worktrees.diff_patch(source, dependency_input.input_tree_sha)
+        self.store.settle_claimed(
+            claimed_worker,
+            NodeResult(
+                "blocked",
+                "fixture worker stopped after its own tracked patch",
+                artifacts={"dependency-input": dependency_input_ref},
+                actual_model="fixture",
+                result_kind="worker",
+                changed_paths=("src/value.txt",),
+                checks=("fixture dependent worker blocked",),
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+        return (
+            contract,
+            self.store.get_task(contract.task_id),
+            source,
+            dependency_input_ref,
+            source_worker_patch,
+        )
+
+    def _authorize_dependent(
+        self,
+        contract: TaskContract,
+        blocked: dict,
+        source: Path,
+        dependency_input_ref: str,
+    ) -> dict:
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        dependency_input = json.loads(
+            ArtifactStore(self.state_root / "artifacts")
+            .verify(dependency_input_ref)
+            .read_text(encoding="utf-8")
+        )
+        recovery = self.recovery.capture(
+            repository=contract.repository,
+            base_sha=contract.base_sha,
+            worktree=str(source),
+            branch=self.worktrees.branch_name(contract.task_id, "worker", int(worker["attempt"])),
+            attempt=int(worker["attempt"]),
+            expected_changed_paths=tuple(worker["result"]["changed_paths"]),
+            task_id=contract.task_id,
+            node_id="worker",
+            input_tree_sha=dependency_input["input_tree_sha"],
+            dependency_input_ref=dependency_input_ref,
+        )
+        self.assertEqual(recovery["schema_version"], 2)
+        return self.store.resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="replay the persisted dependency input and only the worker delta",
+            recovery=recovery,
+        )
+
     def test_clean_a2_recovery_never_invokes_a_model_or_mutates_a1(self) -> None:
         command = f"{sys.executable} -c \"from pathlib import Path; assert Path('src/value.txt').read_text() == 'patched\\n'\""
         contract, blocked, source, source_patch = self._blocked_task(acceptance_command=command)
@@ -193,6 +369,76 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(allocations[2]["state"], "active")
         events = [event["event_type"] for event in self.store.read_events(task_id=contract.task_id)]
         self.assertIn("node.blocked_worktree_recovery_consumed", events)
+
+    def test_dependent_recovery_replays_recorded_input_and_only_worker_delta(self) -> None:
+        contract, blocked, source, dependency_input_ref, source_worker_patch = self._blocked_dependent_task()
+        source_patch_before = subprocess.run(
+            ["git", "-C", str(source), "diff", "--binary", self.base_sha],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self._authorize_dependent(contract, blocked, source, dependency_input_ref)
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("dependent-recovery-worker")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 2))
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("model executor must not run"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((worker["state"], worker["attempt"]), ("accepted", 2))
+        self.assertEqual(worker["result"]["changed_paths"], ["src/value.txt"])
+        self.assertEqual(worker["result"]["artifacts"]["patch"], worker["result"]["artifacts"]["recovery-snapshot"])
+        self.assertEqual(worker["result"]["artifacts"]["dependency-input"], dependency_input_ref)
+        target = Path(worker["worktree"])
+        self.assertEqual((target / "src" / "schema.txt").read_text(encoding="utf-8"), "schema\n")
+        self.assertEqual((target / "src" / "value.txt").read_text(encoding="utf-8"), "patched\n")
+        recovered_input = load_recorded_dependency_input(
+            ArtifactStore(self.state_root / "artifacts"),
+            dependency_input_ref,
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=contract.base_sha,
+        )
+        self.assertEqual(
+            self.worktrees.diff_patch(target, recovered_input.input_tree_sha),
+            source_worker_patch,
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(source), "diff", "--binary", self.base_sha],
+                check=True,
+                capture_output=True,
+            ).stdout,
+            source_patch_before,
+        )
+
+        verifier_input = self.worktrees.prepare(
+            contract.repository,
+            contract.base_sha,
+            contract.task_id,
+            "verify",
+            1,
+        )
+        composed = apply_accepted_ancestor_patches(
+            task,
+            "verify",
+            verifier_input,
+            ArtifactStore(self.state_root / "artifacts"),
+            self.worktrees,
+        )
+        self.assertIsNotNone(composed)
+        self.assertEqual((verifier_input / "src" / "schema.txt").read_text(encoding="utf-8"), "schema\n")
+        self.assertEqual((verifier_input / "src" / "value.txt").read_text(encoding="utf-8"), "patched\n")
 
     def test_failed_clean_a2_preparation_restores_the_a1_block_without_mutation(self) -> None:
         command = f"{sys.executable} -c \"raise SystemExit(7)\""
@@ -358,6 +604,44 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             ).stdout,
             source_patch,
         )
+
+
+    def test_cli_dry_run_preserves_recorded_dependency_input(self) -> None:
+        command = f"{sys.executable} -c \"raise SystemExit(0)\""
+        contract, blocked, source, dependency_input_ref, source_worker_patch = self._blocked_dependent_task()
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        events_before = self.store.read_events(task_id=contract.task_id)
+        args = build_parser().parse_args([
+            "--home", str(self.state_root),
+            "task", "resume-blocked-worktree", contract.task_id, "worker",
+            "--expected-revision", str(blocked["state_revision"]),
+            "--expected-attempt", str(worker["attempt"]),
+            "--reason", "inspect the dependent worker delta before authorizing recovery",
+            "--confirm-recovery", "--dry-run",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(command_task(args), 0)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["dry_run"])
+        self.assertTrue(payload["source_capture_read_only"])
+        recovery = payload["recovery"]
+        self.assertEqual(recovery["schema_version"], 2)
+        self.assertEqual(recovery["dependency_input_ref"], dependency_input_ref)
+        recovered_input = load_recorded_dependency_input(
+            ArtifactStore(self.state_root / "artifacts"),
+            dependency_input_ref,
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=contract.base_sha,
+        )
+        self.assertEqual(recovery["input_tree_sha"], recovered_input.input_tree_sha)
+        self.assertEqual(
+            self.worktrees.diff_patch(source, recovered_input.input_tree_sha),
+            source_worker_patch,
+        )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
 
 
 if __name__ == "__main__":

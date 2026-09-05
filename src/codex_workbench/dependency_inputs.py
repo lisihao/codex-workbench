@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -20,6 +21,130 @@ class DependencyInput:
 
     input_tree_sha: str
     receipt: dict[str, Any]
+
+
+def load_recorded_dependency_input(
+    artifacts: ArtifactStore,
+    ref: str,
+    *,
+    task_id: str,
+    node_id: str,
+    base_sha: str,
+) -> DependencyInput:
+    """Load one immutable dependency-input receipt recorded for a worker.
+
+    A later recovery must use the exact ancestor closure visible to the
+    original worker, rather than whichever accepted nodes happen to exist at
+    recovery time. The content-addressed receipt is therefore both the
+    provenance record and the replay recipe.
+    """
+
+    if not isinstance(ref, str) or not ref:
+        raise DependencyInputError("recorded dependency input ref is invalid")
+    try:
+        payload = json.loads(artifacts.verify(ref).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise DependencyInputError(
+            "recorded dependency input artifact is unavailable or invalid"
+        ) from error
+    if not isinstance(payload, dict):
+        raise DependencyInputError("recorded dependency input must be an object")
+    required = {
+        "schema_version",
+        "kind",
+        "task_id",
+        "node_id",
+        "contract_base_sha",
+        "input_tree_sha",
+        "ancestors",
+    }
+    if set(payload) != required:
+        raise DependencyInputError("recorded dependency input has an invalid shape")
+    if payload["schema_version"] != 1 or payload["kind"] != "accepted-ancestor-patch-input":
+        raise DependencyInputError("recorded dependency input schema is unsupported")
+    if payload["task_id"] != task_id or payload["node_id"] != node_id:
+        raise DependencyInputError("recorded dependency input belongs to another node")
+    if payload["contract_base_sha"] != base_sha:
+        raise DependencyInputError("recorded dependency input has another contract base")
+    input_tree_sha = payload["input_tree_sha"]
+    if not isinstance(input_tree_sha, str) or not input_tree_sha:
+        raise DependencyInputError("recorded dependency input tree is invalid")
+    ancestors = payload["ancestors"]
+    if not isinstance(ancestors, list):
+        raise DependencyInputError("recorded dependency input ancestors are invalid")
+    normalized_ancestors: list[dict[str, Any]] = []
+    for source in ancestors:
+        if not isinstance(source, dict) or set(source) != {"node_id", "attempt", "patch_ref"}:
+            raise DependencyInputError("recorded dependency input ancestor is invalid")
+        source_node_id = source["node_id"]
+        attempt = source["attempt"]
+        patch_ref = source["patch_ref"]
+        if not isinstance(source_node_id, str) or not source_node_id:
+            raise DependencyInputError("recorded dependency input ancestor node is invalid")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise DependencyInputError("recorded dependency input ancestor attempt is invalid")
+        if patch_ref is not None:
+            if not isinstance(patch_ref, str) or not patch_ref:
+                raise DependencyInputError("recorded dependency input ancestor patch is invalid")
+            try:
+                artifacts.verify(patch_ref)
+            except ValueError as error:
+                raise DependencyInputError(
+                    "recorded dependency input ancestor patch is unavailable"
+                ) from error
+        normalized_ancestors.append(
+            {"node_id": source_node_id, "attempt": attempt, "patch_ref": patch_ref}
+        )
+    return DependencyInput(
+        input_tree_sha=input_tree_sha,
+        receipt={
+            "schema_version": 1,
+            "kind": "accepted-ancestor-patch-input",
+            "task_id": task_id,
+            "node_id": node_id,
+            "contract_base_sha": base_sha,
+            "input_tree_sha": input_tree_sha,
+            "ancestors": normalized_ancestors,
+        },
+    )
+
+
+def apply_recorded_dependency_input(
+    artifacts: ArtifactStore,
+    manager: WorktreeManager,
+    *,
+    ref: str,
+    task_id: str,
+    node_id: str,
+    base_sha: str,
+    worktree: Path,
+) -> DependencyInput:
+    """Materialize one recorded dependency-input receipt onto a clean tree."""
+
+    dependency_input = load_recorded_dependency_input(
+        artifacts,
+        ref,
+        task_id=task_id,
+        node_id=node_id,
+        base_sha=base_sha,
+    )
+    _require_clean_worktree(worktree)
+    for source in dependency_input.receipt["ancestors"]:
+        patch_ref = source["patch_ref"]
+        if patch_ref is None:
+            continue
+        try:
+            manager.apply_patch(worktree, artifacts.verify(patch_ref))
+        except (ValueError, WorktreeError) as error:
+            raise DependencyInputError(
+                f"cannot apply recorded dependency {source['node_id']} patch"
+            ) from error
+    actual_tree = write_input_tree(worktree)
+    if actual_tree != dependency_input.input_tree_sha:
+        raise DependencyInputError(
+            "recorded dependency input did not reproduce its input tree"
+        )
+    return dependency_input
 
 
 def apply_accepted_ancestor_patches(

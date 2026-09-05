@@ -11,6 +11,11 @@ import subprocess
 from typing import Any, Callable, Mapping
 
 from .artifacts import ArtifactStore
+from .dependency_inputs import (
+    DependencyInputError,
+    apply_recorded_dependency_input,
+    changed_paths_since_input_tree,
+)
 from .worktrees import WorktreeError, WorktreeManager
 
 
@@ -190,9 +195,49 @@ class DirtyWorktreeRecovery:
         branch: str,
         attempt: int,
         expected_changed_paths: tuple[str, ...],
+        task_id: str | None = None,
+        node_id: str | None = None,
+        input_tree_sha: str | None = None,
+        dependency_input_ref: str | None = None,
     ) -> dict[str, object]:
+        """Capture only the blocked worker's own patch.
+
+        A dependent worker starts from a materialized ancestor tree rather
+        than the contract commit. Its recovery receipt pins that exact input
+        artifact and calculates the worker delta from that tree, so accepted
+        ancestor patches never become part of the worker's patch.
+        """
+
         path = self._validate_worktree(repository, base_sha, worktree, branch)
-        changed_paths = tuple(sorted(self.worktrees.changed_paths(path, base_sha)))
+        if dependency_input_ref is None:
+            if any(value is not None for value in (task_id, node_id, input_tree_sha)):
+                raise DirtyWorktreeRecoveryError(
+                    "dependency recovery input requires its artifact ref"
+                )
+            comparison_tree = self._git_text(path, "rev-parse", f"{base_sha}^{{tree}}")
+            recovery_context: dict[str, object] = {"schema_version": 1}
+        else:
+            if not all(
+                isinstance(value, str) and value
+                for value in (task_id, node_id, input_tree_sha, dependency_input_ref)
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    "dependency recovery input receipt is incomplete"
+                )
+            comparison_tree = self._git_text(
+                path,
+                "rev-parse",
+                "--verify",
+                f"{input_tree_sha}^{{tree}}",
+            )
+            recovery_context = {
+                "schema_version": 2,
+                "source_task_id": task_id,
+                "source_node_id": node_id,
+                "input_tree_sha": comparison_tree,
+                "dependency_input_ref": dependency_input_ref,
+            }
+        changed_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if changed_paths != tuple(sorted(expected_changed_paths)):
             raise DirtyWorktreeRecoveryError(
                 "worktree changed paths do not match the blocked worker receipt"
@@ -201,17 +246,18 @@ class DirtyWorktreeRecovery:
         if untracked:
             names = [name.decode("utf-8", errors="replace") for name in untracked.split(b"\0") if name]
             raise DirtyWorktreeRecoveryError(
-                f"dirty worktree contains untracked files; explicit archival is required first: {', '.join(names)}"
+                "dirty worktree contains untracked files; explicit archival is required first: "
+                + ", ".join(names)
             )
-        check = self._git_text(path, "diff", "--check", base_sha)
+        check = self._git_text(path, "diff", "--check", comparison_tree)
         if check:
             raise DirtyWorktreeRecoveryError(f"dirty worktree fails git diff --check: {check}")
-        patch = self._git_bytes(path, "diff", "--binary", base_sha)
+        patch = self._git_bytes(path, "diff", "--binary", comparison_tree)
         if not patch:
             raise DirtyWorktreeRecoveryError("dirty worktree has no tracked patch to preserve")
         patch_ref = self.artifacts.put_bytes(patch, "blocked-worktree.patch")
         return {
-            "schema_version": 1,
+            **recovery_context,
             "source_attempt": attempt,
             "source_worktree": str(path),
             "source_branch": branch,
@@ -249,16 +295,18 @@ class DirtyWorktreeRecovery:
                 target_attempt,
                 recovery,
             )
+            comparison_tree = self._restore_recorded_input(target, recovery)
             patch = self._load_patch(recovery)
             patch_path = self._patch_path(recovery)
             self.worktrees.apply_patch(target, patch_path)
-            if self._git_bytes(target, "diff", "--binary", str(recovery["base_sha"])) != patch:
+            if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target patch does not exactly match the captured source patch"
                 )
             checks = [
                 "PASS: blocked dirty worktree snapshot is unchanged",
-                "PASS: captured patch was applied to the clean recovery target",
+                "PASS: recorded dependency input was reproduced on the clean recovery target",
+                "PASS: captured worker patch was applied to the clean recovery target",
             ]
             materialization = self.materializer.materialize(target, timeout_seconds=timeout_seconds)
             materialization_ref = self.artifacts.put_text(
@@ -294,7 +342,7 @@ class DirtyWorktreeRecovery:
                         tuple(str(path) for path in recovery["changed_paths"]),
                         outcome.exit_code,
                     )
-            if self._git_bytes(target, "diff", "--binary", str(recovery["base_sha"])) != patch:
+            if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target changed after offline materialization or acceptance"
                 )
@@ -393,19 +441,119 @@ class DirtyWorktreeRecovery:
             ) from error
         if path != expected_source:
             raise DirtyWorktreeRecoveryError("recovery source does not match the captured worktree")
-        current_paths = tuple(sorted(self.worktrees.changed_paths(path, base_sha)))
+        comparison_tree, _, _, _ = self._recovery_input_context(path, recovery)
+        current_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if current_paths != tuple(sorted(changed_paths)):
             raise DirtyWorktreeRecoveryError("dirty worktree changed paths drifted after recovery was scheduled")
         untracked = self._git_bytes(path, "ls-files", "--others", "--exclude-standard", "-z")
         if untracked:
             raise DirtyWorktreeRecoveryError("dirty worktree gained untracked files after recovery was scheduled")
-        patch = self._git_bytes(path, "diff", "--binary", base_sha)
+        patch = self._git_bytes(path, "diff", "--binary", comparison_tree)
         expected_hash = recovery["patch_sha256"]
         if not isinstance(expected_hash, str) or sha256(patch).hexdigest() != expected_hash:
             raise DirtyWorktreeRecoveryError("dirty worktree patch drifted after recovery was scheduled")
         if self._load_patch(recovery) != patch:
             raise DirtyWorktreeRecoveryError("dirty worktree no longer matches its preserved patch artifact")
         return path
+
+    def _recovery_input_context(
+        self,
+        worktree: Path,
+        recovery: Mapping[str, object],
+    ) -> tuple[str, str | None, str | None, str | None]:
+        """Return the worker-input tree and optional recorded-input binding."""
+
+        schema_version = recovery.get("schema_version")
+        base_sha = recovery.get("base_sha")
+        if not isinstance(base_sha, str) or not base_sha:
+            raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid base_sha")
+        if schema_version == 1:
+            legacy = {
+                "schema_version",
+                "source_attempt",
+                "source_worktree",
+                "source_branch",
+                "base_sha",
+                "changed_paths",
+                "patch_ref",
+                "patch_sha256",
+            }
+            if set(recovery) != legacy:
+                raise DirtyWorktreeRecoveryError("blocked legacy recovery receipt has an invalid shape")
+            return (
+                self._git_text(worktree, "rev-parse", f"{base_sha}^{{tree}}"),
+                None,
+                None,
+                None,
+            )
+        if schema_version != 2:
+            raise DirtyWorktreeRecoveryError("blocked recovery receipt schema is unsupported")
+        required = {
+            "schema_version",
+            "source_task_id",
+            "source_node_id",
+            "input_tree_sha",
+            "dependency_input_ref",
+            "source_attempt",
+            "source_worktree",
+            "source_branch",
+            "base_sha",
+            "changed_paths",
+            "patch_ref",
+            "patch_sha256",
+        }
+        if set(recovery) != required:
+            raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt has an invalid shape")
+        task_id = recovery["source_task_id"]
+        node_id = recovery["source_node_id"]
+        input_tree_sha = recovery["input_tree_sha"]
+        dependency_input_ref = recovery["dependency_input_ref"]
+        if not all(
+            isinstance(value, str) and value
+            for value in (task_id, node_id, input_tree_sha, dependency_input_ref)
+        ):
+            raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt is incomplete")
+        return (
+            self._git_text(worktree, "rev-parse", "--verify", f"{input_tree_sha}^{{tree}}"),
+            task_id,
+            node_id,
+            dependency_input_ref,
+        )
+
+    def _restore_recorded_input(
+        self,
+        target: Path,
+        recovery: Mapping[str, object],
+    ) -> str:
+        comparison_tree, task_id, node_id, dependency_input_ref = self._recovery_input_context(
+            target,
+            recovery,
+        )
+        if dependency_input_ref is None:
+            if self._git_text(target, "write-tree") != comparison_tree:
+                raise DirtyWorktreeRecoveryError("clean recovery target does not match contract input tree")
+            return comparison_tree
+        base_sha = recovery["base_sha"]
+        assert isinstance(base_sha, str)
+        try:
+            restored = apply_recorded_dependency_input(
+                self.artifacts,
+                self.worktrees,
+                ref=dependency_input_ref,
+                task_id=str(task_id),
+                node_id=str(node_id),
+                base_sha=base_sha,
+                worktree=target,
+            )
+        except DependencyInputError as error:
+            raise DirtyWorktreeRecoveryError(
+                f"cannot reproduce recorded dependency input: {error}"
+            ) from error
+        if restored.input_tree_sha != comparison_tree:
+            raise DirtyWorktreeRecoveryError(
+                "recorded dependency input tree differs from the recovery receipt"
+            )
+        return comparison_tree
 
     def _validate_target(
         self,
