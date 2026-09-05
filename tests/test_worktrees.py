@@ -156,5 +156,88 @@ class ScopeTests(unittest.TestCase):
         )
 
 
+class WorktreePathTests(unittest.TestCase):
+    @staticmethod
+    def _symlinked_root(root: Path) -> tuple[Path, Path]:
+        physical_root = root / "physical-worktrees"
+        physical_root.mkdir()
+        linked_root = root / "worktrees"
+        linked_root.symlink_to(physical_root, target_is_directory=True)
+        return linked_root, physical_root.resolve(strict=True)
+
+    def test_prepare_registers_new_worktree_at_physical_path_under_symlinked_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, base_sha = ScopeTests._repository(root)
+            linked_root, physical_root = self._symlinked_root(root)
+
+            worktree = WorktreeManager(linked_root).prepare(
+                str(repository), base_sha, "task", "worker", 1
+            )
+
+            expected = physical_root / "task" / "worker-a1"
+            registration = subprocess.run(
+                ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            actual_base = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            actual_branch = subprocess.run(
+                ["git", "-C", str(worktree), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(worktree, expected)
+            self.assertTrue(worktree.is_dir())
+            self.assertEqual(actual_base, base_sha)
+            self.assertEqual(actual_branch, WorktreeManager.branch_name("task", "worker", 1))
+            self.assertIn(f"worktree {expected}", registration)
+            self.assertNotIn(str(linked_root / "task" / "worker-a1"), registration)
+
+    def test_prepare_reuses_legacy_symlinked_worktree_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, base_sha = ScopeTests._repository(root)
+            linked_root, _ = self._symlinked_root(root)
+            legacy = linked_root / "task" / "worker-a1"
+            legacy.parent.mkdir(parents=True)
+            branch = WorktreeManager.branch_name("task", "worker", 1)
+            subprocess.run(
+                ["git", "-C", str(repository), "worktree", "add", "-b", branch, str(legacy), base_sha],
+                check=True,
+                capture_output=True,
+            )
+            before = subprocess.run(
+                ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+            worktree = WorktreeManager(linked_root).prepare(
+                str(repository), base_sha, "task", "worker", 1
+            )
+
+            after = subprocess.run(
+                ["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(worktree, legacy.resolve(strict=True))
+            self.assertEqual(after, before)
+            self.assertEqual(
+                sum(line.startswith("worktree ") for line in after.splitlines()),
+                2,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

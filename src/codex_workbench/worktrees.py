@@ -63,7 +63,9 @@ class WorktreeManager:
             resolved_base = self._git(repo, "rev-parse", f"{base_sha}^{{commit}}")
             task_segment = _safe_segment(task_id)
             node_segment = _safe_segment(node_id)
-            worktree = self.root / task_segment / f"{node_segment}-a{attempt}"
+            worktree = (
+                self.root / task_segment / f"{node_segment}-a{attempt}"
+            ).expanduser().resolve(strict=False)
             branch = self.branch_name(task_id, node_id, attempt)
             if worktree.exists():
                 actual = self._git(worktree, "rev-parse", "HEAD")

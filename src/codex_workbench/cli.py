@@ -328,6 +328,25 @@ def command_task(args: argparse.Namespace) -> int:
         result = store.list_tasks()
     elif args.action == "get":
         result = store.get_task(args.task_id)
+    elif args.action == "reconcile-archify":
+        result = store.reconcile_archify_metadata(
+            args.task_id,
+            expected_revision=args.expected_revision,
+            reason=args.reason,
+            dry_run=bool(args.dry_run),
+        )
+        result = {"ok": True, "action": "reconcile-archify", **result}
+    elif args.action == "retry-blocked":
+        result = store.retry_blocked_node(
+            args.task_id,
+            args.node_id,
+            expected_revision=args.expected_revision,
+            expected_attempt=args.expected_attempt,
+            reason=args.reason,
+            confirm_no_side_effects=bool(args.confirm_no_side_effects),
+            dry_run=bool(args.dry_run),
+        )
+        result = {"ok": True, "action": "retry-blocked", **result}
     elif args.action == "resolve":
         revision = store.resolve_indeterminate(
             args.task_id,
@@ -1399,6 +1418,22 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("node_id")
     resolve.add_argument("--resolution", choices=("retry", "fail", "cancel"), required=True)
     resolve.add_argument("--expected-revision", type=int, required=True)
+    retry_blocked = task_sub.add_parser("retry-blocked")
+    retry_blocked.add_argument("task_id")
+    retry_blocked.add_argument("node_id")
+    retry_blocked.add_argument("--expected-revision", type=int, required=True)
+    retry_blocked.add_argument("--expected-attempt", type=int, required=True)
+    retry_blocked.add_argument("--reason", required=True)
+    retry_blocked.add_argument(
+        "--confirm-no-side-effects", action="store_true", required=True,
+        help="record the operator assertion; it is not automatic verification",
+    )
+    retry_blocked.add_argument("--dry-run", action="store_true")
+    reconcile_archify = task_sub.add_parser("reconcile-archify")
+    reconcile_archify.add_argument("task_id")
+    reconcile_archify.add_argument("--expected-revision", type=int, required=True)
+    reconcile_archify.add_argument("--reason", required=True)
+    reconcile_archify.add_argument("--dry-run", action="store_true")
     priority = task_sub.add_parser("priority")
     priority.add_argument("task_id")
     priority.add_argument("priority", type=int)

@@ -225,20 +225,26 @@ _ARCHIFY_ROLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 _ARCHIFY_ARTIFACT_PATTERN = re.compile(
-    r"archify|architecture\s+(?:artifact|diagram|map)|architectural\s+(?:artifact|diagram|map)|"
-    r"(?:diagram|flowchart|sequence\s+diagram|data[- ]?flow|lifecycle|state\s+machine)|"
-    r"(?:artifact|standalone\s+html|inline\s+svg|typed\s+(?:json|ir))|"
+    r"(?:use|invoke|run|with)\s+\$?archify\b|(?:使用|调用|运行)\s*\$?archify|"
+    r"architecture\s+(?:artifact|diagram|map)|architectural\s+(?:artifact|diagram|map)|"
+    r"(?:\bdiagrams?\b|\bflowcharts?\b|sequence\s+diagram|data[- ]?flow\s+diagram|"
+    r"lifecycle\s+diagram|state\s+machine\s+diagram)|"
+    r"typed\s+(?:graph|diagram)\s*(?:json|ir)?|"
     r"架构(?:图|类工件|类 artifact)|流程图|时序图|数据流图|生命周期图|状态机图|"
     r"生成(?:或|/)?更新(?:架构|图示|工件)|更新(?:架构|图示|工件)",
     re.IGNORECASE,
 )
 _ARCHIFY_NEGATION_PATTERN = re.compile(
     r"(?:\b(?:without|no|not|never|avoid|skip|exclude)\s+"
-    r"(?:(?:an?|any|the)\s+)?(?:(?:create|generate|make|update|produce|use|using)\s+)?"
+    r"(?:(?:an?|any|the)\s+)?(?:(?:create|creating|generate|generating|make|making|update|updating|produce|producing|use|using|add|adding|draw|drawing|render|rendering)\s+)?"
     r"(?:(?:an?|any|the)\s+)?"
-    r"(?:architecture(?:[- ]class)?\s+)?(?:artifacts?|diagrams?|flowcharts?)\b|"
-    r"\b(?:无需|不需要|不要|避免|跳过)\s*(?:使用|生成|更新)?\s*"
-    r"(?:架构(?:类工件|图)?|图示|工件))",
+    r"(?:(?:unrelated|extra|new)\s+)?"
+    r"(?:architecture(?:[- ]class)?\s+)?(?:artifacts?|diagrams?|graphics?|flowcharts?|archify)\b|"
+    r"\bnot\s+(?:an?\s+)?request\s+for\b[^\n.!?;]{0,180}?"
+    r"(?:diagrams?|graphics?|flowcharts?|archify)\b|"
+    r"(?:无需|不需要|不要|避免|跳过|不添加|不生成|不是要求)\s*"
+    r"(?:使用|生成|更新|添加|绘制)?\s*(?:无关的?)?"
+    r"(?:架构(?:类工件|图形|图)?|流程图|时序图|数据流图|图示|图形|工件))",
     re.IGNORECASE,
 )
 _ARCHIFY_INTERNAL_SCHEMA_VERSION = 1
@@ -296,6 +302,20 @@ def _contract_value(contract: Any, name: str, default: Any = None) -> Any:
     return getattr(contract, name, default)
 
 
+def _archify_affirmative_text(text: str) -> str:
+    """Keep affirmative local clauses; a negated graph does not negate another graph."""
+    clauses = re.split(r"[\n.!?;。！？；]|\bbut\b|\binstead\b|但是|但|而是", text, flags=re.IGNORECASE)
+    return "\n".join(clause for clause in clauses if not _ARCHIFY_NEGATION_PATTERN.search(clause))
+
+
+def _explicit_archify_artifact(contract: Any) -> bool:
+    artifacts = _contract_value(contract, "required_artifacts", ())
+    return any(
+        _ARCHIFY_ARTIFACT_PATTERN.search(str(item)) or str(item).lower().startswith("archify")
+        for item in artifacts
+    )
+
+
 def archify_role_for(contract: Any, text: str = "") -> str | None:
     """Resolve an Archify role from the immutable task contract.
 
@@ -320,14 +340,17 @@ def archify_role_for(contract: Any, text: str = "") -> str | None:
         return task_type
     # A node is model-generated text.  It must never turn an ordinary task into
     # an architecture task, including when it quotes a directive-like marker.
-    if _ARCHIFY_NEGATION_PATTERN.search(objective):
+    affirmative = _archify_affirmative_text(objective)
+    if _ARCHIFY_NEGATION_PATTERN.search(objective) and not (
+        _ARCHIFY_ARTIFACT_PATTERN.search(affirmative) or _explicit_archify_artifact(contract)
+    ):
         return None
     for role, pattern in _ARCHIFY_ROLE_PATTERNS:
-        if pattern.search(objective):
+        if pattern.search(affirmative):
             return role
     # A bare design request is intentionally not enough: it may be UI/product
     # work with no architecture artifact and should not spend an Archify turn.
-    if task_type == "design" and _ARCHIFY_ARTIFACT_PATTERN.search(objective):
+    if _ARCHIFY_ARTIFACT_PATTERN.search(affirmative) or _explicit_archify_artifact(contract):
         return "design"
     return None
 
@@ -345,13 +368,14 @@ def archify_artifact_requested(contract: Any, text: str = "") -> bool:
     role = archify_role_for(contract)
     if role is None:
         return False
-    if _ARCHIFY_NEGATION_PATTERN.search(objective):
-        return False
-    if not _ARCHIFY_ARTIFACT_PATTERN.search(objective):
+    affirmative = _archify_affirmative_text(objective)
+    if not (_ARCHIFY_ARTIFACT_PATTERN.search(affirmative) or _explicit_archify_artifact(contract)):
         return False
     # This is the only node-local change accepted by the requirement gate:
     # narrowing a contract-required artifact for a bounded node.
-    if _ARCHIFY_NEGATION_PATTERN.search(node_text):
+    if _ARCHIFY_NEGATION_PATTERN.search(node_text) and not _ARCHIFY_ARTIFACT_PATTERN.search(
+        _archify_affirmative_text(node_text)
+    ):
         return False
     return True
 
@@ -387,6 +411,55 @@ For a required artifact, return archify_receipt as a JSON string, not a nested o
 Attach independent external semantic evidence (requirements, revision-pinned repository evidence, or an independent review) for every artifact receipt. renderer/schema pass is never semantic correctness; authored reachability is never runtime impact or blast radius. A missing, stale, or renderer-only receipt is not acceptance. The verifier must call the Workbench adapter's validate_receipt(..., role="{resolved_role}", require_semantic=True) and reject any receipt whose semantic proof is absent or whose renderer pass is the only evidence.
 Role contract: {contract_json}
 If no architecture-class artifact is actually in this node's scope, do not invoke Archify or add a diagram merely to satisfy this directive; report archify=not-applicable and continue the bounded task."""
+
+
+def _separate_managed_archify_prompt(prompt: str, state: tuple[str, bool] | None) -> tuple[str, str]:
+    """Recognize only an exact generated trailing block, including its original host path."""
+    prefix, separator, tail = prompt.rpartition("\n\nArchify directive (")
+    if not separator or state is None:
+        return prompt, "Codex worker"
+    block = "Archify directive (" + tail
+    header = re.match(r"Archify directive \(([^;\n]+); role=([^;\n]+); artifact=(required|conditional)\):\n", block)
+    core = re.search(r"read the complete managed core at (.+?)/SKILL\.md; native Skill/plugin", block)
+    if header is None or core is None:
+        return prompt, "Codex worker"
+    role, required = state
+    actor = header.group(1)
+    expected = archify_directive({}, role=role, actor=actor, artifact_required=required)
+    expected = expected.replace(str(default_vendor_root().resolve()), core.group(1))
+    if block != expected:
+        return prompt, actor
+    return prefix, actor
+
+
+def propose_archify_reconciliation(contract: Any, nodes: Any) -> tuple[dict[str, Any], ...]:
+    """Propose derived-field repairs only for never-executed durable pending nodes.
+
+    This helper owns no persistence. The caller must apply proposals with a
+    revision fence and audit event; existing executions are never rewritten.
+    """
+    proposals: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, Mapping) or (
+            node.get("verifier") or node.get("state") != "pending" or node.get("attempt") != 0
+            or node.get("result") is not None or node.get("worktree") is not None
+        ):
+            continue
+        before = {"archify": node.get("archify"), "prompt": node["prompt"]}
+        body, actor = _separate_managed_archify_prompt(
+            before["prompt"], archify_internal_state(before["archify"])
+        )
+        text = f"{node.get('title', '')}\n{body}"
+        role = archify_role_for(contract, text)
+        required = archify_artifact_requested(contract, text)
+        directive = archify_directive(contract, text=text, role=role, actor=actor, artifact_required=required) if role else ""
+        after = {
+            "archify": archify_internal_directive(role, required) if role else None,
+            "prompt": body + "\n\n" + directive if directive else body,
+        }
+        if after != before:
+            proposals.append({"node_id": node["node_id"], "before": before, "after": after})
+    return tuple(proposals)
 
 
 def _string_tuple(raw: Any, field: str) -> tuple[str, ...]:

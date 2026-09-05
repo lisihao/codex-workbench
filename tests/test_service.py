@@ -1158,7 +1158,7 @@ raise AssertionError("fatal coordinator failure returned")
             route = _ClaimRoute(None, (), None)
             with (
                 patch.object(coordinator.worktrees, "prepare", return_value=worktree),
-                patch.object(coordinator, "_compose_worker_patches"),
+                patch.object(coordinator, "_compose_worker_patches", return_value=None),
                 patch.object(coordinator, "_archify_receipt_packets", return_value=(packet,)),
                 patch("codex_workbench.service.reusable_evidence_key", return_value="cache-key"),
                 patch(
@@ -1188,7 +1188,7 @@ raise AssertionError("fatal coordinator failure returned")
             )
             with (
                 patch.object(coordinator.worktrees, "prepare", return_value=worktree),
-                patch.object(coordinator, "_compose_worker_patches"),
+                patch.object(coordinator, "_compose_worker_patches", return_value=None),
                 patch.object(coordinator, "_archify_receipt_packets", return_value=(packet,)),
                 patch.object(coordinator, "_executor", return_value=executor),
                 patch("codex_workbench.service.reusable_evidence_key", return_value="cache-key"),

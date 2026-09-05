@@ -6,9 +6,10 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from codex_workbench.model import CODEX_ASTRA_MODEL, NodeResult, NodeSpec, TaskContract
-from codex_workbench.planner import archify_internal_directive
+from codex_workbench.planner import archify_directive, archify_internal_directive
 from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
@@ -899,6 +900,495 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(second["attempt"], 2)
         self.assertEqual(second["spec"]["model"], "gpt-5.6-luna")
         self.assertEqual(second["spec"]["model_capability_id"], "codex:gpt-5.6-luna")
+
+    def _create_blocked_terra_task(self, task_id: str = "blocked-terra") -> tuple[TaskContract, dict]:
+        contract = TaskContract(
+            task_id=task_id,
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="retry a no-write infrastructure block",
+            allowed_scope=("src",),
+            retry_limit=3,
+        )
+        worker = NodeSpec(
+            "worker",
+            task_id,
+            "worker",
+            "codex",
+            "gpt-5.6-terra",
+            "perform bounded work",
+            write_scopes=("src",),
+        )
+        self.store.create_task(contract, verified([worker], task_id), f"{task_id}-create")
+        self.store.queue_task(task_id)
+        claimed = self.store.claim_ready_node("first-worker", self.epoch)
+        assert claimed is not None
+        self.store.assign_worktree(
+            task_id,
+            "worker",
+            str(Path(self.temp.name) / f"{task_id}-attempt-{claimed['attempt']}"),
+            attempt=claimed["attempt"],
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+        )
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "blocked",
+                "sandbox writable root initialization failed before any file edit",
+                actual_model="gpt-5.6-terra",
+                exit_code=0,
+                result_kind="worker",
+                changed_paths=(),
+                checks=("sandbox writable-root preflight",),
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+        return contract, self.store.get_task(task_id)
+
+    def test_blocked_retry_dry_run_preserves_state_and_authorized_claim_keeps_terra_once(self) -> None:
+        contract, blocked = self._create_blocked_terra_task()
+        worker_before = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        events_before = self.store.read_events(task_id=contract.task_id)
+        allocations_before = self.store.list_worktree_allocations()
+
+        preview = self.store.retry_blocked_node(
+            contract.task_id,
+            "worker",
+            expected_revision=blocked["state_revision"],
+            expected_attempt=worker_before["attempt"],
+            reason="the sandbox failure occurred before file edits",
+            confirm_no_side_effects=True,
+            dry_run=True,
+        )
+
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["task"], {
+            "task_id": contract.task_id,
+            "state": "blocked",
+            "revision": blocked["state_revision"],
+        })
+        self.assertEqual(preview["node"], {"node_id": "worker", "state": "blocked", "attempt": 1})
+        self.assertEqual(preview["would_retry"]["attempt"], 2)
+        self.assertEqual(preview["would_retry"]["model"], "gpt-5.6-terra")
+        self.assertEqual(preview["would_retry"]["model_reasoning_effort"], "max")
+        self.assertTrue(preview["operator_asserted"])
+        self.assertFalse(preview["automatically_verified"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
+        self.assertEqual(self.store.list_worktree_allocations(), allocations_before)
+
+        receipt = self.store.retry_blocked_node(
+            contract.task_id,
+            "worker",
+            expected_revision=blocked["state_revision"],
+            expected_attempt=worker_before["attempt"],
+            reason="the sandbox failure occurred before file edits",
+            confirm_no_side_effects=True,
+        )
+        retried = self.store.get_task(contract.task_id)
+        worker = next(node for node in retried["nodes"] if node["node_id"] == "worker")
+        verifier = next(node for node in retried["nodes"] if node["node_id"] == "verify")
+        self.assertEqual(receipt["revision"], blocked["state_revision"] + 1)
+        self.assertEqual(retried["state"], "queued")
+        self.assertEqual(worker["state"], "pending")
+        self.assertEqual(worker["attempt"], 1)
+        self.assertEqual(worker["result"], worker_before["result"])
+        self.assertIsNone(worker["worktree"])
+        self.assertEqual((verifier["state"], verifier["attempt"]), ("pending", 0))
+        retained_allocations = self.store.list_worktree_allocations()
+        self.assertEqual(len(retained_allocations), 1)
+        self.assertEqual(retained_allocations[0]["attempt"], 1)
+        self.assertEqual(retained_allocations[0]["node_result"], worker_before["result"])
+
+        authorization = [
+            event for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.blocked_retry_authorized"
+        ][-1]
+        self.assertEqual(authorization["payload"]["original_attempt"], 1)
+        self.assertEqual(authorization["payload"]["next_attempt"], 2)
+        self.assertEqual(authorization["payload"]["requested_route"]["model"], "gpt-5.6-terra")
+        self.assertEqual(authorization["payload"]["effective_route"]["model"], "gpt-5.6-terra")
+        self.assertTrue(authorization["payload"]["operator_assertion"]["confirm_no_side_effects"])
+        self.assertFalse(authorization["payload"]["operator_assertion"]["automatically_verified"])
+
+        second = self.store.claim_ready_node("second-worker", self.epoch)
+        assert second is not None
+        self.assertEqual(second["attempt"], 2)
+        self.assertEqual(second["spec"]["executor"], "codex")
+        self.assertEqual(second["spec"]["model"], "gpt-5.6-terra")
+        self.assertEqual(second["spec"]["model_reasoning_effort"], "max")
+        started = [
+            event for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.started"
+        ][-1]
+        self.assertEqual(
+            started["payload"]["blocked_retry_authorization_event_cursor"],
+            receipt["authorization_event_cursor"],
+        )
+        self.store.assign_worktree(
+            contract.task_id,
+            "worker",
+            str(Path(self.temp.name) / "blocked-terra-attempt-2"),
+            attempt=second["attempt"],
+            coordinator_epoch=self.epoch,
+            lease_epoch=second["lease_epoch"],
+        )
+        self.assertEqual(
+            sorted(allocation["attempt"] for allocation in self.store.list_worktree_allocations()),
+            [1, 2],
+        )
+        self.store.settle_claimed(
+            second,
+            NodeResult(
+                "failed",
+                "ordinary quality retry after infrastructure recovery",
+                actual_model="gpt-5.6-terra",
+                retryable=True,
+                result_kind="worker",
+                governance_profile=contract.governance_profile,
+                verification_tier=contract.verification_tier,
+            ),
+        )
+        third = self.store.claim_ready_node("third-worker", self.epoch)
+        assert third is not None
+        self.assertEqual(third["attempt"], 3)
+        self.assertEqual(third["spec"]["model"], "gpt-5.6-sol")
+
+    def test_blocked_retry_requires_current_cas_and_operator_assertion(self) -> None:
+        contract, blocked = self._create_blocked_terra_task()
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        events_before = self.store.read_events(task_id=contract.task_id)
+
+        with self.assertRaisesRegex(StateConflictError, "task revision"):
+            self.store.retry_blocked_node(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"] - 1,
+                expected_attempt=worker["attempt"],
+                reason="stale revision",
+                confirm_no_side_effects=True,
+            )
+        with self.assertRaisesRegex(StateConflictError, "node attempt"):
+            self.store.retry_blocked_node(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"] - 1,
+                reason="stale attempt",
+                confirm_no_side_effects=True,
+            )
+        with self.assertRaisesRegex(ValueError, "operator assertion"):
+            self.store.retry_blocked_node(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="acknowledgement omitted",
+                confirm_no_side_effects=False,
+            )
+        with self.assertRaisesRegex(ValueError, "reason"):
+            self.store.retry_blocked_node(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="   ",
+                confirm_no_side_effects=True,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
+
+    def test_blocked_retry_rejects_changed_missing_and_indeterminate_receipts(self) -> None:
+        contract, blocked = self._create_blocked_terra_task()
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        original_result = worker["result"]
+        assert original_result is not None
+
+        invalid_receipts = {
+            "changed": {**original_result, "changed_paths": ["src/owned.py"]},
+            "missing_changed_paths": {key: value for key, value in original_result.items() if key != "changed_paths"},
+            "missing_result": None,
+        }
+        for label, receipt in invalid_receipts.items():
+            with self.subTest(label=label):
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = ?",
+                        (json.dumps(receipt) if receipt is not None else None, contract.task_id, "worker"),
+                    )
+                with self.assertRaises(StateConflictError):
+                    self.store.retry_blocked_node(
+                        contract.task_id,
+                        "worker",
+                        expected_revision=blocked["state_revision"],
+                        expected_attempt=worker["attempt"],
+                        reason="receipt does not prove a no-write block",
+                        confirm_no_side_effects=True,
+                    )
+
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = ?",
+                (json.dumps(original_result), contract.task_id, "worker"),
+            )
+            connection.execute(
+                "UPDATE nodes SET state = 'indeterminate' WHERE task_id = ? AND node_id = 'verify'",
+                (contract.task_id,),
+            )
+        with self.assertRaisesRegex(StateConflictError, "running or indeterminate"):
+            self.store.retry_blocked_node(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="companion node must be resolved first",
+                confirm_no_side_effects=True,
+            )
+
+    def _create_archify_reconciliation_task(
+        self,
+        task_id: str = "archify-reconciliation",
+    ) -> tuple[TaskContract, dict]:
+        contract = TaskContract(
+            task_id=task_id,
+            repository=self.contract.repository,
+            base_sha=self.contract.base_sha,
+            objective="repair the task without producing an architecture artifact",
+            allowed_scope=("src",),
+            task_type="architecture",
+        )
+        nodes = [
+            NodeSpec(
+                node_id,
+                task_id,
+                node_id,
+                "codex",
+                "gpt-5.6-terra",
+                f"raw prompt for {node_id} without a diagram\n\n" + archify_directive(
+                    contract,
+                    text=f"{node_id}\nraw prompt for {node_id} without a diagram",
+                    role="architecture",
+                    actor="Codex worker",
+                    artifact_required=True,
+                ),
+                write_scopes=("src",),
+                ordinal=ordinal,
+                archify=archify_internal_directive("architecture", True),
+            )
+            for ordinal, node_id in enumerate(("one", "two", "three"), start=1)
+        ]
+        self.store.create_task(contract, verified(nodes, task_id), f"{task_id}-create")
+        with self.store.transaction() as connection:
+            verify_row = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = 'verify'",
+                (task_id,),
+            ).fetchone()
+            assert verify_row is not None
+            verify_spec = json.loads(verify_row["spec_json"])
+            verify_body = verify_spec["prompt"]
+            verify_spec["archify"] = archify_internal_directive("architecture", False)
+            verify_spec["prompt"] = verify_body + "\n\n" + archify_directive(
+                contract,
+                text=f"{verify_spec['title']}\n{verify_body}",
+                role="architecture",
+                actor="Codex verifier",
+                artifact_required=False,
+            )
+            connection.execute(
+                "UPDATE nodes SET spec_json = ? WHERE task_id = ? AND node_id = 'verify'",
+                (json.dumps(verify_spec), task_id),
+            )
+            connection.execute(
+                "UPDATE tasks SET state = 'blocked', blocker = ? WHERE task_id = ?",
+                ("stale Archify directive", task_id),
+            )
+        return contract, self.store.get_task(task_id)
+
+    @staticmethod
+    def _archify_reconciliation_proposals(task: dict) -> tuple[dict, ...]:
+        return tuple(
+            {
+                "node_id": node["node_id"],
+                "before": {"archify": node["archify"], "prompt": node["prompt"]},
+                "after": {
+                    "archify": archify_internal_directive("architecture", False),
+                    "prompt": f"raw prompt for {node['node_id']}\n\nArchify directive (reconciled): no artifact",
+                },
+            }
+            for node in task["nodes"]
+            if node["node_id"] in {"one", "two", "three"}
+        )
+
+    def test_archify_reconciliation_dry_run_and_cas_preserve_blocked_task_history(self) -> None:
+        contract, blocked = self._create_archify_reconciliation_task()
+        proposals = self._archify_reconciliation_proposals(blocked)
+        events_before = self.store.read_events(task_id=contract.task_id)
+        with mock.patch(
+            "codex_workbench.store.propose_archify_reconciliation",
+            return_value=proposals,
+        ) as propose:
+            preview = self.store.reconcile_archify_metadata(
+                contract.task_id,
+                expected_revision=blocked["state_revision"],
+                reason="the frozen contract explicitly declines an artifact",
+                dry_run=True,
+            )
+        self.assertEqual(preview["status"], "would-reconcile")
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["task"], {
+            "task_id": contract.task_id,
+            "state": "blocked",
+            "revision": blocked["state_revision"],
+        })
+        self.assertEqual(preview["changes"], list(proposals))
+        propose.assert_called_once()
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
+
+        with mock.patch(
+            "codex_workbench.store.propose_archify_reconciliation",
+            return_value=proposals,
+        ):
+            receipt = self.store.reconcile_archify_metadata(
+                contract.task_id,
+                expected_revision=blocked["state_revision"],
+                reason="the frozen contract explicitly declines an artifact",
+            )
+        reconciled = self.store.get_task(contract.task_id)
+        self.assertEqual(receipt["status"], "reconciled")
+        self.assertEqual(reconciled["state"], "blocked")
+        self.assertEqual(reconciled["state_revision"], blocked["state_revision"] + 1)
+        self.assertEqual(reconciled["contract"], blocked["contract"])
+        self.assertEqual(reconciled["contract_hash"], blocked["contract_hash"])
+        for proposal in proposals:
+            node = next(item for item in reconciled["nodes"] if item["node_id"] == proposal["node_id"])
+            self.assertEqual(node["state"], "pending")
+            self.assertEqual(node["attempt"], 0)
+            self.assertIsNone(node["result"])
+            self.assertIsNone(node["worktree"])
+            self.assertEqual(node["archify"], proposal["after"]["archify"])
+            self.assertEqual(node["prompt"], proposal["after"]["prompt"])
+        verifier_before = next(item for item in blocked["nodes"] if item["node_id"] == "verify")
+        verifier_after = next(item for item in reconciled["nodes"] if item["node_id"] == "verify")
+        self.assertEqual(verifier_after["state"], verifier_before["state"])
+        self.assertEqual(verifier_after["prompt"], verifier_before["prompt"])
+        event = [
+            item for item in self.store.read_events(task_id=contract.task_id)
+            if item["event_type"] == "task.archify_reconciled"
+        ][-1]
+        self.assertEqual(event["payload"]["reason"], "the frozen contract explicitly declines an artifact")
+        self.assertEqual(event["payload"]["changes"], list(proposals))
+
+    def test_archify_reconciliation_uses_real_proposal_and_preserves_raw_prompt_body(self) -> None:
+        contract, blocked = self._create_archify_reconciliation_task()
+        bodies = {
+            node["node_id"]: node["prompt"].partition("\n\nArchify directive (")[0]
+            for node in blocked["nodes"]
+            if node["node_id"] in {"one", "two", "three"}
+        }
+
+        receipt = self.store.reconcile_archify_metadata(
+            contract.task_id,
+            expected_revision=blocked["state_revision"],
+            reason="the frozen contract explicitly declines an artifact",
+        )
+
+        self.assertEqual(receipt["status"], "reconciled")
+        self.assertTrue(
+            {"one", "two", "three"}.issubset({change["node_id"] for change in receipt["changes"]})
+        )
+        task = self.store.get_task(contract.task_id)
+        self.assertEqual(task["state"], "blocked")
+        for node_id, body in bodies.items():
+            node = next(item for item in task["nodes"] if item["node_id"] == node_id)
+            self.assertEqual(node["prompt"].partition("\n\nArchify directive (")[0], body)
+            self.assertEqual(node["archify"], archify_internal_directive("architecture", False))
+            self.assertIn("artifact=conditional", node["prompt"])
+            self.assertNotIn("artifact=required", node["prompt"])
+
+    def test_archify_reconciliation_no_changes_or_active_node_leaves_task_untouched(self) -> None:
+        contract, blocked = self._create_archify_reconciliation_task()
+        events_before = self.store.read_events(task_id=contract.task_id)
+        with mock.patch(
+            "codex_workbench.store.propose_archify_reconciliation",
+            return_value=(),
+        ):
+            unchanged = self.store.reconcile_archify_metadata(
+                contract.task_id,
+                expected_revision=blocked["state_revision"],
+                reason="no derived metadata differs",
+            )
+        self.assertEqual(unchanged["status"], "unchanged")
+        self.assertEqual(unchanged["revision"], blocked["state_revision"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
+
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET state = 'indeterminate' WHERE task_id = ? AND node_id = 'verify'",
+                (contract.task_id,),
+            )
+        with mock.patch("codex_workbench.store.propose_archify_reconciliation") as propose:
+            with self.assertRaisesRegex(StateConflictError, "running or indeterminate"):
+                self.store.reconcile_archify_metadata(
+                    contract.task_id,
+                    expected_revision=blocked["state_revision"],
+                    reason="a node is still unresolved",
+                )
+        propose.assert_not_called()
+
+    def test_archify_reconciliation_rejects_nonrecovery_task_states_including_dry_run(self) -> None:
+        contract, blocked = self._create_archify_reconciliation_task()
+        for state in ("queued", "running", "accepted"):
+            with self.subTest(state=state):
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET state = ? WHERE task_id = ?",
+                        (state, contract.task_id),
+                    )
+                with mock.patch("codex_workbench.store.propose_archify_reconciliation") as propose:
+                    with self.assertRaisesRegex(StateConflictError, "expected blocked or paused"):
+                        self.store.reconcile_archify_metadata(
+                            contract.task_id,
+                            expected_revision=blocked["state_revision"],
+                            reason="only an operator recovery state may reconcile",
+                            dry_run=True,
+                        )
+                    with self.assertRaisesRegex(StateConflictError, "expected blocked or paused"):
+                        self.store.reconcile_archify_metadata(
+                            contract.task_id,
+                            expected_revision=blocked["state_revision"],
+                            reason="only an operator recovery state may reconcile",
+                        )
+                propose.assert_not_called()
+
+    def test_archify_reconciliation_rejects_stale_revision_and_nonzero_attempt(self) -> None:
+        contract, blocked = self._create_archify_reconciliation_task()
+        proposals = self._archify_reconciliation_proposals(blocked)
+        with self.assertRaisesRegex(StateConflictError, "task revision"):
+            self.store.reconcile_archify_metadata(
+                contract.task_id,
+                expected_revision=blocked["state_revision"] - 1,
+                reason="stale request",
+            )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET attempt = 1 WHERE task_id = ? AND node_id = 'one'",
+                (contract.task_id,),
+            )
+        first_only = tuple(proposal for proposal in proposals if proposal["node_id"] == "one")
+        with mock.patch(
+            "codex_workbench.store.propose_archify_reconciliation",
+            return_value=first_only,
+        ):
+            with self.assertRaisesRegex(StateConflictError, "pending attempt-zero"):
+                self.store.reconcile_archify_metadata(
+                    contract.task_id,
+                    expected_revision=blocked["state_revision"],
+                    reason="attempt one must remain historical",
+                )
 
     def test_archify_validate_and_migrate_persist_host_command_validation_evidence(self) -> None:
         for command in ("validate", "migrate"):

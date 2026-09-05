@@ -26,6 +26,7 @@ from .model import (
 from .artifacts import ArtifactStore, presentation_format
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
+from .planner import propose_archify_reconciliation
 from .scheduler_metrics import (
     EXECUTION_LANES,
     execution_lane_for_spec,
@@ -821,6 +822,522 @@ class WorkbenchStore:
                     (now_iso(), task_id),
                 )
         return self.transition_task(task_id, "queued", expected_revision=task["state_revision"])
+
+    @staticmethod
+    def _blocked_retry_candidate(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        task = connection.execute(
+            "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        node = connection.execute(
+            "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+        ).fetchone()
+        if task is None or node is None:
+            raise KeyError((task_id, node_id))
+        if int(task["state_revision"]) != expected_revision:
+            raise StateConflictError(
+                f"expected task revision {expected_revision}, found {task['state_revision']}"
+            )
+        if int(node["attempt"]) != expected_attempt:
+            raise StateConflictError(
+                f"expected node attempt {expected_attempt}, found {node['attempt']}"
+            )
+        if task["state"] != "blocked":
+            raise StateConflictError(f"task {task_id} is {task['state']}, expected blocked")
+        if node["state"] != "blocked":
+            raise StateConflictError(f"node {node_id} is {node['state']}, expected blocked")
+
+        active = connection.execute(
+            """
+            SELECT node_id, state FROM nodes
+            WHERE task_id = ? AND state IN ('running', 'indeterminate')
+            ORDER BY node_id
+            """,
+            (task_id,),
+        ).fetchall()
+        if active:
+            states = ", ".join(f"{row['node_id']}:{row['state']}" for row in active)
+            raise StateConflictError(
+                f"cannot retry blocked node while task has running or indeterminate nodes: {states}"
+            )
+
+        if not node["result_json"]:
+            raise StateConflictError("blocked node has no latest result receipt")
+        try:
+            result = json.loads(node["result_json"])
+        except json.JSONDecodeError as error:
+            raise StateConflictError("blocked node result receipt is invalid JSON") from error
+        if not isinstance(result, dict) or result.get("status") != "blocked":
+            raise StateConflictError("latest node result must explicitly be blocked")
+        if "changed_paths" not in result or not isinstance(result["changed_paths"], list):
+            raise StateConflictError("blocked node result must contain changed_paths as an explicit list")
+        if result["changed_paths"]:
+            raise StateConflictError("blocked node result changed_paths must be an explicit empty list")
+        if result.get("verdict") not in {None, "blocked"}:
+            raise StateConflictError("blocked node result has a contradictory verdict")
+
+        try:
+            spec = json.loads(node["spec_json"])
+        except json.JSONDecodeError as error:
+            raise StateConflictError("blocked node specification is invalid JSON") from error
+        if not isinstance(spec, dict):
+            raise StateConflictError("blocked node specification must be an object")
+        requested_executor = spec.get("executor")
+        requested_model = spec.get("model")
+        effective_executor = node["effective_executor"]
+        effective_model = node["effective_model"]
+        if not isinstance(requested_executor, str) or not requested_executor:
+            raise StateConflictError("blocked node has no requested executor")
+        if not isinstance(requested_model, str) or not requested_model:
+            raise StateConflictError("blocked node has no requested model")
+        if not isinstance(effective_executor, str) or not effective_executor:
+            raise StateConflictError("blocked node has no effective executor to preserve")
+        if not isinstance(effective_model, str) or not effective_model:
+            raise StateConflictError("blocked node has no effective model to preserve")
+
+        def route(executor: str, model: str) -> dict[str, Any]:
+            return {
+                "executor": executor,
+                "model": model,
+                "model_profile": codex_model_profile(model),
+                "model_reasoning_effort": codex_model_reasoning_effort(model),
+            }
+
+        return {
+            "task": {
+                "task_id": task_id,
+                "state": str(task["state"]),
+                "revision": int(task["state_revision"]),
+            },
+            "node": {
+                "node_id": node_id,
+                "state": str(node["state"]),
+                "attempt": int(node["attempt"]),
+            },
+            "requested_route": route(requested_executor, requested_model),
+            "effective_route": route(effective_executor, effective_model),
+            "would_retry": {
+                "attempt": int(node["attempt"]) + 1,
+                **route(effective_executor, effective_model),
+            },
+        }
+
+    @staticmethod
+    def _blocked_retry_authorization(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        next_attempt: int,
+    ) -> dict[str, Any] | None:
+        if next_attempt <= 1:
+            return None
+        rows = connection.execute(
+            """
+            SELECT cursor, payload_json FROM events
+            WHERE task_id = ? AND node_id = ? AND event_type = 'node.blocked_retry_authorized'
+            ORDER BY cursor DESC
+            """,
+            (task_id, node_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except json.JSONDecodeError as error:
+                raise StateConflictError("blocked retry authorization receipt is invalid JSON") from error
+            if not isinstance(payload, dict) or payload.get("next_attempt") != next_attempt:
+                continue
+            if payload.get("original_attempt") != next_attempt - 1:
+                raise StateConflictError("blocked retry authorization attempt is inconsistent")
+            assertion = payload.get("operator_assertion")
+            route = payload.get("effective_route")
+            if (
+                not isinstance(assertion, dict)
+                or assertion.get("confirm_no_side_effects") is not True
+                or assertion.get("automatically_verified") is not False
+                or not isinstance(route, dict)
+                or not isinstance(route.get("executor"), str)
+                or not route["executor"]
+                or not isinstance(route.get("model"), str)
+                or not route["model"]
+            ):
+                raise StateConflictError("blocked retry authorization receipt is incomplete")
+            return {
+                "event_cursor": int(row["cursor"]),
+                "executor": route["executor"],
+                "model": route["model"],
+            }
+        return None
+
+    def retry_blocked_node(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+        confirm_no_side_effects: bool,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("blocked retry reason must be non-empty")
+        if not confirm_no_side_effects:
+            raise ValueError("blocked retry requires an explicit no-side-effects operator assertion")
+
+        if dry_run:
+            with self.connection() as connection:
+                candidate = self._blocked_retry_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": True,
+                "task": candidate["task"],
+                "node": candidate["node"],
+                "would_retry": candidate["would_retry"],
+                "operator_asserted": True,
+                "automatically_verified": False,
+            }
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            candidate = self._blocked_retry_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            changed = connection.execute(
+                """
+                UPDATE nodes
+                SET state = 'pending', worker_id = NULL, worktree = NULL,
+                    started_at = NULL, settled_at = NULL,
+                    coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'blocked' AND attempt = ?
+                """,
+                (timestamp, task_id, node_id, expected_attempt),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("blocked retry node compare-and-set failed")
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL, verdict = NULL
+                WHERE task_id = ? AND state = 'blocked' AND state_revision = ?
+                """,
+                (revision, timestamp, task_id, expected_revision),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("blocked retry task compare-and-set failed")
+
+            authorization_cursor = self._event(
+                connection,
+                "node.blocked_retry_authorized",
+                task_id,
+                node_id,
+                {
+                    "original_attempt": expected_attempt,
+                    "next_attempt": candidate["would_retry"]["attempt"],
+                    "reason": reason,
+                    "operator_assertion": {
+                        "confirm_no_side_effects": True,
+                        "assertion": "operator_asserted",
+                        "automatically_verified": False,
+                    },
+                    "requested_route": candidate["requested_route"],
+                    "effective_route": candidate["effective_route"],
+                    "task_revision": revision,
+                },
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "task.state_changed",
+                task_id,
+                None,
+                {
+                    "from": "blocked",
+                    "to": "queued",
+                    "revision": revision,
+                    "blocker": None,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": False,
+                "revision": revision,
+                "task": {"task_id": task_id, "state": "queued", "revision": revision},
+                "node": {
+                    "node_id": node_id,
+                    "state": "pending",
+                    "attempt": expected_attempt,
+                },
+                "next_attempt": candidate["would_retry"]["attempt"],
+                "authorized_route": candidate["effective_route"],
+                "operator_asserted": True,
+                "automatically_verified": False,
+                "authorization_event_cursor": authorization_cursor,
+            }
+
+    @staticmethod
+    def _archify_reconciliation_candidate(
+        connection: sqlite3.Connection,
+        task_id: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        task = connection.execute(
+            """
+            SELECT state, state_revision, contract_json, contract_hash
+            FROM tasks WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        if int(task["state_revision"]) != expected_revision:
+            raise StateConflictError(
+                f"expected task revision {expected_revision}, found {task['state_revision']}"
+            )
+        if task["state"] not in {"blocked", "paused"}:
+            raise StateConflictError(
+                f"task {task_id} is {task['state']}, expected blocked or paused"
+            )
+        active = connection.execute(
+            """
+            SELECT node_id, state FROM nodes
+            WHERE task_id = ? AND state IN ('running', 'indeterminate')
+            ORDER BY node_id
+            """,
+            (task_id,),
+        ).fetchall()
+        if active:
+            states = ", ".join(f"{row['node_id']}:{row['state']}" for row in active)
+            raise StateConflictError(
+                f"cannot reconcile Archify metadata while task has running or indeterminate nodes: {states}"
+            )
+        try:
+            contract = json.loads(task["contract_json"])
+        except json.JSONDecodeError as error:
+            raise StateConflictError("task frozen contract is invalid JSON") from error
+        if not isinstance(contract, dict):
+            raise StateConflictError("task frozen contract must be an object")
+
+        rows = connection.execute(
+            """
+            SELECT * FROM nodes WHERE task_id = ?
+            ORDER BY json_extract(spec_json, '$.ordinal'), node_id
+            """,
+            (task_id,),
+        ).fetchall()
+        nodes: list[dict[str, Any]] = []
+        stored: dict[str, tuple[sqlite3.Row, dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                spec = json.loads(row["spec_json"])
+                result = json.loads(row["result_json"]) if row["result_json"] is not None else None
+            except json.JSONDecodeError as error:
+                raise StateConflictError(f"node {row['node_id']} has invalid durable JSON") from error
+            if not isinstance(spec, dict):
+                raise StateConflictError(f"node {row['node_id']} specification must be an object")
+            node_id = str(row["node_id"])
+            nodes.append({
+                **spec,
+                "state": row["state"],
+                "attempt": int(row["attempt"]),
+                "result": result,
+                "worktree": row["worktree"],
+            })
+            stored[node_id] = (row, spec)
+
+        proposals = propose_archify_reconciliation(contract, nodes)
+        changes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for proposal in proposals:
+            if not isinstance(proposal, dict) or set(proposal) != {"node_id", "before", "after"}:
+                raise StateConflictError("Archify reconciliation proposal is malformed")
+            node_id = proposal["node_id"]
+            before = proposal["before"]
+            after = proposal["after"]
+            if not isinstance(node_id, str) or node_id in seen or node_id not in stored:
+                raise StateConflictError("Archify reconciliation proposal has an invalid node_id")
+            seen.add(node_id)
+            if (
+                not isinstance(before, dict)
+                or not isinstance(after, dict)
+                or set(before) != {"archify", "prompt"}
+                or set(after) != {"archify", "prompt"}
+                or not isinstance(after["prompt"], str)
+                or (after["archify"] is not None and not isinstance(after["archify"], dict))
+            ):
+                raise StateConflictError("Archify reconciliation proposal has invalid derived fields")
+            row, spec = stored[node_id]
+            current = {"archify": spec.get("archify"), "prompt": spec.get("prompt")}
+            if before != current:
+                raise StateConflictError(
+                    f"Archify reconciliation proposal for {node_id} does not match durable metadata"
+                )
+            if (
+                row["state"] != "pending"
+                or int(row["attempt"]) != 0
+                or row["result_json"] is not None
+                or row["worktree"] is not None
+            ):
+                raise StateConflictError(
+                    f"Archify reconciliation may update only pending attempt-zero node {node_id}"
+                )
+            if before == after:
+                continue
+            updated_spec = {**spec, "archify": after["archify"], "prompt": after["prompt"]}
+            changes.append({
+                "node_id": node_id,
+                "before": before,
+                "after": after,
+                "before_spec_json": row["spec_json"],
+                "after_spec_json": canonical_json(updated_spec),
+            })
+
+        return {
+            "task": {
+                "task_id": task_id,
+                "state": str(task["state"]),
+                "revision": int(task["state_revision"]),
+                "contract_json": task["contract_json"],
+                "contract_hash": task["contract_hash"],
+            },
+            "changes": changes,
+        }
+
+    def reconcile_archify_metadata(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int,
+        reason: str,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Archify reconciliation reason must be non-empty")
+
+        if dry_run:
+            with self.connection() as connection:
+                candidate = self._archify_reconciliation_candidate(
+                    connection, task_id, expected_revision=expected_revision
+                )
+            return {
+                "task_id": task_id,
+                "dry_run": True,
+                "status": "would-reconcile" if candidate["changes"] else "unchanged",
+                "task": {
+                    key: candidate["task"][key]
+                    for key in ("task_id", "state", "revision")
+                },
+                "changes": [
+                    {key: change[key] for key in ("node_id", "before", "after")}
+                    for change in candidate["changes"]
+                ],
+            }
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            candidate = self._archify_reconciliation_candidate(
+                connection, task_id, expected_revision=expected_revision
+            )
+            if not candidate["changes"]:
+                return {
+                    "task_id": task_id,
+                    "dry_run": False,
+                    "status": "unchanged",
+                    "revision": expected_revision,
+                    "task": {
+                        key: candidate["task"][key]
+                        for key in ("task_id", "state", "revision")
+                    },
+                    "changes": [],
+                }
+            for change in candidate["changes"]:
+                changed = connection.execute(
+                    """
+                    UPDATE nodes SET spec_json = ?, updated_at = ?
+                    WHERE task_id = ? AND node_id = ? AND state = 'pending' AND attempt = 0
+                      AND result_json IS NULL AND worktree IS NULL AND spec_json = ?
+                    """,
+                    (
+                        change["after_spec_json"],
+                        timestamp,
+                        task_id,
+                        change["node_id"],
+                        change["before_spec_json"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError(
+                        f"Archify reconciliation compare-and-set failed for {change['node_id']}"
+                    )
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE tasks SET state_revision = ?, updated_at = ?
+                WHERE task_id = ? AND state_revision = ? AND contract_hash = ? AND contract_json = ?
+                """,
+                (
+                    revision,
+                    timestamp,
+                    task_id,
+                    expected_revision,
+                    candidate["task"]["contract_hash"],
+                    candidate["task"]["contract_json"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("Archify reconciliation task compare-and-set failed")
+            public_changes = [
+                {key: change[key] for key in ("node_id", "before", "after")}
+                for change in candidate["changes"]
+            ]
+            event_cursor = self._event(
+                connection,
+                "task.archify_reconciled",
+                task_id,
+                None,
+                {
+                    "reason": reason,
+                    "revision": revision,
+                    "state": candidate["task"]["state"],
+                    "changes": public_changes,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "dry_run": False,
+                "status": "reconciled",
+                "revision": revision,
+                "task": {
+                    "task_id": task_id,
+                    "state": candidate["task"]["state"],
+                    "revision": revision,
+                },
+                "changes": public_changes,
+                "event_cursor": event_cursor,
+            }
 
     def set_task_priority(
         self,
@@ -2571,16 +3088,27 @@ class WorkbenchStore:
             selected_effective_model: str | None = None
             selected_lane: str | None = None
             selected_pool: str | None = None
+            selected_blocked_retry_authorization_cursor: int | None = None
             for candidate in candidates:
                 spec = json.loads(candidate["spec_json"])
                 candidate_attempt = int(candidate["attempt"]) + 1
-                effective_executor = str(candidate["effective_executor"] or spec["executor"])
-                effective_model = retry_model(
-                    str(candidate["effective_model"] or spec["model"]),
+                authorization = self._blocked_retry_authorization(
+                    connection,
+                    str(candidate["task_id"]),
+                    str(candidate["node_id"]),
                     candidate_attempt,
-                    verifier=bool(spec.get("verifier")),
-                    routing_policy_version=spec.get("routing_policy_version"),
                 )
+                if authorization is not None:
+                    effective_executor = str(authorization["executor"])
+                    effective_model = str(authorization["model"])
+                else:
+                    effective_executor = str(candidate["effective_executor"] or spec["executor"])
+                    effective_model = retry_model(
+                        str(candidate["effective_model"] or spec["model"]),
+                        candidate_attempt,
+                        verifier=bool(spec.get("verifier")),
+                        routing_policy_version=spec.get("routing_policy_version"),
+                    )
                 effective_spec = {
                     **spec,
                     "executor": effective_executor,
@@ -2626,6 +3154,7 @@ class WorkbenchStore:
                 selected_effective_model = effective_model
                 selected_lane = lane
                 selected_pool = quota_pool_id_for_spec(effective_spec)
+                selected_blocked_retry_authorization_cursor = authorization["event_cursor"] if authorization is not None else None
                 break
 
             if (
@@ -2698,6 +3227,9 @@ class WorkbenchStore:
                     "lane_capacity": capacities.get(selected_lane),
                     "lane_active_units": running_lane_active[selected_lane] + 1,
                     "claimed_at": timestamp,
+                    **({
+                        "blocked_retry_authorization_event_cursor": selected_blocked_retry_authorization_cursor,
+                    } if selected_blocked_retry_authorization_cursor is not None else {}),
                 },
                 created_at=timestamp,
             )

@@ -19,6 +19,7 @@ from .archify import (
 )
 from .artifacts import ArtifactStore
 from .claude_quota import is_native_subscription_auth
+from .dependency_inputs import changed_paths_since_input_tree
 from .governance import governance_directive, governance_receipt_fields
 from .model import (
     DEFAULT_QUOTA_TTL_SECONDS,
@@ -45,6 +46,12 @@ class ExecutionRequest:
     # the final Sol verifier request.  These are artifact-backed packets, not
     # model text selected from a single role.
     archify_receipts: tuple[dict[str, Any], ...] = ()
+    # A non-fixture node can begin from accepted ancestor patches while its
+    # durable contract remains pinned to the original base commit. The
+    # coordinator records both the tree object and its immutable receipt.
+    input_tree_sha: str | None = None
+    input_receipt: dict[str, Any] | None = None
+    input_receipt_ref: str | None = None
 
 
 class Executor(Protocol):
@@ -2166,7 +2173,13 @@ def validate_worker_scope(
 ) -> NodeResult:
     if request.worktree is None or result.status != "succeeded":
         return result
-    changed = tuple(sorted(manager.changed_paths(request.worktree, request.contract["base_sha"])))
+    changed = tuple(
+        sorted(
+            changed_paths_since_input_tree(request.worktree, request.input_tree_sha)
+            if request.input_tree_sha is not None
+            else manager.changed_paths(request.worktree, request.contract["base_sha"])
+        )
+    )
     task_disallowed = tuple(
         path
         for path in changed

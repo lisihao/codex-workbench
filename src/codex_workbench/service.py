@@ -12,6 +12,12 @@ import time
 from typing import Callable
 
 from .artifacts import ArtifactStore
+from .dependency_inputs import (
+    DependencyInput,
+    DependencyInputError,
+    apply_accepted_ancestor_patches,
+    effective_spec_with_dependency_input,
+)
 from .executors import (
     ClaudeExecutor,
     CodexExecutor,
@@ -29,6 +35,7 @@ from .model import (
     NodeResult,
     QuotaSnapshot,
     TaskContract,
+    canonical_json,
     codex_model_profile,
     codex_model_reasoning_effort,
 )
@@ -377,6 +384,7 @@ class Coordinator:
             spec = claimed["spec"]
             contract = claimed["contract"]
             worktree: Path | None = None
+            dependency_input: DependencyInput | None = None
             if spec["executor"] != "fixture":
                 worktree = self.worktrees.prepare(
                     contract["repository"],
@@ -394,7 +402,16 @@ class Coordinator:
                     lease_epoch=claimed["lease_epoch"],
                 )
                 if spec.get("verifier"):
-                    self._compose_worker_patches(claimed["task_id"], worktree)
+                    dependency_input = self._compose_worker_patches(claimed["task_id"], worktree)
+                elif spec.get("depends_on"):
+                    dependency_input = self._prepare_dependency_input(
+                        claimed["task_id"], claimed["node_id"], worktree
+                    )
+            input_receipt_ref = (
+                self.artifacts.put_text(canonical_json(dependency_input.receipt), "dependency-input.json")
+                if dependency_input is not None
+                else None
+            )
             request = ExecutionRequest(
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],
@@ -403,13 +420,19 @@ class Coordinator:
                 spec=spec,
                 worktree=worktree,
                 steering=claimed["steering"],
+                input_tree_sha=(
+                    dependency_input.input_tree_sha if dependency_input is not None else None
+                ),
+                input_receipt=(dependency_input.receipt if dependency_input is not None else None),
+                input_receipt_ref=input_receipt_ref,
             )
             if spec.get("verifier") and spec.get("executor") != "fixture":
                 request = replace(
                     request,
                     archify_receipts=self._archify_receipt_packets(claimed["task_id"]),
                 )
-            cache_key = reusable_evidence_key(contract, spec, worktree, request.steering)
+            cache_spec = effective_spec_with_dependency_input(spec, dependency_input)
+            cache_key = reusable_evidence_key(contract, cache_spec, worktree, request.steering)
             cached = self.store.cached_evidence(cache_key) if cache_key else None
             if cached is not None:
                 packet_refs: tuple[str, ...] = ()
@@ -422,6 +445,8 @@ class Coordinator:
                         cached = None
                 if cached is not None:
                     result = NodeResult.from_dict(cached["result"])
+                    if input_receipt_ref is not None:
+                        result = self._with_dependency_input_receipt(result, input_receipt_ref)
                     if packet_refs:
                         result = replace(
                             result,
@@ -486,7 +511,9 @@ class Coordinator:
                         )
             result = validate_worker_scope(self.worktrees, request, result)
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
-                patch = self.worktrees.diff_patch(worktree, contract["base_sha"])
+                patch = self.worktrees.diff_patch(
+                    worktree, request.input_tree_sha or contract["base_sha"]
+                )
                 if patch:
                     result = replace(
                         result,
@@ -495,6 +522,8 @@ class Coordinator:
                             "patch": self.artifacts.put_bytes(patch, "patch"),
                         },
                     )
+            if input_receipt_ref is not None:
+                result = self._with_dependency_input_receipt(result, input_receipt_ref)
             if cache_key and result.status == "succeeded":
                 self.store.save_evidence(
                     cache_key,
@@ -502,6 +531,14 @@ class Coordinator:
                     claimed["task_id"],
                     claimed["node_id"],
                 )
+        except DependencyInputError as error:
+            result = NodeResult(
+                status="blocked",
+                summary=f"dependency inputs unavailable: {error}",
+                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                verdict="blocked" if claimed["spec"].get("verifier") else None,
+                **governance_receipt_fields(claimed["contract"]),
+            )
         except WorktreeError as error:
             result = NodeResult(
                 status="blocked",
@@ -583,17 +620,50 @@ class Coordinator:
             worktree=request.worktree,
             steering=request.steering,
             archify_receipts=request.archify_receipts,
+            input_tree_sha=request.input_tree_sha,
+            input_receipt=request.input_receipt,
+            input_receipt_ref=request.input_receipt_ref,
         )
         return routed_request, self._executor("codex").execute(routed_request)
 
-    def _compose_worker_patches(self, task_id: str, worktree: Path) -> None:
+    def _prepare_dependency_input(
+        self, task_id: str, node_id: str, worktree: Path
+    ) -> DependencyInput | None:
         task = self.store.get_task(task_id)
-        for node in task["nodes"]:
-            if node.get("verifier") or node["state"] != "accepted" or not node.get("result"):
-                continue
-            patch_ref = node["result"].get("artifacts", {}).get("patch")
-            if patch_ref:
-                self.worktrees.apply_patch(worktree, self.artifacts.path_for(patch_ref))
+        return apply_accepted_ancestor_patches(
+            task,
+            node_id,
+            worktree,
+            self.artifacts,
+            self.worktrees,
+        )
+
+    def _compose_worker_patches(
+        self, task_id: str, worktree: Path, *, node_id: str | None = None
+    ) -> DependencyInput | None:
+        """Compose the verifier's complete accepted worker closure exactly once."""
+
+        task = self.store.get_task(task_id)
+        target_node_id = node_id
+        if target_node_id is None:
+            verifier_nodes = [node for node in task.get("nodes", ()) if node.get("verifier")]
+            if len(verifier_nodes) != 1 or not isinstance(verifier_nodes[0].get("node_id"), str):
+                raise DependencyInputError("task lacks one verifier for dependency composition")
+            target_node_id = verifier_nodes[0]["node_id"]
+        return apply_accepted_ancestor_patches(
+            task,
+            target_node_id,
+            worktree,
+            self.artifacts,
+            self.worktrees,
+        )
+
+    @staticmethod
+    def _with_dependency_input_receipt(result: NodeResult, receipt_ref: str) -> NodeResult:
+        return replace(
+            result,
+            artifacts={**result.artifacts, "dependency-input": receipt_ref},
+        )
 
     def _archify_receipt_packets(self, task_id: str) -> tuple[dict, ...]:
         """Load every required Archify receipt for the final Sol verifier.
