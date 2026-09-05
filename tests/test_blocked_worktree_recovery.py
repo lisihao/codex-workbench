@@ -391,6 +391,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         install, install_cwd, environment = calls[1]
         self.assertEqual(install_cwd, worktree)
         self.assertIn("--offline", install)
+        self.assertIn("--ignore-scripts", install)
         self.assertIn("--config.minimumReleaseAge=0", install)
         self.assertIn("--config.trustLockfile=true", install)
         self.assertEqual(environment["npm_config_offline"], "true")

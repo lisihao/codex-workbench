@@ -168,6 +168,7 @@ class PnpmOfflineMaterializer:
             "install",
             "--offline",
             "--frozen-lockfile",
+            "--ignore-scripts",
             "--config.minimumReleaseAge=0",
             "--config.trustLockfile=true",
             "--reporter=append-only",
