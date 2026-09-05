@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "package": "pnpm",
+  "version": "11.25.0",
+  "registry_archive": "https://registry.npmjs.org/pnpm/-/pnpm-11.25.0.tgz",
+  "archive": "pnpm-11.25.0.tgz",
+  "sha256": "33dd0748f27e7916c4f1c8b6943461983e3453b06bbda6312a6280130b4881e5",
+  "license": "MIT",
+  "license_files": [
+    "LICENSE"
+  ],
+  "required_files": [
+    "package/package.json",
+    "package/bin/pnpm.mjs",
+    "package/LICENSE"
+  ],
+  "source_note": "Pinned package-manager runtime for bounded offline worktree recovery; do not replace it with a host-global pnpm binary."
+}

@@ -19,7 +19,11 @@ from codex_workbench.dependency_inputs import (
     apply_accepted_ancestor_patches,
     load_recorded_dependency_input,
 )
-from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecovery, PnpmOfflineMaterializer
+from codex_workbench.dirty_worktree_recovery import (
+    DirtyWorktreeRecovery,
+    DirtyWorktreeRecoveryError,
+    PnpmOfflineMaterializer,
+)
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
@@ -367,7 +371,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             return subprocess.CompletedProcess(
                 args,
                 0,
-                "11.7.0\n" if args[-1] == "--version" else "offline fixture ok\n",
+                "11.25.0\n" if args[-1] == "--version" else "offline fixture ok\n",
                 "",
             )
 
@@ -382,6 +386,95 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertIn("--config.minimumReleaseAge=0", install)
         self.assertEqual(environment["npm_config_offline"], "true")
         self.assertEqual(environment["npm_config_minimum_release_age"], "0")
+
+    def test_offline_materializer_rejects_known_hanging_pnpm_before_install(self) -> None:
+        worktree = self.root / "old-pnpm-fixture"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.7.0"}),
+            encoding="utf-8",
+        )
+        (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        calls: list[tuple[str, ...]] = []
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(tuple(args))
+            return subprocess.CompletedProcess(args, 0, "11.7.0\n", "")
+
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "at least 11.25.0"):
+            PnpmOfflineMaterializer(binary=sys.executable, runner=runner).materialize(
+                worktree,
+                timeout_seconds=5_400,
+            )
+        self.assertEqual(calls, [(sys.executable, "--version")])
+
+    def test_offline_materializer_uses_explicit_store_and_hard_timeout(self) -> None:
+        worktree = self.root / "configured-pnpm-fixture"
+        store = self.root / "pnpm-store"
+        worktree.mkdir()
+        store.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.7.0"}),
+            encoding="utf-8",
+        )
+        (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        calls: list[tuple[tuple[str, ...], int]] = []
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            timeout = kwargs["timeout"]
+            assert isinstance(timeout, int)
+            calls.append((tuple(args), timeout))
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "11.25.0\n" if args[-1] == "--version" else "offline fixture ok\n",
+                "",
+            )
+
+        receipt = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=store,
+            runner=runner,
+        ).materialize(worktree, timeout_seconds=5_400)
+
+        self.assertEqual(receipt["materialization_timeout_seconds"], 120)
+        self.assertEqual(receipt["store_dir"], str(store.resolve()))
+        self.assertEqual([timeout for _command, timeout in calls], [120, 120])
+        self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
+
+    def test_offline_materializer_reads_authority_runtime_environment(self) -> None:
+        worktree = self.root / "authority-runtime-fixture"
+        store = self.root / "authority-pnpm-store"
+        worktree.mkdir()
+        store.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.7.0"}),
+            encoding="utf-8",
+        )
+        (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        calls: list[tuple[str, ...]] = []
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(tuple(args))
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "11.25.0\n" if args[-1] == "--version" else "offline fixture ok\n",
+                "",
+            )
+
+        with patch.dict(
+            "os.environ",
+            {
+                PnpmOfflineMaterializer.BINARY_ENVIRONMENT_VARIABLE: sys.executable,
+                PnpmOfflineMaterializer.STORE_ENVIRONMENT_VARIABLE: str(store),
+            },
+        ):
+            receipt = PnpmOfflineMaterializer(runner=runner).materialize(worktree, timeout_seconds=5)
+
+        self.assertEqual(receipt["store_dir"], str(store.resolve()))
+        self.assertEqual(calls[0], (sys.executable, "--version"))
+        self.assertEqual(calls[1][-2:], ("--store-dir", str(store.resolve())))
 
     def test_clean_a2_recovery_never_invokes_a_model_or_mutates_a1(self) -> None:
         command = f"{sys.executable} -c \"from pathlib import Path; assert Path('src/value.txt').read_text() == 'patched\\n'\""

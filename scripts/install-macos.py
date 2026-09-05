@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
 
@@ -64,6 +66,10 @@ RESEARCH_SKILL_REQUIRED_FILES = (
     "Workflows/StandardResearch.md",
     "Workflows/DeepInvestigation.md",
 )
+PNPM_RECOVERY_RUNTIME_DIRECTORY = Path("vendor") / "pnpm-runtime"
+PNPM_RECOVERY_RUNTIME_LOCK = "SOURCE-LOCK.json"
+PNPM_RECOVERY_RUNTIME_PACKAGE_DIRECTORY = "package"
+PNPM_RECOVERY_RUNTIME_ENTRYPOINT = Path("package") / "bin" / "pnpm.mjs"
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -362,6 +368,81 @@ def install_archify(source: Path) -> None:
         raise SystemExit(f"Archify installation failed: {detail}")
 
 
+def pnpm_recovery_runtime_metadata(source: Path) -> dict[str, object]:
+    """Load one pinned, redistributable pnpm runtime archive from source."""
+
+    vendor_root = source / PNPM_RECOVERY_RUNTIME_DIRECTORY
+    lock_path = vendor_root / PNPM_RECOVERY_RUNTIME_LOCK
+    if not lock_path.is_file():
+        raise SystemExit(f"pnpm recovery runtime source lock is missing: {lock_path}")
+    try:
+        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"pnpm recovery runtime source lock is unreadable: {error}") from error
+    if not isinstance(metadata, dict):
+        raise SystemExit("pnpm recovery runtime source lock must be an object")
+    archive_name = metadata.get("archive")
+    expected_digest = metadata.get("sha256")
+    version = metadata.get("version")
+    package = metadata.get("package")
+    if not all(isinstance(value, str) and value for value in (archive_name, expected_digest, version, package)):
+        raise SystemExit("pnpm recovery runtime source lock is incomplete")
+    if package != "pnpm" or len(expected_digest) != 64:
+        raise SystemExit("pnpm recovery runtime source lock has an invalid package or sha256")
+    archive = vendor_root / archive_name
+    if not archive.is_file():
+        raise SystemExit(f"pnpm recovery runtime archive is missing: {archive}")
+    actual_digest = sha256(archive.read_bytes()).hexdigest()
+    if actual_digest != expected_digest:
+        raise SystemExit("pnpm recovery runtime archive digest does not match SOURCE-LOCK.json")
+    return {**metadata, "archive_path": archive, "vendor_root": vendor_root}
+
+
+def install_pnpm_recovery_runtime(app_root: Path, metadata: dict[str, object]) -> Path:
+    """Extract the pinned archive into the disposable application payload."""
+
+    archive_name = metadata.get("archive")
+    expected_digest = metadata.get("sha256")
+    version = metadata.get("version")
+    if not all(isinstance(value, str) and value for value in (archive_name, expected_digest, version)):
+        raise SystemExit("pnpm recovery runtime metadata is incomplete")
+    runtime_root = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY
+    archive = runtime_root / archive_name
+    if not archive.is_file() or sha256(archive.read_bytes()).hexdigest() != expected_digest:
+        raise SystemExit("installed pnpm recovery runtime archive does not match source lock")
+    package_root = runtime_root / PNPM_RECOVERY_RUNTIME_PACKAGE_DIRECTORY
+    if package_root.exists() or package_root.is_symlink():
+        raise SystemExit(f"pnpm recovery runtime extraction target is unexpectedly occupied: {package_root}")
+    runtime_root_resolved = runtime_root.resolve(strict=True)
+    try:
+        with tarfile.open(archive, mode="r:gz") as bundle:
+            members = bundle.getmembers()
+            for member in members:
+                target = (runtime_root / member.name).resolve(strict=False)
+                if target != runtime_root_resolved and runtime_root_resolved not in target.parents:
+                    raise SystemExit("pnpm recovery runtime archive contains an unsafe path")
+                if member.issym() or member.islnk():
+                    raise SystemExit("pnpm recovery runtime archive must not contain links")
+            if sys.version_info >= (3, 12):
+                bundle.extractall(runtime_root, members=members, filter="data")
+            else:  # Python 3.11 has no extraction filter API; members were validated above.
+                bundle.extractall(runtime_root, members=members)
+    except (OSError, tarfile.TarError) as error:
+        raise SystemExit(f"pnpm recovery runtime extraction failed: {error}") from error
+    manifest_path = package_root / "package.json"
+    entrypoint = runtime_root / PNPM_RECOVERY_RUNTIME_ENTRYPOINT
+    try:
+        package_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"pnpm recovery runtime manifest is unreadable: {error}") from error
+    if not isinstance(package_manifest, dict) or package_manifest.get("version") != version:
+        raise SystemExit("pnpm recovery runtime version does not match SOURCE-LOCK.json")
+    if not entrypoint.is_file():
+        raise SystemExit(f"pnpm recovery runtime entrypoint is missing: {entrypoint}")
+    entrypoint.chmod(entrypoint.stat().st_mode | 0o755)
+    return entrypoint
+
+
 def preflight_managed_agent_skills(source: Path) -> None:
     """Preflight both global agent projections before either installer writes."""
 
@@ -419,6 +500,8 @@ def preflight_authority_plists(
     process_home: Path,
     quota_snapshot_file: Path,
     claude_binary: Path | None,
+    pnpm_binary: Path,
+    pnpm_store: Path,
     capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
     radar_refresh_seconds: int = DEFAULT_RADAR_REFRESH_SECONDS,
     ai_frontier_refresh_seconds: int = DEFAULT_AI_FRONTIER_REFRESH_SECONDS,
@@ -433,6 +516,8 @@ def preflight_authority_plists(
         process_home=process_home,
         quota_snapshot_file=quota_snapshot_file,
         claude_binary=claude_binary,
+        pnpm_binary=pnpm_binary,
+        pnpm_store=pnpm_store,
     )
     if claude_binary is not None:
         quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
@@ -763,14 +848,21 @@ def _set_authority_runtime_environment(
     payload: dict[str, object],
     *,
     claude_binary: Path | None,
+    pnpm_binary: Path | None = None,
+    pnpm_store: Path | None = None,
 ) -> None:
     environment = payload.setdefault("EnvironmentVariables", {})
     if not isinstance(environment, dict):
         raise SystemExit("authority LaunchAgent EnvironmentVariables is invalid")
+    if (pnpm_binary is None) != (pnpm_store is None):
+        raise SystemExit("authority pnpm runtime and store must be configured together")
     # Claude's subscription OAuth is held in the real user's macOS Keychain;
     # only the explicit CLI path is persisted, never a credential or token.
     environment["HOME"] = str(Path.home())
     environment["CODEX_WORKBENCH_CLAUDE"] = str(claude_binary) if claude_binary else ""
+    if pnpm_binary is not None and pnpm_store is not None:
+        environment["CODEX_WORKBENCH_PNPM"] = str(pnpm_binary)
+        environment["CODEX_WORKBENCH_PNPM_STORE"] = str(pnpm_store)
 
 
 def _validate_authority_runtime_environment(
@@ -778,6 +870,8 @@ def _validate_authority_runtime_environment(
     *,
     codex_binary: Path,
     claude_binary: Path | None,
+    pnpm_binary: Path | None = None,
+    pnpm_store: Path | None = None,
 ) -> None:
     environment = payload.get("EnvironmentVariables")
     if not isinstance(environment, dict):
@@ -789,6 +883,12 @@ def _validate_authority_runtime_environment(
     expected_claude = str(claude_binary) if claude_binary else ""
     if environment.get("CODEX_WORKBENCH_CLAUDE") != expected_claude:
         raise SystemExit("authority LaunchAgent Claude binary is not explicit")
+    if (pnpm_binary is None) != (pnpm_store is None):
+        raise SystemExit("authority pnpm runtime and store must be configured together")
+    if pnpm_binary is not None and environment.get("CODEX_WORKBENCH_PNPM") != str(pnpm_binary):
+        raise SystemExit("authority LaunchAgent pnpm binary is not explicit")
+    if pnpm_store is not None and environment.get("CODEX_WORKBENCH_PNPM_STORE") != str(pnpm_store):
+        raise SystemExit("authority LaunchAgent pnpm store is not explicit")
 
 
 def _validate_quota_runtime_environment(
@@ -821,6 +921,8 @@ def render_authority_service_plist(
     process_home: Path,
     quota_snapshot_file: Path,
     claude_binary: Path | None,
+    pnpm_binary: Path,
+    pnpm_store: Path,
 ) -> str:
     """Render the main service with an explicit user HOME and binary paths."""
 
@@ -836,11 +938,18 @@ def render_authority_service_plist(
     payload = plistlib.loads(rendered.encode())
     if not isinstance(payload, dict):
         raise SystemExit("authority service LaunchAgent plist is invalid")
-    _set_authority_runtime_environment(payload, claude_binary=claude_binary)
+    _set_authority_runtime_environment(
+        payload,
+        claude_binary=claude_binary,
+        pnpm_binary=pnpm_binary,
+        pnpm_store=pnpm_store,
+    )
     _validate_authority_runtime_environment(
         payload,
         codex_binary=codex_binary,
         claude_binary=claude_binary,
+        pnpm_binary=pnpm_binary,
+        pnpm_store=pnpm_store,
     )
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
 
@@ -1101,6 +1210,10 @@ def main() -> int:
     )
     parser.add_argument("--quota-snapshot-file")
     parser.add_argument(
+        "--pnpm-store",
+        help="existing local pnpm content store pre-seeded for offline worktree recovery",
+    )
+    parser.add_argument(
         "--nas-archive-root",
         help="mounted NAS directory for verified worktree recovery archives",
     )
@@ -1215,6 +1328,15 @@ def main() -> int:
     recovery_config.setdefault("retry_backoff_seconds", 900)
     recovery_config.setdefault("compression", "zstd")
     recovery_config.setdefault("require_smb", True)
+    configured_pnpm_store = args.pnpm_store or recovery_config.get("pnpm_store")
+    if configured_pnpm_store is None:
+        pnpm_store = state_root / "pnpm-store"
+    elif isinstance(configured_pnpm_store, str) and configured_pnpm_store.strip():
+        pnpm_store = absolute_path(Path(configured_pnpm_store))
+    else:
+        raise SystemExit("worktree_recovery pnpm_store must be a non-empty path")
+    assert_directory_target(pnpm_store, "pnpm recovery store")
+    recovery_config["pnpm_store"] = str(pnpm_store)
     if nas_archive_root is not None:
         recovery_config["nas_archive_root"] = str(nas_archive_root)
     if recovery_config.get("compression") == "zstd":
@@ -1307,6 +1429,8 @@ def main() -> int:
         if line.startswith("__version__")
     )
     version = version_line.split("=", 1)[1].strip().strip('"')
+    pnpm_runtime = pnpm_recovery_runtime_metadata(source)
+    pnpm_binary = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY / PNPM_RECOVERY_RUNTIME_ENTRYPOINT
     runtime_binary = runtime_root / "codex"
     assert_file_target(runtime_binary, "runtime Codex executable")
     assert_file_target(runtime_root / "codex-code-mode-host", "runtime Codex workspace tool host")
@@ -1319,6 +1443,8 @@ def main() -> int:
         process_home,
         quota_snapshot_file,
         claude_binary,
+        pnpm_binary,
+        pnpm_store,
         capability_refresh_seconds,
         radar_refresh_seconds,
         ai_frontier_refresh_seconds,
@@ -1334,6 +1460,8 @@ def main() -> int:
         print(f"plan: state_root={state_root}")
         print(f"plan: application={app_root}")
         print(f"plan: Codex runtime={runtime_root}")
+        print(f"plan: pnpm recovery runtime={pnpm_binary} ({pnpm_runtime['version']})")
+        print(f"plan: pnpm recovery store={pnpm_store}")
         print(f"plan: workers={max_workers} (Spark lane={spark_workers})")
         print(f"plan: performance state={performance_state_root}")
         print(f"plan: performance baseline={PERFORMANCE_BASELINE_RESOURCE}")
@@ -1388,6 +1516,7 @@ def main() -> int:
         state_root,
         logs,
         runtime_root,
+        pnpm_store,
         codex_home,
         process_home,
         radar_state_root,
@@ -1427,6 +1556,7 @@ def main() -> int:
         state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         logs.mkdir(parents=True, exist_ok=True, mode=0o700)
         runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        pnpm_store.mkdir(parents=True, exist_ok=True, mode=0o700)
         codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         radar_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1466,6 +1596,7 @@ def main() -> int:
             auth_link.symlink_to(auth_source)
         transaction.preserve_existing_app(app_root, state_root)
         shutil.copytree(source, app_root, ignore=shutil.ignore_patterns(".git", "__pycache__", ".workbench"))
+        pnpm_binary = install_pnpm_recovery_runtime(app_root, pnpm_runtime)
         manifest = app_root / "install-manifest.json"
         manifest.write_text(
             json.dumps(
@@ -1492,6 +1623,13 @@ def main() -> int:
                     "radar": radar_config,
                     "ai_frontier": ai_frontier_config,
                     "worktree_recovery": recovery_config,
+                    "pnpm_recovery_runtime": {
+                        "package": pnpm_runtime["package"],
+                        "version": pnpm_runtime["version"],
+                        "sha256": pnpm_runtime["sha256"],
+                        "binary": str(pnpm_binary),
+                        "store": str(pnpm_store),
+                    },
                     "research_skill": {
                         "name": "Research",
                         "policy": "research-skill/v2",
@@ -1542,6 +1680,8 @@ def main() -> int:
             f"export CODEX_HOME={str(codex_home)!r}\n"
             f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
             f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
+            f"export CODEX_WORKBENCH_PNPM={str(pnpm_binary)!r}\n"
+            f"export CODEX_WORKBENCH_PNPM_STORE={str(pnpm_store)!r}\n"
             f"export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE={str(quota_snapshot_file)!r}\n"
             )
             + (f"export CODEX_WORKBENCH_CLAUDE={str(claude_binary)!r}\n" if claude_binary else "")
@@ -1559,6 +1699,8 @@ def main() -> int:
             process_home=process_home,
             quota_snapshot_file=quota_snapshot_file,
             claude_binary=claude_binary,
+            pnpm_binary=pnpm_binary,
+            pnpm_store=pnpm_store,
         )
         launch_agents.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(rendered)

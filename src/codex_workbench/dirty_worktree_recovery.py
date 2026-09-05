@@ -66,13 +66,25 @@ class PnpmOfflineMaterializer:
     mode while each worktree receives its own linker directory.
     """
 
+    # pnpm 11.7 can wait on registry-backed supply-chain verification even
+    # when `--offline` is present.  11.25 is the first authority runtime we
+    # have verified to fail fast from the local cache instead.  Recovery must
+    # never turn that upstream behavior into an unbounded worker lease.
+    MINIMUM_PNPM_11_VERSION = (11, 25, 0)
+    MAX_MATERIALIZATION_SECONDS = 120
+    BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
+    STORE_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM_STORE"
+
     def __init__(
         self,
         *,
-        binary: str = "pnpm",
+        binary: str | None = None,
+        store_dir: Path | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ) -> None:
-        self.binary = binary
+        self.binary = binary or os.environ.get(self.BINARY_ENVIRONMENT_VARIABLE, "pnpm")
+        configured_store = os.environ.get(self.STORE_ENVIRONMENT_VARIABLE)
+        self.store_dir = store_dir or (Path(configured_store).expanduser() if configured_store else None)
         self.runner = runner
 
     def materialize(self, worktree: Path, *, timeout_seconds: int) -> dict[str, object]:
@@ -100,6 +112,9 @@ class PnpmOfflineMaterializer:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary:
             raise DirtyWorktreeRecoveryError("pnpm is unavailable on the Workbench authority")
+        effective_timeout = min(timeout_seconds, self.MAX_MATERIALIZATION_SECONDS)
+        if effective_timeout <= 0:
+            raise DirtyWorktreeRecoveryError("pnpm recovery timeout must be positive")
         environment = os.environ.copy()
         environment.update({
             "CI": "true",
@@ -110,29 +125,45 @@ class PnpmOfflineMaterializer:
             # recovery must either use the local store or fail immediately.
             "npm_config_minimum_release_age": "0",
         })
-        version = self._run((binary, "--version"), worktree, environment, timeout_seconds)
+        version = self._run((binary, "--version"), worktree, environment, effective_timeout)
         if version.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm version probe failed: {version.stderr.strip() or version.stdout.strip()}"
             )
         actual_version = version.stdout.strip()
         declared_version = declared.split("@", 1)[1].split("+", 1)[0]
-        if actual_version.split(".", 1)[0] != declared_version.split(".", 1)[0]:
+        actual_semver = self._semver(actual_version, label="authority pnpm")
+        declared_semver = self._semver(declared_version, label="declared pnpm")
+        if actual_semver[0] != declared_semver[0]:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm major mismatch: package declares {declared_version}, authority provides {actual_version}"
             )
+        if actual_semver[0] == 11 and actual_semver < self.MINIMUM_PNPM_11_VERSION:
+            minimum = ".".join(str(part) for part in self.MINIMUM_PNPM_11_VERSION)
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm {actual_version} is unsupported for offline recovery; pnpm 11 must be at least "
+                f"{minimum}. Configure {self.BINARY_ENVIRONMENT_VARIABLE} to the Workbench-managed runtime."
+            )
+        install_command: tuple[str, ...] = (
+            binary,
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--config.minimumReleaseAge=0",
+            "--reporter=append-only",
+        )
+        if self.store_dir is not None:
+            store_dir = self.store_dir.resolve(strict=False)
+            if not store_dir.is_dir():
+                raise DirtyWorktreeRecoveryError(
+                    f"configured pnpm store is unavailable: {store_dir}"
+                )
+            install_command += ("--store-dir", str(store_dir))
         install = self._run(
-            (
-                binary,
-                "install",
-                "--offline",
-                "--frozen-lockfile",
-                "--config.minimumReleaseAge=0",
-                "--reporter=append-only",
-            ),
+            install_command,
             worktree,
             environment,
-            timeout_seconds,
+            effective_timeout,
         )
         if install.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
@@ -145,8 +176,18 @@ class PnpmOfflineMaterializer:
             "package_manager": declared,
             "pnpm_version": actual_version,
             "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
+            "materialization_timeout_seconds": effective_timeout,
+            "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
             "commands": [version.to_dict(), install.to_dict()],
         }
+
+    @staticmethod
+    def _semver(value: str, *, label: str) -> tuple[int, int, int]:
+        normalized = value.strip().split("+", 1)[0].split("-", 1)[0]
+        fields = normalized.split(".")
+        if len(fields) != 3 or any(not field.isdigit() for field in fields):
+            raise DirtyWorktreeRecoveryError(f"{label} version is not semantic: {value!r}")
+        return tuple(int(field) for field in fields)  # type: ignore[return-value]
 
     def _run(
         self,
@@ -165,7 +206,12 @@ class PnpmOfflineMaterializer:
                 timeout=timeout_seconds,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except subprocess.TimeoutExpired as error:
+            raise DirtyWorktreeRecoveryError(
+                "offline pnpm materialization timed out after "
+                f"{timeout_seconds}s; recovery stopped without retrying indefinitely"
+            ) from error
+        except OSError as error:
             raise DirtyWorktreeRecoveryError(f"cannot run {' '.join(command)}: {error}") from error
         return CommandOutcome(
             command,

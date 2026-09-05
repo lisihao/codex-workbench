@@ -155,6 +155,8 @@ smbutil statshares -m "$WB_NAS_ARCHIVE_ROOT"
 
 `--dry-run` 不写文件、不启动 LaunchAgent、不启用 Tailscale Serve、不发起 SSH/MCP 连接。它通过只证明当前安装器能接受本机的来源和目标，不证明模型登录、Claude 配额或远端客户端已经可用。
 
+如需让受控脏工作树恢复完全离线，先在 Authority 准备包含目标锁文件依赖的本地 pnpm store，并在 dry-run 与正式安装中都附加 `--pnpm-store "$WB_PNPM_STORE"`。不提供该参数时，安装器会建立独立空 store；缓存缺包会明确阻断恢复，不会访问 registry 或静默重试。
+
 ### 2.2 可选：接入 Claude Code，但保留配额
 
 Claude Code 完全可选。没有它时，Workbench 保持可安装并将 Claude 工作路由为 Codex；不要因缺少 Claude 而阻塞基础部署。

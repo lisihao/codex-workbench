@@ -338,6 +338,8 @@ class InstallerTests(unittest.TestCase):
                 process_home=Path("/tmp/state/process-home"),
                 quota_snapshot_file=Path("/tmp/state/claude-quota.json"),
                 claude_binary=Path("/tmp/claude-2.1.239"),
+                pnpm_binary=Path("/tmp/app/vendor/pnpm-runtime/package/bin/pnpm.mjs"),
+                pnpm_store=Path("/tmp/pnpm-store"),
             )
 
         payload = plistlib.loads(rendered.encode())
@@ -345,6 +347,41 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(environment["HOME"], "/Users/example")
         self.assertEqual(environment["CODEX_WORKBENCH_CLAUDE"], "/tmp/claude-2.1.239")
         self.assertEqual(environment["CODEX_WORKBENCH_CODEX"], "/tmp/runtime/codex")
+        self.assertEqual(
+            environment["CODEX_WORKBENCH_PNPM"],
+            "/tmp/app/vendor/pnpm-runtime/package/bin/pnpm.mjs",
+        )
+        self.assertEqual(environment["CODEX_WORKBENCH_PNPM_STORE"], "/tmp/pnpm-store")
+
+    def test_pnpm_recovery_runtime_is_pinned_and_extractable(self) -> None:
+        module = self._macos_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        metadata = module.pnpm_recovery_runtime_metadata(source)
+        self.assertEqual(metadata["package"], "pnpm")
+        self.assertEqual(metadata["version"], "11.25.0")
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            app_root = Path(directory) / "app"
+            runtime_root = app_root / module.PNPM_RECOVERY_RUNTIME_DIRECTORY
+            runtime_root.mkdir(parents=True)
+            for name in ("SOURCE-LOCK.json", "pnpm-11.25.0.tgz", "LICENSE"):
+                shutil.copy2(source / module.PNPM_RECOVERY_RUNTIME_DIRECTORY / name, runtime_root / name)
+            entrypoint = module.install_pnpm_recovery_runtime(app_root, metadata)
+            manifest = json.loads((runtime_root / "package" / "package.json").read_text())
+            self.assertEqual(
+                entrypoint,
+                app_root / module.PNPM_RECOVERY_RUNTIME_DIRECTORY / module.PNPM_RECOVERY_RUNTIME_ENTRYPOINT,
+            )
+            self.assertTrue(entrypoint.is_file())
+            self.assertEqual(manifest["version"], "11.25.0")
+            runtime = subprocess.run(
+                [str(entrypoint), "--version"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(runtime.returncode, 0, runtime.stderr)
+            self.assertEqual(runtime.stdout.strip(), "11.25.0")
 
     def test_harness_installer_is_idempotent_and_preserves_existing_policy(self) -> None:
         module = self._harness_installer_module()
@@ -1906,6 +1943,7 @@ class InstallerTests(unittest.TestCase):
                     "retry_backoff_seconds": 900,
                     "compression": "zstd",
                     "require_smb": True,
+                    "pnpm_store": str(state_root / "pnpm-store"),
                 },
             )
             self.assertEqual(
