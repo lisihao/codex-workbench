@@ -386,8 +386,10 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         install, environment = calls[1]
         self.assertIn("--offline", install)
         self.assertIn("--config.minimumReleaseAge=0", install)
+        self.assertIn("--config.trustLockfile=true", install)
         self.assertEqual(environment["npm_config_offline"], "true")
         self.assertEqual(environment["npm_config_minimum_release_age"], "0")
+        self.assertEqual(environment["npm_config_trust_lockfile"], "true")
 
     def test_offline_materializer_serializes_shared_store_linking(self) -> None:
         store = self.root / "pnpm-store"

@@ -71,10 +71,12 @@ class PnpmOfflineMaterializer:
     mode while each worktree receives its own linker directory.
     """
 
-    # pnpm 11.7 can wait on registry-backed supply-chain verification even
-    # when `--offline` is present.  11.25 is the first authority runtime we
-    # have verified to fail fast from the local cache instead.  Recovery must
-    # never turn that upstream behavior into an unbounded worker lease.
+    # pnpm 11 verifies a loaded lockfile against registry publish metadata by
+    # default, even when the install itself is offline.  Recovery only accepts
+    # a fixed, frozen lockfile from the already-authorized Git base, so it must
+    # explicitly trust that lockfile rather than retry registry attestations.
+    # The bounded recovery lease still prevents any upstream behavior from
+    # becoming an unbounded worker lease.
     MINIMUM_PNPM_11_VERSION = (11, 25, 0)
     MAX_MATERIALIZATION_SECONDS = 120
     BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
@@ -127,9 +129,11 @@ class PnpmOfflineMaterializer:
             "NO_UPDATE_NOTIFIER": "1",
             "npm_config_offline": "true",
             # pnpm 11 otherwise verifies release-age attestations against the
-            # registry even when installation itself is declared offline. A
-            # recovery must either use the local store or fail immediately.
+            # registry even when installation itself is declared offline.
+            # The frozen base lockfile is the trusted dependency boundary for
+            # this recovery, not the live registry.
             "npm_config_minimum_release_age": "0",
+            "npm_config_trust_lockfile": "true",
         })
         deadline = time.monotonic() + effective_timeout
         version = self._run(
@@ -162,6 +166,7 @@ class PnpmOfflineMaterializer:
             "--offline",
             "--frozen-lockfile",
             "--config.minimumReleaseAge=0",
+            "--config.trustLockfile=true",
             "--reporter=append-only",
         )
         if self.store_dir is not None:
