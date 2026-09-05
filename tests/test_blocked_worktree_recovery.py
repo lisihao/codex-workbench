@@ -8,6 +8,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -386,6 +388,67 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertIn("--config.minimumReleaseAge=0", install)
         self.assertEqual(environment["npm_config_offline"], "true")
         self.assertEqual(environment["npm_config_minimum_release_age"], "0")
+
+    def test_offline_materializer_serializes_shared_store_linking(self) -> None:
+        store = self.root / "pnpm-store"
+        store.mkdir()
+        first = self.root / "first-materialization-fixture"
+        second = self.root / "second-materialization-fixture"
+        for worktree in (first, second):
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.7.0"}),
+                encoding="utf-8",
+            )
+            (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+
+        started_install = threading.Event()
+        release_install = threading.Event()
+        guard = threading.Lock()
+        active_installs = 0
+        peak_installs = 0
+        errors: list[BaseException] = []
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal active_installs, peak_installs
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            with guard:
+                active_installs += 1
+                peak_installs = max(peak_installs, active_installs)
+            started_install.set()
+            release_install.wait(timeout=3)
+            with guard:
+                active_installs -= 1
+            return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=store,
+            runner=runner,
+        )
+
+        def run(worktree: Path) -> None:
+            try:
+                materializer.materialize(worktree, timeout_seconds=5)
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        first_thread = threading.Thread(target=run, args=(first,))
+        second_thread = threading.Thread(target=run, args=(second,))
+        first_thread.start()
+        self.assertTrue(started_install.wait(timeout=1))
+        second_thread.start()
+        time.sleep(0.2)
+        self.assertEqual(peak_installs, 1)
+        release_install.set()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(peak_installs, 1)
 
     def test_offline_materializer_rejects_known_hanging_pnpm_before_install(self) -> None:
         worktree = self.root / "old-pnpm-fixture"

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from typing import Any, Callable, Mapping
+import tempfile
+import time
+from typing import Any, Callable, Iterator, Mapping
 
 from .artifacts import ArtifactStore
 from .dependency_inputs import (
@@ -74,6 +79,7 @@ class PnpmOfflineMaterializer:
     MAX_MATERIALIZATION_SECONDS = 120
     BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
     STORE_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM_STORE"
+    LOCK_FILENAME = ".codex-workbench-pnpm-materialization.lock"
 
     def __init__(
         self,
@@ -125,7 +131,13 @@ class PnpmOfflineMaterializer:
             # recovery must either use the local store or fail immediately.
             "npm_config_minimum_release_age": "0",
         })
-        version = self._run((binary, "--version"), worktree, environment, effective_timeout)
+        deadline = time.monotonic() + effective_timeout
+        version = self._run(
+            (binary, "--version"),
+            worktree,
+            environment,
+            self._remaining_seconds(deadline),
+        )
         if version.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm version probe failed: {version.stderr.strip() or version.stdout.strip()}"
@@ -159,12 +171,17 @@ class PnpmOfflineMaterializer:
                     f"configured pnpm store is unavailable: {store_dir}"
                 )
             install_command += ("--store-dir", str(store_dir))
-        install = self._run(
-            install_command,
-            worktree,
-            environment,
-            effective_timeout,
-        )
+        # pnpm writes shared store metadata while materializing a worktree-local
+        # linker. Parallel workers still run concurrently after preparation, but
+        # concurrent linkers against one store have repeatedly exceeded the
+        # bounded recovery lease on the Mac mini.
+        with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
+            install = self._run(
+                install_command,
+                worktree,
+                environment,
+                self._remaining_seconds(deadline),
+            )
         if install.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
                 "offline pnpm materialization failed: "
@@ -178,8 +195,48 @@ class PnpmOfflineMaterializer:
             "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
             "materialization_timeout_seconds": effective_timeout,
             "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
+            "shared_store_lock": {
+                "path": str(lock_path),
+                "wait_seconds": lock_wait_seconds,
+            },
             "commands": [version.to_dict(), install.to_dict()],
         }
+
+    @staticmethod
+    def _remaining_seconds(deadline: float) -> int:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DirtyWorktreeRecoveryError(
+                "offline pnpm materialization exhausted its bounded recovery window"
+            )
+        return max(1, math.ceil(remaining))
+
+    @contextmanager
+    def _shared_store_lock(self, deadline: float) -> Iterator[tuple[Path, float]]:
+        lock_directory = self.store_dir or Path(tempfile.gettempdir())
+        lock_path = lock_directory / self.LOCK_FILENAME
+        try:
+            handle = lock_path.open("a+", encoding="utf-8")
+        except OSError as error:
+            raise DirtyWorktreeRecoveryError(
+                f"cannot open shared pnpm store lock {lock_path}: {error}"
+            ) from error
+        started = time.monotonic()
+        try:
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise DirtyWorktreeRecoveryError(
+                            "offline pnpm materialization timed out waiting for the shared pnpm store lock"
+                        )
+                    time.sleep(0.1)
+            yield lock_path, round(time.monotonic() - started, 3)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
     @staticmethod
     def _semver(value: str, *, label: str) -> tuple[int, int, int]:
