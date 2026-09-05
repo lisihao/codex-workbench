@@ -3,7 +3,13 @@ from __future__ import annotations
 import copy
 import unittest
 
-from codex_workbench.performance import load_benchmark_baseline
+from codex_workbench.performance import (
+    LOCAL_OUTCOME_HARNESS,
+    LOCAL_OUTCOME_SCORE_KIND,
+    PERFORMANCE_SEMANTIC_VERSION,
+    load_benchmark_baseline,
+)
+from codex_workbench.public_evidence_ranking import canonical_cohort_key
 from codex_workbench.routing_evaluation import (
     calibration_for_requests,
     evaluate_routes,
@@ -102,6 +108,12 @@ def calibration(
         "status": "ok",
         "snapshot_id": snapshot_id,
         "digest": digest,
+        "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+        "calibration_policy": {
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "local_outcomes_only": True,
+            "external_evidence_updates_beta": False,
+        },
         "task_type": "implementation",
         "complexity": "standard",
         "candidates": list(candidates),
@@ -111,20 +123,77 @@ def calibration(
     return value
 
 
-def calibrated_candidate(provider: str, model: str, lower_bound: float) -> dict[str, object]:
+def calibrated_candidate(
+    provider: str,
+    model: str,
+    lower_bound: float,
+    *,
+    runtime_sample_count: int = 5,
+    public_evidence: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    evidence = list(public_evidence or ())
     return {
         "provider": provider,
         "model_id": model,
+        "canonical_model_id": model,
+        "agent_name": provider,
         "agent_version": "unattested",
         "reasoning_effort": "max",
+        "calibration_cohort": {
+            "provider": provider,
+            "canonical_model_id": model,
+            "agent_name": provider,
+            "agent_version": "unattested",
+            "reasoning_effort": "max",
+            "task_type": "implementation",
+            "complexity": "standard",
+            "harness": LOCAL_OUTCOME_HARNESS,
+            "score_kind": LOCAL_OUTCOME_SCORE_KIND,
+        },
+        "public_evidence": evidence,
         "quality": {
-            "prior": {"evidence_status": "available"},
+            "prior": {
+                "kind": "conservative-policy-prior",
+                "policy": "local-outcomes-only-v2-cold-start",
+                "empirical": False,
+                "evidence_status": "reference_only" if evidence else "unavailable",
+            },
             "posterior": {
                 "lower_bound_95": lower_bound,
-                "runtime_sample_count": 5,
+                "runtime_sample_count": runtime_sample_count,
+                "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                "local_outcomes_only": True,
+                "harness": LOCAL_OUTCOME_HARNESS,
+                "score_kind": LOCAL_OUTCOME_SCORE_KIND,
             },
         },
     }
+
+
+def comparable_public_evidence(model: str, value: float) -> dict[str, object]:
+    record: dict[str, object] = {
+        "source": "ai-frontier",
+        "provider": "codex",
+        "model_id": model,
+        "canonical_model_id": model,
+        "reasoning_effort": "max",
+        "metric_kind": "pass_rate",
+        "score_kind": "resolved_rate",
+        "value": value,
+        "unit": "proportion",
+        "sample_count": 200,
+        "observed_at": "2026-09-04T00:00:00Z",
+        "benchmark": "evaluation-fixture",
+        "benchmark_version": "1",
+        "harness": "evaluation-fixture-harness",
+        "domain": "coding",
+        "task_type": "implementation",
+        "lineage_id": f"ai-frontier:{model}",
+        "correlation_group": "ai-frontier:evaluation-fixture",
+        "comparability": {"status": "comparable", "missing_conditions": []},
+    }
+    record["cohort_key"] = canonical_cohort_key(record)
+    return record
 
 
 class RoutingEvaluationTests(unittest.TestCase):
@@ -236,46 +305,42 @@ class RoutingEvaluationTests(unittest.TestCase):
     def test_ai_frontier_incremental_change_is_separate_from_declared_baseline(self) -> None:
         luna = capability("codex", "gpt-5.6-luna", cost=1)
         terra = capability("codex", "gpt-5.6-terra", cost=100)
-        without_frontier = calibration(
-            calibrated_candidate("codex", "gpt-5.6-luna", 0.45),
-            calibrated_candidate("codex", "gpt-5.6-terra", 0.75),
+        current = calibration(
+            calibrated_candidate(
+                "codex",
+                "gpt-5.6-luna",
+                0.45,
+                runtime_sample_count=0,
+                public_evidence=[comparable_public_evidence("gpt-5.6-luna", 0.70)],
+            ),
+            calibrated_candidate(
+                "codex",
+                "gpt-5.6-terra",
+                0.75,
+                runtime_sample_count=0,
+                public_evidence=[comparable_public_evidence("gpt-5.6-terra", 0.95)],
+            ),
         )
-
-        equal_result = evaluate_routes(
+        before = copy.deepcopy(current)
+        result = evaluate_routes(
             catalog(luna, terra),
             [request()],
             calibrations={
-                "without_ai_frontier": without_frontier,
-                "current": without_frontier,
+                "without_ai_frontier": current,
+                "current": current,
             },
         )
-        equal_incremental = equal_result["ai_frontier_incremental"]
-        self.assertEqual(equal_result["strategies"]["current"]["decision_change"]["numerator"], 1)
-        self.assertEqual(equal_incremental["numerator"], 0)
-        self.assertEqual(equal_incremental["denominator"], 1)
-        self.assertEqual(equal_incremental["comparable_rows"], 1)
-        self.assertEqual(equal_incremental["rate"], 0.0)
-        self.assertFalse(equal_incremental["delivery_improvement_proven"])
-        self.assertIsNone(equal_incremental["actual_savings"])
+        incremental = result["ai_frontier_incremental"]
 
-        changed_result = evaluate_routes(
-            catalog(luna, terra),
-            [request()],
-            calibrations={
-                "without_ai_frontier": without_frontier,
-                "current": calibration(
-                    calibrated_candidate("codex", "gpt-5.6-luna", 0.75),
-                    calibrated_candidate("codex", "gpt-5.6-terra", 0.45),
-                ),
-            },
-        )
-        changed_incremental = changed_result["ai_frontier_incremental"]
-        self.assertEqual(changed_result["strategies"]["current"]["rows"][0]["route"], "gpt-5.6-luna")
-        self.assertEqual(changed_incremental["numerator"], 1)
-        self.assertEqual(changed_incremental["denominator"], 1)
-        self.assertEqual(changed_incremental["rate"], 1.0)
-        self.assertFalse(changed_incremental["delivery_improvement_proven"])
-        self.assertIsNone(changed_incremental["actual_savings"])
+        self.assertEqual(current, before)
+        self.assertEqual(result["strategies"]["without_ai_frontier"]["rows"][0]["route"], "gpt-5.6-luna")
+        self.assertEqual(result["strategies"]["current"]["rows"][0]["route"], "gpt-5.6-terra")
+        self.assertEqual(result["strategies"]["current"]["decision_change"]["numerator"], 1)
+        self.assertEqual(incremental["numerator"], 1)
+        self.assertEqual(incremental["denominator"], 1)
+        self.assertEqual(incremental["rate"], 1.0)
+        self.assertFalse(incremental["delivery_improvement_proven"])
+        self.assertIsNone(incremental["actual_savings"])
 
     def test_empty_batch_is_insufficient_data_with_null_rates(self) -> None:
         result = evaluate_routes(
@@ -326,9 +391,16 @@ class RoutingEvaluationTests(unittest.TestCase):
         snapshot = {
             "snapshot_id": "performance-aaaaaaaaaaaaaaaa",
             "digest": "b" * 64,
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "calibration_policy": {
+                "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+                "local_outcomes_only": True,
+                "external_evidence_updates_beta": False,
+            },
             "baseline": load_benchmark_baseline(),
             "metrics": [],
             "source_provenance": {"model_identities": {}},
+            "public_evidence": [],
         }
         active_catalog = {
             "models": [
@@ -353,6 +425,7 @@ class RoutingEvaluationTests(unittest.TestCase):
 
         self.assertEqual(matrix["snapshot_id"], snapshot["snapshot_id"])
         self.assertEqual(matrix["digest"], snapshot["digest"])
+        self.assertEqual(matrix["semantic_version"], PERFORMANCE_SEMANTIC_VERSION)
         self.assertEqual(
             [(context["task_type"], context["complexity"]) for context in matrix["contexts"]],
             [("docs", "low"), ("implementation", "standard")],

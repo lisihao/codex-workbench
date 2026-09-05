@@ -372,7 +372,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-当前源码版本为 `1.12.1`。新增 GPT-6 Astra 显式控制面选择（默认仍为 Sol）、原生结果回执驱动的 Claude 精确型号映射、所有模型性能的 JSON/CSV/HTML 清单和离线路由对照；修复新任务创建时遗漏 AI Frontier 输入的问题。Astra 性能缺失保持 N/A；效果评估分别报告数据覆盖、选择变化和真实交付证据，不能用测试通过或路由分数声称实际提速。继承 1.11.0 的两个独立离线 Provider 和 1.10.0 的运行账本、Spark 调度、worktree/NAS 生命周期及 500K 上下文策略。
+当前源码候选为 `1.13.0`。新增可比公开证据与本地结果的分层融合、可审计的弃权原因，以及可选的 OpenSquilla 本地需求分类。继承 1.12.1 的执行恢复修复和 1.12.0 的 Astra 显式控制面选择、Claude 精确型号映射与分来源性能清单。默认控制面仍为 Sol；Astra 性能缺失保持 N/A。测试通过、分类可运行或路由发生变化，都不能替代真实交付周期与单位配额收益证据。
 
 该版本将 Git 工作树分配和执行路径解析到真实物理目录。下游节点先纳入已 `accepted` 的祖先补丁，再仅导出本节点新增的差异。`task reconcile-archify` 和 `task retry-blocked` 提供只读 `--dry-run` 提议；操作人应先审阅提议，再以当前 revision/attempt 正式授权恢复。恢复不重建任务、不修改冻结 base，也不把人工无副作用确认冒充自动验证。
 

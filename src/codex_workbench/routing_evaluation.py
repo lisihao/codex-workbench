@@ -15,6 +15,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from .performance import (
+    PERFORMANCE_SEMANTIC_VERSION,
     PerformanceRegistry,
     load_benchmark_baseline,
     validate_benchmark_baseline,
@@ -283,6 +284,12 @@ def calibration_for_requests(
         "digest": snapshot_digest,
         "performance_snapshot_id": snapshot_id,
         "performance_digest": snapshot_digest,
+        "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+        "calibration_policy": {
+            "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
+            "local_outcomes_only": True,
+            "external_evidence_updates_beta": False,
+        },
         "task_types": sorted({task_type for task_type, _ in contexts_requested}),
         "complexities": sorted({complexity for _, complexity in contexts_requested}),
         "contexts": contexts,
@@ -392,10 +399,68 @@ def _variant_calibrations(
 def _normalize_calibration(value: Any, *, label: str) -> dict[str, Any]:
     calibration = _as_mapping(value, label=f"calibration[{label}]")
     raw_contexts = calibration.get("contexts")
-    if raw_contexts is None:
-        return calibration
-    calibration["contexts"] = _context_list(raw_contexts)
+    if raw_contexts is not None:
+        calibration["contexts"] = _context_list(raw_contexts)
+    if label == "without_ai_frontier" and _has_current_v2_semantics(calibration):
+        return _without_ai_frontier_public_evidence(calibration)
     return calibration
+
+
+def _has_current_v2_semantics(calibration: Mapping[str, Any]) -> bool:
+    policy = calibration.get("calibration_policy")
+    return (
+        calibration.get("semantic_version") == PERFORMANCE_SEMANTIC_VERSION
+        and isinstance(policy, Mapping)
+        and policy.get("local_outcomes_only") is True
+        and policy.get("external_evidence_updates_beta") is False
+    )
+
+
+def _without_ai_frontier_public_evidence(
+    calibration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a v2 comparator without only AI Frontier public records.
+
+    This deliberately changes neither local posterior counts nor declared
+    policy quality.  Legacy calibration is never passed here: it stays
+    audit-only and is not reinterpreted as v2 evidence.
+    """
+
+    result = dict(calibration)
+    raw_evidence = result.get("public_evidence")
+    if isinstance(raw_evidence, Iterable) and not isinstance(
+        raw_evidence, (str, bytes, Mapping)
+    ):
+        result["public_evidence"] = [
+            dict(record)
+            for record in raw_evidence
+            if isinstance(record, Mapping) and not _is_ai_frontier_record(record)
+        ]
+    raw_candidates = result.get("candidates")
+    if isinstance(raw_candidates, Iterable) and not isinstance(
+        raw_candidates, (str, bytes, Mapping)
+    ):
+        result["candidates"] = [
+            _without_ai_frontier_public_evidence(candidate)
+            if isinstance(candidate, Mapping)
+            else candidate
+            for candidate in raw_candidates
+        ]
+    raw_contexts = result.get("contexts")
+    if isinstance(raw_contexts, Iterable) and not isinstance(
+        raw_contexts, (str, bytes, Mapping)
+    ):
+        result["contexts"] = [
+            _without_ai_frontier_public_evidence(context)
+            if isinstance(context, Mapping)
+            else context
+            for context in raw_contexts
+        ]
+    return result
+
+
+def _is_ai_frontier_record(record: Mapping[str, Any]) -> bool:
+    return str(record.get("source") or "").strip().lower() == "ai-frontier"
 
 
 def _context_list(value: Any) -> list[dict[str, Any]]:
