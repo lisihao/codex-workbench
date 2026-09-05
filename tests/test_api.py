@@ -54,8 +54,9 @@ class APITests(unittest.TestCase):
             thread.start()
             port = server.server_address[1]
             try:
-                with mock.patch(
-                    "codex_workbench.api.WorkbenchAIFrontier", return_value=fake_frontier
+                with (
+                    mock.patch("codex_workbench.api.WorkbenchAIFrontier", return_value=fake_frontier),
+                    mock.patch("codex_workbench.api.code_as_harness_health", return_value={"ok": True}),
                 ):
                     with urlopen(
                         f"http://127.0.0.1:{port}/api/ai-frontier", timeout=2
