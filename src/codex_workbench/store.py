@@ -26,6 +26,7 @@ from .model import (
 )
 from .artifacts import ArtifactStore, presentation_format
 from .dependency_inputs import load_recorded_dependency_input
+from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
 from .planner import propose_archify_reconciliation
@@ -1161,16 +1162,35 @@ class WorkbenchStore:
         if not node["worktree"] or allocation["current_path"] != node["worktree"]:
             raise StateConflictError("blocked node worktree does not match its physical allocation")
         contract = json.loads(task["contract_json"])
+        try:
+            spec = json.loads(node["spec_json"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StateConflictError("blocked node spec is invalid JSON") from error
+        allowed_scope = contract.get("allowed_scope") if isinstance(contract, dict) else None
+        forbidden_scope = contract.get("forbidden_scope") if isinstance(contract, dict) else None
+        write_scopes = spec.get("write_scopes") if isinstance(spec, dict) else None
+        if not (
+            isinstance(allowed_scope, list)
+            and all(isinstance(scope, str) for scope in allowed_scope)
+            and isinstance(forbidden_scope, list)
+            and all(isinstance(scope, str) for scope in forbidden_scope)
+            and isinstance(write_scopes, list)
+            and all(isinstance(scope, str) for scope in write_scopes)
+        ):
+            raise StateConflictError("blocked-worktree recovery scopes are invalid")
         return {
             "task": {
                 "task_id": task_id,
                 "state": str(task["state"]),
                 "revision": int(task["state_revision"]),
+                "allowed_scope": tuple(allowed_scope),
+                "forbidden_scope": tuple(forbidden_scope),
             },
             "node": {
                 "node_id": node_id,
                 "state": str(node["state"]),
                 "attempt": int(node["attempt"]),
+                "write_scopes": tuple(write_scopes),
             },
             "source": {
                 "worktree": str(allocation["current_path"]),
@@ -1239,13 +1259,15 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             required = common
-        elif schema_version == 2:
+        elif schema_version in {2, 3}:
             required = common | {
                 "source_task_id",
                 "source_node_id",
                 "input_tree_sha",
                 "dependency_input_ref",
             }
+            if schema_version == 3:
+                required.add("untracked_paths")
         else:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         if set(recovery) != required:
@@ -1271,7 +1293,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             for field in (
                 "source_task_id",
                 "source_node_id",
@@ -1282,13 +1304,38 @@ class WorkbenchStore:
                     raise StateConflictError(
                         f"dirty-worktree recovery receipt field {field!r} is invalid"
                     )
+        expected_untracked: tuple[str, ...] = ()
+        if schema_version == 3:
+            raw_untracked = recovery.get("untracked_paths")
+            if (
+                not isinstance(raw_untracked, list)
+                or not raw_untracked
+                or not all(isinstance(path, str) and path for path in raw_untracked)
+                or tuple(raw_untracked) != tuple(sorted(set(raw_untracked)))
+                or not set(raw_untracked).issubset(source["changed_paths"])
+            ):
+                raise StateConflictError("dirty-worktree recovery receipt untracked_paths are invalid")
+            expected_untracked = tuple(raw_untracked)
+            allowed_scope = list(candidate["task"]["allowed_scope"])
+            forbidden_scope = list(candidate["task"]["forbidden_scope"])
+            write_scopes = list(candidate["node"]["write_scopes"])
+            for relative_path in expected_untracked:
+                if not scope_allows(relative_path, allowed_scope, forbidden_scope):
+                    raise StateConflictError(
+                        f"untracked recovery path is outside the task contract scope: {relative_path}"
+                    )
+                if not scope_allows(relative_path, write_scopes, []):
+                    raise StateConflictError(
+                        f"untracked recovery path is outside the blocked node write scope: {relative_path}"
+                    )
         try:
             source_path = Path(str(source["worktree"])).expanduser().resolve(strict=True)
             receipt_source = Path(str(recovery["source_worktree"])).expanduser().resolve(strict=True)
             artifacts = ArtifactStore(self.path.parent / "artifacts")
             patch = artifacts.verify(str(recovery["patch_ref"])).read_bytes()
             source_result = json.loads(candidate["source_result_json"])
-        except (OSError, ValueError, json.JSONDecodeError) as error:
+            actual_untracked = DirtyWorktreeRecovery.untracked_paths(source_path)
+        except (OSError, ValueError, DirtyWorktreeRecoveryError, json.JSONDecodeError) as error:
             raise StateConflictError(
                 f"dirty-worktree recovery source or artifact is unavailable: {error}"
             ) from error
@@ -1312,8 +1359,8 @@ class WorkbenchStore:
             raise StateConflictError("dirty-worktree recovery source no longer matches contract base")
         if self._recovery_git_bytes(source_path, "branch", "--show-current").decode().strip() != source["branch"]:
             raise StateConflictError("dirty-worktree recovery source no longer matches allocated branch")
-        if self._recovery_git_bytes(source_path, "ls-files", "--others", "--exclude-standard", "-z"):
-            raise StateConflictError("dirty-worktree recovery source gained untracked files")
+        if actual_untracked != expected_untracked:
+            raise StateConflictError("dirty-worktree recovery source untracked paths drifted")
         comparison_tree = base_sha
         if schema_version == 1:
             if recorded_dependency_ref is not None:
@@ -1351,7 +1398,7 @@ class WorkbenchStore:
                 "--verify",
                 f"{dependency_input.input_tree_sha}^{{tree}}",
             ).decode().strip()
-        source_paths = tuple(
+        tracked_paths = tuple(
             sorted(
                 line
                 for line in self._recovery_git_bytes(
@@ -1367,9 +1414,18 @@ class WorkbenchStore:
                 if line
             )
         )
+        source_paths = tuple(sorted((*tracked_paths, *actual_untracked)))
         if source_paths != source["changed_paths"]:
             raise StateConflictError("dirty-worktree recovery source changed paths drifted")
-        if self._recovery_git_bytes(source_path, "diff", "--binary", comparison_tree) != patch:
+        try:
+            current_patch = DirtyWorktreeRecovery.captured_patch(
+                source_path,
+                comparison_tree,
+                actual_untracked,
+            )
+        except DirtyWorktreeRecoveryError as error:
+            raise StateConflictError(f"dirty-worktree recovery source patch is unavailable: {error}") from error
+        if current_patch != patch:
             raise StateConflictError("dirty-worktree recovery source patch drifted")
         return dict(recovery)
 
@@ -3520,13 +3576,15 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             receipt_fields = common_fields
-        elif schema_version == 2:
+        elif schema_version in {2, 3}:
             receipt_fields = common_fields | {
                 "source_task_id",
                 "source_node_id",
                 "input_tree_sha",
                 "dependency_input_ref",
             }
+            if schema_version == 3:
+                receipt_fields.add("untracked_paths")
         else:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         if set(recovery) != receipt_fields:
@@ -3548,7 +3606,7 @@ class WorkbenchStore:
             "patch_ref",
             "patch_sha256",
         ]
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             fields.extend(
                 [
                     "source_task_id",
@@ -3562,6 +3620,16 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
+        if schema_version == 3:
+            untracked_paths = recovery.get("untracked_paths")
+            if (
+                not isinstance(untracked_paths, list)
+                or not untracked_paths
+                or not all(isinstance(path, str) and path for path in untracked_paths)
+                or tuple(untracked_paths) != tuple(sorted(set(untracked_paths)))
+                or not set(untracked_paths).issubset(recovery["changed_paths"])
+            ):
+                raise StateConflictError("dirty-worktree recovery receipt untracked_paths are invalid")
         return {
             "authorization_revision": authorization["authorization_revision"],
             "source_allocation_id": authorization["source_allocation_id"],
@@ -3854,7 +3922,7 @@ class WorkbenchStore:
                 "dirty-worktree recovery patch artifact does not match the captured receipt"
             )
         comparison_tree = recovery["base_sha"]
-        if recovery.get("schema_version") == 2:
+        if recovery.get("schema_version") in {2, 3}:
             if recovery.get("source_task_id") != task_id or recovery.get("source_node_id") != node_id:
                 raise StateConflictError("dependency recovery receipt belongs to another node")
             try:

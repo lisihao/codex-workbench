@@ -19,7 +19,7 @@ from codex_workbench.dependency_inputs import (
     apply_accepted_ancestor_patches,
     load_recorded_dependency_input,
 )
-from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecovery
+from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecovery, PnpmOfflineMaterializer
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
@@ -160,7 +160,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             recovery=recovery,
         )
 
-    def _blocked_dependent_task(self) -> tuple[TaskContract, dict, Path, str, bytes]:
+    def _blocked_dependent_task(
+        self,
+        *,
+        untracked_path: str | None = None,
+    ) -> tuple[TaskContract, dict, Path, str, bytes]:
         command = (
             f"{sys.executable} -c \"from pathlib import Path; "
             "assert Path('src/schema.txt').read_text() == 'schema\\n'; "
@@ -273,7 +277,17 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             "dependency-input.json",
         )
         (source / "src" / "value.txt").write_text("patched\n", encoding="utf-8")
-        source_worker_patch = self.worktrees.diff_patch(source, dependency_input.input_tree_sha)
+        untracked_paths: tuple[str, ...] = ()
+        if untracked_path is not None:
+            added = source / untracked_path
+            added.parent.mkdir(parents=True, exist_ok=True)
+            added.write_text("untracked recovery fixture\n", encoding="utf-8")
+            untracked_paths = (untracked_path,)
+        source_worker_patch = DirtyWorktreeRecovery.captured_patch(
+            source,
+            dependency_input.input_tree_sha,
+            untracked_paths,
+        )
         self.store.settle_claimed(
             claimed_worker,
             NodeResult(
@@ -282,7 +296,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
                 artifacts={"dependency-input": dependency_input_ref},
                 actual_model="fixture",
                 result_kind="worker",
-                changed_paths=("src/value.txt",),
+                changed_paths=("src/value.txt", *untracked_paths),
                 checks=("fixture dependent worker blocked",),
                 governance_profile=contract.governance_profile,
                 verification_tier=contract.verification_tier,
@@ -302,6 +316,8 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         blocked: dict,
         source: Path,
         dependency_input_ref: str,
+        *,
+        preserve_untracked: bool = False,
     ) -> dict:
         worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
         dependency_input = json.loads(
@@ -320,8 +336,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             node_id="worker",
             input_tree_sha=dependency_input["input_tree_sha"],
             dependency_input_ref=dependency_input_ref,
+            preserve_untracked_paths=(
+                DirtyWorktreeRecovery.untracked_paths(source) if preserve_untracked else ()
+            ),
         )
-        self.assertEqual(recovery["schema_version"], 2)
+        self.assertEqual(recovery["schema_version"], 3 if preserve_untracked else 2)
         return self.store.resume_blocked_worktree(
             contract.task_id,
             "worker",
@@ -330,6 +349,39 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             reason="replay the persisted dependency input and only the worker delta",
             recovery=recovery,
         )
+
+    def test_offline_materializer_disables_release_age_registry_queries(self) -> None:
+        worktree = self.root / "materialization-fixture"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.7.0"}),
+            encoding="utf-8",
+        )
+        (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            environment = kwargs["env"]
+            assert isinstance(environment, dict)
+            calls.append((tuple(args), dict(environment)))
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                "11.7.0\n" if args[-1] == "--version" else "offline fixture ok\n",
+                "",
+            )
+
+        receipt = PnpmOfflineMaterializer(binary=sys.executable, runner=runner).materialize(
+            worktree,
+            timeout_seconds=5,
+        )
+        self.assertEqual(receipt["kind"], "pnpm-offline-materialization")
+        self.assertEqual(len(calls), 2)
+        install, environment = calls[1]
+        self.assertIn("--offline", install)
+        self.assertIn("--config.minimumReleaseAge=0", install)
+        self.assertEqual(environment["npm_config_offline"], "true")
+        self.assertEqual(environment["npm_config_minimum_release_age"], "0")
 
     def test_clean_a2_recovery_never_invokes_a_model_or_mutates_a1(self) -> None:
         command = f"{sys.executable} -c \"from pathlib import Path; assert Path('src/value.txt').read_text() == 'patched\\n'\""
@@ -439,6 +491,126 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(composed)
         self.assertEqual((verifier_input / "src" / "schema.txt").read_text(encoding="utf-8"), "schema\n")
         self.assertEqual((verifier_input / "src" / "value.txt").read_text(encoding="utf-8"), "patched\n")
+
+    def test_dependent_recovery_requires_explicit_preservation_for_untracked_files(self) -> None:
+        contract, blocked, source, dependency_input_ref, _ = self._blocked_dependent_task(
+            untracked_path="src/loader-continuation.host.spec.ts"
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        with self.assertRaisesRegex(Exception, "explicit preservation"):
+            self.recovery.capture(
+                repository=contract.repository,
+                base_sha=contract.base_sha,
+                worktree=str(source),
+                branch=self.worktrees.branch_name(contract.task_id, "worker", int(worker["attempt"])),
+                attempt=int(worker["attempt"]),
+                expected_changed_paths=tuple(worker["result"]["changed_paths"]),
+                task_id=contract.task_id,
+                node_id="worker",
+                input_tree_sha=json.loads(
+                    ArtifactStore(self.state_root / "artifacts").verify(dependency_input_ref).read_text(encoding="utf-8")
+                )["input_tree_sha"],
+                dependency_input_ref=dependency_input_ref,
+            )
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
+
+    def test_explicit_dependent_untracked_recovery_preserves_a1_and_composes_closure(self) -> None:
+        untracked_path = "src/loader-continuation.host.spec.ts"
+        contract, blocked, source, dependency_input_ref, source_worker_patch = self._blocked_dependent_task(
+            untracked_path=untracked_path
+        )
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        self._authorize_dependent(
+            contract,
+            blocked,
+            source,
+            dependency_input_ref,
+            preserve_untracked=True,
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("dependent-untracked-recovery-worker")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("model executor must not run"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((worker["state"], worker["attempt"]), ("accepted", 2))
+        self.assertEqual(
+            worker["result"]["changed_paths"],
+            ["src/loader-continuation.host.spec.ts", "src/value.txt"],
+        )
+        target = Path(worker["worktree"])
+        self.assertEqual(
+            (target / untracked_path).read_text(encoding="utf-8"),
+            "untracked recovery fixture\n",
+        )
+        recovered_input = load_recorded_dependency_input(
+            ArtifactStore(self.state_root / "artifacts"),
+            dependency_input_ref,
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=contract.base_sha,
+        )
+        self.assertEqual(
+            self.worktrees.diff_patch(target, recovered_input.input_tree_sha),
+            source_worker_patch,
+        )
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
+        verifier_input = self.worktrees.prepare(
+            contract.repository, contract.base_sha, contract.task_id, "verify", 1
+        )
+        apply_accepted_ancestor_patches(
+            task,
+            "verify",
+            verifier_input,
+            ArtifactStore(self.state_root / "artifacts"),
+            self.worktrees,
+        )
+        self.assertEqual(
+            (verifier_input / untracked_path).read_text(encoding="utf-8"),
+            "untracked recovery fixture\n",
+        )
+
+    def test_cli_dry_run_preserves_untracked_only_when_explicitly_requested(self) -> None:
+        contract, blocked, source, _, _ = self._blocked_dependent_task(
+            untracked_path="src/loader-continuation.host.spec.ts"
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        args = build_parser().parse_args([
+            "--home", str(self.state_root),
+            "task", "resume-blocked-worktree", contract.task_id, "worker",
+            "--expected-revision", str(blocked["state_revision"]),
+            "--expected-attempt", str(worker["attempt"]),
+            "--reason", "preserve the declared in-scope fixture file on clean a2",
+            "--confirm-recovery", "--preserve-untracked", "--dry-run",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(command_task(args), 0)
+        recovery = json.loads(output.getvalue())["recovery"]
+        self.assertEqual(recovery["schema_version"], 3)
+        self.assertEqual(recovery["untracked_paths"], ["src/loader-continuation.host.spec.ts"])
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
 
     def test_failed_clean_a2_preparation_restores_the_a1_block_without_mutation(self) -> None:
         command = f"{sys.executable} -c \"raise SystemExit(7)\""

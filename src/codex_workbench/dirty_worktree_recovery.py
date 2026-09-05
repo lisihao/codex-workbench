@@ -105,6 +105,10 @@ class PnpmOfflineMaterializer:
             "CI": "true",
             "NO_UPDATE_NOTIFIER": "1",
             "npm_config_offline": "true",
+            # pnpm 11 otherwise verifies release-age attestations against the
+            # registry even when installation itself is declared offline. A
+            # recovery must either use the local store or fail immediately.
+            "npm_config_minimum_release_age": "0",
         })
         version = self._run((binary, "--version"), worktree, environment, timeout_seconds)
         if version.exit_code != 0:
@@ -123,6 +127,7 @@ class PnpmOfflineMaterializer:
                 "install",
                 "--offline",
                 "--frozen-lockfile",
+                "--config.minimumReleaseAge=0",
                 "--reporter=append-only",
             ),
             worktree,
@@ -199,6 +204,7 @@ class DirtyWorktreeRecovery:
         node_id: str | None = None,
         input_tree_sha: str | None = None,
         dependency_input_ref: str | None = None,
+        preserve_untracked_paths: tuple[str, ...] = (),
     ) -> dict[str, object]:
         """Capture only the blocked worker's own patch.
 
@@ -242,19 +248,33 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError(
                 "worktree changed paths do not match the blocked worker receipt"
             )
-        untracked = self._git_bytes(path, "ls-files", "--others", "--exclude-standard", "-z")
-        if untracked:
-            names = [name.decode("utf-8", errors="replace") for name in untracked.split(b"\0") if name]
+        untracked_paths = self.untracked_paths(path)
+        requested_untracked = tuple(sorted(preserve_untracked_paths))
+        if untracked_paths:
+            if dependency_input_ref is None:
+                raise DirtyWorktreeRecoveryError(
+                    "preserving untracked recovery files requires a recorded dependency input"
+                )
+            if requested_untracked != untracked_paths:
+                raise DirtyWorktreeRecoveryError(
+                    "dirty worktree contains untracked files; pass the exact paths through explicit preservation: "
+                    + ", ".join(untracked_paths)
+                )
+            recovery_context = {
+                **recovery_context,
+                "schema_version": 3,
+                "untracked_paths": list(untracked_paths),
+            }
+        elif requested_untracked:
             raise DirtyWorktreeRecoveryError(
-                "dirty worktree contains untracked files; explicit archival is required first: "
-                + ", ".join(names)
+                "explicit untracked preservation paths no longer match the dirty worktree"
             )
         check = self._git_text(path, "diff", "--check", comparison_tree)
         if check:
             raise DirtyWorktreeRecoveryError(f"dirty worktree fails git diff --check: {check}")
-        patch = self._git_bytes(path, "diff", "--binary", comparison_tree)
+        patch = self.captured_patch(path, comparison_tree, untracked_paths)
         if not patch:
-            raise DirtyWorktreeRecoveryError("dirty worktree has no tracked patch to preserve")
+            raise DirtyWorktreeRecoveryError("dirty worktree has no patch to preserve")
         patch_ref = self.artifacts.put_bytes(patch, "blocked-worktree.patch")
         return {
             **recovery_context,
@@ -299,6 +319,10 @@ class DirtyWorktreeRecovery:
             patch = self._load_patch(recovery)
             patch_path = self._patch_path(recovery)
             self.worktrees.apply_patch(target, patch_path)
+            self.mark_untracked_intent_to_add(
+                target,
+                self._recovery_untracked_paths(recovery),
+            )
             if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target patch does not exactly match the captured source patch"
@@ -445,10 +469,12 @@ class DirtyWorktreeRecovery:
         current_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if current_paths != tuple(sorted(changed_paths)):
             raise DirtyWorktreeRecoveryError("dirty worktree changed paths drifted after recovery was scheduled")
-        untracked = self._git_bytes(path, "ls-files", "--others", "--exclude-standard", "-z")
-        if untracked:
-            raise DirtyWorktreeRecoveryError("dirty worktree gained untracked files after recovery was scheduled")
-        patch = self._git_bytes(path, "diff", "--binary", comparison_tree)
+        untracked_paths = self.untracked_paths(path)
+        if untracked_paths != self._recovery_untracked_paths(recovery):
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree untracked paths drifted after recovery was scheduled"
+            )
+        patch = self.captured_patch(path, comparison_tree, untracked_paths)
         expected_hash = recovery["patch_sha256"]
         if not isinstance(expected_hash, str) or sha256(patch).hexdigest() != expected_hash:
             raise DirtyWorktreeRecoveryError("dirty worktree patch drifted after recovery was scheduled")
@@ -486,7 +512,7 @@ class DirtyWorktreeRecovery:
                 None,
                 None,
             )
-        if schema_version != 2:
+        if schema_version not in {2, 3}:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt schema is unsupported")
         required = {
             "schema_version",
@@ -502,6 +528,8 @@ class DirtyWorktreeRecovery:
             "patch_ref",
             "patch_sha256",
         }
+        if schema_version == 3:
+            required.add("untracked_paths")
         if set(recovery) != required:
             raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt has an invalid shape")
         task_id = recovery["source_task_id"]
@@ -513,12 +541,134 @@ class DirtyWorktreeRecovery:
             for value in (task_id, node_id, input_tree_sha, dependency_input_ref)
         ):
             raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt is incomplete")
+        self._recovery_untracked_paths(recovery)
         return (
             self._git_text(worktree, "rev-parse", "--verify", f"{input_tree_sha}^{{tree}}"),
             task_id,
             node_id,
             dependency_input_ref,
         )
+
+    @staticmethod
+    def untracked_paths(worktree: Path) -> tuple[str, ...]:
+        raw = DirtyWorktreeRecovery._git_bytes(
+            worktree,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        )
+        paths = tuple(sorted(item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item))
+        for relative_path in paths:
+            candidate = worktree / relative_path
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"cannot preserve untracked recovery file {relative_path!r}: {error}"
+                ) from error
+            if not resolved.is_relative_to(worktree.resolve()) or candidate.is_symlink() or not candidate.is_file():
+                raise DirtyWorktreeRecoveryError(
+                    f"untracked recovery path must be a regular file inside its worktree: {relative_path!r}"
+                )
+        return paths
+
+    @staticmethod
+    def captured_patch(
+        worktree: Path,
+        comparison_tree: str,
+        untracked_paths: tuple[str, ...] = (),
+    ) -> bytes:
+        tracked = DirtyWorktreeRecovery._git_bytes(worktree, "diff", "--binary", comparison_tree)
+        if not untracked_paths:
+            return tracked
+        actual_paths = DirtyWorktreeRecovery.untracked_paths(worktree)
+        if actual_paths != tuple(untracked_paths):
+            raise DirtyWorktreeRecoveryError("untracked recovery paths changed while capturing patch")
+        tracked_paths = tuple(
+            sorted(
+                line
+                for line in DirtyWorktreeRecovery._git_bytes(
+                    worktree, "diff", "--name-only", "--no-renames", comparison_tree, "--"
+                )
+                .decode(errors="surrogateescape")
+                .splitlines()
+                if line
+            )
+        )
+        additions: list[bytes] = []
+        untracked = set(untracked_paths)
+        for relative_path in sorted((*tracked_paths, *untracked_paths)):
+            if relative_path not in untracked:
+                additions.append(
+                    DirtyWorktreeRecovery._git_bytes(
+                        worktree, "diff", "--binary", comparison_tree, "--", relative_path
+                    )
+                )
+                continue
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "diff",
+                    "--binary",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    relative_path,
+                ],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode not in {0, 1} or not result.stdout:
+                raise DirtyWorktreeRecoveryError(
+                    result.stderr.decode(errors="replace").strip()
+                    or f"cannot capture untracked recovery file {relative_path!r}"
+                )
+            additions.append(bytes(result.stdout))
+        return b"".join(additions)
+
+    @staticmethod
+    def mark_untracked_intent_to_add(worktree: Path, untracked_paths: tuple[str, ...]) -> None:
+        if not untracked_paths:
+            return
+        current_paths = DirtyWorktreeRecovery.untracked_paths(worktree)
+        # `git apply --3way` may already stage a no-index new-file patch. In
+        # that case there is nothing left to mark; the exact combined patch
+        # comparison immediately after this call still proves the target.
+        if not current_paths:
+            return
+        if current_paths != tuple(untracked_paths):
+            raise DirtyWorktreeRecoveryError(
+                "recovery target untracked paths do not match the preserved source paths"
+            )
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "add", "--intent-to-add", "--", *untracked_paths],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode:
+            raise DirtyWorktreeRecoveryError(
+                result.stderr.strip() or result.stdout.strip() or "cannot record recovered untracked paths"
+            )
+
+    @staticmethod
+    def _recovery_untracked_paths(recovery: Mapping[str, object]) -> tuple[str, ...]:
+        if recovery.get("schema_version") in {1, 2}:
+            return ()
+        paths = recovery.get("untracked_paths")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or not all(isinstance(path, str) and path for path in paths)
+            or tuple(paths) != tuple(sorted(set(paths)))
+        ):
+            raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid untracked_paths")
+        return tuple(paths)
 
     def _restore_recorded_input(
         self,

@@ -48,7 +48,7 @@ from .service import Coordinator
 from .session_context import import_session_context
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
-from .worktrees import WorktreeManager
+from .worktrees import WorktreeManager, scope_allows
 from .sync import RepositorySynchronizer
 
 
@@ -381,6 +381,7 @@ def _capture_blocked_worktree_recovery(
     expected_attempt: int,
     reason: str,
     dry_run: bool,
+    preserve_untracked: bool,
 ) -> dict[str, object]:
     candidate = store.blocked_worktree_recovery_candidate(
         task_id,
@@ -402,7 +403,7 @@ def _capture_blocked_worktree_recovery(
         base_sha=base_sha,
         artifacts=ArtifactStore(artifact_root),
     )
-    capture_kwargs: dict[str, str] = {}
+    capture_kwargs: dict[str, object] = {}
     if dependency_input is not None:
         dependency_input_ref, input_tree_sha = dependency_input
         capture_kwargs = {
@@ -411,6 +412,40 @@ def _capture_blocked_worktree_recovery(
             "input_tree_sha": input_tree_sha,
             "dependency_input_ref": dependency_input_ref,
         }
+    if preserve_untracked:
+        if dependency_input is None:
+            raise ValueError("explicit untracked preservation requires a dependent blocked worker")
+        untracked_paths = DirtyWorktreeRecovery.untracked_paths(
+            Path(str(source["worktree"])).expanduser().resolve(strict=True)
+        )
+        if not untracked_paths:
+            raise ValueError("explicit untracked preservation requested but source has no untracked files")
+        nodes = task.get("nodes")
+        if not isinstance(nodes, list):
+            raise ValueError("blocked-worktree recovery task nodes are invalid")
+        node = next((item for item in nodes if isinstance(item, dict) and item.get("node_id") == node_id), None)
+        allowed_scope = contract.get("allowed_scope")
+        forbidden_scope = contract.get("forbidden_scope")
+        write_scopes = node.get("write_scopes") if isinstance(node, dict) else None
+        if not (
+            isinstance(allowed_scope, list)
+            and all(isinstance(scope, str) for scope in allowed_scope)
+            and isinstance(forbidden_scope, list)
+            and all(isinstance(scope, str) for scope in forbidden_scope)
+            and isinstance(write_scopes, list)
+            and all(isinstance(scope, str) for scope in write_scopes)
+        ):
+            raise ValueError("blocked-worktree recovery scopes are invalid")
+        for relative_path in untracked_paths:
+            if not scope_allows(relative_path, allowed_scope, forbidden_scope):
+                raise ValueError(
+                    f"untracked recovery path is outside the task contract scope: {relative_path}"
+                )
+            if not scope_allows(relative_path, write_scopes, []):
+                raise ValueError(
+                    f"untracked recovery path is outside the blocked node write scope: {relative_path}"
+                )
+        capture_kwargs["preserve_untracked_paths"] = untracked_paths
     if dry_run:
         with tempfile.TemporaryDirectory(prefix="codex-workbench-recovery-dry-run-") as directory:
             recovery = DirtyWorktreeRecovery(
@@ -486,13 +521,15 @@ def _validate_blocked_worktree_recovery_receipt(
     schema_version = recovery.get("schema_version")
     if schema_version == 1:
         required = common
-    elif schema_version == 2:
+    elif schema_version in {2, 3}:
         required = common | {
             "source_task_id",
             "source_node_id",
             "input_tree_sha",
             "dependency_input_ref",
         }
+        if schema_version == 3:
+            required.add("untracked_paths")
     else:
         raise ValueError("blocked-worktree recovery receipt schema is unsupported")
     if set(recovery) != required:
@@ -500,7 +537,7 @@ def _validate_blocked_worktree_recovery_receipt(
     if recovery["source_attempt"] != expected_attempt:
         raise ValueError("blocked-worktree recovery receipt source attempt is invalid")
     fields = ["source_worktree", "source_branch", "base_sha", "patch_ref", "patch_sha256"]
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         fields.extend(["source_task_id", "source_node_id", "input_tree_sha", "dependency_input_ref"])
     for field in fields:
         if not isinstance(recovery[field], str) or not recovery[field]:
@@ -512,6 +549,16 @@ def _validate_blocked_worktree_recovery_receipt(
         or not all(isinstance(item, str) and item for item in changed_paths)
     ):
         raise ValueError("blocked-worktree recovery changed_paths are invalid")
+    if schema_version == 3:
+        untracked_paths = recovery.get("untracked_paths")
+        if (
+            not isinstance(untracked_paths, list)
+            or not untracked_paths
+            or not all(isinstance(item, str) and item for item in untracked_paths)
+            or tuple(untracked_paths) != tuple(sorted(set(untracked_paths)))
+            or not set(untracked_paths).issubset(changed_paths)
+        ):
+            raise ValueError("blocked-worktree recovery untracked_paths are invalid")
     if (
         recovery["source_worktree"] != source["worktree"]
         or recovery["source_branch"] != source["branch"]
@@ -542,6 +589,8 @@ def command_task(args: argparse.Namespace) -> int:
         result = {"ok": True, "action": "reconcile-archify", **result}
     elif args.action == "resume-blocked-worktree":
         if getattr(args, "recovery_file", None):
+            if args.preserve_untracked:
+                raise ValueError("--preserve-untracked cannot be combined with --recovery-file")
             recovery = _load_blocked_worktree_recovery(args.recovery_file)
             if not isinstance(recovery.get("patch_ref"), str):
                 raise ValueError("blocked-worktree recovery receipt patch_ref is required")
@@ -567,6 +616,7 @@ def command_task(args: argparse.Namespace) -> int:
                 expected_attempt=args.expected_attempt,
                 reason=args.reason,
                 dry_run=bool(args.dry_run),
+                preserve_untracked=bool(args.preserve_untracked),
             )
         result = {
             "ok": True,
@@ -1677,6 +1727,11 @@ def build_parser() -> argparse.ArgumentParser:
     resume_blocked_worktree.add_argument(
         "--recovery-file",
         help="use an existing artifact-backed recovery receipt instead of capturing a1",
+    )
+    resume_blocked_worktree.add_argument(
+        "--preserve-untracked",
+        action="store_true",
+        help="explicitly preserve exact in-scope untracked files on the clean recovery target",
     )
     resume_blocked_worktree.add_argument("--dry-run", action="store_true")
     retry_blocked = task_sub.add_parser("retry-blocked")
