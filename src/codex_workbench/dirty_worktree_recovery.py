@@ -136,9 +136,12 @@ class PnpmOfflineMaterializer:
             "npm_config_trust_lockfile": "true",
         })
         deadline = time.monotonic() + effective_timeout
+        # pnpm consults workspace configuration even for --version. Probe the
+        # Workbench-managed binary in a neutral directory so a broken target
+        # workspace cannot consume the whole recovery lease before install.
         version = self._run(
             (binary, "--version"),
-            worktree,
+            Path(tempfile.gettempdir()),
             environment,
             self._remaining_seconds(deadline),
         )

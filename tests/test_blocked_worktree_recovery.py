@@ -364,12 +364,14 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             encoding="utf-8",
         )
         (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
-        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+        calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
 
         def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             environment = kwargs["env"]
+            cwd = kwargs["cwd"]
             assert isinstance(environment, dict)
-            calls.append((tuple(args), dict(environment)))
+            assert isinstance(cwd, Path)
+            calls.append((tuple(args), cwd, dict(environment)))
             return subprocess.CompletedProcess(
                 args,
                 0,
@@ -383,7 +385,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(receipt["kind"], "pnpm-offline-materialization")
         self.assertEqual(len(calls), 2)
-        install, environment = calls[1]
+        version, version_cwd, _ = calls[0]
+        self.assertEqual(version, (sys.executable, "--version"))
+        self.assertEqual(version_cwd, Path(tempfile.gettempdir()))
+        install, install_cwd, environment = calls[1]
+        self.assertEqual(install_cwd, worktree)
         self.assertIn("--offline", install)
         self.assertIn("--config.minimumReleaseAge=0", install)
         self.assertIn("--config.trustLockfile=true", install)
