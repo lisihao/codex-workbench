@@ -571,6 +571,9 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             (cwd / "node_modules" / ".bin").mkdir()
             (cwd / "node_modules" / "fixture.txt").write_text("ready\n", encoding="utf-8")
             (cwd / "node_modules" / "workspace").symlink_to("../packages/fixture")
+            package_linker = cwd / "packages" / "fixture" / "node_modules"
+            package_linker.mkdir()
+            (package_linker / "fixture.txt").write_text("package-ready\n", encoding="utf-8")
             return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
 
         materializer = PnpmOfflineMaterializer(
@@ -592,6 +595,12 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertTrue(interrupted_receipt["template"]["replaced_interrupted_node_modules"])
         self.assertEqual(changed_receipt["template"]["state"], "seeded")
         self.assertEqual((second / "node_modules" / "fixture.txt").read_text(encoding="utf-8"), "ready\n")
+        self.assertEqual(
+            (second / "packages" / "fixture" / "node_modules" / "fixture.txt").read_text(
+                encoding="utf-8"
+            ),
+            "package-ready\n",
+        )
         self.assertTrue((interrupted / "node_modules" / ".modules.yaml").is_file())
         self.assertEqual((second / "node_modules" / "workspace").resolve(), (second / "packages" / "fixture").resolve())
         self.assertEqual(len(second_receipt["commands"]), 2)

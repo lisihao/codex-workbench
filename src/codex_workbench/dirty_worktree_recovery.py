@@ -67,9 +67,10 @@ def _bounded(text: str, *, limit: int = 1_000_000) -> str:
 class PnpmOfflineMaterializer:
     """Materialize a worktree-local pnpm linker without network access.
 
-    Each recovered worktree retains an independent ``node_modules`` directory.
-    A verified template is cloned into the target rather than shared or
-    symlinked, so workspace links remain local to the target source tree.
+    Each recovered worktree retains an independent pnpm linker tree, including
+    package-local ``node_modules`` directories. A verified template is cloned
+    into the target rather than shared or symlinked, so workspace links remain
+    local to the target source tree.
     On APFS this is copy-on-write and avoids repeated pnpm linker work.
     """
 
@@ -257,7 +258,7 @@ class PnpmOfflineMaterializer:
             if template_directory is not None and template_signature is not None:
                 self._write_template_marker(worktree / "node_modules", template_signature["key"])
                 template_publish = self._publish_template(
-                    template_directory, template_signature, worktree / "node_modules", deadline
+                    template_directory, template_signature, worktree, deadline
                 )
         return {
             "schema_version": 1,
@@ -317,7 +318,10 @@ class PnpmOfflineMaterializer:
                 digest.update(b"<missing>")
             digest.update(b"\0")
         payload = {
-            "schema_version": "2",
+            # v3 captures package-local pnpm linkers as well as the root
+            # node_modules tree. Reusing a v2 root-only cache would leave
+            # isolated-workspace package imports unresolved.
+            "schema_version": "3",
             "package_manager": package_manager,
             "pnpm_version": pnpm_version,
             "platform": platform.system().lower(),
@@ -339,7 +343,6 @@ class PnpmOfflineMaterializer:
         if not template_directory.exists():
             return None
         metadata_path = template_directory / self.TEMPLATE_METADATA_FILENAME
-        source = template_directory / "node_modules"
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -350,6 +353,8 @@ class PnpmOfflineMaterializer:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency template signature does not match recovery inputs: {template_directory}"
             )
+        linker_paths = self._template_linker_paths(metadata, template_directory)
+        source = template_directory / "node_modules"
         if not source.is_dir():
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency template is missing node_modules: {template_directory}"
@@ -358,24 +363,19 @@ class PnpmOfflineMaterializer:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency template is incomplete or stale: {template_directory}"
             )
-        destination = worktree / "node_modules"
-        if destination.exists() or destination.is_symlink():
-            if self._has_template_marker(destination, signature["key"]):
-                return (
-                    CommandOutcome(
-                        ("pnpm-template", "reuse", str(destination)),
-                        0,
-                        "reused complete worktree-local pnpm linker\n",
-                        "",
-                    ),
-                    False,
-                )
-            self._remove_node_modules(destination)
-            replaced_interrupted_node_modules = True
-        else:
-            replaced_interrupted_node_modules = False
+        if self._linker_tree_is_complete(worktree, linker_paths, signature["key"]):
+            return (
+                CommandOutcome(
+                    ("pnpm-template", "reuse", str(worktree)),
+                    0,
+                    "reused complete worktree-local pnpm linker tree\n",
+                    "",
+                ),
+                False,
+            )
+        replaced_interrupted_node_modules = self._remove_linker_tree(worktree, linker_paths)
         return (
-            self._clone_directory(source, destination, deadline),
+            self._clone_linker_tree(template_directory, worktree, linker_paths, deadline),
             replaced_interrupted_node_modules,
         )
 
@@ -386,7 +386,7 @@ class PnpmOfflineMaterializer:
         source: Path,
         deadline: float,
     ) -> CommandOutcome | None:
-        if not source.is_dir() or template_directory.exists():
+        if not (source / "node_modules").is_dir() or template_directory.exists():
             return None
         template_directory.parent.mkdir(parents=True, exist_ok=True)
         staging = template_directory.parent / (
@@ -394,8 +394,13 @@ class PnpmOfflineMaterializer:
         )
         try:
             staging.mkdir()
-            outcome = self._clone_directory(source, staging / "node_modules", deadline)
-            metadata = {"schema_version": 1, "signature": dict(signature)}
+            linker_paths = self._linker_paths(source)
+            outcome = self._clone_linker_tree(source, staging, linker_paths, deadline)
+            metadata = {
+                "schema_version": 2,
+                "signature": dict(signature),
+                "linker_paths": [str(path) for path in linker_paths],
+            }
             (staging / self.TEMPLATE_METADATA_FILENAME).write_text(
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True), encoding="utf-8"
             )
@@ -405,6 +410,100 @@ class PnpmOfflineMaterializer:
                 shutil.rmtree(staging, ignore_errors=True)
             raise
         return outcome
+
+    @staticmethod
+    def _linker_paths(worktree: Path) -> tuple[Path, ...]:
+        """Return pnpm linker directories without walking root dependencies."""
+
+        root = Path("node_modules")
+        paths = {root}
+        for current, directories, _files in os.walk(worktree):
+            current_path = Path(current)
+            relative = current_path.relative_to(worktree)
+            directories[:] = [name for name in directories if name != ".git"]
+            if relative == Path("."):
+                directories[:] = [name for name in directories if name != "node_modules"]
+                continue
+            if "node_modules" not in directories:
+                continue
+            candidate = relative / "node_modules"
+            directories.remove("node_modules")
+            paths.add(candidate)
+        return tuple(sorted(paths, key=str))
+
+    @staticmethod
+    def _template_linker_paths(
+        metadata: Mapping[str, object], template_directory: Path
+    ) -> tuple[Path, ...]:
+        raw_paths = metadata.get("linker_paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template is missing linker paths: {template_directory}"
+            )
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str):
+                raise DirtyWorktreeRecoveryError(
+                    f"pnpm dependency template has an invalid linker path: {template_directory}"
+                )
+            relative = Path(raw_path)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+                or relative.parts[-1] != "node_modules"
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    f"pnpm dependency template has an unsafe linker path: {template_directory}"
+                )
+            paths.append(relative)
+        normalized = tuple(sorted(set(paths), key=str))
+        if not normalized or normalized[0] != Path("node_modules"):
+            raise DirtyWorktreeRecoveryError(
+                f"pnpm dependency template is missing root node_modules: {template_directory}"
+            )
+        for relative in normalized:
+            linker = template_directory / relative
+            if not linker.is_dir() and not linker.is_symlink():
+                raise DirtyWorktreeRecoveryError(
+                    f"pnpm dependency template is missing linker directory {relative}: {template_directory}"
+                )
+        return normalized
+
+    def _linker_tree_is_complete(
+        self, worktree: Path, linker_paths: tuple[Path, ...], key: str
+    ) -> bool:
+        if not self._has_template_marker(worktree / "node_modules", key):
+            return False
+        return all(
+            (worktree / relative).is_dir() or (worktree / relative).is_symlink()
+            for relative in linker_paths
+        )
+
+    def _remove_linker_tree(self, worktree: Path, linker_paths: tuple[Path, ...]) -> bool:
+        removed = False
+        for relative in sorted(linker_paths, key=lambda path: len(path.parts), reverse=True):
+            target = worktree / relative
+            if target.exists() or target.is_symlink():
+                self._remove_node_modules(target)
+                removed = True
+        return removed
+
+    def _clone_linker_tree(
+        self,
+        source_root: Path,
+        destination_root: Path,
+        linker_paths: tuple[Path, ...],
+        deadline: float,
+    ) -> CommandOutcome:
+        for relative in linker_paths:
+            self._clone_directory(source_root / relative, destination_root / relative, deadline)
+        return CommandOutcome(
+            ("pnpm-template", "clone", str(source_root), str(destination_root)),
+            0,
+            f"cloned {len(linker_paths)} worktree-local pnpm linker directories\n",
+            "",
+        )
 
     def _discard_incomplete_node_modules(self, worktree: Path) -> None:
         """Remove only an interrupted linker tree before a fresh offline seed.
@@ -461,6 +560,7 @@ class PnpmOfflineMaterializer:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency clone destination already exists: {destination}"
             )
+        destination.parent.mkdir(parents=True, exist_ok=True)
         clone_option = "-cR" if platform.system() == "Darwin" else "-R"
         outcome = self._run(
             ("/bin/cp", clone_option, str(source), str(destination)),
