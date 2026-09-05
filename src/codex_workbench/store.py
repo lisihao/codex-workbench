@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
@@ -41,10 +42,12 @@ from .worktrees import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 
+_DIRTY_WORKTREE_RECOVERY_KIND = "blocked-worktree-recovery"
+_DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 
 def _repository_identity(repository: str) -> str:
     root = Path(repository).expanduser().resolve()
@@ -157,6 +160,7 @@ class WorkbenchStore:
                     started_at TEXT,
                     settled_at TEXT,
                     result_json TEXT,
+                    recovery_json TEXT,
                     coordinator_epoch INTEGER NOT NULL DEFAULT 0,
                     lease_epoch INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL,
@@ -296,7 +300,7 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -313,6 +317,8 @@ class WorkbenchStore:
                     connection.execute(
                         "ALTER TABLE nodes ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
                     )
+                if "recovery_json" not in node_columns:
+                    connection.execute("ALTER TABLE nodes ADD COLUMN recovery_json TEXT")
                 task_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
@@ -1095,7 +1101,348 @@ class WorkbenchStore:
                 "authorization_event_cursor": authorization_cursor,
             }
 
+
     @staticmethod
+    def _blocked_worktree_recovery_candidate(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        task = connection.execute(
+            "SELECT state, state_revision, contract_json FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        node = connection.execute(
+            "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+        ).fetchone()
+        if task is None or node is None:
+            raise KeyError((task_id, node_id))
+        if int(task["state_revision"]) != expected_revision:
+            raise StateConflictError(
+                f"expected task revision {expected_revision}, found {task['state_revision']}"
+            )
+        if int(node["attempt"]) != expected_attempt:
+            raise StateConflictError(
+                f"expected node attempt {expected_attempt}, found {node['attempt']}"
+            )
+        if task["state"] not in {"blocked", "queued", "running"}:
+            raise StateConflictError(
+                f"task {task_id} is {task['state']}, expected blocked, queued, or running"
+            )
+        if node["state"] != "blocked":
+            raise StateConflictError(f"node {node_id} is {node['state']}, expected blocked")
+        if node["recovery_json"] is not None:
+            raise StateConflictError("blocked node already has a pending dirty-worktree recovery")
+        if not node["result_json"]:
+            raise StateConflictError("blocked node has no latest result receipt")
+        try:
+            result = json.loads(node["result_json"])
+        except json.JSONDecodeError as error:
+            raise StateConflictError("blocked node result receipt is invalid JSON") from error
+        changed_paths = result.get("changed_paths") if isinstance(result, dict) else None
+        if result.get("status") != "blocked" or not isinstance(changed_paths, list) or not changed_paths:
+            raise StateConflictError(
+                "dirty-worktree recovery requires a blocked result with non-empty changed_paths"
+            )
+        if not all(isinstance(path, str) and path for path in changed_paths):
+            raise StateConflictError("blocked node changed_paths are invalid")
+        allocation = connection.execute(
+            """
+            SELECT * FROM worktree_allocations
+            WHERE task_id = ? AND node_id = ? AND attempt = ?
+            """,
+            (task_id, node_id, expected_attempt),
+        ).fetchone()
+        if allocation is None or allocation["state"] != "active":
+            raise StateConflictError("blocked node has no active physical worktree allocation")
+        if not node["worktree"] or allocation["current_path"] != node["worktree"]:
+            raise StateConflictError("blocked node worktree does not match its physical allocation")
+        contract = json.loads(task["contract_json"])
+        return {
+            "task": {
+                "task_id": task_id,
+                "state": str(task["state"]),
+                "revision": int(task["state_revision"]),
+            },
+            "node": {
+                "node_id": node_id,
+                "state": str(node["state"]),
+                "attempt": int(node["attempt"]),
+            },
+            "source": {
+                "worktree": str(allocation["current_path"]),
+                "branch": str(allocation["branch"]),
+                "base_sha": str(contract["base_sha"]),
+                "changed_paths": tuple(sorted(changed_paths)),
+                "allocation_id": str(allocation["allocation_id"]),
+            },
+            "source_result_json": str(node["result_json"]),
+        }
+
+    def blocked_worktree_recovery_candidate(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        with self.connection() as connection:
+            return self._blocked_worktree_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+
+    @staticmethod
+    def _recovery_git_bytes(worktree: Path, *arguments: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(worktree), *arguments],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except OSError as error:
+            raise StateConflictError(
+                f"cannot inspect blocked-worktree recovery worktree: {error}"
+            ) from error
+        if completed.returncode:
+            raise StateConflictError(
+                completed.stderr.decode(errors="replace").strip()
+                or completed.stdout.decode(errors="replace").strip()
+                or "cannot inspect blocked-worktree recovery worktree"
+            )
+        return bytes(completed.stdout)
+
+    def _validate_blocked_worktree_recovery_capture(
+        self,
+        candidate: dict[str, Any],
+        expected_attempt: int,
+        recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        required = {
+            "schema_version",
+            "source_attempt",
+            "source_worktree",
+            "source_branch",
+            "base_sha",
+            "changed_paths",
+            "patch_ref",
+            "patch_sha256",
+        }
+        if set(recovery) != required:
+            raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
+        if recovery["schema_version"] != 1:
+            raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
+        source = candidate["source"]
+        if (
+            recovery["source_attempt"] != expected_attempt
+            or recovery["source_branch"] != source["branch"]
+            or recovery["base_sha"] != source["base_sha"]
+            or tuple(sorted(recovery["changed_paths"])) != source["changed_paths"]
+        ):
+            raise StateConflictError(
+                "dirty-worktree recovery receipt does not match the blocked allocation"
+            )
+        for field in (
+            "source_worktree",
+            "source_branch",
+            "base_sha",
+            "patch_ref",
+            "patch_sha256",
+        ):
+            if not isinstance(recovery[field], str) or not recovery[field]:
+                raise StateConflictError(
+                    f"dirty-worktree recovery receipt field {field!r} is invalid"
+                )
+        try:
+            source_path = Path(str(source["worktree"])).expanduser().resolve(strict=True)
+            receipt_source = Path(str(recovery["source_worktree"])).expanduser().resolve(strict=True)
+            patch = self.artifacts.verify(str(recovery["patch_ref"])).read_bytes()
+        except (OSError, ValueError) as error:
+            raise StateConflictError(
+                f"dirty-worktree recovery source or artifact is unavailable: {error}"
+            ) from error
+        if receipt_source != source_path:
+            raise StateConflictError(
+                "dirty-worktree recovery receipt source does not match the active allocation"
+            )
+        patch_hash = sha256(patch).hexdigest()
+        if patch_hash != recovery["patch_sha256"]:
+            raise StateConflictError(
+                "dirty-worktree recovery patch artifact does not match the captured receipt"
+            )
+        base_sha = str(source["base_sha"])
+        if self._recovery_git_bytes(source_path, "rev-parse", "HEAD").decode().strip() != base_sha:
+            raise StateConflictError("dirty-worktree recovery source no longer matches contract base")
+        if self._recovery_git_bytes(source_path, "branch", "--show-current").decode().strip() != source["branch"]:
+            raise StateConflictError("dirty-worktree recovery source no longer matches allocated branch")
+        if self._recovery_git_bytes(source_path, "ls-files", "--others", "--exclude-standard", "-z"):
+            raise StateConflictError("dirty-worktree recovery source gained untracked files")
+        source_paths = tuple(
+            sorted(
+                line
+                for line in self._recovery_git_bytes(source_path, "diff", "--name-only", base_sha)
+                .decode(errors="surrogateescape")
+                .splitlines()
+                if line
+            )
+        )
+        if source_paths != source["changed_paths"]:
+            raise StateConflictError("dirty-worktree recovery source changed paths drifted")
+        if self._recovery_git_bytes(source_path, "diff", "--binary", base_sha) != patch:
+            raise StateConflictError("dirty-worktree recovery source patch drifted")
+        return dict(recovery)
+
+    def resume_blocked_worktree(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+        recovery: dict[str, Any],
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("dirty-worktree recovery reason must be non-empty")
+
+        if dry_run:
+            with self.connection() as connection:
+                candidate = self._blocked_worktree_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                capture = self._validate_blocked_worktree_recovery_capture(
+                    candidate,
+                    expected_attempt,
+                    recovery,
+                )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": True,
+                "task": candidate["task"],
+                "node": candidate["node"],
+                "source": candidate["source"],
+                "next_attempt": expected_attempt + 1,
+                "recovery": capture,
+            }
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            candidate = self._blocked_worktree_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            capture = self._validate_blocked_worktree_recovery_capture(
+                candidate,
+                expected_attempt,
+                recovery,
+            )
+            revision = expected_revision + 1
+            authorization = {
+                "schema_version": 1,
+                "kind": _DIRTY_WORKTREE_RECOVERY_KIND,
+                "state": "authorized",
+                "authorization_revision": revision,
+                "source_allocation_id": candidate["source"]["allocation_id"],
+                "source_result_json": candidate["source_result_json"],
+                "recovery": capture,
+            }
+            changed = connection.execute(
+                """
+                UPDATE nodes
+                SET state = 'pending', worker_id = NULL, worktree = NULL,
+                    effective_executor = NULL, effective_model = NULL,
+                    started_at = NULL, settled_at = NULL, result_json = NULL,
+                    coordinator_epoch = 0, lease_epoch = 0, recovery_json = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'blocked' AND attempt = ?
+                """,
+                (
+                    canonical_json(authorization),
+                    timestamp,
+                    task_id,
+                    node_id,
+                    expected_attempt,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("dirty-worktree recovery node compare-and-set failed")
+            next_state = (
+                "queued"
+                if candidate["task"]["state"] == "blocked"
+                else candidate["task"]["state"]
+            )
+            task_changed = connection.execute(
+                """
+                UPDATE tasks
+                SET state = ?, state_revision = ?, updated_at = ?, blocker = NULL, verdict = NULL
+                WHERE task_id = ? AND state_revision = ?
+                """,
+                (next_state, revision, timestamp, task_id, expected_revision),
+            ).rowcount
+            if task_changed != 1:
+                raise StateConflictError(
+                    "dirty-worktree recovery task revision compare-and-set failed"
+                )
+            self._event(
+                connection,
+                "node.blocked_worktree_recovery_authorized",
+                task_id,
+                node_id,
+                {
+                    "source_attempt": expected_attempt,
+                    "next_attempt": expected_attempt + 1,
+                    "reason": reason,
+                    "recovery": capture,
+                    "source_allocation_id": candidate["source"]["allocation_id"],
+                    "task_revision": revision,
+                },
+                created_at=timestamp,
+            )
+            if next_state != candidate["task"]["state"]:
+                self._event(
+                    connection,
+                    "task.state_changed",
+                    task_id,
+                    None,
+                    {
+                        "from": candidate["task"]["state"],
+                        "to": next_state,
+                        "revision": revision,
+                        "blocker": None,
+                    },
+                    created_at=timestamp,
+                )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": False,
+                "revision": revision,
+                "task": {"task_id": task_id, "state": next_state, "revision": revision},
+                "node": {
+                    "node_id": node_id,
+                    "state": "pending",
+                    "attempt": expected_attempt,
+                },
+                "source": candidate["source"],
+                "next_attempt": expected_attempt + 1,
+            }
+
     def _archify_reconciliation_candidate(
         connection: sqlite3.Connection,
         task_id: str,
@@ -1238,7 +1585,7 @@ class WorkbenchStore:
 
         if dry_run:
             with self.connection() as connection:
-                candidate = self._archify_reconciliation_candidate(
+                candidate = WorkbenchStore._archify_reconciliation_candidate(
                     connection, task_id, expected_revision=expected_revision
                 )
             return {
@@ -1257,7 +1604,7 @@ class WorkbenchStore:
 
         timestamp = now_iso()
         with self.transaction() as connection:
-            candidate = self._archify_reconciliation_candidate(
+            candidate = WorkbenchStore._archify_reconciliation_candidate(
                 connection, task_id, expected_revision=expected_revision
             )
             if not candidate["changes"]:
@@ -3026,6 +3373,105 @@ class WorkbenchStore:
             "authority_epoch": coordinator_epoch,
         }
 
+    @staticmethod
+    def _current_dirty_worktree_recovery_binding(
+        raw: object,
+        *,
+        next_attempt: int,
+    ) -> dict[str, Any] | None:
+        """Decode only the currently-authorized one-shot recovery receipt.
+
+        This intentionally reads ``nodes.recovery_json`` rather than replaying
+        historical events: a previous authorization can never route a later
+        attempt.  The receipt remains internal durable state until settlement.
+        """
+
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise StateConflictError("dirty-worktree recovery authorization is invalid")
+        try:
+            authorization = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise StateConflictError(
+                "dirty-worktree recovery authorization is invalid JSON"
+            ) from error
+        required = {
+            "schema_version",
+            "kind",
+            "state",
+            "authorization_revision",
+            "source_allocation_id",
+            "source_result_json",
+            "recovery",
+        }
+        if not isinstance(authorization, dict) or set(authorization) != required:
+            raise StateConflictError("dirty-worktree recovery authorization has an invalid shape")
+        if (
+            authorization["schema_version"] != 1
+            or authorization["kind"] != _DIRTY_WORKTREE_RECOVERY_KIND
+            or authorization["state"] != "authorized"
+        ):
+            raise StateConflictError("dirty-worktree recovery authorization is not claimable")
+        if (
+            isinstance(authorization["authorization_revision"], bool)
+            or not isinstance(authorization["authorization_revision"], int)
+            or authorization["authorization_revision"] <= 0
+            or not isinstance(authorization["source_allocation_id"], str)
+            or not authorization["source_allocation_id"]
+            or not isinstance(authorization["source_result_json"], str)
+        ):
+            raise StateConflictError("dirty-worktree recovery authorization fields are invalid")
+        try:
+            source_result = json.loads(authorization["source_result_json"])
+        except json.JSONDecodeError as error:
+            raise StateConflictError(
+                "dirty-worktree recovery source result is invalid JSON"
+            ) from error
+        if not isinstance(source_result, dict) or source_result.get("status") != "blocked":
+            raise StateConflictError("dirty-worktree recovery source result is not blocked")
+        recovery = authorization["recovery"]
+        receipt_fields = {
+            "schema_version",
+            "source_attempt",
+            "source_worktree",
+            "source_branch",
+            "base_sha",
+            "changed_paths",
+            "patch_ref",
+            "patch_sha256",
+        }
+        if not isinstance(recovery, dict) or set(recovery) != receipt_fields:
+            raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
+        source_attempt = recovery["source_attempt"]
+        if (
+            recovery["schema_version"] != 1
+            or isinstance(source_attempt, bool)
+            or not isinstance(source_attempt, int)
+            or source_attempt + 1 != next_attempt
+            or not isinstance(recovery["changed_paths"], list)
+            or not recovery["changed_paths"]
+            or not all(isinstance(path, str) and path for path in recovery["changed_paths"])
+        ):
+            raise StateConflictError("dirty-worktree recovery receipt does not match the next attempt")
+        for field in (
+            "source_worktree",
+            "source_branch",
+            "base_sha",
+            "patch_ref",
+            "patch_sha256",
+        ):
+            if not isinstance(recovery[field], str) or not recovery[field]:
+                raise StateConflictError(
+                    f"dirty-worktree recovery receipt field {field!r} is invalid"
+                )
+        return {
+            "authorization_revision": authorization["authorization_revision"],
+            "source_allocation_id": authorization["source_allocation_id"],
+            "source_result_json": authorization["source_result_json"],
+            "recovery": dict(recovery),
+        }
+
     def claim_ready_node(
         self,
         worker_id: str,
@@ -3089,6 +3535,7 @@ class WorkbenchStore:
             selected_lane: str | None = None
             selected_pool: str | None = None
             selected_blocked_retry_authorization_cursor: int | None = None
+            selected_dirty_worktree_recovery: dict[str, Any] | None = None
             for candidate in candidates:
                 spec = json.loads(candidate["spec_json"])
                 candidate_attempt = int(candidate["attempt"]) + 1
@@ -3098,7 +3545,16 @@ class WorkbenchStore:
                     str(candidate["node_id"]),
                     candidate_attempt,
                 )
-                if authorization is not None:
+                dirty_worktree_recovery = self._current_dirty_worktree_recovery_binding(
+                    candidate["recovery_json"],
+                    next_attempt=candidate_attempt,
+                )
+                if dirty_worktree_recovery is not None:
+                    # Recovery preparation runs locally against the sealed
+                    # receipt; it must never consume a subscription route.
+                    effective_executor = "deterministic"
+                    effective_model = "blocked-worktree-recovery"
+                elif authorization is not None:
                     effective_executor = str(authorization["executor"])
                     effective_model = str(authorization["model"])
                 else:
@@ -3146,7 +3602,7 @@ class WorkbenchStore:
                     for running_repository, running_reads, running_writes in running_accesses
                 ):
                     continue
-                if admissible is not None and not admissible(spec):
+                if admissible is not None and not admissible(effective_spec):
                     continue
                 selected = candidate
                 selected_spec = spec
@@ -3155,6 +3611,7 @@ class WorkbenchStore:
                 selected_lane = lane
                 selected_pool = quota_pool_id_for_spec(effective_spec)
                 selected_blocked_retry_authorization_cursor = authorization["event_cursor"] if authorization is not None else None
+                selected_dirty_worktree_recovery = dirty_worktree_recovery
                 break
 
             if (
@@ -3230,6 +3687,13 @@ class WorkbenchStore:
                     **({
                         "blocked_retry_authorization_event_cursor": selected_blocked_retry_authorization_cursor,
                     } if selected_blocked_retry_authorization_cursor is not None else {}),
+                    **({
+                        "blocked_worktree_recovery": {
+                            "source_attempt": selected_dirty_worktree_recovery["recovery"]["source_attempt"],
+                            "source_allocation_id": selected_dirty_worktree_recovery["source_allocation_id"],
+                            "patch_ref": selected_dirty_worktree_recovery["recovery"]["patch_ref"],
+                        },
+                    } if selected_dirty_worktree_recovery is not None else {}),
                 },
                 created_at=timestamp,
             )
@@ -3260,7 +3724,49 @@ class WorkbenchStore:
                 },
                 "contract": json.loads(selected["contract_json"]),
                 "steering": steering,
+                **({
+                    "blocked_worktree_recovery": selected_dirty_worktree_recovery,
+                } if selected_dirty_worktree_recovery is not None else {}),
             }
+
+    def _validate_dirty_worktree_recovery_target(
+        self,
+        *,
+        contract: dict[str, Any],
+        task_id: str,
+        node_id: str,
+        attempt: int,
+        worktree: str,
+        recovery_binding: dict[str, Any],
+    ) -> tuple[Path, bytes]:
+        """Verify that an a2 target is the exact prepared a1 patch."""
+
+        recovery = recovery_binding["recovery"]
+        if recovery["base_sha"] != contract["base_sha"]:
+            raise StateConflictError("dirty-worktree recovery receipt base does not match task contract")
+        try:
+            target = Path(worktree).expanduser().resolve(strict=True)
+            patch = self.artifacts.verify(str(recovery["patch_ref"])).read_bytes()
+        except (OSError, ValueError) as error:
+            raise StateConflictError(
+                f"dirty-worktree recovery target or patch artifact is unavailable: {error}"
+            ) from error
+        if sha256(patch).hexdigest() != recovery["patch_sha256"]:
+            raise StateConflictError(
+                "dirty-worktree recovery patch artifact does not match the captured receipt"
+            )
+        expected_branch = WorktreeManager.branch_name(task_id, node_id, attempt)
+        if self._recovery_git_bytes(target, "rev-parse", "HEAD").decode().strip() != recovery["base_sha"]:
+            raise StateConflictError("dirty-worktree recovery target no longer matches contract base")
+        if self._recovery_git_bytes(target, "branch", "--show-current").decode().strip() != expected_branch:
+            raise StateConflictError("dirty-worktree recovery target branch is invalid")
+        if self._recovery_git_bytes(target, "ls-files", "--others", "--exclude-standard", "-z"):
+            raise StateConflictError("dirty-worktree recovery target has unexpected untracked files")
+        if self._recovery_git_bytes(target, "diff", "--binary", recovery["base_sha"]) != patch:
+            raise StateConflictError(
+                "dirty-worktree recovery target does not match the captured source patch"
+            )
+        return target, patch
 
     def assign_worktree(
         self,
@@ -3280,20 +3786,72 @@ class WorkbenchStore:
             ).fetchone()
             if task is None:
                 raise KeyError(task_id)
+            node = connection.execute(
+                """
+                SELECT state, attempt, coordinator_epoch, lease_epoch, worktree, recovery_json
+                FROM nodes WHERE task_id = ? AND node_id = ?
+                """,
+                (task_id, node_id),
+            ).fetchone()
+            if node is None:
+                raise KeyError((task_id, node_id))
+            if (
+                node["state"] != "running"
+                or int(node["attempt"]) != attempt
+                or int(node["coordinator_epoch"]) != coordinator_epoch
+                or int(node["lease_epoch"]) != lease_epoch
+            ):
+                raise StateConflictError(f"node {node_id} lease is stale")
             contract = json.loads(task["contract_json"])
             branch = WorktreeManager.branch_name(task_id, node_id, attempt)
             allocation_id = "wta-" + canonical_hash(
                 {"task_id": task_id, "node_id": node_id, "attempt": attempt}
             )[:24]
             timestamp = now_iso()
+            recovery_binding = None
+            consumed_recovery_json = None
+            assigned_worktree = worktree
+            if node["recovery_json"] is not None:
+                if node["worktree"] is not None:
+                    raise StateConflictError("dirty-worktree recovery target was already assigned")
+                recovery_binding = self._current_dirty_worktree_recovery_binding(
+                    node["recovery_json"],
+                    next_attempt=attempt,
+                )
+                target, _ = self._validate_dirty_worktree_recovery_target(
+                    contract=contract,
+                    task_id=task_id,
+                    node_id=node_id,
+                    attempt=attempt,
+                    worktree=worktree,
+                    recovery_binding=recovery_binding,
+                )
+                try:
+                    authorization = json.loads(node["recovery_json"])
+                except json.JSONDecodeError as error:
+                    raise StateConflictError(
+                        "dirty-worktree recovery authorization is invalid JSON"
+                    ) from error
+                consumed_recovery_json = canonical_json(
+                    {
+                        **authorization,
+                        "state": "consumed",
+                        "consumed_at": timestamp,
+                        "target_attempt": attempt,
+                        "target_worktree": str(target),
+                        "target_branch": branch,
+                    }
+                )
+                assigned_worktree = str(target)
             changed = connection.execute(
                 """
-                UPDATE nodes SET worktree = ?, updated_at = ?
+                UPDATE nodes SET worktree = ?, recovery_json = ?, updated_at = ?
                 WHERE task_id = ? AND node_id = ? AND state = 'running'
                   AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
                 """,
                 (
-                    worktree,
+                    assigned_worktree,
+                    consumed_recovery_json if recovery_binding is not None else node["recovery_json"],
                     timestamp,
                     task_id,
                     node_id,
@@ -3304,6 +3862,19 @@ class WorkbenchStore:
             ).rowcount
             if changed != 1:
                 raise StateConflictError(f"node {node_id} lease is stale")
+            if recovery_binding is not None:
+                superseded = connection.execute(
+                    """
+                    UPDATE worktree_allocations
+                    SET state = 'superseded', updated_at = ?
+                    WHERE allocation_id = ? AND state = 'active'
+                    """,
+                    (timestamp, recovery_binding["source_allocation_id"]),
+                ).rowcount
+                if superseded != 1:
+                    raise StateConflictError(
+                        "dirty-worktree recovery source allocation is not active"
+                    )
             connection.execute(
                 """
                 INSERT INTO worktree_allocations(
@@ -3322,7 +3893,7 @@ class WorkbenchStore:
                     contract["repository"],
                     contract["base_sha"],
                     branch,
-                    worktree,
+                    assigned_worktree,
                     timestamp,
                     timestamp,
                 ),
@@ -3335,10 +3906,189 @@ class WorkbenchStore:
                 {
                     "allocation_id": allocation_id,
                     "attempt": attempt,
-                    "path": worktree,
+                    "path": assigned_worktree,
                     "branch": branch,
                 },
             )
+            if recovery_binding is not None:
+                self._event(
+                    connection,
+                    "node.blocked_worktree_recovery_consumed",
+                    task_id,
+                    node_id,
+                    {
+                        "attempt": attempt,
+                        "source_attempt": recovery_binding["recovery"]["source_attempt"],
+                        "source_allocation_id": recovery_binding["source_allocation_id"],
+                        "recovery": recovery_binding["recovery"],
+                        "target_worktree": assigned_worktree,
+                        "target_branch": branch,
+                    },
+                    created_at=timestamp,
+                )
+
+    def _dirty_worktree_recovery_for_settlement(
+        self,
+        raw: object,
+        *,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        """Return a current receipt only for its authorized or consumed a2."""
+
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise StateConflictError("dirty-worktree recovery receipt is invalid")
+        try:
+            stored = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise StateConflictError("dirty-worktree recovery receipt is invalid JSON") from error
+        if not isinstance(stored, dict):
+            raise StateConflictError("dirty-worktree recovery receipt is invalid")
+        state = stored.get("state")
+        base_fields = {
+            "schema_version",
+            "kind",
+            "state",
+            "authorization_revision",
+            "source_allocation_id",
+            "source_result_json",
+            "recovery",
+        }
+        if state == "authorized":
+            binding = self._current_dirty_worktree_recovery_binding(raw, next_attempt=attempt)
+            return {"state": state, **binding}
+        consumed_fields = base_fields | {
+            "consumed_at",
+            "target_attempt",
+            "target_worktree",
+            "target_branch",
+        }
+        if state != "consumed" or set(stored) != consumed_fields:
+            raise StateConflictError("dirty-worktree recovery receipt is not current")
+        if (
+            stored.get("target_attempt") != attempt
+            or not isinstance(stored.get("consumed_at"), str)
+            or not isinstance(stored.get("target_worktree"), str)
+            or not stored["target_worktree"]
+            or not isinstance(stored.get("target_branch"), str)
+            or not stored["target_branch"]
+        ):
+            raise StateConflictError("dirty-worktree recovery consumed receipt is invalid")
+        authorized = {key: stored[key] for key in base_fields}
+        authorized["state"] = "authorized"
+        binding = self._current_dirty_worktree_recovery_binding(
+            canonical_json(authorized),
+            next_attempt=attempt,
+        )
+        return {
+            "state": state,
+            "target_worktree": stored["target_worktree"],
+            "target_branch": stored["target_branch"],
+            "consumed_at": stored["consumed_at"],
+            **binding,
+        }
+
+    def _rollback_authorized_dirty_worktree_recovery(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        row: sqlite3.Row,
+        recovery: dict[str, Any],
+        result: NodeResult,
+        timestamp: str,
+    ) -> None:
+        """Restore the blocked a1 receipt when a2 was never allocated."""
+
+        if result.status not in {"blocked", "failed"}:
+            raise ValueError("unprepared dirty-worktree recovery may only block or fail")
+        source = recovery["recovery"]
+        allocation = connection.execute(
+            """
+            SELECT state, current_path, branch FROM worktree_allocations
+            WHERE allocation_id = ?
+            """,
+            (recovery["source_allocation_id"],),
+        ).fetchone()
+        if (
+            allocation is None
+            or allocation["state"] != "active"
+            or allocation["current_path"] != source["source_worktree"]
+            or allocation["branch"] != source["source_branch"]
+        ):
+            raise StateConflictError(
+                "dirty-worktree recovery source allocation is no longer active"
+            )
+        changed = connection.execute(
+            """
+            UPDATE nodes
+            SET state = 'blocked', attempt = ?, worker_id = NULL, worktree = ?,
+                effective_executor = NULL, effective_model = NULL,
+                started_at = NULL, settled_at = ?, result_json = ?, recovery_json = NULL,
+                coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+            WHERE task_id = ? AND node_id = ? AND state = 'running'
+              AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
+            """,
+            (
+                source["source_attempt"],
+                source["source_worktree"],
+                timestamp,
+                recovery["source_result_json"],
+                timestamp,
+                task_id,
+                node_id,
+                row["attempt"],
+                row["coordinator_epoch"],
+                row["lease_epoch"],
+            ),
+        ).rowcount
+        if changed != 1:
+            raise StateConflictError("dirty-worktree recovery rollback lease is stale")
+        task = connection.execute(
+            "SELECT state, state_revision FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert task is not None
+        revision = int(task["state_revision"]) + 1
+        connection.execute(
+            """
+            UPDATE tasks
+            SET state = 'blocked', state_revision = ?, updated_at = ?, blocker = ?, verdict = NULL
+            WHERE task_id = ?
+            """,
+            (revision, timestamp, result.summary, task_id),
+        )
+        self._event(
+            connection,
+            "node.blocked_worktree_recovery_rolled_back",
+            task_id,
+            node_id,
+            {
+                "attempt": int(row["attempt"]),
+                "source_attempt": source["source_attempt"],
+                "source_allocation_id": recovery["source_allocation_id"],
+                "recovery": source,
+                "preparation_result": result.to_dict(),
+                "task_revision": revision,
+            },
+            created_at=timestamp,
+        )
+        self._event(
+            connection,
+            "task.state_changed",
+            task_id,
+            None,
+            {
+                "from": task["state"],
+                "to": "blocked",
+                "revision": revision,
+                "blocker": result.summary,
+                "recovery_rolled_back": True,
+            },
+            created_at=timestamp,
+        )
 
     def settle_node(
         self,
@@ -3356,7 +4106,7 @@ class WorkbenchStore:
             row = connection.execute(
                 """
                 SELECT n.state, n.attempt, n.coordinator_epoch, n.lease_epoch,
-                       n.effective_executor, n.effective_model, n.spec_json, t.contract_json
+                       n.effective_executor, n.effective_model, n.spec_json, n.recovery_json, t.contract_json
                 FROM nodes n JOIN tasks t USING(task_id)
                 WHERE n.task_id = ? AND n.node_id = ?
                 """,
@@ -3374,8 +4124,23 @@ class WorkbenchStore:
                 raise StateConflictError(f"node {node_id} lease is stale")
             spec = json.loads(row["spec_json"])
             contract = json.loads(row["contract_json"])
+            recovery = self._dirty_worktree_recovery_for_settlement(
+                row["recovery_json"],
+                attempt=attempt,
+            )
             self._validate_result_contract(spec, row, result)
             self._verify_artifact_refs(result.artifacts)
+            if recovery is not None and recovery["state"] == "authorized":
+                self._rollback_authorized_dirty_worktree_recovery(
+                    connection,
+                    task_id=task_id,
+                    node_id=node_id,
+                    row=row,
+                    recovery=recovery,
+                    result=result,
+                    timestamp=timestamp,
+                )
+                return
             if spec.get("verifier") and spec.get("executor") != "fixture":
                 for ref in result.evidence:
                     self.artifacts.verify(ref)
@@ -3399,7 +4164,8 @@ class WorkbenchStore:
                 node_state = "failed"
             connection.execute(
                 """
-                UPDATE nodes SET state = ?, settled_at = ?, updated_at = ?, result_json = ?
+                UPDATE nodes
+                SET state = ?, settled_at = ?, updated_at = ?, result_json = ?, recovery_json = NULL
                 WHERE task_id = ? AND node_id = ?
                 """,
                 (node_state, timestamp, timestamp, canonical_json(result.to_dict()), task_id, node_id),
@@ -3412,12 +4178,19 @@ class WorkbenchStore:
                 """,
                 (canonical_json(result.to_dict()), timestamp, task_id, node_id, attempt),
             )
+            node_event = {"attempt": row["attempt"], "result": result.to_dict()}
+            if recovery is not None:
+                node_event["blocked_worktree_recovery"] = {
+                    "source_attempt": recovery["recovery"]["source_attempt"],
+                    "source_allocation_id": recovery["source_allocation_id"],
+                    "recovery": recovery["recovery"],
+                }
             self._event(
                 connection,
                 f"node.{node_state}",
                 task_id,
                 node_id,
-                {"attempt": row["attempt"], "result": result.to_dict()},
+                node_event,
             )
             if spec.get("verifier") and result.evidence:
                 for ref in result.evidence:
@@ -3572,8 +4345,13 @@ class WorkbenchStore:
         row: sqlite3.Row,
         result: NodeResult,
     ) -> None:
+        recovery = self._dirty_worktree_recovery_for_settlement(
+            row["recovery_json"],
+            attempt=int(row["attempt"]),
+        )
         if spec.get("executor") == "fixture" or spec.get("model") == "fixture":
-            return
+            if recovery is None:
+                return
         contract = json.loads(row["contract_json"])
         expected_profile, expected_tier = governance_identity(contract)
         if result.governance_profile != expected_profile:
@@ -3586,6 +4364,22 @@ class WorkbenchStore:
                 f"result verification tier {result.verification_tier!r} does not match "
                 f"contract tier {expected_tier!r}"
             )
+        if recovery is not None:
+            if result.provider != _DIRTY_WORKTREE_RECOVERY_PROVIDER:
+                raise ValueError(
+                    "dirty-worktree recovery result must use its exact recovery provider"
+                )
+            if result.actual_model is not None:
+                raise ValueError("dirty-worktree recovery result must not attest a native model")
+            if result.result_kind != "worker":
+                raise ValueError("dirty-worktree recovery result must declare result_kind=worker")
+            if not result.checks or not result.artifacts:
+                raise ValueError(
+                    "dirty-worktree recovery result must contain structured checks and artifacts"
+                )
+            return
+        if result.provider == _DIRTY_WORKTREE_RECOVERY_PROVIDER:
+            raise ValueError("dirty-worktree recovery provider has no persisted receipt")
         if spec.get("verifier"):
             if result.result_kind != "verifier":
                 raise ValueError("verifier result must declare result_kind=verifier")

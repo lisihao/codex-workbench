@@ -26,6 +26,7 @@ from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_quota
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
+from .dirty_worktree_recovery import DirtyWorktreeRecovery
 from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
@@ -46,6 +47,7 @@ from .service import Coordinator
 from .session_context import import_session_context
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import submit_natural_language_request
+from .worktrees import WorktreeManager
 from .sync import RepositorySynchronizer
 
 
@@ -323,6 +325,138 @@ def command_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_blocked_worktree_recovery(path: str) -> dict[str, object]:
+    try:
+        value = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read blocked-worktree recovery receipt: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("blocked-worktree recovery receipt must be a JSON object")
+    return value
+
+
+def _capture_blocked_worktree_recovery(
+    config: WorkbenchConfig,
+    store: WorkbenchStore,
+    *,
+    task_id: str,
+    node_id: str,
+    expected_revision: int,
+    expected_attempt: int,
+    reason: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    candidate = store.blocked_worktree_recovery_candidate(
+        task_id,
+        node_id,
+        expected_revision=expected_revision,
+        expected_attempt=expected_attempt,
+    )
+    source = candidate["source"]
+    task = store.get_task(task_id)
+    contract = task.get("contract")
+    if not isinstance(contract, dict) or not isinstance(contract.get("repository"), str):
+        raise ValueError("blocked-worktree recovery task contract is invalid")
+    artifact_root = config.state_root / "artifacts"
+    if dry_run:
+        with tempfile.TemporaryDirectory(prefix="codex-workbench-recovery-dry-run-") as directory:
+            recovery = DirtyWorktreeRecovery(
+                ArtifactStore(Path(directory) / "artifacts"),
+                WorktreeManager(config.state_root / "worktrees"),
+            ).capture(
+                repository=contract["repository"],
+                base_sha=str(source["base_sha"]),
+                worktree=str(source["worktree"]),
+                branch=str(source["branch"]),
+                attempt=expected_attempt,
+                expected_changed_paths=tuple(source["changed_paths"]),
+            )
+            _validate_blocked_worktree_recovery_receipt(
+                recovery,
+                source,
+                expected_attempt=expected_attempt,
+            )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": True,
+                "task": candidate["task"],
+                "node": candidate["node"],
+                "source": source,
+                "next_attempt": expected_attempt + 1,
+                "recovery": recovery,
+                "reason": reason.strip(),
+            }
+    recovery = DirtyWorktreeRecovery(
+        ArtifactStore(artifact_root),
+        WorktreeManager(config.state_root / "worktrees"),
+    ).capture(
+        repository=contract["repository"],
+        base_sha=str(source["base_sha"]),
+        worktree=str(source["worktree"]),
+        branch=str(source["branch"]),
+        attempt=expected_attempt,
+        expected_changed_paths=tuple(source["changed_paths"]),
+    )
+    return {
+        **store.resume_blocked_worktree(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            reason=reason,
+            recovery=recovery,
+            dry_run=False,
+        ),
+        "recovery": recovery,
+    }
+
+
+def _validate_blocked_worktree_recovery_receipt(
+    recovery: dict[str, object],
+    source: dict[str, object],
+    *,
+    expected_attempt: int,
+) -> None:
+    required = {
+        "schema_version",
+        "source_attempt",
+        "source_worktree",
+        "source_branch",
+        "base_sha",
+        "changed_paths",
+        "patch_ref",
+        "patch_sha256",
+    }
+    if set(recovery) != required:
+        raise ValueError("blocked-worktree recovery receipt has an invalid shape")
+    if recovery["schema_version"] != 1:
+        raise ValueError("blocked-worktree recovery receipt schema is unsupported")
+    if recovery["source_attempt"] != expected_attempt:
+        raise ValueError("blocked-worktree recovery receipt source attempt is invalid")
+    for field in ("source_worktree", "source_branch", "base_sha", "patch_ref", "patch_sha256"):
+        if not isinstance(recovery[field], str) or not recovery[field]:
+            raise ValueError(f"blocked-worktree recovery receipt field {field!r} is invalid")
+    changed_paths = recovery["changed_paths"]
+    if (
+        not isinstance(changed_paths, list)
+        or not changed_paths
+        or not all(isinstance(item, str) and item for item in changed_paths)
+    ):
+        raise ValueError("blocked-worktree recovery changed_paths are invalid")
+    if (
+        recovery["source_worktree"] != source["worktree"]
+        or recovery["source_branch"] != source["branch"]
+        or recovery["base_sha"] != source["base_sha"]
+        or tuple(sorted(changed_paths)) != tuple(source["changed_paths"])
+    ):
+        raise ValueError("blocked-worktree recovery receipt does not match the blocked allocation")
+    if not recovery["patch_ref"].startswith("sha256:"):
+        raise ValueError("blocked-worktree recovery receipt patch_ref is invalid")
+    if len(recovery["patch_sha256"]) != 64:
+        raise ValueError("blocked-worktree recovery receipt patch_sha256 is invalid")
+
+
 def command_task(args: argparse.Namespace) -> int:
     config = _config(args)
     store = _store(config)
@@ -338,6 +472,41 @@ def command_task(args: argparse.Namespace) -> int:
             dry_run=bool(args.dry_run),
         )
         result = {"ok": True, "action": "reconcile-archify", **result}
+    elif args.action == "resume-blocked-worktree":
+        if getattr(args, "recovery_file", None):
+            recovery = _load_blocked_worktree_recovery(args.recovery_file)
+            if not isinstance(recovery.get("patch_ref"), str):
+                raise ValueError("blocked-worktree recovery receipt patch_ref is required")
+            ArtifactStore(config.state_root / "artifacts").verify(recovery["patch_ref"])
+            result = store.resume_blocked_worktree(
+                args.task_id,
+                args.node_id,
+                expected_revision=args.expected_revision,
+                expected_attempt=args.expected_attempt,
+                reason=args.reason,
+                recovery=recovery,
+                dry_run=bool(args.dry_run),
+            )
+            if not args.dry_run:
+                result = {**result, "recovery": recovery}
+        else:
+            result = _capture_blocked_worktree_recovery(
+                config,
+                store,
+                task_id=args.task_id,
+                node_id=args.node_id,
+                expected_revision=args.expected_revision,
+                expected_attempt=args.expected_attempt,
+                reason=args.reason,
+                dry_run=bool(args.dry_run),
+            )
+        result = {
+            "ok": True,
+            "action": "resume-blocked-worktree",
+            "operator_confirmed": True,
+            "source_capture_read_only": True,
+            **result,
+        }
     elif args.action == "retry-blocked":
         result = store.retry_blocked_node(
             args.task_id,
@@ -1420,6 +1589,28 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("node_id")
     resolve.add_argument("--resolution", choices=("retry", "fail", "cancel"), required=True)
     resolve.add_argument("--expected-revision", type=int, required=True)
+    resume_blocked_worktree = task_sub.add_parser(
+        "resume-blocked-worktree",
+        help="capture a blocked dirty worktree and resume it on a new clean target",
+    )
+    resume_blocked_worktree.add_argument("task_id")
+    resume_blocked_worktree.add_argument("node_id")
+    resume_blocked_worktree.add_argument("--expected-revision", type=int, required=True)
+    resume_blocked_worktree.add_argument("--expected-attempt", type=int, required=True)
+    resume_blocked_worktree.add_argument("--reason", required=True)
+    resume_blocked_worktree.add_argument(
+        "--confirm-recovery",
+        "--confirm-no-side-effects",
+        dest="confirm_recovery",
+        action="store_true",
+        required=True,
+        help="explicitly authorize source capture and deterministic clean-target recovery",
+    )
+    resume_blocked_worktree.add_argument(
+        "--recovery-file",
+        help="use an existing artifact-backed recovery receipt instead of capturing a1",
+    )
+    resume_blocked_worktree.add_argument("--dry-run", action="store_true")
     retry_blocked = task_sub.add_parser("retry-blocked")
     retry_blocked.add_argument("task_id")
     retry_blocked.add_argument("node_id")

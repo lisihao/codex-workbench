@@ -77,7 +77,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 11)
+        self.assertEqual(self.store.health()["schema_version"], 12)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -125,7 +125,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 11)
+        self.assertEqual(migrated.health()["schema_version"], 12)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()

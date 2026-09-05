@@ -18,6 +18,7 @@ from .dependency_inputs import (
     apply_accepted_ancestor_patches,
     effective_spec_with_dependency_input,
 )
+from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
 from .executors import (
     ClaudeExecutor,
     CodexExecutor,
@@ -47,6 +48,7 @@ from .worktrees import WorktreeError, WorktreeManager
 
 
 _ARCHIFY_COMMANDS = frozenset({"deliver", "compare", "visual-check", "validate", "migrate"})
+_DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class Coordinator:
         self.quota_ttl_seconds = quota_ttl_seconds
         self.artifacts = ArtifactStore(state_root / "artifacts")
         self.worktrees = WorktreeManager(state_root / "worktrees")
+        self.blocked_worktree_recovery = DirtyWorktreeRecovery(self.artifacts, self.worktrees)
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workbench-worker")
         self._futures: dict[Future[None], tuple[str, str | None]] = {}
         self._routed_to_codex: set[str] = set()
@@ -158,11 +161,12 @@ class Coordinator:
                 claimed = self._claim_next_ready_node(worker_id)
                 if claimed is None:
                     break
-                decision = self._claim_time_decision(
-                    claimed["spec"],
-                    claimed["contract"],
-                    quota,
-                    active_claude_models,
+                decision = (
+                    None
+                    if claimed.get("blocked_worktree_recovery") is not None
+                    else self._claim_time_decision(
+                        claimed["spec"], claimed["contract"], quota, active_claude_models
+                    )
                 )
                 claim_route = _ClaimRoute(quota, active_claude_models, decision)
                 active_claude_model = (
@@ -379,6 +383,9 @@ class Coordinator:
         claimed: dict,
         claim_route: _ClaimRoute | None = None,
     ) -> None:
+        if claimed.get("blocked_worktree_recovery") is not None:
+            self._execute_blocked_worktree_recovery(claimed)
+            return
         request: ExecutionRequest
         try:
             spec = claimed["spec"]
@@ -566,6 +573,228 @@ class Coordinator:
         except StateConflictError:
             # A newer coordinator/node lease owns the durable state; this late result is fenced.
             return
+
+    def _execute_blocked_worktree_recovery(self, claimed: dict) -> None:
+        """Run a blocked-worktree receipt without invoking any model executor."""
+
+        try:
+            result = self._run_blocked_worktree_recovery(claimed)
+        except (DirtyWorktreeRecoveryError, WorktreeError, ValueError, OSError) as error:
+            result = self._blocked_worktree_recovery_failure(
+                claimed,
+                f"blocked-worktree recovery blocked: {error}",
+            )
+        except Exception as error:
+            # Before a2 is assigned, failures must restore the a1 receipt
+            # rather than leaving the recovery node running or indeterminate.
+            result = self._blocked_worktree_recovery_failure(
+                claimed,
+                f"blocked-worktree recovery crashed: {type(error).__name__}: {error}",
+            )
+        try:
+            self.store.settle_node(
+                claimed["task_id"],
+                claimed["node_id"],
+                result,
+                attempt=claimed["attempt"],
+                coordinator_epoch=claimed["coordinator_epoch"],
+                lease_epoch=claimed["lease_epoch"],
+            )
+        except StateConflictError:
+            return
+
+    def _run_blocked_worktree_recovery(self, claimed: dict) -> NodeResult:
+        binding = claimed.get("blocked_worktree_recovery")
+        if not isinstance(binding, dict):
+            raise WorktreeError("recovery binding is missing")
+        spec = claimed["spec"]
+        contract = claimed["contract"]
+        if spec.get("verifier"):
+            raise WorktreeError("blocked-worktree recovery is only supported for worker nodes")
+        recovery = binding.get("recovery")
+        if not isinstance(recovery, dict):
+            raise WorktreeError("blocked-worktree recovery receipt is missing")
+        source_worktree = str(recovery["source_worktree"])
+        target_attempt = int(claimed["attempt"])
+        target = self.worktrees.prepare_clean(
+            contract["repository"],
+            contract["base_sha"],
+            claimed["task_id"],
+            claimed["node_id"],
+            target_attempt,
+        )
+        target_branch = self.worktrees.branch_name(
+            claimed["task_id"], claimed["node_id"], target_attempt
+        )
+        outcome = self.blocked_worktree_recovery.prepare(
+            repository=contract["repository"],
+            source_worktree=source_worktree,
+            target_worktree=str(target),
+            target_branch=target_branch,
+            target_attempt=target_attempt,
+            recovery=recovery,
+            acceptance_commands=tuple(contract.get("acceptance_commands", ())),
+            timeout_seconds=int(contract["timeout_seconds"]),
+        )
+        artifacts = {
+            **outcome.artifacts,
+            "recovery-snapshot": str(recovery["patch_ref"]),
+        }
+        checks = (
+            "PASS: source a1 remained read-only recovery evidence",
+            f"PASS: source allocation {binding['source_allocation_id']} is bound to a1",
+            f"PASS: a2 was prepared as attempt {target_attempt}",
+            *outcome.checks,
+        )
+        if outcome.status != "succeeded":
+            artifacts["recovery-failure-archive"] = self._archive_failed_recovery_target(
+                contract=contract,
+                claimed=claimed,
+                target=target,
+                branch=target_branch,
+            )
+            return NodeResult(
+                status=outcome.status,
+                summary=f"deterministic clean-target recovery: {outcome.summary}",
+                artifacts=artifacts,
+                exit_code=outcome.exit_code,
+                result_kind="worker",
+                changed_paths=outcome.changed_paths,
+                checks=checks,
+                provider=_DIRTY_WORKTREE_RECOVERY_PROVIDER,
+                actual_model=None,
+                **governance_receipt_fields(contract),
+            )
+
+        binding_ref = self.artifacts.put_text(
+            canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "blocked-worktree-recovery-binding",
+                    "source": {
+                        "allocation_id": binding["source_allocation_id"],
+                        "attempt": recovery["source_attempt"],
+                        "worktree": source_worktree,
+                        "branch": recovery["source_branch"],
+                        "base_sha": recovery["base_sha"],
+                        "patch_ref": recovery["patch_ref"],
+                        "patch_sha256": recovery["patch_sha256"],
+                    },
+                    "target": {
+                        "attempt": target_attempt,
+                        "worktree": str(target),
+                        "branch": target_branch,
+                    },
+                }
+            ),
+            "recovery-binding.json",
+        )
+        artifacts["recovery-binding"] = binding_ref
+        result = NodeResult(
+            status="succeeded",
+            summary=f"deterministic clean-target recovery: {outcome.summary}",
+            artifacts=artifacts,
+            result_kind="worker",
+            changed_paths=outcome.changed_paths,
+            checks=checks,
+            provider=_DIRTY_WORKTREE_RECOVERY_PROVIDER,
+            actual_model=None,
+            **governance_receipt_fields(contract),
+        )
+        request = ExecutionRequest(
+            task_id=claimed["task_id"],
+            node_id=claimed["node_id"],
+            attempt=target_attempt,
+            contract=contract,
+            spec=spec,
+            worktree=target,
+        )
+        result = validate_worker_scope(self.worktrees, request, result)
+        if result.status != "succeeded":
+            result = replace(
+                result,
+                artifacts={
+                    **result.artifacts,
+                    "recovery-failure-archive": self._archive_failed_recovery_target(
+                        contract=contract,
+                        claimed=claimed,
+                        target=target,
+                        branch=target_branch,
+                    ),
+                },
+            )
+            return result
+        # a1 is consumed only after a clean a2 holds the exact patch, passed
+        # its declared offline acceptance, and passed scope validation.
+        self.store.assign_worktree(
+            claimed["task_id"],
+            claimed["node_id"],
+            str(target),
+            attempt=target_attempt,
+            coordinator_epoch=int(claimed["coordinator_epoch"]),
+            lease_epoch=int(claimed["lease_epoch"]),
+        )
+        return result
+
+    def _archive_failed_recovery_target(
+        self,
+        *,
+        contract: dict,
+        claimed: dict,
+        target: Path,
+        branch: str,
+    ) -> str:
+        """Archive a2 diagnostics while releasing its deterministic retry slot."""
+
+        archive = self.worktrees.archive_failed_recovery(
+            contract["repository"],
+            target,
+            branch,
+            task_id=claimed["task_id"],
+            node_id=claimed["node_id"],
+            attempt=int(claimed["attempt"]),
+        )
+        return self.artifacts.put_text(
+            canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "blocked-worktree-recovery-failure-archive",
+                    "task_id": claimed["task_id"],
+                    "node_id": claimed["node_id"],
+                    "attempt": int(claimed["attempt"]),
+                    "archive": str(archive),
+                }
+            ),
+            "recovery-failure-archive.json",
+        )
+
+    def _blocked_worktree_recovery_failure(self, claimed: dict, summary: str) -> NodeResult:
+        """Produce a receipt that lets Store restore the authoritative a1."""
+
+        binding = claimed.get("blocked_worktree_recovery")
+        recovery = binding.get("recovery") if isinstance(binding, dict) else None
+        patch_ref = recovery.get("patch_ref") if isinstance(recovery, dict) else None
+        artifacts = (
+            {"recovery-snapshot": patch_ref}
+            if isinstance(patch_ref, str) and patch_ref
+            else {"recovery-error": self.artifacts.put_text(summary, "blocked-worktree-recovery-error.txt")}
+        )
+        changed_paths = tuple(
+            path
+            for path in (recovery.get("changed_paths", ()) if isinstance(recovery, dict) else ())
+            if isinstance(path, str)
+        )
+        return NodeResult(
+            status="blocked",
+            summary=summary,
+            artifacts=artifacts,
+            result_kind="worker",
+            changed_paths=changed_paths,
+            checks=(f"BLOCKED: {summary}",),
+            provider=_DIRTY_WORKTREE_RECOVERY_PROVIDER,
+            actual_model=None,
+            **governance_receipt_fields(claimed["contract"]),
+        )
 
     def _execute_codex_fallback(
         self,
