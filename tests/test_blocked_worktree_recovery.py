@@ -639,6 +639,33 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(calls[0], (sys.executable, "--version"))
         self.assertEqual(calls[1][-2:], ("--store-dir", str(store.resolve())))
 
+    def test_recovery_acceptance_uses_process_local_pnpm_shim(self) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            environment = kwargs.get("env")
+            self.assertIsInstance(environment, dict)
+            calls.append((tuple(args), dict(environment)))
+            return subprocess.CompletedProcess(args, 0, "fixture ok\n", "")
+
+        recovery = DirtyWorktreeRecovery(self.store.artifacts, self.worktrees, runner=runner)
+        shim_environment = {"PATH": "fixture-shim", "WORKER_SHIM": "enabled"}
+        with patch(
+            "codex_workbench.dirty_worktree_recovery.codex_subscription_environment",
+            return_value=shim_environment,
+        ) as subscription_environment:
+            outcome = recovery._run_command(("pnpm", "exec", "vitest", "--version"), self.root, 5)
+
+        self.assertEqual(outcome.exit_code, 0)
+        subscription_environment.assert_called_once()
+        shim_directory = subscription_environment.call_args.kwargs["pnpm_shim_directory"]
+        self.assertFalse(shim_directory.exists())
+        self.assertEqual(calls[0][0], ("pnpm", "exec", "vitest", "--version"))
+        self.assertEqual(calls[0][1]["PATH"], "fixture-shim")
+        self.assertEqual(calls[0][1]["WORKER_SHIM"], "enabled")
+        self.assertEqual(calls[0][1]["npm_config_offline"], "true")
+        self.assertEqual(calls[0][1]["CI"], "true")
+
     def test_clean_a2_recovery_never_invokes_a_model_or_mutates_a1(self) -> None:
         command = f"{sys.executable} -c \"from pathlib import Path; assert Path('src/value.txt').read_text() == 'patched\\n'\""
         contract, blocked, source, source_patch = self._blocked_task(acceptance_command=command)

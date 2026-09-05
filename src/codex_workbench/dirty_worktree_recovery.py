@@ -22,6 +22,7 @@ from .dependency_inputs import (
     apply_recorded_dependency_input,
     changed_paths_since_input_tree,
 )
+from .executors import codex_subscription_environment
 from .worktrees import WorktreeError, WorktreeManager
 
 
@@ -1174,15 +1175,28 @@ class DirtyWorktreeRecovery:
 
     def _run_command(self, command: tuple[str, ...], cwd: Path, timeout_seconds: int) -> CommandOutcome:
         try:
-            completed = self.runner(
-                list(command),
-                cwd=cwd,
-                env={**os.environ, "CI": "true", "NO_UPDATE_NOTIFIER": "1", "npm_config_offline": "true"},
-                text=True,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
+            # Recovery first materializes an independent worktree-local linker.
+            # Its acceptance command must use the same process-local pnpm shim
+            # as a Codex worker; otherwise `pnpm exec` re-selects the user's
+            # global pnpm and launches an unrelated `pnpm install`.
+            with tempfile.TemporaryDirectory(prefix="codex-workbench-recovery-pnpm-shim-") as shim_directory:
+                environment = codex_subscription_environment(
+                    pnpm_shim_directory=Path(shim_directory)
+                )
+                environment.update({
+                    "CI": "true",
+                    "NO_UPDATE_NOTIFIER": "1",
+                    "npm_config_offline": "true",
+                })
+                completed = self.runner(
+                    list(command),
+                    cwd=cwd,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise DirtyWorktreeRecoveryError(f"cannot run recovery acceptance command {' '.join(command)}: {error}") from error
         return CommandOutcome(command, int(completed.returncode), _bounded(completed.stdout or ""), _bounded(completed.stderr or ""))
