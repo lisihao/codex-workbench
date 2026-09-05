@@ -513,6 +513,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(receipt["materialization_timeout_seconds"], 360)
         self.assertEqual(receipt["store_dir"], str(store.resolve()))
         self.assertEqual([timeout for _command, timeout in calls], [360, 360])
+        self.assertIn("--pm-on-fail=ignore", calls[1][0])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
 
     def test_offline_materializer_reuses_isolated_template_for_matching_inputs(self) -> None:

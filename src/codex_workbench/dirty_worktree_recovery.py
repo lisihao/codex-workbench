@@ -192,6 +192,7 @@ class PnpmOfflineMaterializer:
             "--offline",
             "--frozen-lockfile",
             "--ignore-scripts",
+            "--pm-on-fail=ignore",
             "--config.minimumReleaseAge=0",
             "--config.trustLockfile=true",
             "--reporter=append-only",
@@ -203,6 +204,11 @@ class PnpmOfflineMaterializer:
                     f"configured pnpm store is unavailable: {store_dir}"
                 )
             install_command += ("--store-dir", str(store_dir))
+        # Use the fixed Workbench pnpm runtime even when a trusted project
+        # manifest declares an older compatible pnpm.  Recovery is already
+        # frozen/offline and the fixed runtime was qualified before dispatch;
+        # allowing pnpm to download a manifest-pinned CLI would reintroduce an
+        # external registry dependency into this local linker step.
         # pnpm writes shared store metadata while materializing a worktree-local
         # linker. The same lock also protects cache publication so no recovery
         # can observe a partially copied template.
