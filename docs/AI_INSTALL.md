@@ -432,7 +432,7 @@ codex plugin list --json
 | AI Frontier Provider | `ai-frontier consent-personal-use/refresh/status/show`、`/api/ai-frontier` | 72 小时节流、SQLite LKG、模型/分类/原始 payload 行数、精确模型 selected/skipped、快照 ID/digest 与零模型调用 | personal-use consent 不是 Martian 授权；Quality/Consistency/Real Cost 不是本机成功率、订阅 quota 或已证明的美元成本 |
 | 500K 上下文 | 两机用户配置解析、App 内嵌 CLI 解析、Workbench argv 测试 | 新 App/CLI/Workbench 任务会请求 500K/450K | 不能证明旧任务已追溯扩容，也不代表每回合使用满 500K |
 | Cockpit | `install-macbook-client.py`、`codex mcp get`、`curl ...:18766/health` | SSH/MCP 配置与本地隧道可用 | 插件 Hook 已获信任 |
-| 插件 | `codex plugin list --json`，随后人工 `/hooks` 审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
+| 插件 | `codex plugin list --json`，随后在当前 App 的 Hook 设置中人工审核 | 插件被安装且 Hook 被人工审阅 | 会话已同步或远端任务正在执行 |
 | 会话接管 | `WB_SYNC_RECEIPT` 的 `active` 状态 | Context Bundle 已被 Authority 持久绑定 | 任务已 accepted 或模型已调用 |
 | 手机 Remote | `mobile status`、桌面 App 生成二维码、手机真机查看/发送 | 原生 Remote 配置与真实手机旅程 | 仅凭 plugin/MCP 就绪不能声称已配对 |
 | Worktree 恢复 | `worktree status`，以及一次受控归档/恢复 | 隔离、NAS verified receipt、恢复路径与清理状态 | 没有真实 NAS/SMB 与 Tailscale 旅程时，单元测试不能替代生产证明 |
@@ -498,7 +498,7 @@ codex plugin marketplace upgrade "$WB_MARKETPLACE"
 codex plugin list --marketplace "$WB_MARKETPLACE" --available --json
 ```
 
-当前 Codex CLI 没有单独的 `plugin upgrade` 子命令。若 marketplace 刷新后显示插件版本仍旧，先停止新任务、由操作者确认，再执行一次 `codex plugin remove` 后重新 `codex plugin add`，并重新审核 `/hooks`。不要在 Hook 未获重新信任时运行 `wb`。
+当前 Codex CLI 没有单独的 `plugin upgrade` 子命令。若 marketplace 刷新后显示插件版本仍旧，先停止新任务、由操作者确认，再执行一次 `codex plugin remove` 后重新 `codex plugin add`，并在当前 App 的 Hook 设置中重新审核。不要在 Hook 未获重新信任时运行 `wb`。
 
 Authority 安装器会先建立并安全激活与新 runtime 配套的能力目录，再启动主服务和刷新 sidecar。旧任务仍使用 TaskContract 固定的旧 `catalog_id`；新目录不安全时安装会回滚。安装后应比较 `capabilities status` 与 `capabilities diff`，未知/弃用模型保持 observed-only 是正确结果，不应手工把它们改成 routable。
 

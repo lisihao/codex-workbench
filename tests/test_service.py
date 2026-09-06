@@ -823,7 +823,7 @@ raise AssertionError("fatal coordinator failure returned")
             ]
             store.create_task(contract, verified(nodes, contract.task_id), "green-shared-capacity-create")
             store.queue_task(contract.task_id)
-            codex_started = threading.Event()
+            executions_started = threading.Barrier(3, timeout=2)
 
             class ClaudeStub:
                 def __init__(self):
@@ -837,8 +837,7 @@ raise AssertionError("fatal coordinator failure returned")
                         self.calls += 1
                         self.active += 1
                         self.max_active = max(self.max_active, self.active)
-                    codex_started.wait(timeout=2)
-                    time.sleep(0.03)
+                    executions_started.wait()
                     with self.lock:
                         self.active -= 1
                     return NodeResult(
@@ -852,7 +851,7 @@ raise AssertionError("fatal coordinator failure returned")
 
                 def execute(self, _request):
                     self.calls += 1
-                    codex_started.set()
+                    executions_started.wait()
                     return NodeResult(
                         "succeeded", "Codex completed", actual_model="gpt-5.6-luna",
                         result_kind="worker", checks=("fixture-check",),
@@ -882,6 +881,10 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(claude.calls, 2)
             self.assertEqual(claude.max_active, 2)
             self.assertEqual(codex.calls, 1)
+            self.assertTrue(all(
+                node["state"] == "accepted"
+                for node in store.get_task(contract.task_id)["nodes"]
+            ))
             routed = [
                 event for event in store.read_events(task_id=contract.task_id)
                 if event["event_type"] == "node.routed"
