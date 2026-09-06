@@ -1,6 +1,6 @@
 ---
 name: code-as-harness
-description: "Use when choosing proportional tests or executable governance for a code change, investigating repeated workflow friction, or preparing release, deployment, migration, security-sensitive, or governed completion evidence."
+description: "Choose verification for code changes, investigate recurring workflow friction, or prepare required delivery evidence."
 metadata:
   codex_workbench_managed: "true"
   profile: "code-as-harness/v1"
@@ -38,6 +38,8 @@ Project and higher-priority rules can raise the tier. Never lower an explicit de
 - Do not parallelize competing writes to the same files, schema, generated artifact, Git state, installed app, release, or deployment target.
 - Do not invent speculative work merely to occupy capacity.
 - A later user message continues the active objective by default. Preserve its objective and scope unless the user explicitly pauses, cancels, or replaces it.
+- Continue already-authorized implementation through running the result, relevant checks, and fixing failures caused by the change. Do not pause after each step for approval; ask only for a material missing decision, new permission, or a genuine external blocker. Analysis-only requests remain read-only.
+- Read skills and references only when their workflow is needed. A localized fix does not automatically require brainstorming, a repository-wide audit, or an extra reviewer.
 
 ## Reuse evidence safely
 
@@ -46,6 +48,8 @@ Project and higher-priority rules can raise the tier. Never lower an explicit de
 - After a change, rerun affected checks only. A Git-only commit does not invalidate evidence unless the repository binds evidence to HEAD.
 - A matching L3 fingerprint has one full gate. Do not repeat it for reassurance.
 - Run final full governance only once after the worktree is stable and the delivery boundary requires it.
+- Existing applicable evidence can support a later status or completion report; do not rerun a command merely because the report is in a new message. Produce the report from the same check results.
+- Judge GUI and integration checks by the defect they detect and measured cost, not by their names or breadth alone. Do not omit required coverage to make a task appear faster.
 
 ## Scope and completion
 

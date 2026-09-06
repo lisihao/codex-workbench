@@ -393,7 +393,7 @@ codex plugin list --json
 
 接着在 Codex 的交互式界面中完成一次人工信任：
 
-1. 打开 `/hooks`。
+1. 打开当前 Codex App 的插件/Hook 设置；仅在当前界面确实支持时使用 `/hooks`。发送同名聊天消息不等于打开管理入口。
 2. 找到 `codex-workbench` 的 `UserPromptSubmit` Hook，核对它来自刚安装的插件版本，且命令仅指向插件内的 `scripts/wb_hook.py`。
 3. 由操作者显式信任该 Hook；Hook 内容或版本变化后应重新审核。
 4. 不得用任何绕过 Hook 信任的命令启动 Codex。
@@ -469,7 +469,7 @@ codex-workbench worktree send <allocation-id> --host "$WB_AUTHORITY_ALIAS"
 
 `send` 没有 direct-SSH fallback：location-aware Tailscale profile 缺失、远端校验失败或 receipt 不匹配时，压缩临时文件会清理，但隔离 worktree 保留在回收目录。
 
-若 Hook 回执为 `degraded`，AI 必须明确报告 Mac mini 未接管，并在当前 MacBook checkout 中继续本地工作。不得伪称任务已派到 Authority，也不得复制、编辑或合并 Authority SQLite。网络恢复后，在同一会话再次输入 `wb`；Hook 会重新尝试同步当前上下文与允许的 Git 增量。
+若 Hook 回执为 `degraded`，AI 必须报告回执中的具体原因和 Mac mini 未接管，并在当前 MacBook checkout 中继续本地工作。上下文校验拒绝不等于网络不可达；原因未变时不要反复要求输入 `wb`。不得伪称任务已派到 Authority，也不得复制、编辑或合并 Authority SQLite。原因修复后，再在同一会话输入 `wb` 同步当前上下文与允许的 Git 增量。生产端排除 Git 元数据，接收端仍拒绝写入 `.git`。
 
 ## 6. 升级与兼容性
 

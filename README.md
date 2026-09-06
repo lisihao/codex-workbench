@@ -161,6 +161,8 @@ Authority 会在安装时建立第一份能力目录，并由独立 LaunchAgent 
 
 Workbench 将 `code-as-harness/v1` 投影到 Codex 与 Claude Code 的受控路径，并把验证层级、作用域、并行策略和 Evidence reuse 规则记录到每个任务契约中。
 
+已授权实现应连续推进到运行、受影响检查和问题修复；只在关键决定、新权限或真实外部阻塞时询问。普通局部修复不自动触发脑暴或额外审查；有效检查证据可用于后续报告，不因新消息而重跑。相同治理指令由 planner、隔离 Codex worker 与 Claude worker 的实际 prompt 入口共享，不依赖交互用户的全局配置。模型、推理强度、并行上限与记忆策略不因此改变；GUI 检查是否保留取决于覆盖作用和实际成本，正式交付协议不削弱。
+
 - `L0`：只读或文档变更，检查相关内容与 diff。
 - `L1`：局部改动，运行一个能证伪改动的聚焦检查。
 - `L2`：跨文件或共享接口，运行受影响测试与必要的构建/类型检查。
@@ -372,7 +374,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.13.15`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.13.16`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
 
 1.13.12 令每个托管 Codex worker 的临时 PATH 优先使用 Workbench 已验证的 pnpm 11.25，并固定 `--pm-on-fail=ignore`；恢复后模型自行运行 pnpm 时不会再由项目的同主版本 packageManager 声明降级或下载旧 CLI。该 shim 只活在单个 Worker 子进程内，不修改用户 shell、全局 pnpm 或其他项目。1.13.11 固定受控恢复使用已验证的 pnpm 11.25 运行时，并显式设为 `--pm-on-fail=ignore`：项目的同主版本 packageManager 声明不得触发下载或切换旧 pnpm，因此离线恢复不会因 registry 签名读取而失败。1.13.10 将已成功离线物化的依赖树按完整 workspace 输入指纹缓存为只读模板；同一输入的后续恢复在 APFS 上复制为独立的写时复制目录，workspace link 仍只解析到新 worktree。首次新指纹构建仍严格有界为 360 秒，模板命中不再执行 pnpm install，并在回执中记录 hit 或 seeded；工作区 package manifest、pnpm workspace 配置、lockfile、pnpm 版本或平台变化都会生成新模板，绝不跨输入复用。1.13.9 令受控脏工作树恢复的 pnpm 物化固定使用 `--ignore-scripts`：依赖链接只负责准备可验证的本地树，不执行项目生命周期脚本；这避免 DSH 的 lefthook postinstall 在恢复窗口中阻塞，同时把任何真正需要脚本的失败保留给节点自身的显式验收。1.13.8 修复受控脏工作树恢复的 pnpm 版本探测：pnpm 即使只执行 `--version` 也会读取当前工作区配置，曾在 DSH 工作树内消耗整个恢复窗口；Workbench 现在在中性目录探测已固定的 pnpm 二进制，随后仍只在目标工作树中做冻结、离线安装。1.13.6 将共享 pnpm store 的离线 linker 物化限定为短暂互斥区：等待与安装共同受原有 120 秒边界约束，收据记录锁路径和等待时间；依赖准备完成后，独立 Worker 仍照常并行。它修复了两个干净工作树同时链接同一 store 时超时而误阻塞整个任务的路径。1.13.5 将离线 pnpm 材料化收敛为可复现的 Authority 运行时：安装包携带来源锁定的 pnpm 11.25.0（MIT），LaunchAgent 与 CLI wrapper 均显式传入它和已预热的本地 store；已知会在 `--offline` 下等待 registry 校验的 pnpm 11.7 会在派发前立即报出可操作错误，材料化最大 120 秒，绝不再无限占用 worker lease。`--pnpm-store` 允许 Authority 指向已预热的内容寻址 store；缓存缺包仍是明确失败，不伪装为可恢复成功。1.13.4 为依赖节点的受控脏工作树恢复新增显式 `task resume-blocked-worktree --preserve-untracked`：只有调用方明确选择、文件集与收据精确一致、且每个文件同时落在任务及节点 write scope 内时，才会把合法未跟踪文件纳入内容寻址补丁并在干净 a2 复原；a1 永远不执行 `git add` 或写入。v3 收据固定该文件集和合并补丁，恢复后仍以字节级补丁、声明验收和 scope 校验替换 a1。1.13.3 修复依赖节点的受控脏工作树恢复：恢复器会从原 a1 的不可变 dependency-input 收据重建已验收祖先补丁闭包，再仅捕获并重放该 worker 自己的差异；不会把上游已验收改动误判为该 worker 的写入。1.13.1 新增受控的脏工作树恢复；1.12.1 修复执行恢复；1.12.0 增加 Astra 显式控制面选择、Claude 精确型号映射与分来源性能清单。默认控制面仍为 Sol；Astra 性能缺失保持 N/A。测试通过、分类可运行或路由发生变化，都不能替代真实交付周期与单位配额收益证据。
 

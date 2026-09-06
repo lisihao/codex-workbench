@@ -13,11 +13,14 @@ The plugin hook owns context synchronization. Use only the injected
 - `active`: route implementation, status, steering, and acceptance through the
   `codex-workbench` MCP tools. Existing conversations continue from their latest
   unfinished request; new conversations wait for a normal user request.
-- `degraded`: state clearly that the authority is unreachable and continue only
-  in the current MacBook checkout. The hook retries on the next prompt.
+- `degraded`: report the receipt's actual error and continue in the current
+  MacBook checkout. A rejected context bundle is not proof of a network outage.
+  Diagnose the named cause; do not keep asking for `wb` while it is unchanged.
 - missing receipt: do not claim activation. Tell the user to enable the plugin,
-  review its hook with `/hooks`, and type `wb`; `$WB` and `/skills` remain
-  supported alternatives.
+  review its hook in the installed app's plugin/Hook settings, and type `wb`.
+  Use `/hooks` only if that interface actually provides it; a chat message is
+  not a trust action. Never write trust records or bypass user approval.
+  `$WB` and `/skills` are alternatives where the host supports them.
 
 Do not widen imported scopes, copy secrets, trigger Claude login, spend paid API
 quota, or bypass the protected Claude reserve.

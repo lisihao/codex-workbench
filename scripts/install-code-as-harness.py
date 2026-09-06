@@ -87,6 +87,8 @@ def policy_block(agent: str) -> str:
             "- Maximize useful safe parallelism; independent work may run together, conflicting writes may not.",
             "- Reuse passing evidence only for the same complete Evidence fingerprint; do not repeat an L3 full gate for that fingerprint.",
             "- Treat a later user message as steering for the active objective. Preserve it unless an explicit pause, cancel, or replacement is requested.",
+            "- Continue authorized implementation through running, affected checks, and fixes; ask only for a material missing decision, new permission, or real external blocker.",
+            "- Read only task-relevant skill workflows. Reuse applicable check results in reports instead of rerunning them for a new message.",
             "- Confirm repeated friction with evidence, then prefer a code-level harness fix over a reminder-only rule.",
             f"- Target agent: `{agent}`.",
             POLICY_END,

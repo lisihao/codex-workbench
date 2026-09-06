@@ -190,6 +190,30 @@ def _allowed_file(path: Path) -> bool:
     return path.is_file() and 0 <= size <= MAX_FILE_BYTES
 
 
+def _git_metadata_paths(repository: Path) -> tuple[Path, ...]:
+    paths = [repository / ".git"]
+    for value in _git(repository, "rev-parse", "--git-dir", "--git-common-dir").splitlines():
+        path = Path(value)
+        paths.append(path if path.is_absolute() else repository / path)
+    return tuple(path.resolve() for path in paths)
+
+
+def _is_git_metadata_path(path: Path, metadata_paths: tuple[Path, ...]) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    if ".git" in resolved.parts:
+        return True
+    for metadata_path in metadata_paths:
+        try:
+            resolved.relative_to(metadata_path)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _tar_bytes(members: list[Tuple[str, bytes]]) -> bytes:
     raw = io.BytesIO()
     with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
@@ -213,6 +237,7 @@ def _bundle(event: dict) -> Tuple[bytes, dict, bool]:
         event.get("transcript_path"), event.get("prompt") or ""
     )
     root, head, branch, origin, patch, changed, untracked = _repository_context(cwd)
+    metadata_paths = _git_metadata_paths(root)
     file_entries = []
     members = [("transcript.jsonl", transcript)]
     if patch:
@@ -240,7 +265,11 @@ def _bundle(event: dict) -> Tuple[bytes, dict, bool]:
     seen = set()
     for index, (path, logical, kind) in enumerate(candidates, 1):
         key = str(path)
-        if key in seen or not _allowed_file(path):
+        if (
+            key in seen
+            or _is_git_metadata_path(path, metadata_paths)
+            or not _allowed_file(path)
+        ):
             continue
         seen.add(key)
         data = path.read_bytes()

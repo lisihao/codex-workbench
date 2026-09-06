@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -139,6 +140,30 @@ class WBHookTests(unittest.TestCase):
                     self.assertEqual(wb_hook.main(), 0)
                 send.assert_not_called()
                 self.assertEqual(output.getvalue(), "")
+
+    def test_bundle_keeps_untracked_content_and_excludes_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = self._repository(root)
+            content = repository / "notes.txt"
+            content.write_text("legal content\n")
+            (repository / "git-head").symlink_to(repository / ".git" / "HEAD")
+
+            bundle, manifest, _ = wb_hook._bundle(
+                {
+                    "cwd": str(repository),
+                    "prompt": f"include {content} and {repository / '.git' / 'HEAD'}",
+                    "session_id": "session-bundle",
+                    "transcript_path": None,
+                }
+            )
+
+            entries = manifest["files"]
+            self.assertEqual([entry["logical_path"] for entry in entries], ["notes.txt"])
+            with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
+                source = archive.extractfile(entries[0]["archive_path"])
+                self.assertIsNotNone(source)
+                self.assertEqual(source.read(), b"legal content\n")
 
     def test_transport_is_derived_from_existing_mcp_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
