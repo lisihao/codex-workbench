@@ -134,11 +134,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_control_task",
-        "description": "Queue, pause, resume, cancel, or explicitly resolve an indeterminate node.",
+        "description": "Queue, pause, resume, cancel, steer, or explicitly resolve an indeterminate node. Queue/resume may include an instruction, which is validated and persisted atomically before launch.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["task_id", "action"],
+            "required": ["task_id", "action", "expected_revision"],
             "properties": {
                 "task_id": {"type": "string"},
                 "action": {
@@ -339,6 +339,25 @@ class WorkbenchMCPServer:
             ]
         }
 
+    @staticmethod
+    def _required_expected_revision(arguments: dict[str, Any]) -> int:
+        value = arguments.get("expected_revision")
+        if type(value) is not int:
+            raise ValueError("expected_revision must be an integer")
+        return value
+
+    @staticmethod
+    def _control_instruction(arguments: dict[str, Any]) -> str | None:
+        if "instruction" not in arguments:
+            return None
+        instruction = arguments["instruction"]
+        if type(instruction) is not str:
+            raise ValueError("instruction must be a string")
+        normalized = instruction.strip()
+        if not normalized or len(normalized) > 500:
+            raise ValueError("instruction must contain 1 to 500 characters")
+        return normalized
+
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "workbench_request":
             source_thread_id = arguments.get("source_thread_id")
@@ -512,39 +531,54 @@ class WorkbenchMCPServer:
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]
-            task = self.store.get_task(task_id)
+            expected_revision = self._required_expected_revision(arguments)
             if action in {"queue", "resume"}:
-                revision = self.store.queue_task(task_id)
+                instruction = self._control_instruction(arguments)
+                if instruction is not None:
+                    receipt = self.store.queue_task_with_instruction(
+                        task_id,
+                        instruction,
+                        expected_revision=expected_revision,
+                    )
+                    return self._text({"ok": True, "task_id": task_id, **receipt})
+                revision = self.store.queue_task(
+                    task_id,
+                    expected_revision=expected_revision,
+                )
             elif action == "pause":
                 revision = self.store.transition_task(
                     task_id,
                     "paused",
-                    expected_revision=int(arguments.get("expected_revision", task["state_revision"])),
+                    expected_revision=expected_revision,
                 )
             elif action == "cancel":
                 revision = self.store.transition_task(
                     task_id,
                     "cancelled",
-                    expected_revision=int(arguments.get("expected_revision", task["state_revision"])),
+                    expected_revision=expected_revision,
                 )
             elif action == "set_priority":
                 revision = self.store.set_task_priority(
                     task_id,
                     int(arguments["priority"]),
-                    expected_revision=int(arguments["expected_revision"]),
+                    expected_revision=expected_revision,
                 )
             elif action == "steer":
-                revision = self.store.append_task_steering(
+                instruction = self._control_instruction(arguments)
+                if instruction is None:
+                    raise ValueError("instruction is required")
+                receipt = self.store.append_task_steering_receipt(
                     task_id,
-                    arguments["instruction"],
-                    expected_revision=int(arguments["expected_revision"]),
+                    instruction,
+                    expected_revision=expected_revision,
                 )
+                return self._text({"ok": True, "task_id": task_id, **receipt})
             elif action == "resolve_indeterminate":
                 revision = self.store.resolve_indeterminate(
                     task_id,
                     arguments["node_id"],
                     arguments["resolution"],
-                    expected_revision=int(arguments["expected_revision"]),
+                    expected_revision=expected_revision,
                 )
             else:
                 raise ValueError(f"unsupported control action: {action}")

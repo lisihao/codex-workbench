@@ -36,6 +36,13 @@ class WorktreeManager:
         node_segment = _safe_segment(node_id)
         return f"codex-workbench/{task_segment}/{node_segment}-a{attempt}"
 
+    def worktree_path(self, task_id: str, node_id: str, attempt: int) -> Path:
+        """Return the deterministic physical path for one node attempt."""
+
+        return (
+            self.root / _safe_segment(task_id) / f"{_safe_segment(node_id)}-a{attempt}"
+        ).expanduser().resolve(strict=False)
+
     @staticmethod
     def _git(repository: Path, *args: str) -> str:
         result = subprocess.run(
@@ -62,11 +69,7 @@ class WorktreeManager:
             if not (repo / ".git").exists() and not self._git(repo, "rev-parse", "--git-dir"):
                 raise WorktreeError(f"repository is not a Git checkout: {repo}")
             resolved_base = self._git(repo, "rev-parse", f"{base_sha}^{{commit}}")
-            task_segment = _safe_segment(task_id)
-            node_segment = _safe_segment(node_id)
-            worktree = (
-                self.root / task_segment / f"{node_segment}-a{attempt}"
-            ).expanduser().resolve(strict=False)
+            worktree = self.worktree_path(task_id, node_id, attempt)
             branch = self.branch_name(task_id, node_id, attempt)
             if worktree.exists():
                 actual = self._git(worktree, "rev-parse", "HEAD")
@@ -104,9 +107,7 @@ class WorktreeManager:
         """
 
         repo = Path(repository).expanduser().resolve(strict=True)
-        target = (
-            self.root / _safe_segment(task_id) / f"{_safe_segment(node_id)}-a{attempt}"
-        ).expanduser().resolve(strict=False)
+        target = self.worktree_path(task_id, node_id, attempt)
         expected_branch = self.branch_name(task_id, node_id, attempt)
         if target.is_symlink():
             raise WorktreeError(f"recovery target {target} must not be a symlink")

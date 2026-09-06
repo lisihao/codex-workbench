@@ -724,6 +724,12 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError(
                 "worktree changed paths do not match the blocked worker receipt"
             )
+        ignored_paths = self.ignored_paths(path)
+        if ignored_paths:
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree contains ignored paths that cannot be recovered safely: "
+                + ", ".join(ignored_paths)
+            )
         untracked_paths = self.untracked_paths(path)
         requested_untracked = tuple(sorted(preserve_untracked_paths))
         if untracked_paths:
@@ -762,6 +768,18 @@ class DirtyWorktreeRecovery:
             "patch_ref": patch_ref,
             "patch_sha256": sha256(patch).hexdigest(),
         }
+
+    def validate_retry_source(
+        self,
+        *,
+        repository: str,
+        base_sha: str,
+        worktree: str,
+        branch: str,
+    ) -> Path:
+        """Check a failed source binding before deciding whether it is clean."""
+
+        return self._validate_worktree(repository, base_sha, worktree, branch)
 
     def prepare(
         self,
@@ -878,6 +896,79 @@ class DirtyWorktreeRecovery:
                 else {},
                 (f"BLOCKED: {error}",),
                 tuple(str(path) for path in recovery.get("changed_paths", ()) if isinstance(path, str)),
+            )
+
+    def prepare_for_retry(
+        self,
+        *,
+        repository: str,
+        source_worktree: str,
+        target_worktree: str,
+        target_branch: str,
+        target_attempt: int,
+        recovery: Mapping[str, object],
+    ) -> RecoveryOutcome:
+        """Restore a sealed failed attempt before its normal executor runs.
+
+        Unlike ``prepare``, this deliberately does not execute acceptance
+        commands or materialize dependencies: the retry's original executor
+        still owns those actions.  It only proves that the old worker patch
+        and recorded ancestor input can be reproduced on a fresh target
+        without changing the source worktree.
+        """
+
+        try:
+            source = self._validate_snapshot(repository, source_worktree, recovery)
+            target = self._validate_target(
+                repository,
+                target_worktree,
+                target_branch,
+                target_attempt,
+                recovery,
+            )
+            comparison_tree = self._restore_recorded_input(target, recovery)
+            patch = self._load_patch(recovery)
+            self.worktrees.apply_patch(target, self._patch_path(recovery))
+            self.mark_untracked_intent_to_add(
+                target,
+                self._recovery_untracked_paths(recovery),
+            )
+            if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
+                raise DirtyWorktreeRecoveryError(
+                    "retry target patch does not exactly match the captured failed attempt"
+                )
+            self._validate_snapshot(repository, str(source), recovery)
+            return RecoveryOutcome(
+                "succeeded",
+                "captured failed-attempt patch was restored on a clean retry target before model dispatch",
+                {"recovery-snapshot": str(recovery["patch_ref"])},
+                (
+                    "PASS: failed source worktree snapshot is unchanged",
+                    "PASS: recorded dependency input was reproduced on the retry target",
+                    "PASS: captured failed-attempt patch was restored before model dispatch",
+                ),
+                tuple(str(path) for path in recovery["changed_paths"]),
+                prepared_recovery={
+                    **dict(recovery),
+                    "target_attempt": target_attempt,
+                    "target_worktree": str(target),
+                    "target_branch": target_branch,
+                    "target_patch_sha256": sha256(patch).hexdigest(),
+                },
+            )
+        except DirtyWorktreeRecoveryError as error:
+            return RecoveryOutcome(
+                "blocked",
+                str(error),
+                {"recovery-snapshot": str(recovery["patch_ref"])}
+                if isinstance(recovery.get("patch_ref"), str)
+                else {},
+                (f"BLOCKED: {error}",),
+                tuple(
+                    str(path)
+                    for path in recovery.get("changed_paths", ())
+                    if isinstance(path, str)
+                ),
             )
 
     def run(
@@ -1023,6 +1114,26 @@ class DirtyWorktreeRecovery:
             task_id,
             node_id,
             dependency_input_ref,
+        )
+
+    @staticmethod
+    def ignored_paths(worktree: Path) -> tuple[str, ...]:
+        """List ignored untracked paths so recovery cannot discard them silently."""
+
+        raw = DirtyWorktreeRecovery._git_bytes(
+            worktree,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        )
+        return tuple(
+            sorted(
+                item.decode("utf-8", errors="surrogateescape")
+                for item in raw.split(b"\0")
+                if item
+            )
         )
 
     @staticmethod

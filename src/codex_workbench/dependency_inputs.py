@@ -23,6 +23,111 @@ class DependencyInput:
     receipt: dict[str, Any]
 
 
+def validate_dependency_input_lineage(
+    task: Mapping[str, Any],
+    node_id: str,
+    dependency_input: DependencyInput,
+) -> None:
+    """Require one loaded dependency input to match the current accepted closure.
+
+    The task snapshot is authoritative for the ordered ancestor source records.
+    A receipt from another task, node, contract base, or accepted-attempt
+    closure is rejected before it can be used as worker input.
+    """
+
+    if not isinstance(task, Mapping):
+        raise DependencyInputError("dependency task snapshot is invalid")
+    if not isinstance(node_id, str) or not node_id:
+        raise DependencyInputError("dependency target node is invalid")
+    if not isinstance(dependency_input, DependencyInput):
+        raise DependencyInputError("dependency input is invalid")
+    task_id = task.get("task_id")
+    contract = task.get("contract")
+    if not isinstance(task_id, str) or not task_id:
+        raise DependencyInputError("dependency task snapshot has an invalid task id")
+    if not isinstance(contract, Mapping):
+        raise DependencyInputError("dependency task snapshot has an invalid contract")
+    base_sha = contract.get("base_sha")
+    if not isinstance(base_sha, str) or not base_sha:
+        raise DependencyInputError("dependency task snapshot lacks contract base")
+
+    receipt = dependency_input.receipt
+    if not isinstance(receipt, Mapping):
+        raise DependencyInputError("dependency input receipt is invalid")
+    if receipt.get("task_id") != task_id:
+        raise DependencyInputError("dependency input receipt belongs to another task")
+    if receipt.get("node_id") != node_id:
+        raise DependencyInputError("dependency input receipt belongs to another node")
+    if receipt.get("contract_base_sha") != base_sha:
+        raise DependencyInputError("dependency input receipt has another contract base")
+    input_tree_sha = receipt.get("input_tree_sha")
+    if input_tree_sha != dependency_input.input_tree_sha:
+        raise DependencyInputError("dependency input receipt tree does not match its input")
+    if not isinstance(input_tree_sha, str) or not input_tree_sha:
+        raise DependencyInputError("dependency input receipt tree is invalid")
+
+    raw_ancestors = receipt.get("ancestors")
+    if not isinstance(raw_ancestors, list):
+        raise DependencyInputError("dependency input receipt ancestors are invalid")
+    actual: list[tuple[str, int, str | None]] = []
+    for source in raw_ancestors:
+        if not isinstance(source, Mapping) or set(source) != {"node_id", "attempt", "patch_ref"}:
+            raise DependencyInputError("dependency input receipt ancestor is invalid")
+        source_node_id = source["node_id"]
+        attempt = source["attempt"]
+        patch_ref = source["patch_ref"]
+        if not isinstance(source_node_id, str) or not source_node_id:
+            raise DependencyInputError("dependency input receipt ancestor node is invalid")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise DependencyInputError("dependency input receipt ancestor attempt is invalid")
+        if patch_ref is not None and (not isinstance(patch_ref, str) or not patch_ref):
+            raise DependencyInputError("dependency input receipt ancestor patch is invalid")
+        actual.append((source_node_id, attempt, patch_ref))
+
+    expected = tuple(
+        (
+            source["node_id"],
+            source["attempt"],
+            source["patch_ref"],
+        )
+        for ancestor in accepted_ancestor_nodes(task, node_id)
+        for source in (_source_receipt(ancestor),)
+    )
+    if tuple(actual) != expected:
+        raise DependencyInputError(
+            "dependency input receipt ancestor lineage does not match accepted closure"
+        )
+
+
+def base_dependency_input(
+    *,
+    task_id: str,
+    node_id: str,
+    base_sha: str,
+    worktree: Path,
+) -> DependencyInput:
+    """Create the immutable empty-ancestor lineage for a base-only worker.
+
+    Normal workers without dependencies historically had no input artifact.
+    A dirty failed retry needs one so tracked and explicitly preserved
+    untracked changes can be replayed against the exact original input tree.
+    """
+
+    input_tree_sha = _resolve_tree(worktree, base_sha)
+    return DependencyInput(
+        input_tree_sha=input_tree_sha,
+        receipt={
+            "schema_version": 1,
+            "kind": "accepted-ancestor-patch-input",
+            "task_id": task_id,
+            "node_id": node_id,
+            "contract_base_sha": base_sha,
+            "input_tree_sha": input_tree_sha,
+            "ancestors": [],
+        },
+    )
+
+
 def load_recorded_dependency_input(
     artifacts: ArtifactStore,
     ref: str,

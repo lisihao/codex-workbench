@@ -209,12 +209,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             task_id = unquote(parsed.path.removeprefix("/api/tasks/").removesuffix("/steer"))
             try:
                 body = json.loads(self._read_body() or b"{}")
-                revision = self.server.store.append_task_steering(
+                receipt = self.server.store.append_task_steering_receipt(
                     task_id,
-                    str(body["instruction"]),
-                    expected_revision=int(body["expected_revision"]),
+                    self._instruction(body),
+                    expected_revision=self._expected_revision(body),
                 )
-                return self._json({"ok": True, "revision": revision})
+                return self._json({"ok": True, **receipt})
             except KeyError:
                 return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
             except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -224,38 +224,80 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             try:
                 body = json.loads(self._read_body() or b"{}")
                 action = body.get("action")
-                task = self.server.store.get_task(task_id)
+                expected_revision = self._expected_revision(body)
                 if action in {"queue", "resume"}:
-                    revision = self.server.store.queue_task(task_id)
+                    if "instruction" not in body:
+                        receipt = {
+                            "task_id": task_id,
+                            "revision": self.server.store.queue_task(
+                                task_id,
+                                expected_revision=expected_revision,
+                            ),
+                        }
+                    else:
+                        receipt = self.server.store.queue_task_with_instruction(
+                            task_id,
+                            body["instruction"],
+                            expected_revision=expected_revision,
+                        )
                 elif action == "pause":
-                    revision = self.server.store.transition_task(
-                        task_id, "paused", expected_revision=task["state_revision"]
-                    )
+                    receipt = {
+                        "task_id": task_id,
+                        "revision": self.server.store.transition_task(
+                            task_id, "paused", expected_revision=expected_revision
+                        ),
+                    }
                 elif action == "cancel":
-                    revision = self.server.store.transition_task(
-                        task_id, "cancelled", expected_revision=task["state_revision"]
-                    )
+                    receipt = {
+                        "task_id": task_id,
+                        "revision": self.server.store.transition_task(
+                            task_id, "cancelled", expected_revision=expected_revision
+                        ),
+                    }
                 elif action == "set_priority":
-                    revision = self.server.store.set_task_priority(
-                        task_id,
-                        int(body["priority"]),
-                        expected_revision=int(body["expected_revision"]),
-                    )
+                    receipt = {
+                        "task_id": task_id,
+                        "revision": self.server.store.set_task_priority(
+                            task_id,
+                            int(body["priority"]),
+                            expected_revision=expected_revision,
+                        ),
+                    }
                 elif action == "resolve_indeterminate":
-                    revision = self.server.store.resolve_indeterminate(
-                        task_id,
-                        body["node_id"],
-                        body["resolution"],
-                        expected_revision=int(body["expected_revision"]),
-                    )
+                    receipt = {
+                        "task_id": task_id,
+                        "revision": self.server.store.resolve_indeterminate(
+                            task_id,
+                            body["node_id"],
+                            body["resolution"],
+                            expected_revision=expected_revision,
+                        ),
+                    }
                 else:
                     return self._json({"error": "unsupported action"}, HTTPStatus.BAD_REQUEST)
-                return self._json({"ok": True, "revision": revision})
+                return self._json({"ok": True, **receipt})
             except KeyError:
                 return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
-            except (StateConflictError, ValueError) as error:
+            except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    @staticmethod
+    def _expected_revision(body: dict[str, object]) -> int:
+        value = body.get("expected_revision")
+        if type(value) is not int:
+            raise ValueError("expected_revision must be an integer")
+        return value
+
+    @staticmethod
+    def _instruction(body: dict[str, object]) -> str:
+        value = body.get("instruction")
+        if type(value) is not str:
+            raise ValueError("instruction must be a string")
+        instruction = value.strip()
+        if not instruction or len(instruction) > 500:
+            raise ValueError("instruction must contain 1 to 500 characters")
+        return instruction
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))

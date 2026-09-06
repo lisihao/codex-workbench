@@ -383,6 +383,174 @@ class APITests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_task_control_cas_and_receipts_are_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+
+            def create_task(task_id: str, command_id: str) -> None:
+                contract = TaskContract(
+                    task_id=task_id,
+                    repository=str(root),
+                    base_sha="fixture",
+                    objective="exercise task control",
+                    allowed_scope=("tests",),
+                )
+                store.create_task(
+                    contract,
+                    [
+                        NodeSpec(task_id + "-work", task_id, "work", "fixture", "fixture", "ok"),
+                        NodeSpec(
+                            task_id + "-verify",
+                            task_id,
+                            "verify",
+                            "fixture",
+                            "fixture",
+                            "accepted",
+                            depends_on=(task_id + "-work",),
+                            verifier=True,
+                        ),
+                    ],
+                    command_id,
+                )
+
+            create_task("control-cas", "control-cas-create")
+            create_task("steer-receipt", "steer-receipt-create")
+            create_task("atomic-queue", "atomic-queue-create")
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            headers = {
+                "Authorization": f"Bearer {config.token()}",
+                "Content-Type": "application/json",
+            }
+
+            def post(path: str, payload: dict[str, object]) -> dict[str, object]:
+                request = Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(payload).encode(),
+                    method="POST",
+                    headers=headers,
+                )
+                with urlopen(request, timeout=2) as response:
+                    return json.load(response)
+
+            def expect_conflict(path: str, payload: dict[str, object]) -> dict[str, object]:
+                request = Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(payload).encode(),
+                    method="POST",
+                    headers=headers,
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, HTTPStatus.CONFLICT)
+                result = json.load(caught.exception)
+                caught.exception.close()
+                return result
+
+            try:
+                stale = expect_conflict(
+                    "/api/tasks/control-cas/control",
+                    {"action": "queue", "expected_revision": 0},
+                )
+                self.assertIn("expected task revision", stale["error"])
+                self.assertEqual(store.get_task("control-cas")["state_revision"], 1)
+
+                queued = post(
+                    "/api/tasks/control-cas/control",
+                    {"action": "queue", "expected_revision": 1},
+                )
+                self.assertEqual(queued["revision"], 2)
+                paused = post(
+                    "/api/tasks/control-cas/control",
+                    {"action": "pause", "expected_revision": 2},
+                )
+                self.assertEqual(paused["revision"], 3)
+                expect_conflict(
+                    "/api/tasks/control-cas/control",
+                    {"action": "resume", "expected_revision": 2},
+                )
+                resumed = post(
+                    "/api/tasks/control-cas/control",
+                    {"action": "resume", "expected_revision": 3},
+                )
+                self.assertEqual(resumed["revision"], 4)
+                expect_conflict(
+                    "/api/tasks/control-cas/control",
+                    {"action": "cancel", "expected_revision": 3},
+                )
+                cancelled = post(
+                    "/api/tasks/control-cas/control",
+                    {"action": "cancel", "expected_revision": 4},
+                )
+                self.assertEqual(cancelled["revision"], 5)
+
+                queued_steer = post(
+                    "/api/tasks/steer-receipt/control",
+                    {"action": "queue", "expected_revision": 1},
+                )
+                steering = post(
+                    "/api/tasks/steer-receipt/steer",
+                    {
+                        "instruction": "保留公开接口",
+                        "expected_revision": queued_steer["revision"],
+                    },
+                )
+                self.assertTrue(steering["steering_id"])
+                self.assertEqual(steering["revision"], 3)
+                self.assertIn("delivery", steering)
+                self.assertEqual(store.get_task("steer-receipt")["state"], "queued")
+
+                for instruction in (None, True, "x" * 501):
+                    expect_conflict(
+                        "/api/tasks/steer-receipt/steer",
+                        {"instruction": instruction, "expected_revision": 3},
+                    )
+                    unchanged = store.get_task("steer-receipt")
+                    self.assertEqual(unchanged["state_revision"], 3)
+                    self.assertEqual(len(unchanged["steering"]), 1)
+
+                invalid = "/api/tasks/atomic-queue/control"
+                for instruction in ("x" * 501, "   "):
+                    expect_conflict(
+                        invalid,
+                        {
+                            "action": "queue",
+                            "expected_revision": 1,
+                            "instruction": instruction,
+                        },
+                    )
+                    unchanged = store.get_task("atomic-queue")
+                    self.assertEqual(unchanged["state"], "inbox")
+                    self.assertEqual(unchanged["state_revision"], 1)
+                    self.assertEqual(unchanged["steering"], [])
+
+                started = post(
+                    invalid,
+                    {
+                        "action": "queue",
+                        "expected_revision": 1,
+                        "instruction": "保留公开接口并补测试",
+                    },
+                )
+                self.assertEqual(started["state"], "queued")
+                self.assertEqual(started["revision"], 3)
+                self.assertTrue(started["steering"]["steering_id"])
+                self.assertIn("delivery", started["steering"])
+                self.assertEqual(
+                    store.get_task("atomic-queue")["steering"][0]["instruction"],
+                    "保留公开接口并补测试",
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_capability_endpoints_are_read_only_and_expose_active_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

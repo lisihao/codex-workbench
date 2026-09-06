@@ -15,6 +15,7 @@ from codex_workbench.dependency_inputs import (
     accepted_ancestor_nodes,
     changed_paths_since_input_tree,
     effective_spec_with_dependency_input,
+    validate_dependency_input_lineage,
     write_input_tree,
 )
 from codex_workbench.artifacts import ArtifactStore
@@ -25,6 +26,158 @@ from codex_workbench.store import WorkbenchStore
 
 
 class DependencyInputTests(unittest.TestCase):
+    @staticmethod
+    def _lineage_task() -> dict:
+        return {
+            "task_id": "task",
+            "contract": {"base_sha": "base"},
+            "nodes": [
+                {
+                    "node_id": "a",
+                    "state": "accepted",
+                    "depends_on": (),
+                    "attempt": 2,
+                    "result": {
+                        "artifacts": {"patch": "patch-a"},
+                        "changed_paths": ["a.txt"],
+                    },
+                },
+                {
+                    "node_id": "b",
+                    "state": "accepted",
+                    "depends_on": ("a",),
+                    "attempt": 3,
+                    "result": {
+                        "artifacts": {"patch": "patch-b"},
+                        "changed_paths": ["b.txt"],
+                    },
+                },
+                {
+                    "node_id": "target",
+                    "state": "running",
+                    "depends_on": ("b",),
+                    "attempt": 1,
+                    "result": None,
+                },
+            ],
+        }
+
+    @staticmethod
+    def _lineage_input(ancestors: list[dict]) -> DependencyInput:
+        return DependencyInput(
+            input_tree_sha="tree",
+            receipt={
+                "schema_version": 1,
+                "kind": "accepted-ancestor-patch-input",
+                "task_id": "task",
+                "node_id": "target",
+                "contract_base_sha": "base",
+                "input_tree_sha": "tree",
+                "ancestors": ancestors,
+            },
+        )
+
+    def test_dependency_input_lineage_accepts_ordered_transitive_closure(self) -> None:
+        task = self._lineage_task()
+        dependency_input = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 2, "patch_ref": "patch-a"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+            ]
+        )
+
+        self.assertIsNone(validate_dependency_input_lineage(task, "target", dependency_input))
+
+    def test_dependency_input_lineage_rejects_missing_or_extra_ancestors(self) -> None:
+        task = self._lineage_task()
+        missing = self._lineage_input(
+            [{"node_id": "a", "attempt": 2, "patch_ref": "patch-a"}]
+        )
+        extra = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 2, "patch_ref": "patch-a"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+                {"node_id": "extra", "attempt": 1, "patch_ref": "patch-extra"},
+            ]
+        )
+
+        for dependency_input in (missing, extra):
+            with self.assertRaisesRegex(DependencyInputError, "ancestor lineage"):
+                validate_dependency_input_lineage(task, "target", dependency_input)
+
+    def test_dependency_input_lineage_rejects_unaccepted_ancestor(self) -> None:
+        task = self._lineage_task()
+        task["nodes"] = [
+            *task["nodes"][:2],
+            {
+                "node_id": "pending",
+                "state": "running",
+                "depends_on": (),
+                "attempt": 1,
+                "result": None,
+            },
+            {
+                "node_id": "target",
+                "state": "running",
+                "depends_on": ("pending",),
+                "attempt": 1,
+                "result": None,
+            },
+        ]
+        dependency_input = self._lineage_input(
+            [{"node_id": "pending", "attempt": 1, "patch_ref": None}]
+        )
+
+        with self.assertRaisesRegex(DependencyInputError, "expected accepted"):
+            validate_dependency_input_lineage(task, "target", dependency_input)
+
+    def test_dependency_input_lineage_rejects_stale_attempt_or_patch_ref(self) -> None:
+        task = self._lineage_task()
+        stale_attempt = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 1, "patch_ref": "patch-a"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+            ]
+        )
+        stale_patch = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 2, "patch_ref": "patch-a-old"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+            ]
+        )
+
+        for dependency_input in (stale_attempt, stale_patch):
+            with self.assertRaisesRegex(DependencyInputError, "ancestor lineage"):
+                validate_dependency_input_lineage(task, "target", dependency_input)
+
+    def test_dependency_input_lineage_rejects_task_node_or_base_mismatch(self) -> None:
+        task = self._lineage_task()
+        dependency_input = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 2, "patch_ref": "patch-a"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+            ]
+        )
+
+        for field, value, message in (
+            ("task_id", "other-task", "another task"),
+            ("node_id", "other-node", "another node"),
+            ("contract_base_sha", "other-base", "another contract base"),
+        ):
+            changed_task = self._lineage_task()
+            changed_input = dependency_input
+            if field == "task_id":
+                changed_input = self._lineage_input(dependency_input.receipt["ancestors"])
+                changed_input.receipt["task_id"] = value
+            elif field == "node_id":
+                changed_input = self._lineage_input(dependency_input.receipt["ancestors"])
+                changed_input.receipt["node_id"] = value
+            else:
+                changed_task["contract"]["base_sha"] = value
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(DependencyInputError, message):
+                    validate_dependency_input_lineage(changed_task, "target", changed_input)
+
     def test_dependency_closure_rejects_unaccepted_and_missing_nodes(self) -> None:
         unaccepted = {
             "task_id": "task",

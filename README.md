@@ -80,6 +80,14 @@ Workbench 对 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna` 的 Codex 进�
 
 Spark 是一个独立的逻辑队列，不是另一套协调器。它和普通 Worker 共享全局执行器上限，但拥有自己的容量、等待、启动和 busy-slot 计数；默认上限为 `min(4, max_workers)`，可用 `serve --spark-workers N` 调整，`0` 表示关闭 Spark 优先 lane。规划器会主动寻找互不冲突、可单独验收的短切片；无法安全拆分时保留 Luna/Terra 的较大切片。routing-v3 的 Spark 失败不会被当成成功，也不会在 claim 时绕过已固定能力目录静默换模型；需要换档时由后续 planner repair 重新路由，最终仍由 Sol 验收。
 
+### 无损续修与并发控制
+
+Worker 失败后，Workbench 不再把“重新排队”等同于“从空白重做”。失败 attempt 的真实 tracked/untracked 差异、精确 dependency-input、base、attempt、branch、allocation、内容哈希和任务/节点 scope 会绑定到现有 SQLite 状态权威；下一 attempt 先在新工作树复原已验收祖先闭包和该 Worker 自己的补丁，再调用原执行器。来源漂移、哈希不符、越权路径或捕获不确定都会恢复原失败 attempt 并转入 needs_fix，不会静默丢弃文件或重复执行已验收依赖。
+
+所有外部 queue、resume、pause、cancel 和 steer 操作必须携带调用方刚读取的 expected_revision。带指导的 queue/resume 会先校验 1–500 字符的 instruction，再在同一事务中保存指导和启动状态；任一校验或 CAS 失败时两者都不发生。运行节点在 claim 时取得指导快照，因此之后追加的指导回执会明确返回 not_delivered、current_attempt_received=false 和后续生效点，而不会宣称实时注入现有进程。精确 attempt 的送达记录可从 cursor events 审计。
+
+恢复准备、Git/文件捕获、Artifact 哈希和仓库身份解析都在 SQLite 写事务之外完成；写事务只提交短时、带 lease/revision 的状态变更。恢复 target 在 assignment 前发生进程重启时会原子回滚到原失败 attempt，并写入可重放的 orphan cleanup receipt；coordinator 启动恢复在事务外归档 target，失败或再次重启会继续重放，直到记录 resolved。assignment 后进程状态不确定时会保留 target 和 allocation、进入人工裁决，自动 retry 明确拒绝，防止同一工作树被重复派发。完整操作与故障语义见 [任务控制与失败恢复](docs/task-control-recovery.md)。
+
 ### 可恢复的 Worktree 回收与 NAS 归档
 
 每次 worktree 分配都会写入持久账本。任务进入 `accepted` 或 `cancelled` 后，后台维护线程只做以下有序状态转换：
@@ -374,13 +382,16 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.13.16`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.13.17`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+
+1.13.17 将失败 Worker 的合法 tracked/untracked 差异、固定 dependency-input 和物理 allocation 纳入下一 attempt；外部任务控制强制 caller revision，queue/resume 与 instruction 原子提交，指导回执区分保存与精确 attempt 快照；恢复、Artifact 和仓库 Git 校验移出 SQLite 写事务，并补齐重启、旧回写、重复请求及暂停/取消竞态 fencing。
 
 1.13.12 令每个托管 Codex worker 的临时 PATH 优先使用 Workbench 已验证的 pnpm 11.25，并固定 `--pm-on-fail=ignore`；恢复后模型自行运行 pnpm 时不会再由项目的同主版本 packageManager 声明降级或下载旧 CLI。该 shim 只活在单个 Worker 子进程内，不修改用户 shell、全局 pnpm 或其他项目。1.13.11 固定受控恢复使用已验证的 pnpm 11.25 运行时，并显式设为 `--pm-on-fail=ignore`：项目的同主版本 packageManager 声明不得触发下载或切换旧 pnpm，因此离线恢复不会因 registry 签名读取而失败。1.13.10 将已成功离线物化的依赖树按完整 workspace 输入指纹缓存为只读模板；同一输入的后续恢复在 APFS 上复制为独立的写时复制目录，workspace link 仍只解析到新 worktree。首次新指纹构建仍严格有界为 360 秒，模板命中不再执行 pnpm install，并在回执中记录 hit 或 seeded；工作区 package manifest、pnpm workspace 配置、lockfile、pnpm 版本或平台变化都会生成新模板，绝不跨输入复用。1.13.9 令受控脏工作树恢复的 pnpm 物化固定使用 `--ignore-scripts`：依赖链接只负责准备可验证的本地树，不执行项目生命周期脚本；这避免 DSH 的 lefthook postinstall 在恢复窗口中阻塞，同时把任何真正需要脚本的失败保留给节点自身的显式验收。1.13.8 修复受控脏工作树恢复的 pnpm 版本探测：pnpm 即使只执行 `--version` 也会读取当前工作区配置，曾在 DSH 工作树内消耗整个恢复窗口；Workbench 现在在中性目录探测已固定的 pnpm 二进制，随后仍只在目标工作树中做冻结、离线安装。1.13.6 将共享 pnpm store 的离线 linker 物化限定为短暂互斥区：等待与安装共同受原有 120 秒边界约束，收据记录锁路径和等待时间；依赖准备完成后，独立 Worker 仍照常并行。它修复了两个干净工作树同时链接同一 store 时超时而误阻塞整个任务的路径。1.13.5 将离线 pnpm 材料化收敛为可复现的 Authority 运行时：安装包携带来源锁定的 pnpm 11.25.0（MIT），LaunchAgent 与 CLI wrapper 均显式传入它和已预热的本地 store；已知会在 `--offline` 下等待 registry 校验的 pnpm 11.7 会在派发前立即报出可操作错误，材料化最大 120 秒，绝不再无限占用 worker lease。`--pnpm-store` 允许 Authority 指向已预热的内容寻址 store；缓存缺包仍是明确失败，不伪装为可恢复成功。1.13.4 为依赖节点的受控脏工作树恢复新增显式 `task resume-blocked-worktree --preserve-untracked`：只有调用方明确选择、文件集与收据精确一致、且每个文件同时落在任务及节点 write scope 内时，才会把合法未跟踪文件纳入内容寻址补丁并在干净 a2 复原；a1 永远不执行 `git add` 或写入。v3 收据固定该文件集和合并补丁，恢复后仍以字节级补丁、声明验收和 scope 校验替换 a1。1.13.3 修复依赖节点的受控脏工作树恢复：恢复器会从原 a1 的不可变 dependency-input 收据重建已验收祖先补丁闭包，再仅捕获并重放该 worker 自己的差异；不会把上游已验收改动误判为该 worker 的写入。1.13.1 新增受控的脏工作树恢复；1.12.1 修复执行恢复；1.12.0 增加 Astra 显式控制面选择、Claude 精确型号映射与分来源性能清单。默认控制面仍为 Sol；Astra 性能缺失保持 N/A。测试通过、分类可运行或路由发生变化，都不能替代真实交付周期与单位配额收益证据。
 
 该版本将 Git 工作树分配和执行路径解析到真实物理目录。下游节点先纳入已 `accepted` 的祖先补丁，再仅导出本节点新增的差异。`task reconcile-archify` 和 `task retry-blocked` 提供只读 `--dry-run` 提议；操作人应先审阅提议，再以当前 revision/attempt 正式授权恢复。恢复不重建任务、不修改冻结 base，也不把人工无副作用确认冒充自动验证。
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
+- [任务控制与失败恢复](docs/task-control-recovery.md) — caller CAS、指导送达回执、失败 attempt 续修、崩溃 fencing 与事务边界。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
 - [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、personal-use consent、SQLite 断网缓存、Workbench 先验与未来 DSH 消费合同。

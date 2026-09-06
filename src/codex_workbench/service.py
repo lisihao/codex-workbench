@@ -16,7 +16,12 @@ from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
     apply_accepted_ancestor_patches,
+    apply_recorded_dependency_input,
+    base_dependency_input,
+    changed_paths_since_input_tree,
     effective_spec_with_dependency_input,
+    load_recorded_dependency_input,
+    validate_dependency_input_lineage,
 )
 from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
 from .executors import (
@@ -44,11 +49,12 @@ from .quota import JsonFileQuotaAdapter, QuotaRefresher
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
 from .routing import codex_fallback_model, route_task, strategy_for_node
 from .store import StateConflictError, WorkbenchStore
-from .worktrees import WorktreeError, WorktreeManager
+from .worktrees import WorktreeError, WorktreeManager, scope_allows
 
 
 _ARCHIFY_COMMANDS = frozenset({"deliver", "compare", "visual-check", "validate", "migrate"})
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
+_FAILED_ATTEMPT_RECOVERY_PROVIDER = "workbench-failed-attempt-recovery"
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,9 @@ class Coordinator:
         self.artifacts = ArtifactStore(state_root / "artifacts")
         self.worktrees = WorktreeManager(state_root / "worktrees")
         self.blocked_worktree_recovery = DirtyWorktreeRecovery(self.artifacts, self.worktrees)
+        # Failed retries use the same sealed capture/lineage mechanism, but
+        # continue into their original executor after restoration.
+        self.failed_attempt_recovery = self.blocked_worktree_recovery
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workbench-worker")
         self._futures: dict[Future[None], tuple[str, str | None]] = {}
         self._routed_to_codex: set[str] = set()
@@ -123,7 +132,52 @@ class Coordinator:
         self._quota_unavailable_reported = False
 
     def recover(self) -> int:
-        return self.store.recover_interrupted()
+        recovered, _ = self.store.recover_interrupted_with_orphans()
+        for orphan in self.store.pending_failed_attempt_recovery_orphans():
+            target = self.worktrees.worktree_path(
+                str(orphan["task_id"]),
+                str(orphan["node_id"]),
+                int(orphan["attempt"]),
+            )
+            if not target.exists():
+                self.store.record_system_event(
+                    "failed_attempt_recovery.orphan_resolved",
+                    {
+                        **orphan,
+                        "target": str(target),
+                        "status": "target_absent",
+                    },
+                )
+                continue
+            try:
+                archive = self.worktrees.archive_failed_recovery(
+                    str(orphan["repository"]),
+                    target,
+                    str(orphan["branch"]),
+                    task_id=str(orphan["task_id"]),
+                    node_id=str(orphan["node_id"]),
+                    attempt=int(orphan["attempt"]),
+                )
+            except (OSError, ValueError, WorktreeError) as error:
+                self.store.record_system_event(
+                    "failed_attempt_recovery.orphan_cleanup_failed",
+                    {
+                        **orphan,
+                        "target": str(target),
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                )
+            else:
+                self.store.record_system_event(
+                    "failed_attempt_recovery.orphan_resolved",
+                    {
+                        **orphan,
+                        "target": str(target),
+                        "archive": str(archive),
+                        "status": "archived",
+                    },
+                )
+        return recovered
 
     def run_forever(self) -> None:
         worker_counter = 0
@@ -387,12 +441,24 @@ class Coordinator:
             self._execute_blocked_worktree_recovery(claimed)
             return
         request: ExecutionRequest
+        failed_attempt_recovery = claimed.get("failed_attempt_recovery")
+        failed_attempt_assigned = False
         try:
             spec = claimed["spec"]
             contract = claimed["contract"]
             worktree: Path | None = None
             dependency_input: DependencyInput | None = None
-            if spec["executor"] != "fixture":
+            input_receipt_ref: str | None = None
+            recovery_artifacts: dict[str, str] = {}
+            if failed_attempt_recovery is not None:
+                (
+                    worktree,
+                    dependency_input,
+                    input_receipt_ref,
+                    recovery_artifacts,
+                ) = self._prepare_failed_attempt_recovery(claimed)
+                failed_attempt_assigned = True
+            elif spec["executor"] != "fixture":
                 worktree = self.worktrees.prepare(
                     contract["repository"],
                     contract["base_sha"],
@@ -414,11 +480,10 @@ class Coordinator:
                     dependency_input = self._prepare_dependency_input(
                         claimed["task_id"], claimed["node_id"], worktree
                     )
-            input_receipt_ref = (
-                self.artifacts.put_text(canonical_json(dependency_input.receipt), "dependency-input.json")
-                if dependency_input is not None
-                else None
-            )
+            if input_receipt_ref is None and dependency_input is not None:
+                input_receipt_ref = self.artifacts.put_text(
+                    canonical_json(dependency_input.receipt), "dependency-input.json"
+                )
             request = ExecutionRequest(
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],
@@ -452,6 +517,11 @@ class Coordinator:
                         cached = None
                 if cached is not None:
                     result = NodeResult.from_dict(cached["result"])
+                    if recovery_artifacts:
+                        result = replace(
+                            result,
+                            artifacts={**recovery_artifacts, **result.artifacts},
+                        )
                     if input_receipt_ref is not None:
                         result = self._with_dependency_input_receipt(result, input_receipt_ref)
                     if packet_refs:
@@ -516,6 +586,8 @@ class Coordinator:
                             decision.zone if decision is not None else "unknown",
                             fallback_kind=f"claude-executor-{result.status}",
                         )
+            if worktree is not None and not spec.get("verifier") and result.status in {"failed", "blocked"}:
+                result = self._with_observed_failure_paths(request, result)
             result = validate_worker_scope(self.worktrees, request, result)
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(
@@ -529,6 +601,11 @@ class Coordinator:
                             "patch": self.artifacts.put_bytes(patch, "patch"),
                         },
                     )
+            if recovery_artifacts:
+                result = replace(
+                    result,
+                    artifacts={**recovery_artifacts, **result.artifacts},
+                )
             if input_receipt_ref is not None:
                 result = self._with_dependency_input_receipt(result, input_receipt_ref)
             if cache_key and result.status == "succeeded":
@@ -539,28 +616,44 @@ class Coordinator:
                     claimed["node_id"],
                 )
         except DependencyInputError as error:
-            result = NodeResult(
-                status="blocked",
-                summary=f"dependency inputs unavailable: {error}",
-                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
-                verdict="blocked" if claimed["spec"].get("verifier") else None,
-                **governance_receipt_fields(claimed["contract"]),
-            )
+            if failed_attempt_recovery is not None and not failed_attempt_assigned:
+                result = self._failed_attempt_recovery_failure(
+                    claimed, f"failed-attempt recovery dependency lineage is unavailable: {error}"
+                )
+            else:
+                result = NodeResult(
+                    status="blocked",
+                    summary=f"dependency inputs unavailable: {error}",
+                    result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                    verdict="blocked" if claimed["spec"].get("verifier") else None,
+                    **governance_receipt_fields(claimed["contract"]),
+                )
         except WorktreeError as error:
-            result = NodeResult(
-                status="blocked",
-                summary=f"worktree unavailable: {error}",
-                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
-                verdict="blocked" if claimed["spec"].get("verifier") else None,
-                **governance_receipt_fields(claimed["contract"]),
-            )
+            if failed_attempt_recovery is not None and not failed_attempt_assigned:
+                result = self._failed_attempt_recovery_failure(
+                    claimed, f"failed-attempt recovery rejected: {error}"
+                )
+            else:
+                result = NodeResult(
+                    status="blocked",
+                    summary=f"worktree unavailable: {error}",
+                    result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                    verdict="blocked" if claimed["spec"].get("verifier") else None,
+                    **governance_receipt_fields(claimed["contract"]),
+                )
         except Exception as error:
-            result = NodeResult(
-                status="indeterminate",
-                summary=f"worker crashed: {type(error).__name__}: {error}",
-                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
-                **governance_receipt_fields(claimed["contract"]),
-            )
+            if failed_attempt_recovery is not None and not failed_attempt_assigned:
+                result = self._failed_attempt_recovery_failure(
+                    claimed,
+                    f"failed-attempt recovery crashed: {type(error).__name__}: {error}",
+                )
+            else:
+                result = NodeResult(
+                    status="indeterminate",
+                    summary=f"worker crashed: {type(error).__name__}: {error}",
+                    result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                    **governance_receipt_fields(claimed["contract"]),
+                )
         try:
             self.store.settle_node(
                 claimed["task_id"],
@@ -573,6 +666,311 @@ class Coordinator:
         except StateConflictError:
             # A newer coordinator/node lease owns the durable state; this late result is fenced.
             return
+
+    def _prepare_failed_attempt_recovery(
+        self,
+        claimed: dict,
+    ) -> tuple[Path, DependencyInput, str, dict[str, str]]:
+        """Capture and restore one failed worktree before its executor starts.
+
+        This entire method runs after the durable claim and before model
+        dispatch.  It intentionally performs Git and artifact IO outside a
+        store transaction; ``assign_failed_attempt_recovery_worktree`` later
+        commits only the fenced, already-validated outcome.
+        """
+
+        binding = claimed.get("failed_attempt_recovery")
+        if not isinstance(binding, dict):
+            raise DirtyWorktreeRecoveryError("failed-attempt recovery binding is missing")
+        spec = claimed["spec"]
+        contract = claimed["contract"]
+        if spec.get("verifier"):
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt worktree recovery is only supported for worker nodes"
+            )
+        source = binding.get("source")
+        if not isinstance(source, dict):
+            raise DirtyWorktreeRecoveryError("failed-attempt recovery source is missing")
+        source_worktree = source.get("worktree")
+        source_branch = source.get("branch")
+        source_base = source.get("base_sha")
+        expected_paths = source.get("changed_paths")
+        if not (
+            isinstance(source_worktree, str)
+            and isinstance(source_branch, str)
+            and isinstance(source_base, str)
+            and isinstance(expected_paths, list)
+            and all(isinstance(path, str) and path for path in expected_paths)
+        ):
+            raise DirtyWorktreeRecoveryError("failed-attempt recovery source is invalid")
+        if source_base != contract["base_sha"]:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt recovery source base does not match the task contract"
+            )
+        source_path = self.failed_attempt_recovery.validate_retry_source(
+            repository=contract["repository"],
+            base_sha=source_base,
+            worktree=source_worktree,
+            branch=source_branch,
+        )
+        ignored_paths = self.failed_attempt_recovery.ignored_paths(source_path)
+        if ignored_paths:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt source contains ignored paths that cannot be recovered safely: "
+                + ", ".join(ignored_paths)
+            )
+        try:
+            source_result = json.loads(str(binding["source_result_json"]))
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt recovery source result is invalid"
+            ) from error
+        source_artifacts = source_result.get("artifacts") if isinstance(source_result, dict) else None
+        dependency_ref = (
+            source_artifacts.get("dependency-input")
+            if isinstance(source_artifacts, dict)
+            else None
+        )
+        if dependency_ref is not None:
+            if not isinstance(dependency_ref, str) or not dependency_ref:
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt recovery dependency input reference is invalid"
+                )
+            dependency_input = load_recorded_dependency_input(
+                self.artifacts,
+                dependency_ref,
+                task_id=claimed["task_id"],
+                node_id=claimed["node_id"],
+                base_sha=source_base,
+            )
+            validate_dependency_input_lineage(
+                self.store.get_task(claimed["task_id"]),
+                claimed["node_id"],
+                dependency_input,
+            )
+        else:
+            if spec.get("depends_on"):
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt recovery cannot reproduce an unrecorded dependency input"
+                )
+            dependency_input = base_dependency_input(
+                task_id=claimed["task_id"],
+                node_id=claimed["node_id"],
+                base_sha=source_base,
+                worktree=source_path,
+            )
+            dependency_ref = self.artifacts.put_text(
+                canonical_json(dependency_input.receipt),
+                "failed-attempt-base-input.json",
+            )
+
+        actual_paths = tuple(
+            sorted(changed_paths_since_input_tree(source_path, dependency_input.input_tree_sha))
+        )
+        expected = tuple(expected_paths)
+        if actual_paths != expected:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt source changes drifted from its result receipt"
+            )
+        self._validate_failed_attempt_recovery_scope(contract, spec, actual_paths)
+
+        target_attempt = int(claimed["attempt"])
+        target = self.worktrees.prepare_clean(
+            contract["repository"],
+            source_base,
+            claimed["task_id"],
+            claimed["node_id"],
+            target_attempt,
+        )
+        target_branch = self.worktrees.branch_name(
+            claimed["task_id"], claimed["node_id"], target_attempt
+        )
+        if not actual_paths:
+            try:
+                # Even a clean failed attempt reproduces its immutable input rather
+                # than recomputing accepted ancestors from a potentially changed
+                # task snapshot.
+                restored = apply_recorded_dependency_input(
+                    self.artifacts,
+                    self.worktrees,
+                    ref=dependency_ref,
+                    task_id=claimed["task_id"],
+                    node_id=claimed["node_id"],
+                    base_sha=source_base,
+                    worktree=target,
+                )
+                if restored.input_tree_sha != dependency_input.input_tree_sha:
+                    raise DirtyWorktreeRecoveryError(
+                        "failed-attempt recovery input lineage changed before retry"
+                    )
+                if tuple(
+                    sorted(changed_paths_since_input_tree(source_path, dependency_input.input_tree_sha))
+                ) != expected:
+                    raise DirtyWorktreeRecoveryError(
+                        "failed-attempt source changed while its clean retry was being prepared"
+                    )
+                self.store.assign_failed_attempt_recovery_worktree(
+                    claimed["task_id"],
+                    claimed["node_id"],
+                    str(target),
+                    attempt=target_attempt,
+                    coordinator_epoch=int(claimed["coordinator_epoch"]),
+                    lease_epoch=int(claimed["lease_epoch"]),
+                    binding=binding,
+                    recovery=None,
+                    recovery_ref=None,
+                    prepared_recovery=None,
+                )
+                return target, dependency_input, dependency_ref, {}
+            except Exception:
+                self._archive_failed_recovery_target(
+                    contract=contract,
+                    claimed=claimed,
+                    target=target,
+                    branch=target_branch,
+                )
+                raise
+
+        try:
+            untracked_paths = DirtyWorktreeRecovery.untracked_paths(source_path)
+            recovery = self.failed_attempt_recovery.capture(
+                repository=contract["repository"],
+                base_sha=source_base,
+                worktree=str(source_path),
+                branch=source_branch,
+                attempt=int(source["attempt"]),
+                expected_changed_paths=expected,
+                task_id=claimed["task_id"],
+                node_id=claimed["node_id"],
+                input_tree_sha=dependency_input.input_tree_sha,
+                dependency_input_ref=dependency_ref,
+                preserve_untracked_paths=untracked_paths,
+            )
+            recovered_paths = tuple(recovery.get("changed_paths", ()))
+            if recovered_paths != actual_paths:
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt recovery capture did not preserve the observed changed paths"
+                )
+            self._validate_failed_attempt_recovery_scope(contract, spec, recovered_paths)
+            recovery_ref = self.artifacts.put_text(
+                canonical_json(recovery), "failed-attempt-recovery.json"
+            )
+            outcome = self.failed_attempt_recovery.prepare_for_retry(
+                repository=contract["repository"],
+                source_worktree=str(source_path),
+                target_worktree=str(target),
+                target_branch=target_branch,
+                target_attempt=target_attempt,
+                recovery=recovery,
+            )
+            if outcome.status != "succeeded":
+                raise DirtyWorktreeRecoveryError(outcome.summary)
+            prepared_recovery = outcome.prepared_recovery
+            expected_prepared = {
+                "target_attempt": target_attempt,
+                "target_worktree": str(target),
+                "target_branch": target_branch,
+                "target_patch_sha256": recovery["patch_sha256"],
+            }
+            if not isinstance(prepared_recovery, dict) or any(
+                prepared_recovery.get(key) != value
+                for key, value in expected_prepared.items()
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt recovery prepared target does not match the captured patch"
+                )
+            self.store.assign_failed_attempt_recovery_worktree(
+                claimed["task_id"],
+                claimed["node_id"],
+                str(target),
+                attempt=target_attempt,
+                coordinator_epoch=int(claimed["coordinator_epoch"]),
+                lease_epoch=int(claimed["lease_epoch"]),
+                binding=binding,
+                recovery=recovery,
+                recovery_ref=recovery_ref,
+                prepared_recovery=prepared_recovery,
+            )
+            return (
+                target,
+                dependency_input,
+                dependency_ref,
+                {
+                    "failed-attempt-recovery": recovery_ref,
+                    "failed-attempt-recovery-snapshot": str(recovery["patch_ref"]),
+                },
+            )
+        except Exception:
+            self._archive_failed_recovery_target(
+                contract=contract,
+                claimed=claimed,
+                target=target,
+                branch=target_branch,
+            )
+            raise
+
+    @staticmethod
+    def _validate_failed_attempt_recovery_scope(
+        contract: dict,
+        spec: dict,
+        paths: tuple[str, ...],
+    ) -> None:
+        for relative_path in paths:
+            try:
+                task_allowed = scope_allows(
+                    relative_path,
+                    list(contract["allowed_scope"]),
+                    list(contract["forbidden_scope"]),
+                )
+                node_allowed = scope_allows(relative_path, list(spec.get("write_scopes", ())), [])
+            except (KeyError, TypeError, ValueError) as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"failed-attempt recovery path is invalid: {relative_path!r}"
+                ) from error
+            if not task_allowed:
+                raise DirtyWorktreeRecoveryError(
+                    f"failed-attempt recovery path is outside task scope: {relative_path}"
+                )
+            if not node_allowed:
+                raise DirtyWorktreeRecoveryError(
+                    f"failed-attempt recovery path is outside node write scope: {relative_path}"
+                )
+
+    def _with_observed_failure_paths(self, request: ExecutionRequest, result: NodeResult) -> NodeResult:
+        if request.worktree is None:
+            return result
+        paths = tuple(
+            sorted(
+                (
+                    changed_paths_since_input_tree(request.worktree, request.input_tree_sha)
+                    if request.input_tree_sha is not None
+                    else self.worktrees.changed_paths(
+                        request.worktree, request.contract["base_sha"]
+                    )
+                )
+                | set(DirtyWorktreeRecovery.ignored_paths(request.worktree))
+            )
+        )
+        return replace(result, changed_paths=paths)
+
+    def _failed_attempt_recovery_failure(self, claimed: dict, summary: str) -> NodeResult:
+        binding = claimed.get("failed_attempt_recovery")
+        source = binding.get("source") if isinstance(binding, dict) else None
+        changed_paths = (
+            tuple(path for path in source.get("changed_paths", ()) if isinstance(path, str))
+            if isinstance(source, dict)
+            else ()
+        )
+        return NodeResult(
+            status="failed",
+            summary=summary,
+            result_kind="worker",
+            changed_paths=changed_paths,
+            checks=(f"REJECTED: {summary}",),
+            provider=_FAILED_ATTEMPT_RECOVERY_PROVIDER,
+            actual_model=None,
+            **governance_receipt_fields(claimed["contract"]),
+        )
 
     def _execute_blocked_worktree_recovery(self, claimed: dict) -> None:
         """Run a blocked-worktree receipt without invoking any model executor."""
@@ -741,6 +1139,14 @@ class Coordinator:
             return result
         # a1 is consumed only after a clean a2 holds the exact patch, passed
         # its declared offline acceptance, and passed scope validation.
+        recovery_preflight = self.store.prevalidate_dirty_worktree_recovery_target(
+            claimed["task_id"],
+            claimed["node_id"],
+            str(target),
+            attempt=target_attempt,
+            coordinator_epoch=int(claimed["coordinator_epoch"]),
+            lease_epoch=int(claimed["lease_epoch"]),
+        )
         self.store.assign_worktree(
             claimed["task_id"],
             claimed["node_id"],
@@ -748,6 +1154,7 @@ class Coordinator:
             attempt=target_attempt,
             coordinator_epoch=int(claimed["coordinator_epoch"]),
             lease_epoch=int(claimed["lease_epoch"]),
+            recovery_preflight=recovery_preflight,
         )
         return result
 

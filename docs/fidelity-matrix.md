@@ -42,7 +42,7 @@
 | 配额触线自动转 Codex | implemented | 同一 attempt 记录 node.routed，不调用 Claude 后再重启 | A8 真实配额窗口证据 external-pending |
 | 指标可比性与先验分离 | implemented | `local-outcomes-only-v2` 将公开证据与本地结果分开；只有精确本地分桶结果更新 Beta；公开比较校验 benchmark/version、指标、harness、effort、任务、score kind 和单位；冲突或缺失弃权，旧快照 audit-only | 不把公开综合指数、本地成功率和声明能力分数相加；来源重复不增加独立证据量；数据覆盖不等于调度收益 |
 | OpenSquilla 本地需求分类 | compatible-subset | 固定 Git revision、真实 bundle、隔离 Python 与离线安装；新 DAG 单批分类并冻结提示词脱敏回执；复杂度只升不降；安装前真实本地分类与失败恢复 | 不包含完整网关、集成推理或自学习训练器；需要明确安装启用；原生分类可运行不等于质量或成本优化已验证 |
-| MacBook 完整驾驶舱 | implemented | 任务/DAG/契约/Evidence/配额/告警、暂停恢复、优先级、steering、approval | 原文“接管异常 Agent”当前是控制与下一 attempt 指令，不是交互式终端 attach |
+| MacBook 完整驾驶舱 | implemented | 任务/DAG/契约/Evidence/配额/告警；外部 queue/resume/pause/cancel/steer 强制 caller revision；queue/resume 与合法 instruction 原子提交；steering 回执和事件区分未送达、未来 attempt 与精确 attempt 快照 | 原文“接管异常 Agent”当前是控制与下一 attempt 指令，不是交互式终端 attach；不能把运行后追加的指导实时注入既有进程 |
 | 手机 Codex App Remote | external-pending | `mobile status/enable` 配置同一 WB plugin/MCP/Authority；桌面 App 独占原生 Remote host；`pair/disable` 只返回桌面操作路径，不启动冲突 CLI daemon | 尚需用户在 Mac mini 桌面 App 与真实手机 Codex App 完成二维码配对、查看和发任务旅程 |
 | 手机精简 Web 驾驶舱 | external-pending | 响应式 UI、认证、任务状态/控制与 A2 `client.observed` receipt 已实现并列入当前验收 | 尚需手机真机渲染真实 Authority 快照并写入服务端回执 |
 | 手机后台通知 | deferred | 页面打开时的浏览器 Notification 代码保留 | 页面关闭后的 Web Push 仍在 backlog |

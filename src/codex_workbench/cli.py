@@ -208,7 +208,7 @@ def command_submit(args: argparse.Namespace) -> int:
     try:
         task_id = store.create_task(contract, nodes, command_id)
         if args.queue:
-            store.queue_task(task_id)
+            store.queue_task(task_id, expected_revision=1)
     except (ValueError, CommandConflictError, StateConflictError) as error:
         print(json.dumps({"ok": False, "error": str(error)}))
         return 2
@@ -652,27 +652,53 @@ def command_task(args: argparse.Namespace) -> int:
         )
         result = {"ok": True, "task_id": args.task_id, "revision": revision}
     elif args.action == "steer":
-        revision = store.append_task_steering(
+        receipt = store.append_task_steering_receipt(
             args.task_id,
             args.instruction,
             expected_revision=args.expected_revision,
         )
-        result = {"ok": True, "task_id": args.task_id, "revision": revision}
-    else:
-        task = store.get_task(args.task_id)
-        if args.action in {"queue", "resume"}:
-            revision = store.queue_task(args.task_id)
-        elif args.action == "pause":
-            revision = store.transition_task(
-                args.task_id, "paused", expected_revision=task["state_revision"]
-            )
-        elif args.action == "cancel":
-            revision = store.transition_task(
-                args.task_id, "cancelled", expected_revision=task["state_revision"]
-            )
+        result = {"ok": True, **receipt}
+    elif args.action in {"queue", "resume"}:
+        if args.instruction is None:
+            result = {
+                "ok": True,
+                "task_id": args.task_id,
+                "revision": store.queue_task(
+                    args.task_id,
+                    expected_revision=args.expected_revision,
+                ),
+            }
         else:
-            raise AssertionError(args.action)
-        result = {"ok": True, "task_id": args.task_id, "revision": revision}
+            result = {
+                "ok": True,
+                **store.queue_task_with_instruction(
+                    args.task_id,
+                    args.instruction,
+                    expected_revision=args.expected_revision,
+                ),
+            }
+    elif args.action == "pause":
+        result = {
+            "ok": True,
+            "task_id": args.task_id,
+            "revision": store.transition_task(
+                args.task_id,
+                "paused",
+                expected_revision=args.expected_revision,
+            ),
+        }
+    elif args.action == "cancel":
+        result = {
+            "ok": True,
+            "task_id": args.task_id,
+            "revision": store.transition_task(
+                args.task_id,
+                "cancelled",
+                expected_revision=args.expected_revision,
+            ),
+        }
+    else:
+        raise AssertionError(args.action)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -1699,9 +1725,17 @@ def build_parser() -> argparse.ArgumentParser:
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="action", required=True)
     task_sub.add_parser("list")
-    for action in ("get", "queue", "resume", "pause", "cancel"):
+    get_task = task_sub.add_parser("get")
+    get_task.add_argument("task_id")
+    for action in ("queue", "resume"):
         action_parser = task_sub.add_parser(action)
         action_parser.add_argument("task_id")
+        action_parser.add_argument("--expected-revision", type=int, required=True)
+        action_parser.add_argument("--instruction", default=None)
+    for action in ("pause", "cancel"):
+        action_parser = task_sub.add_parser(action)
+        action_parser.add_argument("task_id")
+        action_parser.add_argument("--expected-revision", type=int, required=True)
     resolve = task_sub.add_parser("resolve")
     resolve.add_argument("task_id")
     resolve.add_argument("node_id")

@@ -198,6 +198,88 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(after["contract"], before["contract"])
         self.assertEqual(after["steering"][-1]["instruction"], "继续当前目标并检查新增边界。")
 
+    def test_control_requires_strict_revision_and_atomic_instruction_validation(self) -> None:
+        contract = TaskContract(
+            task_id="mcp-control-cas",
+            repository=str(self.root),
+            base_sha="fixture",
+            objective="MCP control CAS",
+            allowed_scope=("tests",),
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec("work", contract.task_id, "work", "fixture", "fixture", "ok"),
+                NodeSpec(
+                    "verify",
+                    contract.task_id,
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    depends_on=("work",),
+                    verifier=True,
+                ),
+            ],
+            "mcp-control-cas-create",
+        )
+
+        for invalid_revision in (True, "1", None):
+            arguments = {"task_id": contract.task_id, "action": "queue"}
+            if invalid_revision is not None:
+                arguments["expected_revision"] = invalid_revision
+            response = self.call("workbench_control_task", arguments)
+            self.assertTrue(response["isError"])
+            self.assertIn("expected_revision must be an integer", response["content"][0]["text"])
+            self.assertEqual(self.store.get_task(contract.task_id)["state"], "inbox")
+            self.assertEqual(self.store.get_task(contract.task_id)["state_revision"], 1)
+
+        for invalid_instruction in (None, "", "   ", "x" * 501):
+            response = self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "queue",
+                    "expected_revision": 1,
+                    "instruction": invalid_instruction,
+                },
+            )
+            self.assertTrue(response["isError"])
+            self.assertEqual(self.store.get_task(contract.task_id)["state"], "inbox")
+            self.assertEqual(self.store.get_task(contract.task_id)["state_revision"], 1)
+            self.assertEqual(self.store.get_task(contract.task_id)["steering"], [])
+
+        queued = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "queue",
+                    "expected_revision": 1,
+                    "instruction": "保留公开接口",
+                },
+            )["content"][0]["text"]
+        )
+        self.assertEqual(queued["state"], "queued")
+        self.assertEqual(queued["revision"], 3)
+        self.assertTrue(queued["steering"]["steering_id"])
+        self.assertIn("delivery", queued["steering"])
+
+        steered = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "steer",
+                    "expected_revision": queued["revision"],
+                    "instruction": "补充回归测试",
+                },
+            )["content"][0]["text"]
+        )
+        self.assertTrue(steered["steering_id"])
+        self.assertEqual(steered["revision"], 4)
+        self.assertIn("delivery", steered)
+
     def test_harness_health_requires_real_skill_and_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             home = Path(directory)
@@ -445,7 +527,10 @@ class MCPTests(unittest.TestCase):
         inspected = json.loads(self.call("workbench_inspect_task", {"task_id": "mcp-task"})["content"][0]["text"])
         self.assertEqual(inspected["state"], "inbox")
         controlled = json.loads(
-            self.call("workbench_control_task", {"task_id": "mcp-task", "action": "queue"})["content"][0]["text"]
+            self.call(
+                "workbench_control_task",
+                {"task_id": "mcp-task", "action": "queue", "expected_revision": 1},
+            )["content"][0]["text"]
         )
         self.assertEqual(controlled["revision"], 2)
         events = json.loads(self.call("workbench_read_events", {"task_id": "mcp-task"})["content"][0]["text"])
