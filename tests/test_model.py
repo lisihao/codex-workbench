@@ -660,11 +660,24 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(shim.is_file())
             self.assertTrue(os.access(shim, os.X_OK))
             self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(shims))
+            self.assertEqual(environment["ZDOTDIR"], str(shims))
             self.assertEqual(environment["npm_config_pm_on_fail"], "ignore")
             self.assertEqual(environment["npm_config_offline"], "true")
             self.assertIn(str(runtime), shim.read_text(encoding="utf-8"))
             self.assertIn("--pm-on-fail=ignore", shim.read_text(encoding="utf-8"))
             self.assertIn("node_modules/.bin", shim.read_text(encoding="utf-8"))
+            self.assertIn(str(shims), (shims / ".zprofile").read_text(encoding="utf-8"))
+
+            if Path("/bin/zsh").is_file():
+                login_shell = subprocess.run(
+                    ["/bin/zsh", "-lc", "command -v pnpm"],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(login_shell.returncode, 0, login_shell.stderr)
+                self.assertEqual(login_shell.stdout.strip(), str(shim))
 
             worktree = root / "worktree"
             local_bin = worktree / "node_modules" / ".bin"
@@ -682,6 +695,17 @@ class ModelTests(unittest.TestCase):
             )
             self.assertEqual(direct.returncode, 0)
             self.assertEqual(direct.stdout, "fixture:--check\n")
+            if Path("/bin/zsh").is_file():
+                login_exec = subprocess.run(
+                    ["/bin/zsh", "-lc", "pnpm exec fixture --login-check"],
+                    cwd=worktree,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(login_exec.returncode, 0, login_exec.stderr)
+                self.assertEqual(login_exec.stdout, "fixture:--login-check\n")
 
     def test_contract_hash_is_deterministic(self) -> None:
         contract = TaskContract(

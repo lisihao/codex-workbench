@@ -256,6 +256,17 @@ def codex_subscription_environment(
         )
         shim.chmod(0o755)
         environment["PATH"] = str(pnpm_shim_directory) + os.pathsep + environment.get("PATH", "")
+        # Codex commonly executes tools through ``/bin/zsh -lc``. macOS
+        # ``path_helper`` runs for a login shell and can place Homebrew's pnpm
+        # ahead of the process PATH, bypassing the qualified Workbench shim.
+        # Use an isolated ZDOTDIR whose login profile restores only this
+        # process-local prefix after the system profile has run.
+        zprofile = pnpm_shim_directory / ".zprofile"
+        zprofile.write_text(
+            f"export PATH={shlex.quote(str(pnpm_shim_directory))}:\"$PATH\"\n",
+            encoding="utf-8",
+        )
+        environment["ZDOTDIR"] = str(pnpm_shim_directory)
         # Keep subprocesses launched by pnpm on the same qualified runtime as
         # the initial command.  This is intentionally scoped to Codex workers,
         # never the user's global shell configuration.
