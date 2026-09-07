@@ -719,9 +719,15 @@ class SubmissionTests(unittest.TestCase):
                 len(get_args(RoutingTaskType)) * len(get_args(RoutingComplexity)),
             )
             self.assertNotIn("contexts", result["performance"]["calibration"])
+            self.assertNotIn("candidates", result["performance"]["calibration"])
+            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 20_000)
             routing_catalog = compile_plan.call_args.kwargs["capability_snapshot"]
             self.assertEqual(routing_catalog["catalog_id"], "catalog-submission-v3")
             calibration = routing_catalog["performance_calibration"]
+            self.assertEqual(
+                result["performance"]["calibration"]["candidate_count"],
+                len(calibration["candidates"]),
+            )
             self.assertEqual(calibration["task_type"], "implementation")
             self.assertEqual(calibration["complexity"], "standard")
             self.assertEqual(calibration["snapshot_id"], contract["performance_snapshot_id"])

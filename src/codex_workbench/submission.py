@@ -849,9 +849,10 @@ def compile_natural_language_request(
                     **{
                         key: value
                         for key, value in performance_calibration.items()
-                        if key != "contexts"
+                        if key not in {"contexts", "candidates"}
                     },
                     "matrix_context_count": len(performance_calibration.get("contexts", ())),
+                    "candidate_count": len(performance_calibration.get("candidates", ())),
                 }
                 if performance_calibration is not None
                 else None

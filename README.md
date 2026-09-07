@@ -387,7 +387,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.15.0`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+源码版本/合同为 `1.15.1`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+
+1.15.1 压缩异步规划成功回执：候选模型的完整校准数据仍保留在固定性能快照中，MCP/CLI 状态只返回引用、策略状态和计数，避免一次状态查询消耗大量会话上下文。
 
 1.15.0 新增异步自然语言规划、稳定幂等请求 ID、`workbench_get_request`/`request-status` 状态查询、任务 ID 预留、旧 coordinator fencing、原子任务物化和隐私安全回执。Coordinator 在真实退出前保持 Authority lease；规划占用既有 worker pool 的一个槽位，同一时间最多一个，不建立第二个调度器，也不阻塞 MCP 快速回执。
 
