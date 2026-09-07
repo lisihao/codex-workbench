@@ -25,6 +25,7 @@ PROVIDER_UPSTREAM_LOCK_PATH = PROVIDER_PLUGIN_ROOT / "upstream-lock.json"
 HOOKS_PATH = PLUGIN_ROOT / "hooks" / "hooks.json"
 HOOK_SCRIPT = PLUGIN_ROOT / "scripts" / "wb_hook.py"
 PROVIDER_LICENSE_PATH = PROVIDER_PLUGIN_ROOT / "LICENSE-WineChord-Codex-Radar"
+UPGRADE_SCRIPT = ROOT / "scripts" / "upgrade-codex-plugin.py"
 
 
 class PluginDistributionTests(unittest.TestCase):
@@ -164,6 +165,19 @@ class PluginDistributionTests(unittest.TestCase):
         self.assertIn("$PLUGIN_ROOT/scripts/wb_hook.py", command)
         self.assertTrue(HOOK_SCRIPT.is_file())
         self.assertTrue((PLUGIN_ROOT / "skills" / "WB" / "SKILL.md").is_file())
+
+    def test_source_distribution_includes_the_controlled_upgrade_entrypoint(self) -> None:
+        self.assertTrue(UPGRADE_SCRIPT.is_file())
+        self.assertTrue(os.access(UPGRADE_SCRIPT, os.X_OK))
+        result = subprocess.run(
+            [sys.executable, str(UPGRADE_SCRIPT), "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--confirm-host-stopped", result.stdout)
+        self.assertIn("--confirm-active-hook-cache-retention", result.stdout)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS hook interpreter check")
     def test_hook_parses_with_macos_system_python(self) -> None:

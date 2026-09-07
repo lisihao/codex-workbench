@@ -487,18 +487,55 @@ ditto "$WB_STATE_ROOT" "$WB_BACKUP_ROOT/state-root"
 
 3. 在 Authority 与 MacBook 各自执行 `git fetch --tags --prune origin`，核对候选 ref，再用 `git checkout --detach "$WB_NEXT_REF"` 切换。
 4. 先重跑相应 `--dry-run`，再重跑 Authority 或 Cockpit 安装器。
-5. 在 MacBook 上刷新 marketplace：
+5. 在 MacBook 上只通过固定源码 ref 中的受控升级器刷新主插件。先保持 Codex App 与交互式 Codex 宿主运行，执行只读预检：
 
 ```bash
 export WB_NEXT_REF="<NEXT_RELEASE_TAG_OR_FULL_COMMIT>"
 git -C "$WB_ROOT" fetch --tags --prune origin
 git -C "$WB_ROOT" show --quiet --format='%H %D' "$WB_NEXT_REF"
 
-codex plugin marketplace upgrade "$WB_MARKETPLACE"
-codex plugin list --marketplace "$WB_MARKETPLACE" --available --json
+"$WB_ROOT/scripts/upgrade-codex-plugin.py" \
+  --codex-home "$HOME/.codex" \
+  --marketplace "$WB_MARKETPLACE" \
+  --plugin codex-workbench
 ```
 
-当前 Codex CLI 没有单独的 `plugin upgrade` 子命令。若 marketplace 刷新后显示插件版本仍旧，先停止新任务、由操作者确认，再执行一次 `codex plugin remove` 后重新 `codex plugin add`，并在当前 App 的 Hook 设置中重新审核。不要在 Hook 未获重新信任时运行 `wb`。
+预检不得写缓存、信任记录或升级状态。确认目标、来源与现有缓存版本后，保存其他工作并完全退出 Codex App 及仍使用该插件的交互式 Codex CLI；升级器不会替操作者退出宿主。然后从普通 Terminal 执行：
+
+```bash
+"$WB_ROOT/scripts/upgrade-codex-plugin.py" \
+  --codex-home "$HOME/.codex" \
+  --marketplace "$WB_MARKETPLACE" \
+  --plugin codex-workbench \
+  --apply \
+  --confirm-host-stopped \
+  --confirm-active-hook-cache-retention
+```
+
+升级器在调用原生安装命令前，将所有现有版本复制到 `~/.codex/plugin-cache-retention/<marketplace>/<plugin>/pending`，逐文件记录内容哈希和 POSIX mode，完成文件与目录 `fsync` 后才发布 pending 状态；跨进程锁覆盖检查、备份、原生 CLI、恢复与最终收据。原生 `plugin add` 删除旧缓存后，升级器把每个旧版本原样恢复到同一版本路径，再独立执行 `plugin list`、manifest 与缓存核验。新旧版本并存；升级器不运行 Hook、不改信任记录、不碰 Workbench 任务数据库，也不自动清理旧版本。
+
+当前 Codex CLI 没有单独的 `plugin upgrade` 子命令。Git marketplace 的刷新由升级器内部执行；本地 marketplace 不支持 Git marketplace 的 `upgrade`，升级器只核对其绝对源码路径后调用原生安装。升级已安装插件时禁止再使用裸 `plugin remove` 或裸 `plugin add`；首次安装仍使用第 3.4 节命令。
+
+插件缓存路径带版本号，正在运行的 Codex 回合可能仍持有旧路径。原生安装仍会产生“删除旧缓存到恢复完成”的短窗口，因此本流程是离线维护，不是热切换或零中断。Authority 健康、新 MCP 握手成功或历史 `WB_SYNC_RECEIPT=active` 都不能证明旧宿主已重新加载 Hook。
+
+如果进程退出或机器掉电时已有完整 pending，下次仍先退出宿主，再执行恢复；若安装配置已切到目标版本但目标缓存缺失，恢复会用收据固定的精确目标重新调用原生安装，随后再次恢复旧版本并核验。目标来源已变化、路径越界、哈希冲突或收据不完整时明确阻断并保留 pending：
+
+```bash
+"$WB_ROOT/scripts/upgrade-codex-plugin.py" \
+  --codex-home "$HOME/.codex" \
+  --marketplace "$WB_MARKETPLACE" \
+  --plugin codex-workbench \
+  --apply \
+  --recover-only \
+  --confirm-host-stopped \
+  --confirm-active-hook-cache-retention
+```
+
+自动化验收使用真实子进程 `SIGKILL` 证明两条进程崩溃路径：完整 pending 发布且原生安装删除缓存后，新进程能恢复；pending 发布前被终止时，原缓存未被修改。后者可能留下 `.pending-<uuid>` staging，升级器会明确报告并阻断后续安装，不会自动删除或信任这个未完成目录。实际硬件掉电未做破坏性试验；文件和目录 `fsync` 加原子改名提供持久化顺序，但不能把进程测试冒充整机断电 Evidence。
+
+若旧回合报告旧版 `wb_hook.py` 不存在，但没有受控升级器生成的完整 pending 或可信的逐字节备份，升级器不得用新脚本冒充旧版本。应先从已核对的精确旧 release 恢复，在当前 App 的 Hook 设置中保持原信任决定，不反复登录或改写批准记录。
+
+升级完成后正常重开 Codex App，发送一条普通新消息；同时核对实际 Hook 路径已是新版本，并确认远端记录了这条消息对应的新事件。旧 `active` 回执不算通过。离线 fixture 只证明旧入口文件可加载，不证明长生命周期 App 已热切换；本流程不依赖或宣称这种能力。Hook 内容或版本需要重新批准时，只能由操作者在 App 中审核；安装器不会代写批准。没有这组新证据就保留全部旧缓存；1.13.18 故意不提供自动清理命令。
 
 Authority 安装器会先建立并安全激活与新 runtime 配套的能力目录，再启动主服务和刷新 sidecar。旧任务仍使用 TaskContract 固定的旧 `catalog_id`；新目录不安全时安装会回滚。安装后应比较 `capabilities status` 与 `capabilities diff`，未知/弃用模型保持 observed-only 是正确结果，不应手工把它们改成 routable。
 

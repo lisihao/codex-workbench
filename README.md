@@ -382,7 +382,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.13.17`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.13.18`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+
+1.13.18 将 Codex 插件升级收敛到默认离线的受控安装器：原生安装前把所有旧缓存版本以内容哈希和 POSIX mode 固定到缓存目录外，并以跨进程锁、原子 pending 与 `fsync` 固定恢复顺序；原生安装后恢复旧路径、逐项核验 Hook/Skill 引用并比对源树哈希，新旧并存且不代写 Hook 信任。自动化覆盖真实子进程 `SIGKILL`，但不冒充物理掉电试验或长生命周期 App 热切换。原生 `plugin add` 仍有短暂删除窗口，所以该机制不宣称在线零中断；只有重开宿主后的一条新消息确实通过新 Hook 到达远端，旧缓存才具备后续人工清理前提。
 
 1.13.17 将失败 Worker 的合法 tracked/untracked 差异、固定 dependency-input 和物理 allocation 纳入下一 attempt；外部任务控制强制 caller revision，queue/resume 与 instruction 原子提交，指导回执区分保存与精确 attempt 快照；恢复、Artifact 和仓库 Git 校验移出 SQLite 写事务，并补齐重启、旧回写、重复请求及暂停/取消竞态 fencing。
 

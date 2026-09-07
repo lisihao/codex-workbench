@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-workbench"
-version = "1.13.17"
+version = "1.13.18"
 description = "Self-hosted macOS control plane for durable, evidence-gated AI development."
 requires-python = ">=3.11"
 dependencies = []
@@ -13,6 +13,7 @@ dependencies = []
 codex-workbench = "codex_workbench.cli:main"
 codex-radar-provider = "codex_radar_provider.cli:main"
 ai-frontier-provider = "ai_frontier_provider.cli:main"
+codex-workbench-plugin-upgrade = "codex_workbench.plugin_cache_upgrade:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

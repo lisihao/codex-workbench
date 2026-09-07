@@ -32,6 +32,42 @@ codex plugin add codex-workbench@codex-workbench
 Codex asks you to review and approve the `UserPromptSubmit` hook.  Do that in
 `/hooks` before activating a session.
 
+## Upgrade without invalidating older Hook paths
+
+Do not upgrade an installed copy with bare `codex plugin remove` or `codex
+plugin add`. From a checkout pinned to the intended release, first run the
+read-only inspection:
+
+```sh
+./scripts/upgrade-codex-plugin.py \
+  --marketplace codex-workbench \
+  --plugin codex-workbench
+```
+
+Save other work and fully stop Codex App and interactive Codex hosts using the
+plugin. Then run the same checked-out script from a normal terminal:
+
+```sh
+./scripts/upgrade-codex-plugin.py \
+  --marketplace codex-workbench \
+  --plugin codex-workbench \
+  --apply \
+  --confirm-host-stopped \
+  --confirm-active-hook-cache-retention
+```
+
+The installer snapshots and synchronizes every old cache version before native
+installation, restores any deleted old paths, and independently verifies the
+new installed version. It never runs the Hook, edits trust state, or prunes old
+caches. Native installation still creates a short delete-to-restore window, so
+this is an offline maintenance flow, not a zero-downtime hot upgrade. After
+reopening Codex, a new message must traverse the new Hook and create a new
+remote event; an older `active` receipt is not acceptance. Full recovery and
+trust instructions are in `docs/AI_INSTALL.md` in the same pinned checkout.
+The automated gate covers a killed upgrade process, not a physical power-loss
+test or a long-lived host hot-reload claim. Pre-publish staging residue is
+reported and blocks another upgrade; it is never silently deleted.
+
 ## What the v1.8.2 authority adds
 
 The plugin remains a thin session-binding entry point; scheduling and evidence
