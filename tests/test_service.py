@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from codex_workbench.claude_quota import (
     SUPPORTED_USAGE_VERSION,
 )
 from codex_workbench.evidence import evidence_fingerprint
+from codex_workbench.dirty_worktree_recovery import PnpmOfflineMaterializer
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.service import Coordinator, _ClaimRoute
 from codex_workbench.executors import ExecutionRequest, FixtureExecutor
@@ -572,6 +574,321 @@ raise AssertionError("fatal coordinator failure returned")
             attribution = result["execution_attribution"]
             self.assertEqual(attribution["requested_model"]["model_id"], "gpt-5.6-luna")
             self.assertEqual(attribution["observed_model"]["status"], "unknown")
+
+    def test_fresh_pnpm_worktree_materializes_before_readiness_and_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            (repository / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+            )
+            (repository / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+            shim = root / "pnpm"
+            shim.write_text("#!/bin/sh\nprintf '%s\\n' '11.25.0'\n", encoding="utf-8")
+            shim.chmod(0o755)
+            materializer_calls: list[tuple[str, ...]] = []
+
+            def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                materializer_calls.append(tuple(args))
+                if args[-1] == "--version":
+                    return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+                cwd = kwargs["cwd"]
+                assert isinstance(cwd, Path)
+                node_modules = cwd / "node_modules"
+                node_modules.mkdir()
+                (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+                (node_modules / ".bin").mkdir()
+                return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+            materializer = PnpmOfflineMaterializer(binary=sys.executable, runner=runner)
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("fresh-pnpm", "test-machine")
+            contract = TaskContract(
+                task_id="fresh-pnpm",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="materialize a fresh worker linker before execution",
+                allowed_scope=("package.json", "pnpm-lock.yaml"),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "fresh pnpm worker",
+                "codex",
+                "gpt-5.6-luna",
+                "inspect the prepared worktree",
+                read_scopes=("package.json", "pnpm-lock.yaml"),
+            )
+            store.create_task(contract, verified([node], contract.task_id), "fresh-pnpm-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("fresh-pnpm-worker", epoch)
+            assert claimed is not None
+            executor = MagicMock()
+            execution_worktrees: list[Path] = []
+            executor.execute.return_value = NodeResult(
+                status="succeeded",
+                summary="prepared worktree inspected",
+                provider="codex",
+                result_kind="worker",
+                checks=("fixture-check",),
+            )
+            coordinator = Coordinator(
+                store,
+                state,
+                coordinator_epoch=epoch,
+                pnpm_materializer=materializer,
+            )
+            try:
+                with (
+                    patch.dict(os.environ, {"CODEX_WORKBENCH_PNPM": str(shim)}),
+                    patch.object(coordinator, "_executor", return_value=executor),
+                ):
+                    def assert_prepared(request: ExecutionRequest) -> NodeResult:
+                        assert request.worktree is not None
+                        execution_worktrees.append(request.worktree)
+                        self.assertTrue((request.worktree / "node_modules" / ".modules.yaml").is_file())
+                        return executor.execute.return_value
+
+                    executor.execute.side_effect = assert_prepared
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            executor.execute.assert_called_once()
+            self.assertEqual(len(materializer_calls), 2)
+            self.assertEqual(materializer_calls[0][-1], "--version")
+            self.assertEqual(materializer_calls[1][1], "install")
+            self.assertEqual(len(execution_worktrees), 1)
+            work = next(
+                item for item in store.get_task(contract.task_id)["nodes"] if item["node_id"] == "work"
+            )
+            result = work["result"]
+            assert isinstance(result, dict)
+            receipt = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["dependency-materialization"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(receipt["kind"], "pnpm-offline-materialization")
+            report = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["execution-readiness"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(report["ready"])
+
+    def test_non_node_worktree_records_non_applicable_materialization_without_pnpm_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            (repository / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+            calls: list[tuple[str, ...]] = []
+
+            def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append(tuple(args))
+                raise AssertionError("non-Node worktrees must not probe pnpm")
+
+            materializer = PnpmOfflineMaterializer(binary=sys.executable, runner=runner)
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("non-node", "test-machine")
+            contract = TaskContract(
+                task_id="non-node",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="run a non-Node worker",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "non-Node worker",
+                "codex",
+                "gpt-5.6-luna",
+                "inspect README",
+                read_scopes=("README.md",),
+            )
+            store.create_task(contract, verified([node], contract.task_id), "non-node-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("non-node-worker", epoch)
+            assert claimed is not None
+            executor = MagicMock()
+            executor.execute.return_value = NodeResult(
+                status="succeeded",
+                summary="non-Node work completed",
+                provider="codex",
+                result_kind="worker",
+                checks=("fixture-check",),
+            )
+            coordinator = Coordinator(
+                store,
+                state,
+                coordinator_epoch=epoch,
+                pnpm_materializer=materializer,
+            )
+            try:
+                with patch.object(coordinator, "_executor", return_value=executor):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            executor.execute.assert_called_once()
+            self.assertEqual(calls, [])
+            work = next(
+                item for item in store.get_task(contract.task_id)["nodes"] if item["node_id"] == "work"
+            )
+            result = work["result"]
+            assert isinstance(result, dict)
+            receipt = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["dependency-materialization"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(receipt["kind"], "not-applicable")
+
+    def test_pnpm_materialization_failure_blocks_before_executor_with_failure_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            (repository / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+            )
+            (repository / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+
+            def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                if args[-1] == "--version":
+                    return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+                return subprocess.CompletedProcess(args, 1, "", "offline store miss\n")
+
+            materializer = PnpmOfflineMaterializer(binary=sys.executable, runner=runner)
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("pnpm-failure", "test-machine")
+            contract = TaskContract(
+                task_id="pnpm-failure",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="block when offline dependency materialization fails",
+                allowed_scope=("package.json", "pnpm-lock.yaml"),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "failing pnpm worker",
+                "codex",
+                "gpt-5.6-luna",
+                "must not execute after materialization failure",
+                read_scopes=("package.json", "pnpm-lock.yaml"),
+            )
+            store.create_task(contract, verified([node], contract.task_id), "pnpm-failure-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("pnpm-failure-worker", epoch)
+            assert claimed is not None
+            executor = MagicMock()
+            coordinator = Coordinator(
+                store,
+                state,
+                coordinator_epoch=epoch,
+                pnpm_materializer=materializer,
+            )
+            try:
+                with patch.object(coordinator, "_executor", return_value=executor):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            executor.execute.assert_not_called()
+            task = store.get_task(contract.task_id)
+            work = next(item for item in task["nodes"] if item["node_id"] == "work")
+            self.assertEqual((task["state"], work["state"]), ("blocked", "blocked"))
+            result = work["result"]
+            assert isinstance(result, dict)
+            self.assertEqual(result["execution_attribution"]["failure"]["origin"], "environment")
+            receipt = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["dependency-materialization"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(receipt["status"], "blocked")
+            self.assertIn("offline pnpm materialization failed", receipt["reason"])
+
+    def test_complete_pnpm_linker_is_reused_without_second_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            template_root = worktree / "templates"
+            (worktree / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+            )
+            (worktree / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n", encoding="utf-8"
+            )
+            install_calls = 0
+
+            def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                nonlocal install_calls
+                if args[0] == "/bin/cp":
+                    shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                    return subprocess.CompletedProcess(args, 0, "template fixture ok\n", "")
+                if args[-1] == "--version":
+                    return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+                install_calls += 1
+                cwd = kwargs["cwd"]
+                assert isinstance(cwd, Path)
+                node_modules = cwd / "node_modules"
+                node_modules.mkdir()
+                (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+                (node_modules / ".bin").mkdir()
+                return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+            materializer = PnpmOfflineMaterializer(
+                binary=sys.executable,
+                template_dir=template_root,
+                runner=runner,
+            )
+            first = materializer.materialize(worktree, timeout_seconds=5)
+            second = materializer.materialize(worktree, timeout_seconds=5)
+
+            self.assertEqual(install_calls, 1)
+            self.assertEqual(first["kind"], "pnpm-offline-materialization")
+            self.assertEqual(second["template"]["state"], "reuse")
 
     def test_verifier_readiness_block_preserves_accepted_worker_patch_without_reexecution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1476,6 +1793,7 @@ raise AssertionError("fatal coordinator failure returned")
                     "base_sha": "fixture-base",
                     "allowed_scope": (),
                     "forbidden_scope": (),
+                    "timeout_seconds": 3600,
                 },
                 "spec": {
                     "executor": "deterministic",

@@ -385,7 +385,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.14.3`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.14.4`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+
+1.14.4 将已有的冻结锁文件、离线 store 和 APFS linker 模板物化接入每个新建的非 fixture Worker/Verifier worktree，并在执行就绪检查与模型调用之前写入内容寻址回执。完整且输入签名匹配的 worktree linker 原地复用；缺包、超时或不完整 linker 明确阻断为环境失败，不调用模型，也不修改项目的 `packageManager` 或锁文件。
 
 1.14.3 修复执行就绪检查在目标工作树内运行 `pnpm --version` 的职责混淆：pnpm 会读取项目的 `packageManager` 并把受管 11.25 运行时表现为项目声明的 11.7，导致兼容项目被错误阻断。版本探测现在与离线物化器一致地在中性临时目录运行，随后只校验受管运行时与项目声明的主版本兼容；不会修改项目 `packageManager`、锁文件或依赖树。
 

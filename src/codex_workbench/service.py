@@ -23,7 +23,11 @@ from .dependency_inputs import (
     load_recorded_dependency_input,
     validate_dependency_input_lineage,
 )
-from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
+from .dirty_worktree_recovery import (
+    DirtyWorktreeRecovery,
+    DirtyWorktreeRecoveryError,
+    PnpmOfflineMaterializer,
+)
 from .execution_attribution import (
     AttributionReference,
     CandidateDecision,
@@ -121,6 +125,7 @@ class _ExecutionAttributionContext:
     execute_duration_ms: int | None = None
     readiness_report_ref: str | None = None
     readiness_report: ExecutionReadinessReport | None = None
+    dependency_materialization_ref: str | None = None
     dependency_input_ref: str | None = None
     scope_checked: bool = False
     quota_snapshot_id: int | None = None
@@ -147,6 +152,7 @@ class Coordinator:
         quota_ttl_seconds: int = 900,
         quota_refresh_seconds: float = 60,
         quota_snapshot_file: Path | None = None,
+        pnpm_materializer: PnpmOfflineMaterializer | None = None,
         fatal_exit: Callable[[int], None] | None = None,
     ):
         if max_workers <= 0:
@@ -168,7 +174,11 @@ class Coordinator:
         self.quota_ttl_seconds = quota_ttl_seconds
         self.artifacts = ArtifactStore(state_root / "artifacts")
         self.worktrees = WorktreeManager(state_root / "worktrees")
-        self.blocked_worktree_recovery = DirtyWorktreeRecovery(self.artifacts, self.worktrees)
+        self.blocked_worktree_recovery = DirtyWorktreeRecovery(
+            self.artifacts,
+            self.worktrees,
+            materializer=pnpm_materializer,
+        )
         # Failed retries use the same sealed capture/lineage mechanism, but
         # continue into their original executor after restoration.
         self.failed_attempt_recovery = self.blocked_worktree_recovery
@@ -695,6 +705,51 @@ class Coordinator:
         context.readiness_report_ref = report_ref
         return report
 
+    def _materialize_worktree_dependencies(
+        self,
+        worktree: Path,
+        context: _ExecutionAttributionContext,
+        *,
+        timeout_seconds: int,
+    ) -> str:
+        """Materialize local dependencies before readiness or executor work.
+
+        Dependency materialization is filesystem and subprocess IO, so it is
+        deliberately performed by the coordinator outside any store
+        transaction.  The receipt is content-addressed even when materialize
+        reports a non-Node worktree, making the preparation outcome explicit
+        in the node result.
+        """
+
+        materializer = self.blocked_worktree_recovery.materializer
+        try:
+            materialization = materializer.materialize(
+                worktree,
+                timeout_seconds=min(
+                    timeout_seconds,
+                    PnpmOfflineMaterializer.MAX_TEMPLATE_SEED_SECONDS,
+                ),
+            )
+        except DirtyWorktreeRecoveryError as error:
+            materialization = {
+                "schema_version": 1,
+                "kind": "pnpm-offline-materialization",
+                "status": "blocked",
+                "reason": str(error),
+            }
+            receipt_ref = self.artifacts.put_text(
+                canonical_json(materialization),
+                "dependency-materialization.json",
+            )
+            context.dependency_materialization_ref = receipt_ref
+            raise
+        receipt_ref = self.artifacts.put_text(
+            canonical_json(materialization),
+            "dependency-materialization.json",
+        )
+        context.dependency_materialization_ref = receipt_ref
+        return receipt_ref
+
     @staticmethod
     def _readiness_fingerprint(report: ExecutionReadinessReport) -> dict:
         """Return stable readiness inputs for the existing Evidence fingerprint.
@@ -1208,6 +1263,11 @@ class Coordinator:
                     dependency_input = self._prepare_dependency_input(
                         claimed["task_id"], claimed["node_id"], worktree
                     )
+                self._materialize_worktree_dependencies(
+                    worktree,
+                    context,
+                    timeout_seconds=int(contract["timeout_seconds"]),
+                )
             if input_receipt_ref is None and dependency_input is not None:
                 input_receipt_ref = self.artifacts.put_text(
                     canonical_json(dependency_input.receipt), "dependency-input.json"
@@ -1248,6 +1308,11 @@ class Coordinator:
                 )
                 if input_receipt_ref is not None:
                     result = self._with_dependency_input_receipt(result, input_receipt_ref)
+                if context.dependency_materialization_ref is not None:
+                    result = self._with_dependency_materialization_receipt(
+                        result,
+                        context.dependency_materialization_ref,
+                    )
                 if recovery_artifacts:
                     result = self._with_failed_attempt_recovery_artifacts(
                         result,
@@ -1304,6 +1369,11 @@ class Coordinator:
                     )
                     if input_receipt_ref is not None:
                         result = self._with_dependency_input_receipt(result, input_receipt_ref)
+                    if context.dependency_materialization_ref is not None:
+                        result = self._with_dependency_materialization_receipt(
+                            result,
+                            context.dependency_materialization_ref,
+                        )
                     if packet_refs:
                         result = replace(
                             result,
@@ -1406,6 +1476,11 @@ class Coordinator:
                     "execution-readiness": str(context.readiness_report_ref),
                 },
             )
+            if context.dependency_materialization_ref is not None:
+                result = self._with_dependency_materialization_receipt(
+                    result,
+                    context.dependency_materialization_ref,
+                )
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(
                     worktree, request.input_tree_sha or contract["base_sha"]
@@ -1454,6 +1529,21 @@ class Coordinator:
                     verdict="blocked" if claimed["spec"].get("verifier") else None,
                     **governance_receipt_fields(claimed["contract"]),
                 )
+        except DirtyWorktreeRecoveryError as error:
+            context.failure_origin = "environment"
+            context.failure_detail = f"dependency materialization blocked: {error}"
+            if failed_attempt_recovery is not None and not failed_attempt_assigned:
+                result = self._failed_attempt_recovery_failure(
+                    claimed, f"failed-attempt recovery rejected: {error}"
+                )
+            else:
+                result = NodeResult(
+                    status="blocked",
+                    summary=f"dependency materialization blocked: {error}",
+                    result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                    verdict="blocked" if claimed["spec"].get("verifier") else None,
+                    **governance_receipt_fields(claimed["contract"]),
+                )
         except WorktreeError as error:
             context.failure_origin = "environment"
             context.failure_detail = f"worktree unavailable: {error}"
@@ -1490,6 +1580,14 @@ class Coordinator:
                     **result.artifacts,
                     "execution-readiness": context.readiness_report_ref,
                 },
+            )
+        if (
+            context.dependency_materialization_ref is not None
+            and "dependency-materialization" not in result.artifacts
+        ):
+            result = self._with_dependency_materialization_receipt(
+                result,
+                context.dependency_materialization_ref,
             )
         if (
             context.dependency_input_ref is not None
@@ -2222,6 +2320,16 @@ class Coordinator:
         return replace(
             result,
             artifacts={**result.artifacts, "dependency-input": receipt_ref},
+        )
+
+    @staticmethod
+    def _with_dependency_materialization_receipt(
+        result: NodeResult,
+        receipt_ref: str,
+    ) -> NodeResult:
+        return replace(
+            result,
+            artifacts={**result.artifacts, "dependency-materialization": receipt_ref},
         )
 
     def _archify_receipt_packets(self, task_id: str) -> tuple[dict, ...]:

@@ -71,6 +71,8 @@ class PnpmOfflineMaterializer:
     package-local ``node_modules`` directories. A verified template is cloned
     into the target rather than shared or symlinked, so workspace links remain
     local to the target source tree.
+    A complete linker carrying the matching Workbench marker is reused in
+    place, avoiding a second offline install for the same worktree inputs.
     On APFS this is copy-on-write and avoids repeated pnpm linker work.
     """
 
@@ -178,14 +180,12 @@ class PnpmOfflineMaterializer:
                 f"pnpm {actual_version} is unsupported for offline recovery; pnpm 11 must be at least "
                 f"{minimum}. Configure {self.BINARY_ENVIRONMENT_VARIABLE} to the Workbench-managed runtime."
             )
-        template_signature = (
-            self._template_signature(worktree, declared, actual_version)
-            if cache_root is not None
-            else None
+        template_signature = self._template_signature(
+            worktree, declared, actual_version
         )
         template_directory = (
             cache_root / template_signature["key"]
-            if cache_root is not None and template_signature is not None
+            if cache_root is not None
             else None
         )
 
@@ -217,7 +217,34 @@ class PnpmOfflineMaterializer:
         # can observe a partially copied template.
         template_publish: CommandOutcome | None = None
         with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
-            if template_directory is not None and template_signature is not None:
+            if self._has_template_marker(
+                worktree / "node_modules", template_signature["key"]
+            ):
+                return {
+                    "schema_version": 1,
+                    "kind": "pnpm-offline-materialization",
+                    "package_manager": declared,
+                    "pnpm_version": actual_version,
+                    "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
+                    "materialization_timeout_seconds": effective_timeout,
+                    "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
+                    "shared_store_lock": {
+                        "path": str(lock_path),
+                        "wait_seconds": lock_wait_seconds,
+                    },
+                    "template": {
+                        "state": "reuse",
+                        "key": template_signature["key"],
+                        "path": str(worktree / "node_modules"),
+                    },
+                    "commands": [version.to_dict(), {
+                        "command": ["pnpm-worktree", "reuse", str(worktree)],
+                        "exit_code": 0,
+                        "stdout": "reused complete worktree-local pnpm linker tree\n",
+                        "stderr": "",
+                    }],
+                }
+            if template_directory is not None:
                 cached_clone = self._clone_cached_template(
                     template_directory, template_signature, worktree, deadline
                 )
@@ -255,11 +282,13 @@ class PnpmOfflineMaterializer:
                     "offline pnpm materialization failed: "
                     f"{install.stderr.strip() or install.stdout.strip()}"
                 )
-            if template_directory is not None and template_signature is not None:
+            if template_directory is not None:
                 self._write_template_marker(worktree / "node_modules", template_signature["key"])
                 template_publish = self._publish_template(
                     template_directory, template_signature, worktree, deadline
                 )
+            elif self._node_modules_is_complete(worktree / "node_modules"):
+                self._write_template_marker(worktree / "node_modules", template_signature["key"])
         return {
             "schema_version": 1,
             "kind": "pnpm-offline-materialization",
@@ -280,7 +309,6 @@ class PnpmOfflineMaterializer:
                     "clone": template_publish.to_dict(),
                 }
                 if template_publish is not None
-                and template_signature is not None
                 and template_directory is not None
                 else {"state": "disabled" if cache_root is None else "not-created"}
             ),
