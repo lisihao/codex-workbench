@@ -121,6 +121,37 @@ def absolute_path(path: Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
+def resolve_optional_executable(value: object, *, label: str) -> Path | None:
+    """Resolve one optional executable while rejecting malformed persisted paths."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{label} must be a non-empty path or executable name")
+    selected = value.strip()
+    resolved = shutil.which(selected) if "/" not in selected else selected
+    if resolved is None:
+        raise SystemExit(f"{label} is not resolvable: {selected}")
+    candidate = Path(resolved).expanduser().resolve(strict=False)
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise SystemExit(f"{label} is not executable: {candidate}")
+    return candidate
+
+
+def resolve_quota_claude_binary(
+    config: dict[str, object],
+    *,
+    requested: str | None,
+    fallback: Path | None,
+) -> Path | None:
+    """Resolve the quota producer independently from the Claude executor."""
+
+    selected = requested if requested is not None else config.get("quota_claude_binary")
+    if selected is None:
+        return fallback
+    return resolve_optional_executable(selected, label="quota Claude CLI")
+
+
 def assert_no_symlink_ancestors(path: Path, *, label: str) -> None:
     """Reject direct, broken, and ancestor symlinks before any write."""
 
@@ -500,6 +531,7 @@ def preflight_authority_plists(
     process_home: Path,
     quota_snapshot_file: Path,
     claude_binary: Path | None,
+    quota_claude_binary: Path | None,
     pnpm_binary: Path,
     pnpm_store: Path,
     capability_refresh_seconds: int = DEFAULT_CAPABILITY_REFRESH_SECONDS,
@@ -519,20 +551,15 @@ def preflight_authority_plists(
         pnpm_binary=pnpm_binary,
         pnpm_store=pnpm_store,
     )
-    if claude_binary is not None:
+    if quota_claude_binary is not None:
         quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
-        quota_rendered = (
-            quota_template.replace("__APP_ROOT__", str(app_root))
-            .replace("__STATE_ROOT__", str(state_root))
-            .replace("__USER_HOME__", str(Path.home()))
-            .replace("__CLAUDE_BINARY__", str(claude_binary))
-            .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
-        )
-        quota_payload = plistlib.loads(quota_rendered.encode())
-        _validate_quota_runtime_environment(
-            quota_payload,
-            claude_binary=claude_binary,
+        render_quota_plist(
+            quota_template,
+            app_root=app_root,
+            state_root=state_root,
             user_home=Path.home(),
+            claude_binary=quota_claude_binary,
+            quota_snapshot_file=quota_snapshot_file,
         )
     capability_template = (source / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
     capability_rendered = render_capability_plist(
@@ -911,6 +938,35 @@ def _validate_quota_runtime_environment(
         raise SystemExit("quota LaunchAgent Claude binary is not explicit")
 
 
+def render_quota_plist(
+    template: str,
+    *,
+    app_root: Path,
+    state_root: Path,
+    user_home: Path,
+    claude_binary: Path,
+    quota_snapshot_file: Path,
+) -> str:
+    """Render the quota producer with its independently pinned Claude CLI."""
+
+    rendered = (
+        template.replace("__APP_ROOT__", str(app_root))
+        .replace("__STATE_ROOT__", str(state_root))
+        .replace("__USER_HOME__", str(user_home))
+        .replace("__CLAUDE_BINARY__", str(claude_binary))
+        .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+    )
+    payload = plistlib.loads(rendered.encode())
+    if not isinstance(payload, dict):
+        raise SystemExit("quota LaunchAgent plist is invalid")
+    _validate_quota_runtime_environment(
+        payload,
+        claude_binary=claude_binary,
+        user_home=user_home,
+    )
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False).decode()
+
+
 def render_authority_service_plist(
     template: str,
     *,
@@ -1206,7 +1262,11 @@ def main() -> int:
     parser.add_argument("--codex-binary", default="~/.codex/packages/standalone/current/codex")
     parser.add_argument(
         "--claude-binary",
-        help="absolute or resolvable Claude CLI to use for the passive quota producer",
+        help="absolute or resolvable Claude CLI for execution and capability probes",
+    )
+    parser.add_argument(
+        "--quota-claude-binary",
+        help="compatible Claude CLI for passive quota collection; persists independently",
     )
     parser.add_argument("--quota-snapshot-file")
     parser.add_argument(
@@ -1390,20 +1450,12 @@ def main() -> int:
         raise SystemExit("Codex subscription auth is missing at ~/.codex/auth.json")
     int(config_raw.get("quota_refresh_seconds", 60))
     selected_claude = args.claude_binary if args.claude_binary is not None else shutil.which("claude")
-    if selected_claude and "/" not in selected_claude:
-        selected_claude = shutil.which(selected_claude)
-        if args.claude_binary is not None and selected_claude is None:
-            raise SystemExit(f"Claude CLI is not resolvable: {args.claude_binary}")
-    claude_binary = None
-    if selected_claude:
-        candidate = Path(selected_claude).expanduser().resolve(strict=False)
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            if args.claude_binary is not None:
-                raise SystemExit(f"Claude CLI is not executable: {candidate}")
-        else:
-            claude_binary = candidate
-    elif args.claude_binary is not None:
-        raise SystemExit(f"Claude CLI is not resolvable: {args.claude_binary}")
+    claude_binary = resolve_optional_executable(selected_claude, label="Claude CLI")
+    quota_claude_binary = resolve_quota_claude_binary(
+        config_raw,
+        requested=args.quota_claude_binary,
+        fallback=claude_binary,
+    )
 
     tailscale_socket = None
     tailscale = None
@@ -1443,6 +1495,7 @@ def main() -> int:
         process_home,
         quota_snapshot_file,
         claude_binary,
+        quota_claude_binary,
         pnpm_binary,
         pnpm_store,
         capability_refresh_seconds,
@@ -1477,7 +1530,12 @@ def main() -> int:
         )
         print(f"plan: Research skill={research_destination}")
         print(f"plan: service={plist_path}")
-        print(f"plan: quota={quota_plist_path} ({'enabled' if claude_binary else 'skipped: Claude CLI unavailable'})")
+        print(f"plan: Claude executor={claude_binary or 'unavailable'}")
+        print(f"plan: Claude quota producer={quota_claude_binary or 'unavailable'}")
+        print(
+            f"plan: quota={quota_plist_path} "
+            f"({'enabled' if quota_claude_binary else 'skipped: compatible Claude CLI unavailable'})"
+        )
         print(
             f"plan: capabilities={capability_plist_path} "
             f"(RunAtLoad + every {capability_refresh_seconds}s; passive bundled refresh before services)"
@@ -1581,6 +1639,10 @@ def main() -> int:
                 "worktree_recovery": recovery_config,
             }
         )
+        if quota_claude_binary is None:
+            config_raw.pop("quota_claude_binary", None)
+        else:
+            config_raw["quota_claude_binary"] = str(quota_claude_binary)
         config_file.write_text(json.dumps(config_raw, indent=2) + "\n")
         config_file.chmod(0o600)
         codex_binary = runtime_binary
@@ -1706,16 +1768,16 @@ def main() -> int:
         plist_path.write_text(rendered)
         plist_path.chmod(0o600)
         quota_rendered: str | None = None
-        if claude_binary is not None:
+        if quota_claude_binary is not None:
             quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
-            quota_rendered = (
-                quota_template.replace("__APP_ROOT__", str(app_root))
-                .replace("__STATE_ROOT__", str(state_root))
-                .replace("__USER_HOME__", str(Path.home()))
-                .replace("__CLAUDE_BINARY__", str(claude_binary))
-                .replace("__QUOTA_SNAPSHOT_FILE__", str(quota_snapshot_file))
+            quota_rendered = render_quota_plist(
+                quota_template,
+                app_root=app_root,
+                state_root=state_root,
+                user_home=Path.home(),
+                claude_binary=quota_claude_binary,
+                quota_snapshot_file=quota_snapshot_file,
             )
-            plistlib.loads(quota_rendered.encode())
             quota_plist_path.write_text(quota_rendered)
             quota_plist_path.chmod(0o600)
 
@@ -1769,7 +1831,7 @@ def main() -> int:
 
         services_touched = True
         restart_launch_agent(domain, LABEL, plist_path)
-        if claude_binary is not None and quota_rendered is not None:
+        if quota_claude_binary is not None and quota_rendered is not None:
             restart_launch_agent(domain, QUOTA_LABEL, quota_plist_path)
         else:
             run("launchctl", "bootout", domain, str(quota_plist_path), check=False)
@@ -1823,7 +1885,11 @@ def main() -> int:
         raise
     else:
         transaction.commit()
-    quota_status = f"installed {QUOTA_LABEL}" if claude_binary is not None else "skipped quota producer: Claude CLI unavailable"
+    quota_status = (
+        f"installed {QUOTA_LABEL}"
+        if quota_claude_binary is not None
+        else "skipped quota producer: compatible Claude CLI unavailable"
+    )
     print(f"installed {LABEL} from {source} to {app_root}; {quota_status}")
     return 0
 

@@ -167,15 +167,19 @@ Claude Code 完全可选。没有它时，Workbench 保持可安装并将 Claude
 command -v claude
 claude --version
 export WB_CLAUDE_BINARY="$(command -v claude)"
+export WB_CLAUDE_QUOTA_BINARY="$WB_CLAUDE_BINARY"
 ```
 
-仅当上面的命令都成功，才在下一步的 Authority 安装命令中附加：
+`WB_CLAUDE_BINARY` 供 Claude worker 与能力探针使用。被动配额显示如果只与另一个已安装版本兼容，则把该路径写入 `WB_CLAUDE_QUOTA_BINARY`；安装器会将它独立持久化，后续升级不会因 `PATH` 顺序覆盖。
+
+仅当相应命令成功，才在下一步的 Authority 安装命令中附加：
 
 ```text
 --claude-binary "$WB_CLAUDE_BINARY"
+--quota-claude-binary "$WB_CLAUDE_QUOTA_BINARY"
 ```
 
-Authority 的被动配额采集器只接受兼容的本地 Claude CLI 使用量显示；认证未知、来源不兼容、快照过期或任一受保护池不高于 25% 时，系统不得启动新的 Claude 节点，而是回落到 Codex。20% 是保留目标，30% 是 admission guard，25% 是硬停线。安装成功不等于 Claude 已登录，也不等于已验证任何真实余额或单回合绝不跨线。
+未显式提供 `--quota-claude-binary` 时，首次安装沿用 `--claude-binary`；升级会优先复用 `config.json` 中已经持久化的 `quota_claude_binary`。Authority 的被动配额采集器只接受兼容的本地 Claude CLI 使用量显示；认证未知、来源不兼容、快照过期或任一受保护池不高于 25% 时，系统不得启动新的 Claude 节点，而是回落到 Codex。20% 是保留目标，30% 是 admission guard，25% 是硬停线。安装成功不等于 Claude 已登录，也不等于已验证任何真实余额或单回合绝不跨线。
 
 ### 2.3 安装 Authority
 
@@ -201,7 +205,8 @@ Authority 的被动配额采集器只接受兼容的本地 Claude CLI 使用量�
   --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
   --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET" \
-  --claude-binary "$WB_CLAUDE_BINARY"
+  --claude-binary "$WB_CLAUDE_BINARY" \
+  --quota-claude-binary "$WB_CLAUDE_QUOTA_BINARY"
 ```
 
 Authority 安装后进行无模型验证：

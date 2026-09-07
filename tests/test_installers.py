@@ -103,6 +103,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE", source)
         self.assertIn('"authority_machine_id": authority_machine_id', source)
         self.assertIn('"--claude-binary"', source)
+        self.assertIn('"--quota-claude-binary"', source)
         self.assertNotIn("CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude", source)
         self.assertIn('default="~/.agents/skills/research"', source)
 
@@ -352,6 +353,50 @@ class InstallerTests(unittest.TestCase):
             "/tmp/app/vendor/pnpm-runtime/package/bin/pnpm.mjs",
         )
         self.assertEqual(environment["CODEX_WORKBENCH_PNPM_STORE"], "/tmp/pnpm-store")
+
+    def test_quota_launch_agent_can_pin_a_separate_claude_binary(self) -> None:
+        module = self._macos_installer_module()
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "launchd" / f"{module.QUOTA_LABEL}.plist.in").read_text()
+
+        rendered = module.render_quota_plist(
+            template,
+            app_root=Path("/tmp/app"),
+            state_root=Path("/tmp/state"),
+            user_home=Path("/Users/example"),
+            claude_binary=Path("/tmp/claude-2.1.239"),
+            quota_snapshot_file=Path("/tmp/state/claude-quota.json"),
+        )
+
+        payload = plistlib.loads(rendered.encode())
+        arguments = payload["ProgramArguments"]
+        index = arguments.index("--claude-binary")
+        self.assertEqual(arguments[index + 1], "/tmp/claude-2.1.239")
+        self.assertEqual(payload["EnvironmentVariables"]["HOME"], "/Users/example")
+
+    def test_persisted_quota_binary_overrides_executor_for_future_installs(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            executor = root / "claude-latest"
+            quota = root / "claude-2.1.239"
+            for fixture in (executor, quota):
+                fixture.write_text("#!/bin/sh\n")
+                fixture.chmod(0o755)
+
+            selected = module.resolve_quota_claude_binary(
+                {"quota_claude_binary": str(quota)},
+                requested=None,
+                fallback=executor,
+            )
+            overridden = module.resolve_quota_claude_binary(
+                {"quota_claude_binary": str(executor)},
+                requested=str(quota),
+                fallback=executor,
+            )
+
+        self.assertEqual(selected, quota.resolve())
+        self.assertEqual(overridden, quota.resolve())
 
     def test_pnpm_recovery_runtime_is_pinned_and_extractable(self) -> None:
         module = self._macos_installer_module()
@@ -1855,12 +1900,16 @@ class InstallerTests(unittest.TestCase):
             for fixture in (codex, codex_host):
                 fixture.write_text("#!/bin/sh\nexit 0\n")
                 fixture.chmod(0o755)
+            quota_claude = root / "claude-2.1.239"
+            quota_claude.write_text("#!/bin/sh\nexit 0\n")
+            quota_claude.chmod(0o755)
             state_root = root / "state"
             state_root.mkdir()
             (state_root / "config.json").write_text(
                 json.dumps(
                     {
                         "user_setting": "preserve",
+                        "quota_claude_binary": str(quota_claude),
                         "capability_refresh_seconds": 1234,
                         "ai_frontier": {
                             "operator_note": "preserve",
@@ -1931,6 +1980,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(config["capability_refresh_seconds"], 1234)
             self.assertEqual(config["max_workers"], 8)
             self.assertEqual(config["spark_workers"], 4)
+            self.assertEqual(config["quota_claude_binary"], str(quota_claude.resolve()))
             self.assertEqual(
                 config["worktree_recovery"],
                 {
@@ -2066,6 +2116,11 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(payload["EnvironmentVariables"]["CODEX_HOME"], str(state_root / "codex-home"))
             self.assertEqual(payload["EnvironmentVariables"]["CODEX_WORKBENCH_CODEX"], str(state_root / "runtime" / "codex"))
             self.assertEqual(payload["EnvironmentVariables"]["HOME"], str(home))
+            quota_plist = home / "Library" / "LaunchAgents" / f"{module.QUOTA_LABEL}.plist"
+            quota_payload = plistlib.loads(quota_plist.read_bytes())
+            quota_arguments = quota_payload["ProgramArguments"]
+            quota_index = quota_arguments.index("--claude-binary")
+            self.assertEqual(quota_arguments[quota_index + 1], str(quota_claude.resolve()))
             launchctl_commands = [command for command in calls if command and command[0] == "launchctl"]
             sidecar_service = f"gui/501/{module.CAPABILITY_LABEL}"
             self.assertTrue(
