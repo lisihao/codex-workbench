@@ -7,11 +7,13 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import threading
 import time
 from typing import Callable, Iterable
 
 from .artifacts import ArtifactStore
+from .config import WorkbenchConfig
 from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
@@ -72,16 +74,19 @@ from .model import (
     codex_model_reasoning_effort,
     now_iso,
 )
+from .planner import PlannerError
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
 from .routing import codex_fallback_model, route_task, strategy_for_node
-from .store import StateConflictError, WorkbenchStore
+from .store import CommandConflictError, StateConflictError, WorkbenchStore
+from .submission import compile_natural_language_request
 from .worktrees import WorktreeError, WorktreeManager, scope_allows
 
 
 _ARCHIFY_COMMANDS = frozenset({"deliver", "compare", "visual-check", "validate", "migrate"})
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_PROVIDER = "workbench-failed-attempt-recovery"
+_PLANNING_FUTURE_PREFIX = "planning/"
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,7 @@ class Coordinator:
         quota_snapshot_file: Path | None = None,
         pnpm_materializer: PnpmOfflineMaterializer | None = None,
         fatal_exit: Callable[[int], None] | None = None,
+        config: WorkbenchConfig | None = None,
     ):
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
@@ -163,6 +169,10 @@ class Coordinator:
         self.store = store
         self.state_root = state_root
         self.max_workers = max_workers
+        # The authority passes its fully loaded configuration.  Unit callers
+        # and legacy construction sites retain a local, state-root-bound
+        # default until they can be migrated without changing their behavior.
+        self.config = config or WorkbenchConfig(state_root, max_workers=max_workers)
         self.spark_workers = resolved_spark_workers
         self._lane_capacities = {
             "spark": self.spark_workers,
@@ -210,6 +220,7 @@ class Coordinator:
         self._quota_unavailable_reported = False
 
     def recover(self) -> int:
+        recovered_planning = self.store.recover_interrupted_planning_requests()
         recovered, _ = self.store.recover_interrupted_with_orphans()
         for orphan in self.store.pending_failed_attempt_recovery_orphans():
             target = self.worktrees.worktree_path(
@@ -255,7 +266,7 @@ class Coordinator:
                         "status": "archived",
                     },
                 )
-        return recovered
+        return recovered + recovered_planning
 
     def run_forever(self) -> None:
         worker_counter = 0
@@ -281,6 +292,7 @@ class Coordinator:
                     )
                 self._next_quota_refresh = time.monotonic() + self._quota_refresher.interval_seconds
             self._collect()
+            self._dispatch_one_planning_request()
             while len(self._futures) < self.max_workers:
                 worker_counter += 1
                 worker_id = f"{socket.gethostname()}-{os.getpid()}-{worker_counter}"
@@ -343,7 +355,279 @@ class Coordinator:
                 )
             self._stop.wait(self.poll_seconds)
         self._pool.shutdown(wait=True, cancel_futures=False)
-        self._recovery_thread.join(timeout=30)
+        # A coordinator cannot be considered stopped while its recovery
+        # companion still owns work.  The authority caller waits for this
+        # method's thread before releasing its lease, so preserve correctness
+        # over a misleading bounded shutdown claim.
+        self._recovery_thread.join()
+
+    def _dispatch_one_planning_request(self) -> bool:
+        """Claim and submit at most one durable planning request per turn.
+
+        Planning runs in the same bounded pool as execution.  A slow model
+        compile therefore cannot block the MCP response thread, nor can it
+        create an unbounded second executor.  The store claim is the durable
+        ownership boundary; this method never retries a failed claim locally.
+        """
+
+        if len(self._futures) >= self.max_workers or self._planning_in_flight():
+            return False
+        try:
+            claimed = self.store.claim_planning_request(self.coordinator_epoch)
+        except Exception as error:
+            self._record_planning_system_event(
+                "planning.claim_failed",
+                {"error": self._planning_error_text(error)},
+            )
+            return False
+        if claimed is None:
+            return False
+        command_id, attempt, coordinator_epoch = self._planning_claim_values(claimed)
+        try:
+            command_id, attempt, coordinator_epoch = self._planning_claim_identity(claimed)
+        except (KeyError, TypeError, ValueError) as error:
+            detail = "planning claim invalid: " + self._planning_error_text(error)
+            if command_id is not None and attempt is not None and coordinator_epoch is not None:
+                # The durable claim still has a complete fencing identity, so
+                # turn corruption into an observable failed receipt now.
+                self._fail_planning_request(
+                    command_id,
+                    attempt,
+                    coordinator_epoch,
+                    detail,
+                )
+            else:
+                # Without all three fence fields we cannot safely settle the
+                # row.  Leave it running for startup recovery to mark
+                # indeterminate instead of guessing at a task side effect.
+                self._record_planning_system_event(
+                    "planning.claim_invalid",
+                    {
+                        "error": detail,
+                        "command_id": command_id,
+                        "attempt": attempt,
+                        "coordinator_epoch": coordinator_epoch,
+                    },
+                )
+            return False
+        try:
+            future = self._pool.submit(self._execute_planning_request, claimed)
+        except Exception as error:
+            self._fail_planning_request(
+                command_id,
+                attempt,
+                coordinator_epoch,
+                "planning background submission failed: " + self._planning_error_text(error),
+            )
+            return False
+        self._futures[future] = (f"{_PLANNING_FUTURE_PREFIX}{command_id}", None)
+        return True
+
+    def _planning_in_flight(self) -> bool:
+        """Return whether the shared pool already owns one planning attempt."""
+
+        return any(
+            label.startswith(_PLANNING_FUTURE_PREFIX)
+            for label, _model in self._futures.values()
+        )
+
+    @staticmethod
+    def _planning_claim_values(
+        claimed: object,
+    ) -> tuple[str | None, int | None, int | None]:
+        """Read only individually valid durable claim fence fields."""
+
+        if not isinstance(claimed, dict):
+            return None, None, None
+        raw_command_id = claimed.get("command_id")
+        command_id = (
+            raw_command_id
+            if isinstance(raw_command_id, str) and raw_command_id.strip()
+            else None
+        )
+        raw_attempt = claimed.get("attempt")
+        attempt = (
+            raw_attempt
+            if isinstance(raw_attempt, int) and not isinstance(raw_attempt, bool) and raw_attempt >= 1
+            else None
+        )
+        raw_epoch = claimed.get("coordinator_epoch")
+        coordinator_epoch = (
+            raw_epoch
+            if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool) and raw_epoch >= 1
+            else None
+        )
+        return command_id, attempt, coordinator_epoch
+
+    @classmethod
+    def _planning_claim_identity(cls, claimed: object) -> tuple[str, int, int]:
+        """Return the complete claim fence or reject a malformed claim."""
+
+        if not isinstance(claimed, dict):
+            raise ValueError("planning claim must be an object")
+        command_id, attempt, coordinator_epoch = cls._planning_claim_values(claimed)
+        if command_id is None:
+            raise ValueError("planning claim command_id is required")
+        if attempt is None:
+            raise ValueError("planning claim attempt must be a positive integer")
+        if coordinator_epoch is None:
+            raise ValueError("planning claim coordinator_epoch must be a positive integer")
+        return command_id, attempt, coordinator_epoch
+
+    @staticmethod
+    def _planning_error_text(error: Exception) -> str:
+        return f"{type(error).__name__}: {error}"[:1024]
+
+    def _record_planning_system_event(self, event_type: str, payload: dict[str, object]) -> None:
+        """Best-effort diagnostics must not turn a planning failure into exit."""
+
+        try:
+            self.store.record_system_event(event_type, payload)
+        except Exception:
+            # The attempt finalizer still owns durable state.  A secondary
+            # diagnostics write cannot be allowed to kill the coordinator.
+            pass
+
+    def _execute_planning_request(self, claimed: dict) -> None:
+        """Compile one claimed request and durably finalize its exact attempt.
+
+        All expected planner, process, validation, and unexpected Python
+        errors become a failed planning receipt.  A stale completion is
+        intentionally ignored: the store fences it by command, attempt, and
+        coordinator epoch, so an old worker cannot overwrite a newer owner.
+        """
+
+        command_id: str | None = None
+        attempt: int | None = None
+        coordinator_epoch: int | None = None
+        try:
+            command_id, attempt, coordinator_epoch = self._planning_claim_identity(claimed)
+            request = claimed["request"]
+            if not isinstance(request, dict):
+                raise ValueError("planning claim request must be an object")
+            submit_request = dict(request)
+            request_schema = submit_request.pop("request_schema", None)
+            if request_schema is not None and request_schema != "natural-language-planning-v1":
+                raise ValueError(f"unsupported planning request schema {request_schema!r}")
+            queue = submit_request.get("queue")
+            if not isinstance(queue, bool):
+                raise ValueError("planning request queue must be a boolean")
+            source_thread_id = submit_request.get("source_thread_id")
+            context_ref = submit_request.get("context_bundle_ref")
+            if source_thread_id is None and context_ref is None:
+                context_excerpt = None
+            elif isinstance(source_thread_id, str) and isinstance(context_ref, str):
+                frozen_context = self.store.get_session_context(source_thread_id, context_ref)
+                if (
+                    frozen_context.get("source_thread_id") != source_thread_id
+                    or frozen_context.get("context_ref") != context_ref
+                ):
+                    raise ValueError("frozen planning context identity did not match the request")
+                context_excerpt = frozen_context.get("context_excerpt")
+                if not isinstance(context_excerpt, str):
+                    raise ValueError("frozen planning context excerpt is invalid")
+            else:
+                raise ValueError(
+                    "planning source_thread_id and context_bundle_ref must be supplied together"
+                )
+            # The planning ledger deliberately contains references rather than
+            # a second plaintext history copy.  Compile receives only the
+            # exact, content-addressed receipt selected by the claimed row.
+            submit_request["context_excerpt"] = context_excerpt
+            compiled = compile_natural_language_request(
+                self.config,
+                self.store,
+                **submit_request,
+            )
+            if compiled.command_id != command_id:
+                raise ValueError("compiled planning command_id did not match the claimed request")
+            if compiled.contract.task_id != claimed.get("task_id"):
+                raise ValueError("compiled planning task_id did not match the claimed request")
+        except (CommandConflictError, KeyError, PlannerError, OSError, subprocess.SubprocessError, ValueError) as error:
+            self._fail_planning_request(
+                command_id,
+                attempt,
+                coordinator_epoch,
+                self._planning_error_text(error),
+            )
+            return
+        except Exception as error:
+            self._fail_planning_request(
+                command_id,
+                attempt,
+                coordinator_epoch,
+                self._planning_error_text(error),
+            )
+            return
+        try:
+            # This is the only successful completion path.  The store fences
+            # the epoch and atomically creates the task, queues it, binds its
+            # session, and settles the planning receipt.
+            self.store.materialize_planning_request(
+                command_id,
+                attempt=attempt,
+                coordinator_epoch=coordinator_epoch,
+                contract=compiled.contract,
+                nodes=list(compiled.nodes),
+                result=compiled.result,
+                queue=queue,
+                source_thread_id=source_thread_id,
+            )
+        except StateConflictError:
+            # A newer authority owns the ledger.  materialize executes all
+            # side effects in its transaction, so fencing here means none of
+            # task creation, queueing, or session binding was applied.
+            return
+        except (CommandConflictError, KeyError, OSError, ValueError) as error:
+            self._fail_planning_request(
+                command_id,
+                attempt,
+                coordinator_epoch,
+                "planning materialization failed: " + self._planning_error_text(error),
+            )
+        except Exception as error:
+            self._fail_planning_request(
+                command_id,
+                attempt,
+                coordinator_epoch,
+                "planning materialization failed: " + self._planning_error_text(error),
+            )
+
+    def _fail_planning_request(
+        self,
+        command_id: str | None,
+        attempt: int | None,
+        coordinator_epoch: int | None,
+        error: str,
+    ) -> None:
+        """Persist one bounded failure, without allowing it to exit the process."""
+
+        if command_id is None or attempt is None or coordinator_epoch is None:
+            self._record_planning_system_event(
+                "planning.finalize_invalid",
+                {"state": "failed", "command_id": command_id, "error": error},
+            )
+            return
+        try:
+            self.store.fail_planning_request(
+                command_id,
+                attempt=attempt,
+                coordinator_epoch=coordinator_epoch,
+                error=error,
+            )
+        except StateConflictError:
+            return
+        except Exception as persistence_error:
+            self._record_planning_system_event(
+                "planning.failure_persist_failed",
+                {
+                    "command_id": command_id,
+                    "attempt": attempt,
+                    "coordinator_epoch": coordinator_epoch,
+                    "error": error,
+                    "persistence_error": self._planning_error_text(persistence_error),
+                },
+            )
 
     def _claim_next_ready_node(
         self,

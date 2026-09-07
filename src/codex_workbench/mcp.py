@@ -15,14 +15,14 @@ from .governance import code_as_harness_health
 from .planner import PlannerError
 from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
-from .submission import submit_natural_language_request
+from .submission import enqueue_natural_language_request, planning_request_receipt
 from .sync import RepositorySynchronizer, RepositorySyncError
 
 
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "workbench_request",
-        "description": "Compile and optionally queue a bounded development DAG on the Mac mini authority.",
+        "description": "Quickly enqueue a bounded natural-language planning request on the Mac mini authority; planning and model calls run asynchronously.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -40,7 +40,10 @@ TOOLS: list[dict[str, Any]] = [
                 "task_id": {"type": "string"},
                 "command_id": {"type": "string"},
                 "base_sha": {"type": "string"},
+                "planner_model": {"type": "string", "default": "gpt-5.6-sol"},
                 "executor_model": {"type": "string", "default": "gpt-5.6-luna"},
+                "verifier_model": {"type": "string", "default": "gpt-5.6-sol"},
+                "strategy": {"type": "object"},
                 "task_type": {
                     "enum": [
                         "implementation",
@@ -64,6 +67,16 @@ TOOLS: list[dict[str, Any]] = [
                 "external_write_permission": {"type": "boolean", "default": False},
                 "queue": {"type": "boolean", "default": True},
             },
+        },
+    },
+    {
+        "name": "workbench_get_request",
+        "description": "Read the durable status and frozen input of one asynchronous planning request.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["command_id"],
+            "properties": {"command_id": {"type": "string"}},
         },
     },
     {
@@ -377,7 +390,7 @@ class WorkbenchMCPServer:
                     "repository and allowed_scopes are required unless source_thread_id has an active WB binding"
                 )
             return self._text(
-                submit_natural_language_request(
+                enqueue_natural_language_request(
                     self.config,
                     self.store,
                     objective=arguments["objective"],
@@ -387,7 +400,9 @@ class WorkbenchMCPServer:
                     acceptance_commands=arguments.get("acceptance_commands", ()),
                     task_id=arguments.get("task_id"),
                     command_id=arguments.get("command_id"),
+                    planner_model=arguments.get("planner_model", "gpt-5.6-sol"),
                     executor_model=arguments.get("executor_model", "gpt-5.6-luna"),
+                    verifier_model=arguments.get("verifier_model", "gpt-5.6-sol"),
                     task_type=arguments.get("task_type", "implementation"),
                     complexity=arguments.get("complexity", "standard"),
                     parallelizable=bool(arguments.get("parallelizable", True)),
@@ -399,9 +414,16 @@ class WorkbenchMCPServer:
                     external_write_permission=bool(arguments.get("external_write_permission", False)),
                     queue=bool(arguments.get("queue", True)),
                     base_sha=arguments.get("base_sha") or (binding["base_sha"] if binding else None),
+                    strategy=arguments.get("strategy"),
                     source_thread_id=source_thread_id,
                     context_bundle_ref=binding["context_ref"] if binding else None,
                     context_excerpt=binding["context_excerpt"] if binding else None,
+                )
+            )
+        if name == "workbench_get_request":
+            return self._text(
+                planning_request_receipt(
+                    self.store.get_planning_request(arguments["command_id"])
                 )
             )
         if name == "workbench_get_session":

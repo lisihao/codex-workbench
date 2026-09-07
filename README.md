@@ -117,6 +117,8 @@ codex-workbench worktree restore <archive-id> --destination <local-path>
 
 当前 Codex 会话也可直接调用 MCP 工具 `workbench_worktree_status`、`workbench_reclaim_worktrees` 与 `workbench_restore_worktree`。远程 `send` 没有 direct-SSH fallback：它必须复用已安装的 location-aware profile 并强制 `--force-tailscale`；远端 receipt 缺失或不匹配时保留源 worktree。
 
+`workbench_request` 先把自然语言请求、固定 base、范围和幂等 `command_id` 写入 Authority 的 planning ledger，然后立即返回 `pending` 回执；Sol 编译在长期运行的 Coordinator 中后台执行，同一时间最多一个规划，占用既有 worker pool 的一个槽位而不建立第二套调度器。用 `workbench_get_request(command_id)` 或 Authority CLI 的 `request-status <command_id>` 查询 `pending`、`running`、`succeeded`、`failed` 或 `indeterminate`。重复提交相同 command/request 只返回原回执；不同请求复用 command id 会被拒绝。进程中断的规划保持 `indeterminate`，不会自动重复模型调用。已经具备完整合法 `TaskContract`/`NodeSpec[]` 时，可用 `submit <contract.json> --command-id <id> --queue` 绕过模型规划，但仍受范围、唯一最终 verifier 和 Evidence 门禁约束。
+
 ### Benchmark 基线、长期校准与快照绑定
 
 Workbench 保留版本化的公开性能证据目录，包括 [OpenAI GPT-5.6 官方评测](https://openai.com/index/gpt-5-6/)、[Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1)、[SWE-Bench Pro](https://scaleapi.github.io/SWE-bench_Pro-os/) 和 [Humanity's Last Exam](https://labs.scale.com/leaderboard/humanitys_last_exam)。新快照使用 `local-outcomes-only-v2`：外部评测只作为独立 `public_evidence`，不再转换为 Beta 伪样本，也不在模型家族或版本之间借分。

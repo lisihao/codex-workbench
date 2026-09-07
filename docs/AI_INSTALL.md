@@ -443,6 +443,8 @@ codex plugin list --json
 
 连接正常时，Codex 是唯一用户入口：在已有会话输入 `wb`，随后用 MCP 工具提交、查看或追加任务。Authority 持有唯一账本；MacBook 只是 cockpit，关闭或离线不会停止已在 Mac mini 运行的任务。
 
+自然语言 `workbench_request` 只负责先持久化请求并快速返回 `command_id` 与 planning 状态；Coordinator 随后在后台运行 Sol 编译。用 MCP `workbench_get_request` 查询状态，或在 Authority 执行 `"$WB_AUTHORITY_BIN" --home "$WB_STATE_ROOT" request-status <command-id>`。超时或断链后应查询原 command id，不要盲目重投；相同请求是幂等读取，不同请求复用该 id 会冲突。`indeterminate` 表示上一次规划可能已触达模型但未可靠落账，系统不会自动重放。若调用方已经能提供完整、合法且经过审阅的合同 DAG，可执行 `submit <contract.json> --command-id <new-id> --queue`，无需再次调用规划模型。
+
 MCP、Hook、tunnel 与 Git 同步共享同一传输 profile。Git 的 `sync` 与 `tailscale bundle` 也会复用安装时写入的 `workbench-location-proxy` 路径与 `ProxyCommand` 规则，故 transport 语义对同一设备一致。
 
 终态 worktree 先进入 `$WB_STATE_ROOT/recycle/worktrees`。后台恢复线程每次只处理有持久 allocation 的 Workbench worktree，并遵守以下门禁：

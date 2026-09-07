@@ -26,7 +26,12 @@ from codex_workbench.model import (
 )
 from codex_workbench.performance import PerformanceRegistry
 from codex_workbench.store import WorkbenchStore
-from codex_workbench.submission import submit_natural_language_request
+from codex_workbench.submission import (
+    compile_natural_language_request,
+    enqueue_natural_language_request,
+    planning_request_receipt,
+    submit_natural_language_request,
+)
 
 
 def compatible_provenance() -> dict[str, object]:
@@ -47,6 +52,20 @@ def unavailable_registry() -> MagicMock:
         "catalog": None,
     }
     return registry
+
+
+def fixture_repository(root: Path) -> Path:
+    """Create one minimal committed repository for submission-boundary tests."""
+
+    repository = root / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+    (repository / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+    return repository
 
 
 def active_catalog() -> dict[str, object]:
@@ -132,6 +151,233 @@ def install_fresh_radar(config: WorkbenchConfig) -> None:
 
 
 class SubmissionTests(unittest.TestCase):
+    def test_enqueue_fast_path_persists_frozen_request_without_planning_or_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "fixture@example.invalid"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Fixture"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "fixture"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            config = WorkbenchConfig(root / "state")
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            with (
+                patch("codex_workbench.submission.CodexPlanner.compile") as compile_plan,
+                patch("codex_workbench.submission.ClaudeExecutor.authentication") as authenticate,
+            ):
+                result = enqueue_natural_language_request(
+                    config,
+                    store,
+                    objective="bounded work",
+                    repository=str(repository),
+                    allowed_scope=("README.md",),
+                    task_id="planning-task",
+                    command_id="planning-command",
+                    base_sha="HEAD",
+                    queue=True,
+                )
+
+            self.assertEqual(result["status"], "pending")
+            compile_plan.assert_not_called()
+            authenticate.assert_not_called()
+            frozen = store.get_planning_request("planning-command")["request"]
+            self.assertEqual(frozen["task_id"], "planning-task")
+            self.assertEqual(frozen["command_id"], "planning-command")
+            self.assertEqual(frozen["base_sha"], subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip())
+            self.assertEqual(frozen["strategy"]["task_type"], "implementation")
+
+            retry = enqueue_natural_language_request(
+                config,
+                store,
+                objective="bounded work",
+                repository=str(repository),
+                allowed_scope=("README.md",),
+                task_id="planning-task",
+                command_id="planning-command",
+                base_sha="HEAD",
+                queue=True,
+            )
+            self.assertEqual(retry["status"], "pending")
+            self.assertEqual(retry["task_id"], result["task_id"])
+            self.assertEqual(retry["request_hash"], result["request_hash"])
+
+    def test_enqueue_omitted_ids_are_stable_and_never_persist_context_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = fixture_repository(root)
+            config = WorkbenchConfig(root / "state")
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            context_ref = "sha256:" + "a" * 64 + ":tar.gz"
+            request = {
+                "objective": "bounded work",
+                "repository": str(repository),
+                "allowed_scope": ("README.md",),
+                "source_thread_id": "thread-stable-id",
+                "context_bundle_ref": context_ref,
+                "context_excerpt": "private imported context must not enter the ledger",
+            }
+            with (
+                patch("codex_workbench.submission.CodexPlanner.compile") as compile_plan,
+                patch("codex_workbench.submission.ClaudeExecutor.authentication") as authenticate,
+            ):
+                first = enqueue_natural_language_request(config, store, **request)
+                retry = enqueue_natural_language_request(config, store, **request)
+                different = enqueue_natural_language_request(
+                    config,
+                    store,
+                    **{**request, "objective": "different bounded work"},
+                )
+                explicit_command = enqueue_natural_language_request(
+                    config,
+                    store,
+                    **{**request, "command_id": "caller-command"},
+                )
+
+            self.assertEqual(first["command_id"], retry["command_id"])
+            self.assertEqual(first["task_id"], retry["task_id"])
+            self.assertTrue(first["context_excerpt_present"])
+            self.assertNotEqual(first["command_id"], different["command_id"])
+            self.assertNotEqual(first["task_id"], different["task_id"])
+            self.assertEqual(explicit_command["command_id"], "caller-command")
+            self.assertEqual(explicit_command["task_id"], "task-caller-command")
+            frozen = store.get_planning_request(first["command_id"])["request"]
+            self.assertEqual(frozen["source_thread_id"], "thread-stable-id")
+            self.assertEqual(frozen["context_bundle_ref"], context_ref)
+            self.assertNotIn("context_excerpt", frozen)
+            compile_plan.assert_not_called()
+            authenticate.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "at most 20000"):
+                enqueue_natural_language_request(
+                    config,
+                    store,
+                    **{**request, "context_excerpt": "x" * 20_001},
+                )
+            with self.assertRaisesRegex(ValueError, "must be a string"):
+                enqueue_natural_language_request(
+                    config,
+                    store,
+                    **{**request, "context_excerpt": 42},  # type: ignore[arg-type]
+                )
+
+    def test_compile_returns_prompt_free_result_without_materializing_a_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = fixture_repository(root)
+            config = WorkbenchConfig(root / "state")
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+
+            def compiled_nodes(contract: object, **_: object) -> list[NodeSpec]:
+                task_id = getattr(contract, "task_id")
+                return [
+                    NodeSpec(
+                        "verify",
+                        task_id,
+                        "verify",
+                        "fixture",
+                        "fixture",
+                        "private planner prompt",
+                        verifier=True,
+                    )
+                ]
+
+            with (
+                patch(
+                    "codex_workbench.submission.CapabilityRegistry",
+                    return_value=unavailable_registry(),
+                ),
+                patch(
+                    "codex_workbench.submission.CodexPlanner.compile",
+                    side_effect=compiled_nodes,
+                ) as planner_compile,
+                patch("codex_workbench.submission.ClaudeExecutor.authentication") as authenticate,
+            ):
+                compiled = compile_natural_language_request(
+                    config,
+                    store,
+                    objective="compile only",
+                    repository=str(repository),
+                    allowed_scope=("README.md",),
+                    task_id="compile-only-task",
+                    command_id="compile-only-command",
+                    queue=False,
+                    context_excerpt="private context must not be returned",
+                )
+
+            self.assertEqual(compiled.contract.task_id, "compile-only-task")
+            self.assertEqual(compiled.command_id, "compile-only-command")
+            self.assertEqual(len(compiled.nodes), 1)
+            self.assertEqual(compiled.result["node_count"], 1)
+            self.assertNotIn("nodes", compiled.result)
+            self.assertNotIn("private", json.dumps(compiled.result))
+            with self.assertRaises(KeyError):
+                store.get_task("compile-only-task")
+            planner_compile.assert_called_once()
+            authenticate.assert_not_called()
+
+    def test_planning_receipt_does_not_expose_context_or_planner_nodes(self) -> None:
+        receipt = planning_request_receipt(
+            {
+                "command_id": "safe-command",
+                "task_id": "safe-task",
+                "state": "succeeded",
+                "request": {
+                    "objective": "bounded work",
+                    "context_excerpt": "private request context",
+                },
+                "result": {
+                    "ok": True,
+                    "task_id": "safe-task",
+                    "command_id": "safe-command",
+                    "base_sha": "abc123",
+                    "routing_policy": {"version": "model-routing-v3"},
+                    "governance": {"profile": "code-as-harness/v1"},
+                    "nodes": [{"node_id": "work", "prompt": "private planner prompt"}],
+                    "prompt": "private top-level planner prompt",
+                    "context_excerpt": "private result context",
+                    "unexpected": "must not be public",
+                },
+            }
+        )
+
+        public_text = json.dumps(receipt, sort_keys=True)
+        self.assertNotIn("private", public_text)
+        self.assertNotIn("prompt", public_text)
+        self.assertNotIn('"context_excerpt":', public_text)
+        self.assertEqual(receipt["result"]["node_count"], 1)
+        self.assertNotIn("nodes", receipt["result"])
+        self.assertNotIn("unexpected", receipt["result"])
+        self.assertEqual(receipt["status_tool"], "workbench_get_request")
+        self.assertTrue(receipt["ok"])
+
     def test_imported_context_is_persisted_in_contract_and_bound_to_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

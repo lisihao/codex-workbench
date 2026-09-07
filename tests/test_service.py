@@ -30,9 +30,10 @@ from codex_workbench.evidence import evidence_fingerprint
 from codex_workbench.dirty_worktree_recovery import PnpmOfflineMaterializer
 from codex_workbench.model import NodeResult, NodeSpec, QuotaSnapshot, TaskContract, now_iso
 from codex_workbench.service import Coordinator, _ClaimRoute
+from codex_workbench.submission import CompiledNaturalLanguageRequest
 from codex_workbench.executors import ExecutionRequest, FixtureExecutor
-from codex_workbench.planner import archify_internal_directive
-from codex_workbench.store import WorkbenchStore
+from codex_workbench.planner import PlannerError, archify_internal_directive
+from codex_workbench.store import CommandConflictError, WorkbenchStore
 
 
 def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
@@ -391,6 +392,491 @@ raise AssertionError("fatal coordinator failure returned")
 
             self.assertFalse(thread.is_alive())
             self.assertEqual(fatal_exit_codes, [])
+
+    @staticmethod
+    def _planning_claim(
+        command_id: str = "planning-command",
+        task_id: str = "planning-task",
+    ) -> dict[str, object]:
+        return {
+            "command_id": command_id,
+            "task_id": task_id,
+            "attempt": 1,
+            "coordinator_epoch": 7,
+            "state": "running",
+            "request": {
+                "request_schema": "natural-language-planning-v1",
+                "objective": "compile the bounded task",
+                "repository": "/tmp/planning-repository",
+                "allowed_scope": ["src"],
+                "forbidden_scope": [],
+                "acceptance_commands": [],
+                "task_id": task_id,
+                "command_id": command_id,
+                "planner_model": "fixture",
+                "executor_model": "fixture",
+                "verifier_model": "fixture",
+                "timeout_seconds": 60,
+                "retry_limit": 0,
+                "external_write_permission": False,
+                "queue": True,
+                "base_sha": "fixture-base",
+                "routing_strategy": "model-routing-v2",
+                "task_type": "implementation",
+                "complexity": "standard",
+                "parallelizable": True,
+                "claude_allowed": False,
+                "task_points": 1.0,
+                "verification_tier": "L2",
+                "strategy": {
+                    "version": "model-routing-v2",
+                    "task_type": "implementation",
+                    "complexity": "standard",
+                    "parallelizable": True,
+                    "claude_allowed": False,
+                },
+                "source_thread_id": None,
+                "context_bundle_ref": None,
+            },
+        }
+
+    @staticmethod
+    def _compiled_planning_request(
+        command_id: str = "planning-command",
+        task_id: str = "planning-task",
+        *,
+        source_thread_id: str | None = None,
+        context_bundle_ref: str | None = None,
+    ) -> CompiledNaturalLanguageRequest:
+        contract = TaskContract(
+            task_id=task_id,
+            repository="/tmp/planning-repository",
+            base_sha="fixture-base",
+            objective="compile the bounded task",
+            allowed_scope=("src",),
+            planner_model="fixture",
+            executor_model="fixture",
+            verifier_model="fixture",
+            retry_limit=0,
+            claude_allowed=False,
+            source_thread_id=source_thread_id,
+            context_bundle_ref=context_bundle_ref,
+        )
+        nodes = (
+            NodeSpec(
+                "verify",
+                task_id,
+                "verify compiled task",
+                "fixture",
+                "fixture",
+                "fixture verifier",
+                verifier=True,
+            ),
+        )
+        return CompiledNaturalLanguageRequest(
+            contract=contract,
+            nodes=nodes,
+            command_id=command_id,
+            result={
+                "ok": True,
+                "task_id": task_id,
+                "command_id": command_id,
+                "base_sha": "fixture-base",
+                "node_count": len(nodes),
+            },
+        )
+
+    def test_planning_request_completes_in_shared_background_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("planning-success", "test-machine")
+            store.enqueue_planning_request(
+                "planning-command",
+                "planning-task",
+                self._planning_claim()["request"],
+            )
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch, max_workers=2)
+            compiled = self._compiled_planning_request()
+            try:
+                with (
+                    patch(
+                        "codex_workbench.service.compile_natural_language_request",
+                        return_value=compiled,
+                    ) as compile_request,
+                    patch.object(
+                        store,
+                        "materialize_planning_request",
+                        wraps=store.materialize_planning_request,
+                    ) as materialize,
+                ):
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+
+                compile_request.assert_called_once()
+                self.assertEqual(compile_request.call_args.args, (coordinator.config, store))
+                self.assertEqual(
+                    compile_request.call_args.kwargs["objective"],
+                    "compile the bounded task",
+                )
+                self.assertIsNone(compile_request.call_args.kwargs["context_excerpt"])
+                materialize.assert_called_once_with(
+                    "planning-command",
+                    attempt=1,
+                    coordinator_epoch=epoch,
+                    contract=compiled.contract,
+                    nodes=list(compiled.nodes),
+                    result=compiled.result,
+                    queue=True,
+                    source_thread_id=None,
+                )
+                receipt = store.get_planning_request("planning-command")
+                self.assertEqual(receipt["state"], "succeeded")
+                self.assertEqual(receipt["result"], compiled.result)
+                self.assertEqual(receipt["attempt"], 1)
+                self.assertEqual(receipt["coordinator_epoch"], epoch)
+                self.assertEqual(store.get_task("planning-task")["state"], "queued")
+                self.assertFalse(coordinator._futures)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_planning_error_is_durable_and_does_not_fail_the_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("planning-failure", "test-machine")
+            store.enqueue_planning_request(
+                "planning-command",
+                "planning-task",
+                self._planning_claim()["request"],
+            )
+            fatal_exit_codes: list[int] = []
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=epoch,
+                fatal_exit=fatal_exit_codes.append,
+            )
+            try:
+                with patch(
+                    "codex_workbench.service.compile_natural_language_request",
+                    side_effect=PlannerError("planner rejected the request"),
+                ):
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+
+                receipt = store.get_planning_request("planning-command")
+                self.assertEqual(receipt["state"], "failed")
+                self.assertIn("PlannerError: planner rejected the request", receipt["error"])
+                self.assertEqual(fatal_exit_codes, [])
+                self.assertFalse(coordinator._stop.is_set())
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_planning_compile_conflict_is_durable_and_not_replanned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("planning-conflict", "test-machine")
+            store.enqueue_planning_request(
+                "planning-command",
+                "planning-task",
+                self._planning_claim()["request"],
+            )
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            try:
+                with patch(
+                    "codex_workbench.service.compile_natural_language_request",
+                    side_effect=CommandConflictError("command already owns another task"),
+                ) as compile_request:
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+
+                receipt = store.get_planning_request("planning-command")
+                self.assertEqual(receipt["state"], "failed")
+                self.assertIn("command already owns another task", receipt["error"])
+                self.assertEqual(compile_request.call_count, 1)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_fenced_planning_completion_is_ignored_without_a_second_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("planning-fence-old", "test-machine")
+            store.enqueue_planning_request(
+                "planning-command",
+                "planning-task",
+                self._planning_claim()["request"],
+            )
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            started = threading.Event()
+            release = threading.Event()
+
+            def block_planner(
+                *_args: object,
+                **_kwargs: object,
+            ) -> CompiledNaturalLanguageRequest:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+                return self._compiled_planning_request()
+
+            try:
+                with patch(
+                    "codex_workbench.service.compile_natural_language_request",
+                    side_effect=block_planner,
+                ):
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    self.assertTrue(started.wait(timeout=2))
+                    store.activate_coordinator("planning-fence-new", "test-machine")
+                    release.set()
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+
+                receipt = store.get_planning_request("planning-command")
+                self.assertEqual(receipt["state"], "running")
+                self.assertEqual(receipt["attempt"], 1)
+                self.assertEqual(receipt["coordinator_epoch"], epoch)
+                self.assertFalse(coordinator._futures)
+                with self.assertRaises(KeyError):
+                    store.get_task("planning-task")
+            finally:
+                release.set()
+                coordinator._pool.shutdown(wait=True)
+
+    def test_only_one_planning_attempt_is_in_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            coordinator = Coordinator(store, root, coordinator_epoch=7, max_workers=2)
+            store.claim_planning_request.return_value = self._planning_claim()
+            started = threading.Event()
+            release = threading.Event()
+
+            def block_planner(
+                *_args: object,
+                **_kwargs: object,
+            ) -> CompiledNaturalLanguageRequest:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+                return self._compiled_planning_request()
+
+            try:
+                with patch(
+                    "codex_workbench.service.compile_natural_language_request",
+                    side_effect=block_planner,
+                ):
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    self.assertTrue(started.wait(timeout=2))
+                    self.assertFalse(coordinator._dispatch_one_planning_request())
+                    self.assertEqual(store.claim_planning_request.call_count, 1)
+                    self.assertEqual(len(coordinator._futures), 1)
+                    release.set()
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+            finally:
+                release.set()
+                coordinator._pool.shutdown(wait=True)
+
+    def test_planning_reads_exact_frozen_context_before_compiling(self) -> None:
+        """A changed active binding cannot replace the claimed context reference."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            source_thread_id = "thread-fixture"
+            context_ref = "sha256:" + "a" * 64
+            claim = self._planning_claim()
+            request = claim["request"]
+            assert isinstance(request, dict)
+            request["source_thread_id"] = source_thread_id
+            request["context_bundle_ref"] = context_ref
+            store.claim_planning_request.return_value = claim
+            store.get_session_context.return_value = {
+                "source_thread_id": source_thread_id,
+                "context_ref": context_ref,
+                "context_excerpt": "frozen history, not the current binding",
+            }
+            compiled = self._compiled_planning_request(
+                source_thread_id=source_thread_id,
+                context_bundle_ref=context_ref,
+            )
+            coordinator = Coordinator(store, root, coordinator_epoch=7)
+            try:
+                with patch(
+                    "codex_workbench.service.compile_natural_language_request",
+                    return_value=compiled,
+                ) as compile_request:
+                    self.assertTrue(coordinator._dispatch_one_planning_request())
+                    future = next(iter(coordinator._futures))
+                    future.result(timeout=2)
+                    coordinator._collect()
+
+                store.get_session_context.assert_called_once_with(source_thread_id, context_ref)
+                self.assertEqual(
+                    compile_request.call_args.kwargs["context_excerpt"],
+                    "frozen history, not the current binding",
+                )
+                self.assertNotIn("context_excerpt", request)
+                self.assertEqual(
+                    store.materialize_planning_request.call_args.kwargs["source_thread_id"],
+                    source_thread_id,
+                )
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_malformed_planning_claim_with_complete_fence_is_durably_failed(self) -> None:
+        """A corrupt request must not wait for a restart when it can be fenced."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            claim = self._planning_claim()
+            claim["request"] = None
+            store.claim_planning_request.return_value = claim
+            coordinator = Coordinator(store, root, coordinator_epoch=7)
+            try:
+                self.assertTrue(coordinator._dispatch_one_planning_request())
+                future = next(iter(coordinator._futures))
+                future.result(timeout=2)
+                coordinator._collect()
+
+                store.fail_planning_request.assert_called_once()
+                self.assertEqual(
+                    store.fail_planning_request.call_args.args[0],
+                    "planning-command",
+                )
+                self.assertEqual(
+                    store.fail_planning_request.call_args.kwargs["attempt"],
+                    1,
+                )
+                self.assertEqual(
+                    store.fail_planning_request.call_args.kwargs["coordinator_epoch"],
+                    7,
+                )
+                store.materialize_planning_request.assert_not_called()
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_claim_without_complete_fence_is_left_for_startup_indeterminate_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            store.claim_planning_request.return_value = {
+                "command_id": "planning-command",
+                "attempt": 1,
+                "coordinator_epoch": "stale",
+            }
+            coordinator = Coordinator(store, root, coordinator_epoch=7)
+            try:
+                self.assertFalse(coordinator._dispatch_one_planning_request())
+                store.fail_planning_request.assert_not_called()
+                store.record_system_event.assert_called_once()
+                self.assertEqual(
+                    store.record_system_event.call_args.args[0],
+                    "planning.claim_invalid",
+                )
+                self.assertFalse(coordinator._futures)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_recover_marks_interrupted_planning_before_node_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("planning-recovery", "test-machine")
+            store.enqueue_planning_request(
+                "planning-command",
+                "planning-task",
+                self._planning_claim()["request"],
+            )
+            claimed = store.claim_planning_request(epoch)
+            assert claimed is not None
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            try:
+                self.assertEqual(coordinator.recover(), 1)
+                receipt = store.get_planning_request("planning-command")
+                self.assertEqual(receipt["state"], "indeterminate")
+                self.assertEqual(receipt["attempt"], claimed["attempt"])
+                self.assertIn("explicit resolution required", receipt["error"])
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+    def test_planning_uses_one_slot_while_another_slot_executes_a_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MagicMock()
+            store.latest_quota.return_value = None
+            planning_started = threading.Event()
+            release_planning = threading.Event()
+            node_started = threading.Event()
+            coordinator = Coordinator(
+                store,
+                root,
+                coordinator_epoch=7,
+                max_workers=2,
+                poll_seconds=0.01,
+            )
+            planning_claim = self._planning_claim()
+            node_claim = {
+                "task_id": "independent-task",
+                "node_id": "worker",
+                "spec": {"executor": "fixture", "model": "fixture"},
+                "contract": {},
+            }
+
+            def block_planner(
+                *_args: object,
+                **_kwargs: object,
+            ) -> CompiledNaturalLanguageRequest:
+                planning_started.set()
+                self.assertTrue(release_planning.wait(timeout=2))
+                return self._compiled_planning_request()
+
+            def execute_node(*_args: object, **_kwargs: object) -> None:
+                node_started.set()
+
+            try:
+                with (
+                    patch(
+                        "codex_workbench.service.compile_natural_language_request",
+                        side_effect=block_planner,
+                    ),
+                    patch.object(
+                        coordinator,
+                        "_claim_next_ready_node",
+                        side_effect=(node_claim, None),
+                    ),
+                    patch.object(coordinator, "_claim_time_decision", return_value=None),
+                    patch.object(coordinator, "_execute_claimed", side_effect=execute_node),
+                    patch.object(coordinator._recovery_thread, "start"),
+                    patch.object(coordinator._recovery_thread, "join"),
+                ):
+                    store.claim_planning_request.return_value = planning_claim
+                    thread = threading.Thread(target=coordinator.run_forever)
+                    thread.start()
+                    self.assertTrue(planning_started.wait(timeout=2))
+                    self.assertTrue(node_started.wait(timeout=2))
+                    coordinator.stop()
+                    release_planning.set()
+                    thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+            finally:
+                release_planning.set()
+                coordinator._pool.shutdown(wait=True)
 
     @staticmethod
     def run_until_terminal(store: WorkbenchStore, state: Path, task_id: str) -> dict:

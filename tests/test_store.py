@@ -64,6 +64,44 @@ class StoreTests(unittest.TestCase):
                 (json.dumps(spec), task_id, node_id),
             )
 
+    def _planning_contract(
+        self,
+        task_id: str,
+        *,
+        source_thread_id: str | None = None,
+        context_bundle_ref: str | None = None,
+    ) -> TaskContract:
+        return TaskContract(
+            task_id=task_id,
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="materialize one bounded plan",
+            allowed_scope=("src",),
+            source_thread_id=source_thread_id,
+            context_bundle_ref=context_bundle_ref,
+        )
+
+    @staticmethod
+    def _planning_nodes(task_id: str) -> list[NodeSpec]:
+        return verified(
+            [NodeSpec("worker", task_id, "implement", "fixture", "fixture", "ok")],
+            task_id,
+        )
+
+    def _record_planning_context(self, source_thread_id: str, context_ref: str) -> None:
+        self.store.record_session_context(
+            command_id=f"context-{source_thread_id}",
+            request_hash=f"request-{source_thread_id}",
+            source_thread_id=source_thread_id,
+            context_ref=context_ref,
+            archive_ref=context_ref,
+            manifest={"schema_version": 1},
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            allowed_scopes=("src",),
+            context_excerpt="frozen prior context",
+        )
+
     def test_idempotent_submit_and_command_conflict(self) -> None:
         nodes = verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1")
         self.assertEqual(self.store.create_task(self.contract, nodes, "cmd-1"), "task-1")
@@ -77,7 +115,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 12)
+        self.assertEqual(self.store.health()["schema_version"], 13)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -99,6 +137,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(
             {"worktree_allocations", "worktree_archives", "home_presence_leases"}.issubset(tables)
         )
+        self.assertIn("planning_requests", tables)
 
     def test_schema_three_adds_effective_route_columns(self) -> None:
         path = Path(self.temp.name) / "schema-three.sqlite"
@@ -125,13 +164,80 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 12)
+        self.assertEqual(migrated.health()["schema_version"], 13)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
             }
         self.assertIn("effective_executor", columns)
         self.assertIn("effective_model", columns)
+
+    def test_schema_twelve_migrates_planning_request_ledger(self) -> None:
+        path = Path(self.temp.name) / "schema-twelve.sqlite"
+        legacy = WorkbenchStore(path)
+        legacy.initialize()
+        evidence = {
+            "artifacts": {"receipt": "sha256:" + "a" * 64 + ":json"},
+            "checks": [{"name": "focused", "status": "passed"}],
+            "summary": "preserve every evidence field",
+        }
+        evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        evidence_digest = hashlib.sha256(evidence_json.encode()).hexdigest()
+        with legacy.connection() as connection:
+            connection.execute("UPDATE metadata SET value = '12' WHERE key = 'schema_version'")
+            connection.execute("DROP TABLE planning_requests")
+            connection.execute(
+                "INSERT INTO evidence_cache(cache_key,result_json,source_task_id,source_node_id,created_at,last_used_at,use_count) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    "schema-12-evidence",
+                    evidence_json,
+                    "source-task",
+                    "source-node",
+                    "now",
+                    "now",
+                    0,
+                ),
+            )
+
+        migrated = WorkbenchStore(path)
+        migrated.initialize()
+        self.assertEqual(migrated.health()["schema_version"], 13)
+        with migrated.connection() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(planning_requests)").fetchall()
+            }
+        self.assertTrue(
+            {
+                "command_id",
+                "request_hash",
+                "task_id",
+                "request_json",
+                "state",
+                "attempt",
+                "coordinator_epoch",
+                "result_json",
+                "error",
+                "started_at",
+                "settled_at",
+                "created_at",
+                "updated_at",
+            }.issubset(columns)
+        )
+        with migrated.connection() as connection:
+            cached = connection.execute(
+                "SELECT result_json FROM evidence_cache WHERE cache_key = 'schema-12-evidence'"
+            ).fetchone()
+        assert cached is not None
+        self.assertEqual(cached["result_json"], evidence_json)
+        self.assertEqual(hashlib.sha256(cached["result_json"].encode()).hexdigest(), evidence_digest)
+
+    def test_unknown_newer_schema_is_rejected(self) -> None:
+        with self.store.connection() as connection:
+            connection.execute("UPDATE metadata SET value = '14' WHERE key = 'schema_version'")
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema version 14; expected 13"):
+            self.store.initialize()
 
     def test_schema_nine_migrates_steering_sequence_by_legacy_timestamp_and_id(self) -> None:
         path = Path(self.temp.name) / "schema-nine.sqlite"
@@ -179,6 +285,381 @@ class StoreTests(unittest.TestCase):
             [(row["steering_id"], row["sequence"]) for row in rows],
             [("first", 1), ("second", 2), ("later", 3)],
         )
+
+    def test_planning_request_enqueue_is_idempotent_and_conflicts_on_changed_request(self) -> None:
+        request = {"objective": "draft a bounded plan", "nodes": ["one", "two"]}
+        first = self.store.enqueue_planning_request("plan-command", "plan-task", request)
+        second = self.store.enqueue_planning_request(
+            "plan-command",
+            "plan-task",
+            {"nodes": ["one", "two"], "objective": "draft a bounded plan"},
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "pending")
+        self.assertEqual(first["attempt"], 0)
+        self.assertEqual(first["coordinator_epoch"], 0)
+        self.assertEqual(first["request"], request)
+        with self.assertRaises(CommandConflictError):
+            self.store.enqueue_planning_request(
+                "plan-command",
+                "plan-task",
+                {"objective": "different plan"},
+            )
+        with self.assertRaises(CommandConflictError):
+            self.store.enqueue_planning_request(
+                "plan-command",
+                "different-task",
+                request,
+            )
+        self.assertEqual(self.store.get_planning_request("plan-command"), first)
+
+    def test_planning_enqueue_reserves_task_and_rejects_existing_task_or_command(self) -> None:
+        first = self.store.enqueue_planning_request(
+            "plan-reserve",
+            "reserved-plan-task",
+            {"objective": "reserve", "context_excerpt": "must not be copied"},
+        )
+        self.assertNotIn("context_excerpt", first["request"])
+        with self.store.connection() as connection:
+            stored = connection.execute(
+                "SELECT request_json FROM planning_requests WHERE command_id = 'plan-reserve'"
+            ).fetchone()
+        assert stored is not None
+        self.assertNotIn("must not be copied", stored["request_json"])
+
+        with self.assertRaises(CommandConflictError):
+            self.store.enqueue_planning_request(
+                "plan-reserve-other-command",
+                "reserved-plan-task",
+                {"objective": "would otherwise invoke a planner"},
+            )
+
+        existing_contract = self._planning_contract("existing-task")
+        self.store.create_task(
+            existing_contract,
+            self._planning_nodes(existing_contract.task_id),
+            "existing-create-command",
+        )
+        with self.assertRaises(StateConflictError):
+            self.store.enqueue_planning_request(
+                "plan-existing-task",
+                "existing-task",
+                {"objective": "must fail before any model work"},
+            )
+        with self.assertRaises(CommandConflictError):
+            self.store.enqueue_planning_request(
+                "existing-create-command",
+                "different-task",
+                {"objective": "must fail before any model work"},
+            )
+
+    def test_planning_request_claims_once_and_completes_with_durable_event(self) -> None:
+        self.store.enqueue_planning_request(
+            "plan-claim",
+            "plan-task",
+            {"objective": "claim me"},
+        )
+
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+        self.assertEqual(claimed["state"], "running")
+        self.assertEqual(claimed["attempt"], 1)
+        self.assertEqual(claimed["coordinator_epoch"], self.epoch)
+        self.assertIsNotNone(claimed["started_at"])
+        self.assertIsNone(self.store.claim_planning_request(self.epoch))
+
+        completed = self.store.complete_planning_request(
+            "plan-claim",
+            claimed["attempt"],
+            self.epoch,
+            {"nodes": [{"node_id": "one"}]},
+        )
+        self.assertEqual(completed["state"], "succeeded")
+        self.assertEqual(completed["result"], {"nodes": [{"node_id": "one"}]})
+        self.assertIsNotNone(completed["settled_at"])
+        event_types = [
+            event["event_type"] for event in self.store.read_events(task_id="plan-task")
+        ]
+        self.assertEqual(
+            event_types,
+            ["planning_request.enqueued", "planning_request.claimed", "planning_request.succeeded"],
+        )
+
+    def test_planning_request_completion_and_failure_are_fenced(self) -> None:
+        self.store.enqueue_planning_request("plan-fence", "plan-task", {"objective": "fence"})
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+
+        with self.assertRaises(StateConflictError):
+            self.store.complete_planning_request(
+                "plan-fence",
+                claimed["attempt"] + 1,
+                self.epoch,
+                {"nodes": []},
+            )
+        self.assertEqual(self.store.get_planning_request("plan-fence")["state"], "running")
+
+        new_epoch = self.store.activate_coordinator("test-store-new", "test-machine")
+        with self.assertRaises(StateConflictError):
+            self.store.fail_planning_request(
+                "plan-fence",
+                claimed["attempt"],
+                self.epoch,
+                "stale coordinator",
+            )
+        self.assertEqual(self.store.get_planning_request("plan-fence")["state"], "running")
+        with self.assertRaises(StateConflictError):
+            self.store.fail_planning_request(
+                "plan-fence",
+                claimed["attempt"],
+                new_epoch,
+                "planner timed out",
+            )
+        self.store.enqueue_planning_request(
+            "plan-fence-new",
+            "plan-fence-new-task",
+            {"objective": "new fence"},
+        )
+        new_claim = self.store.claim_planning_request(new_epoch)
+        assert new_claim is not None
+        failed = self.store.fail_planning_request(
+            "plan-fence-new",
+            new_claim["attempt"],
+            new_epoch,
+            "planner timed out",
+        )
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["error"], "planner timed out")
+        self.assertIsNone(failed["result"])
+
+    def test_interrupted_planning_requests_become_indeterminate_without_requeue(self) -> None:
+        self.store.enqueue_planning_request("plan-recover", "plan-task", {"objective": "recover"})
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+
+        self.assertEqual(self.store.recover_interrupted_planning_requests(), 1)
+        recovered = self.store.get_planning_request("plan-recover")
+        self.assertEqual(recovered["state"], "indeterminate")
+        self.assertEqual(recovered["attempt"], claimed["attempt"])
+        self.assertEqual(recovered["coordinator_epoch"], self.epoch)
+        self.assertIn("explicit resolution required", recovered["error"])
+        self.assertEqual(self.store.recover_interrupted_planning_requests(), 0)
+        with self.assertRaises(StateConflictError):
+            self.store.complete_planning_request(
+                "plan-recover",
+                claimed["attempt"],
+                self.epoch,
+                {"nodes": []},
+            )
+        interrupted = [
+            event
+            for event in self.store.read_events(task_id="plan-task")
+            if event["event_type"] == "planning_request.interrupted"
+        ]
+        self.assertEqual(len(interrupted), 1)
+        self.assertEqual(interrupted[0]["payload"]["attempt"], claimed["attempt"])
+
+    def test_materialize_planning_request_commits_task_queue_binding_and_success_together(self) -> None:
+        source_thread_id = "planning-thread"
+        context_ref = "sha256:" + "c" * 64 + ":tar.gz"
+        self._record_planning_context(source_thread_id, context_ref)
+        contract = self._planning_contract(
+            "materialized-task",
+            source_thread_id=source_thread_id,
+            context_bundle_ref=context_ref,
+        )
+        nodes = self._planning_nodes(contract.task_id)
+        self.store.enqueue_planning_request(
+            "plan-materialize",
+            contract.task_id,
+            {"objective": contract.objective, "source_thread_id": source_thread_id},
+        )
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+
+        receipt = self.store.materialize_planning_request(
+            "plan-materialize",
+            attempt=claimed["attempt"],
+            coordinator_epoch=self.epoch,
+            contract=contract,
+            nodes=nodes,
+            result={"planner": "fixture", "node_count": len(nodes)},
+            queue=True,
+            source_thread_id=source_thread_id,
+        )
+
+        self.assertEqual(receipt["state"], "succeeded")
+        self.assertEqual(receipt["task_state"], "queued")
+        self.assertEqual(receipt["task_revision"], 2)
+        self.assertEqual(receipt["result"], {"planner": "fixture", "node_count": len(nodes)})
+        self.assertEqual(
+            self.store.materialize_planning_request(
+                "plan-materialize",
+                attempt=claimed["attempt"],
+                coordinator_epoch=self.epoch,
+                contract=contract,
+                nodes=nodes,
+                result={"planner": "fixture", "node_count": len(nodes)},
+                queue=True,
+                source_thread_id=source_thread_id,
+            ),
+            receipt,
+        )
+        self.assertEqual(self.store.get_task(contract.task_id)["state"], "queued")
+        self.assertEqual(
+            self.store.get_session_binding(source_thread_id)["active_task_id"],
+            contract.task_id,
+        )
+        with self.store.connection() as connection:
+            command = connection.execute(
+                "SELECT request_hash, task_id FROM command_receipts WHERE command_id = 'plan-materialize'"
+            ).fetchone()
+        assert command is not None
+        self.assertEqual(command["task_id"], contract.task_id)
+        event_types = [
+            event["event_type"] for event in self.store.read_events(task_id=contract.task_id)
+        ]
+        self.assertEqual(
+            event_types,
+            [
+                "planning_request.enqueued",
+                "planning_request.claimed",
+                "task.created",
+                "task.state_changed",
+                "context.task_bound",
+                "planning_request.succeeded",
+            ],
+        )
+
+    def test_materialize_planning_request_stale_epoch_has_no_task_or_binding_side_effect(self) -> None:
+        source_thread_id = "stale-planning-thread"
+        context_ref = "sha256:" + "d" * 64 + ":tar.gz"
+        self._record_planning_context(source_thread_id, context_ref)
+        contract = self._planning_contract(
+            "stale-materialized-task",
+            source_thread_id=source_thread_id,
+            context_bundle_ref=context_ref,
+        )
+        self.store.enqueue_planning_request("plan-stale", contract.task_id, {"objective": "stale"})
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+        self.store.activate_coordinator("new-owner", "test-machine")
+
+        with self.assertRaises(StateConflictError):
+            self.store.materialize_planning_request(
+                "plan-stale",
+                attempt=claimed["attempt"],
+                coordinator_epoch=self.epoch,
+                contract=contract,
+                nodes=self._planning_nodes(contract.task_id),
+                result={"planner": "fixture"},
+                queue=True,
+                source_thread_id=source_thread_id,
+            )
+
+        with self.assertRaises(KeyError):
+            self.store.get_task(contract.task_id)
+        self.assertEqual(
+            self.store.get_session_binding(source_thread_id)["active_task_id"],
+            None,
+        )
+        self.assertEqual(self.store.get_planning_request("plan-stale")["state"], "running")
+
+    def test_materialize_planning_request_rejects_mismatched_frozen_context_atomically(self) -> None:
+        source_thread_id = "mismatched-planning-thread"
+        actual_ref = "sha256:" + "e" * 64 + ":tar.gz"
+        contract_ref = "sha256:" + "f" * 64 + ":tar.gz"
+        self._record_planning_context(source_thread_id, actual_ref)
+        contract = self._planning_contract(
+            "mismatched-materialized-task",
+            source_thread_id=source_thread_id,
+            context_bundle_ref=contract_ref,
+        )
+        self.store.enqueue_planning_request(
+            "plan-context-mismatch",
+            contract.task_id,
+            {"objective": "must not bind a changed context"},
+        )
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+
+        with self.assertRaisesRegex(StateConflictError, "context_ref"):
+            self.store.materialize_planning_request(
+                "plan-context-mismatch",
+                attempt=claimed["attempt"],
+                coordinator_epoch=self.epoch,
+                contract=contract,
+                nodes=self._planning_nodes(contract.task_id),
+                result={"planner": "fixture"},
+                queue=True,
+                source_thread_id=source_thread_id,
+            )
+
+        with self.assertRaises(KeyError):
+            self.store.get_task(contract.task_id)
+        self.assertEqual(
+            self.store.get_session_binding(source_thread_id)["active_task_id"],
+            None,
+        )
+        self.assertEqual(
+            self.store.get_planning_request("plan-context-mismatch")["state"],
+            "running",
+        )
+
+    def test_materialize_planning_request_rolls_back_queue_binding_and_settlement(self) -> None:
+        source_thread_id = "rollback-planning-thread"
+        context_ref = "sha256:" + "e" * 64 + ":tar.gz"
+        self._record_planning_context(source_thread_id, context_ref)
+        contract = self._planning_contract(
+            "rollback-materialized-task",
+            source_thread_id=source_thread_id,
+            context_bundle_ref=context_ref,
+        )
+        self.store.enqueue_planning_request("plan-rollback", contract.task_id, {"objective": "rollback"})
+        claimed = self.store.claim_planning_request(self.epoch)
+        assert claimed is not None
+
+        original_event = WorkbenchStore._event
+
+        def fail_success_event(
+            connection: sqlite3.Connection,
+            event_type: str,
+            task_id: str | None,
+            node_id: str | None,
+            payload: dict,
+            **kwargs: object,
+        ) -> int:
+            if event_type == "planning_request.succeeded":
+                raise RuntimeError("fault after queue and binding")
+            return original_event(connection, event_type, task_id, node_id, payload, **kwargs)
+
+        with mock.patch.object(self.store, "_event", side_effect=fail_success_event):
+            with self.assertRaisesRegex(RuntimeError, "fault after queue and binding"):
+                self.store.materialize_planning_request(
+                    "plan-rollback",
+                    attempt=claimed["attempt"],
+                    coordinator_epoch=self.epoch,
+                    contract=contract,
+                    nodes=self._planning_nodes(contract.task_id),
+                    result={"planner": "fixture"},
+                    queue=True,
+                    source_thread_id=source_thread_id,
+                )
+
+        with self.assertRaises(KeyError):
+            self.store.get_task(contract.task_id)
+        self.assertEqual(
+            self.store.get_session_binding(source_thread_id)["active_task_id"],
+            None,
+        )
+        self.assertEqual(self.store.get_planning_request("plan-rollback")["state"], "running")
+        with self.store.connection() as connection:
+            command_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM command_receipts WHERE command_id = 'plan-rollback'"
+            ).fetchone()["count"]
+        self.assertEqual(command_count, 0)
+
 
     def test_context_receipt_binds_latest_context_and_task(self) -> None:
         receipt = self.store.record_session_context(
@@ -243,6 +724,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(binding["context_ref"], second_ref)
         self.assertIsNone(binding["active_task_id"])
         self.assertEqual(binding["context_excerpt"], "new history")
+        frozen_first = self.store.get_session_context("thread-reimport", first_ref)
+        self.assertEqual(frozen_first["context_excerpt"], "old history")
+        with self.assertRaises(KeyError):
+            self.store.get_session_context("thread-reimport", "sha256:" + "f" * 64 + ":tar.gz")
         invalidated = [
             event
             for event in self.store.read_events()

@@ -47,7 +47,7 @@ from .recovery import RecoveryPolicy, WorktreeRecoveryManager
 from .service import Coordinator
 from .session_context import import_session_context
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
-from .submission import submit_natural_language_request
+from .submission import enqueue_natural_language_request, planning_request_receipt
 from .worktrees import WorktreeManager, scope_allows
 from .sync import RepositorySynchronizer
 
@@ -146,6 +146,7 @@ def command_serve(args: argparse.Namespace) -> int:
             spark_workers=config.effective_spark_workers,
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
+            config=config,
         )
         recovered = coordinator.recover()
         ledger = store.health()
@@ -188,7 +189,10 @@ def command_serve(args: argparse.Namespace) -> int:
             server.serve_forever(poll_interval=0.5)
         finally:
             coordinator.stop()
-            coordinator_thread.join(timeout=30)
+            # Keep the authority lease through real coordinator termination.
+            # A timed join could record a false stopped event and allow a
+            # second authority while planner or recovery work still runs.
+            coordinator_thread.join()
             if server is not None:
                 server.server_close()
             store.record_system_event(
@@ -220,7 +224,7 @@ def command_request(args: argparse.Namespace) -> int:
     config = _config(args)
     store = _store(config)
     try:
-        result = submit_natural_language_request(
+        result = enqueue_natural_language_request(
             config,
             store,
             objective=args.objective,
@@ -245,8 +249,26 @@ def command_request(args: argparse.Namespace) -> int:
             task_points=args.task_points,
             verification_tier=args.verification_tier,
         )
-    except PlannerError as error:
+    except (CommandConflictError, OSError, PlannerError, subprocess.SubprocessError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_request_status(args: argparse.Namespace) -> int:
+    """Read one durable asynchronous planning receipt without invoking a model."""
+
+    store = _store(_config(args))
+    try:
+        result = planning_request_receipt(store.get_planning_request(args.command_id))
+    except KeyError:
+        print(
+            json.dumps(
+                {"ok": False, "command_id": args.command_id, "error": "planning request not found"},
+                ensure_ascii=False,
+            )
+        )
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1642,7 +1664,7 @@ def command_fixture_demo(args: argparse.Namespace) -> int:
                     break
                 time.sleep(0.05)
             coordinator.stop()
-            thread.join(timeout=5)
+            thread.join()
             task = store.get_task(task_id)
     print(json.dumps(task, ensure_ascii=False, indent=2))
     return 0 if task["state"] == "accepted" else 1
@@ -1721,6 +1743,13 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--allow-external-write", action="store_true")
     request.add_argument("--queue", action="store_true")
     request.set_defaults(func=command_request)
+
+    request_status = sub.add_parser(
+        "request-status",
+        help="read one durable asynchronous planning request without invoking a model",
+    )
+    request_status.add_argument("command_id")
+    request_status.set_defaults(func=command_request_status)
 
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="action", required=True)

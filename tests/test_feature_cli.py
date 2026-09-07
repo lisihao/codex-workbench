@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -17,12 +18,72 @@ from codex_workbench.cli import (
     command_mobile,
     command_performance,
     command_radar,
+    command_request,
+    command_request_status,
     command_serve,
 )
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.store import WorkbenchStore
 
 
 class FeatureCLITests(unittest.TestCase):
+    def test_request_cli_returns_the_durable_pending_receipt_without_sync_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            args = build_parser().parse_args([
+                "--home", directory,
+                "request", "repair the bounded behavior",
+                "--repository", str(repository),
+                "--allowed-scope", "src/owner.py",
+                "--command-id", "planning-command",
+                "--queue",
+            ])
+            config = mock.Mock()
+            store = mock.Mock()
+            receipt = {
+                "ok": True,
+                "command_id": "planning-command",
+                "task_id": "task-planning-command",
+                "state": "pending",
+                "status": "pending",
+            }
+            with (
+                mock.patch("codex_workbench.cli._config", return_value=config),
+                mock.patch("codex_workbench.cli._store", return_value=store),
+                mock.patch(
+                    "codex_workbench.cli.enqueue_natural_language_request",
+                    return_value=receipt,
+                ) as enqueue,
+            ):
+                code, payload = self._run(command_request, args)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload, receipt)
+            enqueue.assert_called_once()
+            self.assertEqual(enqueue.call_args.kwargs["command_id"], "planning-command")
+            self.assertTrue(enqueue.call_args.kwargs["queue"])
+
+    def test_request_status_cli_reads_without_starting_planning(self) -> None:
+        args = build_parser().parse_args(["request-status", "planning-command"])
+        store = mock.Mock()
+        store.get_planning_request.return_value = {
+            "command_id": "planning-command",
+            "task_id": "planning-task",
+            "state": "succeeded",
+            "result": {"ok": True},
+        }
+        with (
+            mock.patch("codex_workbench.cli._config", return_value=mock.Mock()),
+            mock.patch("codex_workbench.cli._store", return_value=store),
+        ):
+            code, payload = self._run(command_request_status, args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "succeeded")
+        store.get_planning_request.assert_called_once_with("planning-command")
+
     def test_performance_list_exports_missing_astra_without_task_store_or_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             args = build_parser().parse_args(["--home", directory, "performance", "list", "--format", "json"])
@@ -559,6 +620,76 @@ class FeatureCLITests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(coordinator_class.call_args.kwargs["max_workers"], 3)
             self.assertEqual(coordinator_class.call_args.kwargs["spark_workers"], 1)
+            passed_config = coordinator_class.call_args.kwargs["config"]
+            self.assertIsInstance(passed_config, WorkbenchConfig)
+            self.assertEqual(passed_config.state_root, root)
+
+    def test_serve_waits_for_true_coordinator_exit_before_recording_stopped(self) -> None:
+        """A slow shutdown must retain authority rather than claim it stopped."""
+
+        with tempfile.TemporaryDirectory(prefix="serve-shutdown-fencing-") as directory:
+            root = Path(directory)
+            WorkbenchConfig(
+                root,
+                deployment_role="authority",
+                authority_host=socket.gethostname(),
+                authority_machine_id=authority_machine_id(),
+            ).initialize()
+            args = build_parser().parse_args(["--home", directory, "serve"])
+            coordinator_started = threading.Event()
+            stop_called = threading.Event()
+            release_coordinator = threading.Event()
+
+            class BlockingCoordinator:
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                def recover(self) -> int:
+                    return 0
+
+                def run_forever(self) -> None:
+                    coordinator_started.set()
+                    release_coordinator.wait(timeout=5)
+
+                def stop(self) -> None:
+                    stop_called.set()
+
+            server = mock.Mock()
+            command_result: list[int] = []
+            command_output = io.StringIO()
+
+            def run_serve() -> None:
+                with redirect_stdout(command_output):
+                    command_result.append(command_serve(args))
+
+            try:
+                with (
+                    mock.patch("codex_workbench.cli.Coordinator", BlockingCoordinator),
+                    mock.patch("codex_workbench.cli.WorkbenchHTTPServer", return_value=server),
+                    mock.patch("codex_workbench.cli.signal.signal"),
+                ):
+                    thread = threading.Thread(target=run_serve)
+                    thread.start()
+                    self.assertTrue(coordinator_started.wait(timeout=2))
+                    self.assertTrue(stop_called.wait(timeout=2))
+                    self.assertTrue(thread.is_alive())
+                    event_types = {
+                        event["event_type"]
+                        for event in WorkbenchStore(root / "state.sqlite").read_events()
+                    }
+                    self.assertNotIn("coordinator.stopped", event_types)
+                    release_coordinator.set()
+                    thread.join(timeout=2)
+            finally:
+                release_coordinator.set()
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(command_result, [0])
+            event_types = {
+                event["event_type"]
+                for event in WorkbenchStore(root / "state.sqlite").read_events()
+            }
+            self.assertIn("coordinator.stopped", event_types)
 
 
 if __name__ == "__main__":

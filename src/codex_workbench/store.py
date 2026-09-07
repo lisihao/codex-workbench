@@ -45,7 +45,7 @@ from .worktrees import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 
@@ -185,6 +185,21 @@ class WorkbenchStore:
                     task_id TEXT NOT NULL REFERENCES tasks(task_id),
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS planning_requests (
+                    command_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    coordinator_epoch INTEGER NOT NULL DEFAULT 0,
+                    result_json TEXT,
+                    error TEXT,
+                    started_at TEXT,
+                    settled_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS quota_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     provider TEXT NOT NULL,
@@ -286,6 +301,10 @@ class WorkbenchStore:
                 );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
+                CREATE UNIQUE INDEX IF NOT EXISTS planning_requests_task_id_unique_idx
+                    ON planning_requests(task_id);
+                CREATE INDEX IF NOT EXISTS planning_requests_state_idx
+                    ON planning_requests(state, created_at, command_id);
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
                 CREATE INDEX IF NOT EXISTS task_steering_task_created_idx
                     ON task_steering(task_id, created_at);
@@ -305,7 +324,8 @@ class WorkbenchStore:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+                prior_schema_version = int(current["value"])
                 node_columns = {
                     row["name"]
                     for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -370,8 +390,9 @@ class WorkbenchStore:
                     (str(SCHEMA_VERSION),),
                 )
                 # v8 binds reusable Evidence to the code-as-harness governance
-                # receipt; older rows cannot prove which profile governed them.
-                connection.execute("DELETE FROM evidence_cache")
+                # receipt; only rows that actually predate v8 lack that proof.
+                if prior_schema_version < 8:
+                    connection.execute("DELETE FROM evidence_cache")
             elif int(current["value"]) != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
@@ -623,6 +644,350 @@ class WorkbenchStore:
             "updated_at": row["updated_at"],
         }
 
+    def enqueue_planning_request(
+        self,
+        command_id: str,
+        task_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably enqueue one planning request with command-id idempotency."""
+
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise ValueError("planning command_id is required")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("planning task_id is required")
+        if not isinstance(request, dict):
+            raise ValueError("planning request must be a JSON object")
+
+        # Session history is already durably content-addressed in
+        # ``context_import_receipts``. The planning ledger keeps only the
+        # reference, never a second plaintext copy.
+        frozen_request = dict(request)
+        frozen_request.pop("context_excerpt", None)
+        request_json = canonical_json(frozen_request)
+        request_hash = canonical_hash({"task_id": task_id, "request": frozen_request})
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise CommandConflictError(
+                        f"planning command {command_id!r} was already used with a different request"
+                    )
+                return self._planning_request_row(existing)
+
+            task = connection.execute(
+                "SELECT task_id FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is not None:
+                raise StateConflictError(f"planning task {task_id!r} already exists")
+
+            receipt = connection.execute(
+                "SELECT task_id FROM command_receipts WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if receipt is not None:
+                raise CommandConflictError(
+                    f"planning command {command_id!r} already belongs to task {receipt['task_id']!r}"
+                )
+
+            reservation = connection.execute(
+                "SELECT command_id FROM planning_requests WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if reservation is not None:
+                raise CommandConflictError(
+                    f"planning task {task_id!r} is already reserved by command "
+                    f"{reservation['command_id']!r}"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO planning_requests(
+                    command_id, request_hash, task_id, request_json, state,
+                    attempt, coordinator_epoch, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+                """,
+                (command_id, request_hash, task_id, request_json, timestamp, timestamp),
+            )
+            self._event(
+                connection,
+                "planning_request.enqueued",
+                task_id,
+                None,
+                {
+                    "command_id": command_id,
+                    "request_hash": request_hash,
+                    "state": "pending",
+                    "attempt": 0,
+                },
+                created_at=timestamp,
+            )
+            row = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            assert row is not None
+            return self._planning_request_row(row)
+
+    def get_planning_request(self, command_id: str) -> dict[str, Any]:
+        """Return one durable planning request or raise ``KeyError``."""
+
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(command_id)
+            return self._planning_request_row(row)
+
+    def claim_planning_request(self, coordinator_epoch: int) -> dict[str, Any] | None:
+        """Claim the oldest pending planning request under the active epoch."""
+
+        if isinstance(coordinator_epoch, bool) or not isinstance(coordinator_epoch, int):
+            raise ValueError("planning coordinator_epoch must be an integer")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            row = connection.execute(
+                """
+                SELECT * FROM planning_requests
+                WHERE state = 'pending'
+                ORDER BY created_at, command_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            attempt = int(row["attempt"]) + 1
+            changed = connection.execute(
+                """
+                UPDATE planning_requests
+                SET state = 'running', attempt = ?, coordinator_epoch = ?,
+                    started_at = ?, settled_at = NULL, result_json = NULL,
+                    error = NULL, updated_at = ?
+                WHERE command_id = ? AND state = 'pending' AND attempt = ?
+                """,
+                (
+                    attempt,
+                    coordinator_epoch,
+                    timestamp,
+                    timestamp,
+                    row["command_id"],
+                    row["attempt"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("planning request claim compare-and-set failed")
+            self._event(
+                connection,
+                "planning_request.claimed",
+                row["task_id"],
+                None,
+                {
+                    "command_id": row["command_id"],
+                    "request_hash": row["request_hash"],
+                    "state": "running",
+                    "attempt": attempt,
+                    "coordinator_epoch": coordinator_epoch,
+                },
+                created_at=timestamp,
+            )
+            claimed = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (row["command_id"],),
+            ).fetchone()
+            assert claimed is not None
+            return self._planning_request_row(claimed)
+
+    def complete_planning_request(
+        self,
+        command_id: str,
+        attempt: int,
+        coordinator_epoch: int,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Settle a running planning request successfully with fencing."""
+
+        if not isinstance(result, dict):
+            raise ValueError("planning result must be a JSON object")
+        result_json = canonical_json(result)
+        return self._settle_planning_request(
+            command_id,
+            attempt,
+            coordinator_epoch,
+            state="succeeded",
+            result_json=result_json,
+            error=None,
+        )
+
+    def fail_planning_request(
+        self,
+        command_id: str,
+        attempt: int,
+        coordinator_epoch: int,
+        error: str,
+    ) -> dict[str, Any]:
+        """Settle a running planning request as failed with fencing."""
+
+        if not isinstance(error, str) or not error.strip():
+            raise ValueError("planning error is required")
+        return self._settle_planning_request(
+            command_id,
+            attempt,
+            coordinator_epoch,
+            state="failed",
+            result_json=None,
+            error=error,
+        )
+
+    def _settle_planning_request(
+        self,
+        command_id: str,
+        attempt: int,
+        coordinator_epoch: int,
+        *,
+        state: str,
+        result_json: str | None,
+        error: str | None,
+    ) -> dict[str, Any]:
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("planning attempt must be a positive integer")
+        if isinstance(coordinator_epoch, bool) or not isinstance(coordinator_epoch, int):
+            raise ValueError("planning coordinator_epoch must be an integer")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            row = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(command_id)
+            if int(row["attempt"]) != attempt:
+                raise StateConflictError(
+                    f"planning request {command_id!r} has attempt {row['attempt']}, expected {attempt}"
+                )
+            if int(row["coordinator_epoch"]) != coordinator_epoch:
+                raise StateConflictError(
+                    f"planning request {command_id!r} has coordinator epoch "
+                    f"{row['coordinator_epoch']}, expected {coordinator_epoch}"
+                )
+            if row["state"] != "running":
+                if (
+                    row["state"] == state
+                    and row["result_json"] == result_json
+                    and row["error"] == error
+                ):
+                    return self._planning_request_row(row)
+                raise StateConflictError(
+                    f"planning request {command_id!r} is {row['state']}, expected running"
+                )
+            changed = connection.execute(
+                """
+                UPDATE planning_requests
+                SET state = ?, result_json = ?, error = ?, settled_at = ?, updated_at = ?
+                WHERE command_id = ? AND state = 'running'
+                  AND attempt = ? AND coordinator_epoch = ?
+                """,
+                (
+                    state,
+                    result_json,
+                    error,
+                    timestamp,
+                    timestamp,
+                    command_id,
+                    attempt,
+                    coordinator_epoch,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("planning request settlement compare-and-set failed")
+            self._event(
+                connection,
+                f"planning_request.{state}",
+                row["task_id"],
+                None,
+                {
+                    "command_id": command_id,
+                    "request_hash": row["request_hash"],
+                    "state": state,
+                    "attempt": attempt,
+                    "coordinator_epoch": coordinator_epoch,
+                },
+                created_at=timestamp,
+            )
+            settled = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            assert settled is not None
+            return self._planning_request_row(settled)
+
+    def recover_interrupted_planning_requests(self) -> int:
+        """Fence all running planning requests as indeterminate after interruption."""
+
+        timestamp = now_iso()
+        error = "planning request interrupted before settlement; explicit resolution required"
+        recovered = 0
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM planning_requests WHERE state = 'running' ORDER BY created_at, command_id"
+            ).fetchall()
+            for row in rows:
+                changed = connection.execute(
+                    """
+                    UPDATE planning_requests
+                    SET state = 'indeterminate', error = ?, settled_at = ?, updated_at = ?
+                    WHERE command_id = ? AND state = 'running'
+                    """,
+                    (error, timestamp, timestamp, row["command_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError(
+                        f"planning request {row['command_id']!r} recovery compare-and-set failed"
+                    )
+                self._event(
+                    connection,
+                    "planning_request.interrupted",
+                    row["task_id"],
+                    None,
+                    {
+                        "command_id": row["command_id"],
+                        "request_hash": row["request_hash"],
+                        "state": "indeterminate",
+                        "attempt": int(row["attempt"]),
+                        "coordinator_epoch": int(row["coordinator_epoch"]),
+                        "reason": "coordinator_restart",
+                    },
+                    created_at=timestamp,
+                )
+                recovered += 1
+        return recovered
+
+    @staticmethod
+    def _planning_request_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "command_id": row["command_id"],
+            "request_hash": row["request_hash"],
+            "task_id": row["task_id"],
+            "request": json.loads(row["request_json"]),
+            "state": row["state"],
+            "attempt": int(row["attempt"]),
+            "coordinator_epoch": int(row["coordinator_epoch"]),
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error": row["error"],
+            "started_at": row["started_at"],
+            "settled_at": row["settled_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     @staticmethod
     def _event(
         connection: sqlite3.Connection,
@@ -643,12 +1008,19 @@ class WorkbenchStore:
         assert cursor is not None
         return int(cursor)
 
-    def create_task(
+    def _prepare_task_materialization(
         self,
         contract: TaskContract,
         nodes: list[NodeSpec],
-        command_id: str,
-    ) -> str:
+    ) -> dict[str, Any]:
+        """Validate one task graph and freeze all durable values before locking.
+
+        Planner-controlled validation and hashing intentionally finish before a
+        writer transaction begins. Persistence then contains only SQLite work,
+        so model, filesystem, and other slow operations never hold the writer
+        lock.
+        """
+
         contract.validate()
         if not nodes:
             raise ValueError("task requires at least one node")
@@ -673,8 +1045,31 @@ class WorkbenchStore:
         self._assert_verifier_contract(contract, nodes)
         self._assert_acyclic(nodes)
 
-        request = {"contract": contract.to_dict(), "nodes": [node.to_dict() for node in nodes]}
-        request_hash = canonical_hash(request)
+        contract_document = contract.to_dict()
+        node_documents = [node.to_dict() for node in nodes]
+        return {
+            "contract_json": canonical_json(contract_document),
+            "contract_hash": contract.digest,
+            "node_rows": tuple(
+                (
+                    node.node_id,
+                    node.ordinal,
+                    canonical_json(document),
+                )
+                for node, document in zip(nodes, node_documents, strict=True)
+            ),
+            "request_hash": canonical_hash(
+                {"contract": contract_document, "nodes": node_documents}
+            ),
+        }
+
+    def create_task(
+        self,
+        contract: TaskContract,
+        nodes: list[NodeSpec],
+        command_id: str,
+    ) -> str:
+        prepared = self._prepare_task_materialization(contract, nodes)
         timestamp = now_iso()
         with self.transaction() as connection:
             receipt = connection.execute(
@@ -682,7 +1077,7 @@ class WorkbenchStore:
                 (command_id,),
             ).fetchone()
             if receipt is not None:
-                if receipt["request_hash"] != request_hash:
+                if receipt["request_hash"] != prepared["request_hash"]:
                     raise CommandConflictError(
                         f"command {command_id!r} was already used with a different request"
                     )
@@ -697,35 +1092,317 @@ class WorkbenchStore:
                 """,
                 (
                     contract.task_id,
-                    canonical_json(contract.to_dict()),
-                    contract.digest,
+                    prepared["contract_json"],
+                    prepared["contract_hash"],
                     timestamp,
                     timestamp,
                 ),
             )
-            for node in sorted(nodes, key=lambda item: (item.ordinal, item.node_id)):
+            for node_id, ordinal, spec_json in sorted(
+                prepared["node_rows"], key=lambda item: (item[1], item[0])
+            ):
                 connection.execute(
                     """
                     INSERT INTO nodes(task_id, node_id, spec_json, state, updated_at)
                     VALUES(?, ?, ?, 'pending', ?)
                     """,
-                    (contract.task_id, node.node_id, canonical_json(node.to_dict()), timestamp),
+                    (contract.task_id, node_id, spec_json, timestamp),
                 )
             connection.execute(
                 """
                 INSERT INTO command_receipts(command_id, request_hash, task_id, created_at)
                 VALUES(?, ?, ?, ?)
                 """,
-                (command_id, request_hash, contract.task_id, timestamp),
+                (command_id, prepared["request_hash"], contract.task_id, timestamp),
             )
             self._event(
                 connection,
                 "task.created",
                 contract.task_id,
                 None,
-                {"contract_hash": contract.digest, "node_count": len(nodes)},
+                {"contract_hash": prepared["contract_hash"], "node_count": len(nodes)},
+                created_at=timestamp,
             )
         return contract.task_id
+
+    def materialize_planning_request(
+        self,
+        command_id: str,
+        *,
+        attempt: int,
+        coordinator_epoch: int,
+        contract: TaskContract,
+        nodes: list[NodeSpec],
+        result: dict,
+        queue: bool,
+        source_thread_id: str | None,
+    ) -> dict:
+        """Atomically persist one fenced planning result and its executable task.
+
+        A successful return proves the planning receipt, task graph, optional
+        queue transition, and optional session binding committed together. A
+        failure leaves the claimed request running, so recovery marks it
+        indeterminate rather than replaying a potentially materialized plan.
+        """
+
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise ValueError("planning command_id is required")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("planning attempt must be a positive integer")
+        if isinstance(coordinator_epoch, bool) or not isinstance(coordinator_epoch, int):
+            raise ValueError("planning coordinator_epoch must be an integer")
+        if not isinstance(result, dict):
+            raise ValueError("planning result must be a JSON object")
+        if not isinstance(queue, bool):
+            raise ValueError("planning queue must be a boolean")
+        if source_thread_id is not None and (
+            not isinstance(source_thread_id, str)
+            or not source_thread_id.strip()
+            or any(character.isspace() for character in source_thread_id)
+        ):
+            raise ValueError("planning source_thread_id must be non-empty and contain no whitespace")
+        if source_thread_id != contract.source_thread_id:
+            raise ValueError("planning source_thread_id must match the task contract")
+
+        # All planner-controlled validation and hash calculation happens
+        # before the durable fencing transaction begins.
+        prepared = self._prepare_task_materialization(contract, nodes)
+        result_json = canonical_json(result)
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            planning = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if planning is None:
+                raise KeyError(command_id)
+            if planning["task_id"] != contract.task_id:
+                raise StateConflictError(
+                    f"planning request {command_id!r} belongs to task "
+                    f"{planning['task_id']!r}, not {contract.task_id!r}"
+                )
+            if int(planning["attempt"]) != attempt:
+                raise StateConflictError(
+                    f"planning request {command_id!r} has attempt {planning['attempt']}, "
+                    f"expected {attempt}"
+                )
+            if int(planning["coordinator_epoch"]) != coordinator_epoch:
+                raise StateConflictError(
+                    f"planning request {command_id!r} has coordinator epoch "
+                    f"{planning['coordinator_epoch']}, expected {coordinator_epoch}"
+                )
+
+            if planning["state"] == "succeeded":
+                if planning["result_json"] != result_json:
+                    raise CommandConflictError(
+                        f"planning request {command_id!r} already succeeded with a different result"
+                    )
+                task = connection.execute(
+                    "SELECT state, state_revision, contract_hash FROM tasks WHERE task_id = ?",
+                    (contract.task_id,),
+                ).fetchone()
+                receipt = connection.execute(
+                    "SELECT request_hash, task_id FROM command_receipts WHERE command_id = ?",
+                    (command_id,),
+                ).fetchone()
+                if (
+                    task is None
+                    or task["contract_hash"] != prepared["contract_hash"]
+                    or receipt is None
+                    or receipt["task_id"] != contract.task_id
+                    or receipt["request_hash"] != prepared["request_hash"]
+                ):
+                    raise StateConflictError(
+                        "succeeded planning request has incomplete or inconsistent materialization"
+                    )
+                return {
+                    **self._planning_request_row(planning),
+                    "task_state": task["state"],
+                    "task_revision": int(task["state_revision"]),
+                }
+            if planning["state"] != "running":
+                raise StateConflictError(
+                    f"planning request {command_id!r} is {planning['state']}, expected running"
+                )
+
+            existing_task = connection.execute(
+                "SELECT task_id FROM tasks WHERE task_id = ?",
+                (contract.task_id,),
+            ).fetchone()
+            if existing_task is not None:
+                raise StateConflictError(
+                    f"planning materialization task {contract.task_id!r} already exists"
+                )
+            existing_receipt = connection.execute(
+                "SELECT task_id FROM command_receipts WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if existing_receipt is not None:
+                raise CommandConflictError(
+                    f"planning materialization command {command_id!r} already belongs to task "
+                    f"{existing_receipt['task_id']!r}"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, contract_json, contract_hash, state,
+                    state_revision, created_at, updated_at
+                ) VALUES(?, ?, ?, 'inbox', 1, ?, ?)
+                """,
+                (
+                    contract.task_id,
+                    prepared["contract_json"],
+                    prepared["contract_hash"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            for node_id, ordinal, spec_json in sorted(
+                prepared["node_rows"], key=lambda item: (item[1], item[0])
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO nodes(task_id, node_id, spec_json, state, updated_at)
+                    VALUES(?, ?, ?, 'pending', ?)
+                    """,
+                    (contract.task_id, node_id, spec_json, timestamp),
+                )
+            connection.execute(
+                """
+                INSERT INTO command_receipts(command_id, request_hash, task_id, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (command_id, prepared["request_hash"], contract.task_id, timestamp),
+            )
+            self._event(
+                connection,
+                "task.created",
+                contract.task_id,
+                None,
+                {"contract_hash": prepared["contract_hash"], "node_count": len(nodes)},
+                created_at=timestamp,
+            )
+
+            task_state = "inbox"
+            task_revision = 1
+            if queue:
+                task_state = "queued"
+                task_revision = 2
+                changed = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL, verdict = NULL
+                    WHERE task_id = ? AND state = 'inbox' AND state_revision = 1
+                    """,
+                    (task_revision, timestamp, contract.task_id),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError("planning task queue compare-and-set failed")
+                self._event(
+                    connection,
+                    "task.state_changed",
+                    contract.task_id,
+                    None,
+                    {"from": "inbox", "to": "queued", "revision": task_revision, "blocker": None},
+                    created_at=timestamp,
+                )
+
+            if source_thread_id is not None:
+                binding = connection.execute(
+                    "SELECT context_ref FROM session_bindings WHERE source_thread_id = ?",
+                    (source_thread_id,),
+                ).fetchone()
+                if binding is None:
+                    raise StateConflictError(
+                        f"planning session binding {source_thread_id!r} does not exist"
+                    )
+                if binding["context_ref"] != contract.context_bundle_ref:
+                    raise StateConflictError(
+                        "planning session binding context_ref does not match the task contract"
+                    )
+                context_receipt = connection.execute(
+                    """
+                    SELECT command_id FROM context_import_receipts
+                    WHERE source_thread_id = ? AND context_ref = ?
+                    ORDER BY created_at DESC, command_id DESC
+                    LIMIT 1
+                    """,
+                    (source_thread_id, contract.context_bundle_ref),
+                ).fetchone()
+                if context_receipt is None:
+                    raise StateConflictError(
+                        "planning session binding points to a missing frozen context receipt"
+                    )
+                changed = connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET active_task_id = ?, updated_at = ?
+                    WHERE source_thread_id = ? AND context_ref = ?
+                    """,
+                    (contract.task_id, timestamp, source_thread_id, contract.context_bundle_ref),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError("planning session binding compare-and-set failed")
+                self._event(
+                    connection,
+                    "context.task_bound",
+                    contract.task_id,
+                    None,
+                    {
+                        "source_thread_id": source_thread_id,
+                        "context_ref": contract.context_bundle_ref,
+                    },
+                    created_at=timestamp,
+                )
+
+            changed = connection.execute(
+                """
+                UPDATE planning_requests
+                SET state = 'succeeded', result_json = ?, error = NULL,
+                    settled_at = ?, updated_at = ?
+                WHERE command_id = ? AND state = 'running'
+                  AND attempt = ? AND coordinator_epoch = ?
+                """,
+                (
+                    result_json,
+                    timestamp,
+                    timestamp,
+                    command_id,
+                    attempt,
+                    coordinator_epoch,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("planning request materialization compare-and-set failed")
+            self._event(
+                connection,
+                "planning_request.succeeded",
+                contract.task_id,
+                None,
+                {
+                    "command_id": command_id,
+                    "request_hash": planning["request_hash"],
+                    "state": "succeeded",
+                    "attempt": attempt,
+                    "coordinator_epoch": coordinator_epoch,
+                    "contract_hash": prepared["contract_hash"],
+                    "task_state": task_state,
+                    "task_revision": task_revision,
+                },
+                created_at=timestamp,
+            )
+            settled = connection.execute(
+                "SELECT * FROM planning_requests WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            assert settled is not None
+            return {
+                **self._planning_request_row(settled),
+                "task_state": task_state,
+                "task_revision": task_revision,
+            }
 
     @staticmethod
     def _assert_acyclic(nodes: list[NodeSpec]) -> None:
@@ -3125,6 +3802,27 @@ class WorkbenchStore:
                 "active_task_id": binding["active_task_id"],
                 "updated_at": binding["updated_at"],
             }
+
+    def get_session_context(self, source_thread_id: str, context_ref: str) -> dict[str, Any]:
+        """Read one frozen context receipt without consulting active bindings."""
+
+        if not isinstance(source_thread_id, str) or not source_thread_id:
+            raise ValueError("source_thread_id is required")
+        if not isinstance(context_ref, str) or not context_ref:
+            raise ValueError("context_ref is required")
+        with self.connection() as connection:
+            receipt = connection.execute(
+                """
+                SELECT * FROM context_import_receipts
+                WHERE source_thread_id = ? AND context_ref = ?
+                ORDER BY created_at DESC, command_id DESC
+                LIMIT 1
+                """,
+                (source_thread_id, context_ref),
+            ).fetchone()
+            if receipt is None:
+                raise KeyError((source_thread_id, context_ref))
+            return self._context_receipt(receipt)
 
     def bind_task_to_session(self, source_thread_id: str, task_id: str) -> None:
         timestamp = now_iso()

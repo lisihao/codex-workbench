@@ -99,6 +99,7 @@ class MCPTests(unittest.TestCase):
             names,
             {
                 "workbench_request",
+                "workbench_get_request",
                 "workbench_get_session",
                 "workbench_continue_session",
                 "workbench_harness_health",
@@ -448,9 +449,9 @@ class MCPTests(unittest.TestCase):
 
     def test_request_exposes_and_forwards_routing_controls(self) -> None:
         with patch(
-            "codex_workbench.mcp.submit_natural_language_request",
+            "codex_workbench.mcp.enqueue_natural_language_request",
             return_value={"ok": True, "task_id": "routed"},
-        ) as submit:
+        ) as enqueue:
             result = json.loads(
                 self.call(
                     "workbench_request",
@@ -469,7 +470,7 @@ class MCPTests(unittest.TestCase):
             )
 
         self.assertEqual(result["task_id"], "routed")
-        kwargs = submit.call_args.kwargs
+        kwargs = enqueue.call_args.kwargs
         self.assertEqual(kwargs["task_type"], "architecture")
         self.assertEqual(kwargs["complexity"], "high")
         self.assertFalse(kwargs["parallelizable"])
@@ -492,9 +493,9 @@ class MCPTests(unittest.TestCase):
             context_excerpt="prior requirement",
         )
         with patch(
-            "codex_workbench.mcp.submit_natural_language_request",
+            "codex_workbench.mcp.enqueue_natural_language_request",
             return_value={"ok": True, "task_id": "from-context"},
-        ) as submit:
+        ) as enqueue:
             result = json.loads(
                 self.call(
                     "workbench_request",
@@ -502,7 +503,7 @@ class MCPTests(unittest.TestCase):
                 )["content"][0]["text"]
             )
         self.assertEqual(result["task_id"], "from-context")
-        kwargs = submit.call_args.kwargs
+        kwargs = enqueue.call_args.kwargs
         self.assertEqual(kwargs["repository"], str(self.root))
         self.assertEqual(kwargs["allowed_scope"], ["src", "tests"])
         self.assertEqual(kwargs["context_bundle_ref"], context_ref)
@@ -510,6 +511,31 @@ class MCPTests(unittest.TestCase):
             self.call("workbench_get_session", {"source_thread_id": "thread-wb"})["content"][0]["text"]
         )
         self.assertNotIn("context_excerpt", binding)
+
+    def test_get_request_reads_durable_planning_receipt(self) -> None:
+        self.store.enqueue_planning_request(
+            "mcp-planning-command",
+            "mcp-planning-task",
+            {
+                "request_schema": "natural-language-planning-v1",
+                "command_id": "mcp-planning-command",
+                "task_id": "mcp-planning-task",
+                "objective": "bounded planning",
+                "context_excerpt": "private imported context",
+            },
+        )
+        result = json.loads(
+            self.call(
+                "workbench_get_request",
+                {"command_id": "mcp-planning-command"},
+            )["content"][0]["text"]
+        )
+        self.assertEqual(result["command_id"], "mcp-planning-command")
+        self.assertEqual(result["task_id"], "mcp-planning-task")
+        self.assertIn(result["status"], {"pending", "running", "succeeded", "failed", "indeterminate"})
+        self.assertEqual(result["request"]["objective"], "bounded planning")
+        self.assertNotIn("context_excerpt", result["request"])
+        self.assertFalse(result["context_excerpt_present"])
 
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(
