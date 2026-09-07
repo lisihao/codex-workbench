@@ -250,7 +250,7 @@ v1.11.0 的实际 routing-v3 顺序是：先完成能力、角色、任务类型
        → relative cost/catalog cost/throughput/utilization → 确定性 tie-break
 ```
 
-硬门禁包括 role、task type、complexity、工具和权限、结构化输出、harness/Agent 版本、证据能力、Claude quota freshness/admission、并发容量和任务作用域。任何候选低于 role 的 `quality_floor` 都不可用；成本和速度不能把它重新买回来。当前没有 quota reservation/cost-unit 预留账本；只有通过硬门禁的候选，才比较保守质量下界、已观测返工、延迟、成本、吞吐和容量利用率。
+硬门禁包括 role、task type、complexity、工具和权限、结构化输出、harness/Agent 版本、证据能力、Claude quota freshness/admission、声明容量和任务作用域。任何候选低于 role 的 `quality_floor` 都不可用；成本和速度不能把它重新买回来。当前占用量不是永久能力缺失：规划时若唯一阻断是并发池正在使用，仍固定静态合法的模型；运行时节点保持 `pending` 并写入 `node.admission_deferred`、当前配额快照引用、所需容量和恢复条件，容量释放后继续原路由。真实不兼容的失败会携带逐候选拒绝原因；认证、保护线或配额策略拒绝不会被伪装成并发等待。当前没有 quota reservation/cost-unit 预留账本；只有通过硬门禁的候选，才比较保守质量下界、已观测返工、延迟、成本、吞吐和容量利用率。
 
 ### 5.1 AI Frontier 与本地账本的融合算法
 

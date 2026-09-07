@@ -76,6 +76,8 @@ Codex Workbench 是面向拥有一台长期运行 Mac mini 与一台 MacBook 的
 
 路由不是固定“弱模型干活”的盲目规则：低风险、短且可机械验收的工作可进入独立 Spark 池；边界明确的常规实现优先 Luna；较大的独立切片可以升级 Terra；需求拆解、跨模块判断和最终验收留给 Sol。Claude Code 的 Sonnet、Opus 或 Fable 只在其订阅资格和受保护配额可证明时作为 Worker 使用。
 
+routing-v3 分开记录静态能力与动态准入：真实不兼容会返回逐候选拒绝原因；Claude 认证或配额不满足控制面挑战要求时使用明确的 Sol 控制面回退；只有共享并发已满或完成后配额快照尚未刷新时，原 Claude 节点保持 `pending`，并持久化 `node.admission_deferred`、配额快照引用和恢复条件。容量恢复后该节点继续原模型，不会仅因临时繁忙静默改派 Luna。
+
 Workbench 对 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6-luna` 的 Codex 进程显式传入 `model_context_window=500000` 与 `model_auto_compact_token_limit=450000`。这是容量与额度消耗之间的默认平衡点；受管 planner/worker 使用 `--ignore-user-config`，因此必须显式传入。`gpt-5.3-codex-spark` 不接收这两个覆盖值，保持其模型自身的上下文合同。
 
 Spark 是一个独立的逻辑队列，不是另一套协调器。它和普通 Worker 共享全局执行器上限，但拥有自己的容量、等待、启动和 busy-slot 计数；默认上限为 `min(4, max_workers)`，可用 `serve --spark-workers N` 调整，`0` 表示关闭 Spark 优先 lane。规划器会主动寻找互不冲突、可单独验收的短切片；无法安全拆分时保留 Luna/Terra 的较大切片。routing-v3 的 Spark 失败不会被当成成功，也不会在 claim 时绕过已固定能力目录静默换模型；需要换档时由后续 planner repair 重新路由，最终仍由 Sol 验收。
@@ -383,7 +385,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.14.0`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.14.1`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+
+1.14.1 修复 routing-v3 将动态 Claude 准入误报成静态能力缺失的问题：高复杂度 exploration 在 Opus 已准入时保持 Claude challenge，运行时认证/配额未准入时明确回落到精确 Sol 控制面，真实不兼容则输出逐候选拒绝原因。共享容量用满或完成后的新配额快照尚未到达时，节点保持 `pending`，以去重的 `node.admission_deferred` 记录配额引用、所需单位和恢复条件；恢复后继续固定的 Claude 模型，不再因临时繁忙改派 Luna。
 
 1.14.0 新增类型化执行归因、工作树执行就绪检查、失败来源与物理调用去重指标，并把这些证据接入本地性能账本和调度报告。Codex 的 legacy `actual_model` 字段继续兼容旧消费者，但请求值不会被提升为已证明的模型身份；ArtifactStore 文件校验在 SQLite 写事务之前完成，失败重试只能引用同一结果中实际携带的工件，测试发现也固定为可导入的包。
 

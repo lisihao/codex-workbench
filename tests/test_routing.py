@@ -582,8 +582,71 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual((codex_only.role, codex_only.executor, codex_only.model), ("control", "codex", "gpt-5.6-sol"))
         self.assertIn("disabled by the immutable task contract", codex_only.reason)
 
+    def test_v3_high_exploration_separates_runtime_admission_from_capability_support(self) -> None:
+        catalog = v3_catalog()
+        catalog["models"] = [
+            model
+            for model in catalog["models"]  # type: ignore[index]
+            if model["model_id"] != "fable"  # type: ignore[index]
+        ]
+        contract = v3_contract(task_type="exploration", complexity="high")
+
+        admitted = route_task(
+            contract,
+            claude_models_available=("opus",),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual(
+            (admitted.role, admitted.executor, admitted.model),
+            ("challenge", "claude", "opus"),
+        )
+
+        unavailable = route_task(
+            contract,
+            claude_models_available=(),
+            quota_snapshot=healthy_quota(),
+            capability_snapshot=catalog,
+        )
+        self.assertEqual(
+            (unavailable.role, unavailable.executor, unavailable.model),
+            ("control", "codex", "gpt-5.6-sol"),
+        )
+        self.assertIn("runtime authentication and quota admission", unavailable.reason)
+
+    def test_v3_capacity_is_a_runtime_wait_not_a_capability_rejection(self) -> None:
+        catalog = v3_catalog()
+        catalog["models"] = [
+            model
+            for model in catalog["models"]  # type: ignore[index]
+            if model["model_id"] != "fable"  # type: ignore[index]
+        ]
+        opus_only_quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=None,
+            weekly_fable_remaining=80,
+            **compatible_provenance(),
+        )
+        decision = route_task(
+            v3_contract(task_type="exploration", complexity="high"),
+            claude_models_available=("opus",),
+            quota_snapshot=opus_only_quota,
+            active_models=("opus",),
+            capability_snapshot=catalog,
+        )
+
+        self.assertEqual((decision.executor, decision.model), ("claude", "opus"))
+        self.assertIn("persistent runtime admission", decision.reason)
+
     def test_v3_fails_loud_when_no_legal_worker_exists(self) -> None:
-        with self.assertRaisesRegex(ValueError, "no legal worker"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "no legal worker.*candidate_rejections=.*runtime authentication and quota admission",
+        ):
             route_task(
                 v3_contract(task_type="creative", complexity="high"),
                 quota_snapshot=healthy_quota(),

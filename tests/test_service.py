@@ -1010,7 +1010,7 @@ raise AssertionError("fatal coordinator failure returned")
             routed = [event for event in store.read_events(task_id=contract.task_id) if event["event_type"] == "node.routed"]
             self.assertEqual(routed[0]["payload"]["zone"], "red")
 
-    def test_green_shared_capacity_routes_overflow_to_codex_without_idling_workers(self) -> None:
+    def test_green_shared_capacity_persists_wait_then_resumes_same_claude_route(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repository = root / "repository"
@@ -1052,7 +1052,8 @@ raise AssertionError("fatal coordinator failure returned")
             ]
             store.create_task(contract, verified(nodes, contract.task_id), "green-shared-capacity-create")
             store.queue_task(contract.task_id)
-            executions_started = threading.Barrier(3, timeout=2)
+            first_wave_started = threading.Event()
+            release_first_wave = threading.Event()
 
             class ClaudeStub:
                 def __init__(self):
@@ -1064,9 +1065,13 @@ raise AssertionError("fatal coordinator failure returned")
                 def execute(self, _request):
                     with self.lock:
                         self.calls += 1
+                        call = self.calls
                         self.active += 1
                         self.max_active = max(self.max_active, self.active)
-                    executions_started.wait()
+                        if self.active == 2:
+                            first_wave_started.set()
+                    if call <= 2:
+                        release_first_wave.wait(timeout=3)
                     with self.lock:
                         self.active -= 1
                     return NodeResult(
@@ -1080,7 +1085,6 @@ raise AssertionError("fatal coordinator failure returned")
 
                 def execute(self, _request):
                     self.calls += 1
-                    executions_started.wait()
                     return NodeResult(
                         "succeeded", "Codex completed", actual_model="gpt-5.6-luna",
                         result_kind="worker", checks=("fixture-check",),
@@ -1103,17 +1107,89 @@ raise AssertionError("fatal coordinator failure returned")
             ):
                 thread = threading.Thread(target=coordinator.run_forever)
                 thread.start()
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    if all(node["state"] == "accepted" for node in store.get_task(contract.task_id)["nodes"]):
-                        break
-                    time.sleep(0.02)
-                coordinator.stop()
-                thread.join(timeout=3)
+                try:
+                    self.assertTrue(first_wave_started.wait(timeout=2))
+                    deadline = time.monotonic() + 2
+                    deferred: list[dict] = []
+                    while time.monotonic() < deadline:
+                        deferred = [
+                            event
+                            for event in store.read_events(task_id=contract.task_id)
+                            if event["event_type"] == "node.admission_deferred"
+                        ]
+                        if deferred:
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual(len(deferred), 1)
+                    waiting = next(
+                        node
+                        for node in store.get_task(contract.task_id)["nodes"]
+                        if node["node_id"] == "c"
+                    )
+                    self.assertEqual((waiting["state"], waiting["attempt"]), ("pending", 0))
+                    self.assertEqual(codex.calls, 0)
+                    self.assertEqual(deferred[0]["node_id"], "c")
+                    self.assertEqual(deferred[0]["payload"]["reason_kind"], "temporary-capacity")
+                    self.assertEqual(deferred[0]["payload"]["next_attempt"], 1)
+                    self.assertIn("enough shared capacity", deferred[0]["payload"]["resume_condition"])
+                    self.assertIsInstance(deferred[0]["payload"].get("quota_snapshot_id"), int)
 
-            self.assertEqual(claude.calls, 2)
+                    release_first_wave.set()
+                    deadline = time.monotonic() + 2
+                    refresh_wait: dict | None = None
+                    while time.monotonic() < deadline:
+                        events = store.read_events(task_id=contract.task_id)
+                        refresh_wait = next(
+                            (
+                                event
+                                for event in events
+                                if event["event_type"] == "node.admission_deferred"
+                                and event["payload"]["reason_kind"]
+                                == "quota-refresh-required"
+                            ),
+                            None,
+                        )
+                        if refresh_wait is not None:
+                            break
+                        time.sleep(0.02)
+                    self.assertIsNotNone(refresh_wait)
+                    assert refresh_wait is not None
+                    self.assertEqual(refresh_wait["node_id"], "c")
+                    self.assertIn(
+                        "newer than the most recent Claude completion",
+                        refresh_wait["payload"]["resume_condition"],
+                    )
+
+                    # Quota observations use second precision. Wait for a
+                    # genuinely newer receipt instead of forging a future one.
+                    time.sleep(1.05)
+                    store.write_quota(
+                        QuotaSnapshot(
+                            observed_at=now_iso(),
+                            auth_ok=True,
+                            auth_method="native-subscription",
+                            five_hour_remaining=60,
+                            weekly_all_remaining=60,
+                            weekly_sonnet_remaining=60,
+                            **compatible_provenance(),
+                        )
+                    )
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if all(
+                            node["state"] == "accepted"
+                            for node in store.get_task(contract.task_id)["nodes"]
+                        ):
+                            break
+                        time.sleep(0.02)
+                finally:
+                    release_first_wave.set()
+                    coordinator.stop()
+                    thread.join(timeout=3)
+
+            self.assertEqual(claude.calls, 3)
             self.assertEqual(claude.max_active, 2)
-            self.assertEqual(codex.calls, 1)
+            self.assertEqual(codex.calls, 0)
             self.assertTrue(all(
                 node["state"] == "accepted"
                 for node in store.get_task(contract.task_id)["nodes"]
@@ -1122,10 +1198,25 @@ raise AssertionError("fatal coordinator failure returned")
                 event for event in store.read_events(task_id=contract.task_id)
                 if event["event_type"] == "node.routed"
             ]
-            self.assertEqual(routed[0]["payload"]["fallback_kind"], "claude-capacity-overflow")
-            self.assertEqual(routed[0]["payload"]["zone"], "green")
-            overflow = next(node for node in store.get_task(contract.task_id)["nodes"] if node["node_id"] == "c")
-            self.assertEqual((overflow["effective_executor"], overflow["effective_model"]), ("codex", "gpt-5.6-luna"))
+            self.assertEqual(routed, [])
+            resumed = next(
+                event
+                for event in store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "node.started" and event["node_id"] == "c"
+            )
+            self.assertEqual(
+                resumed["payload"]["admission_deferred_event_cursor"],
+                refresh_wait["cursor"],
+            )
+            completed = next(
+                node
+                for node in store.get_task(contract.task_id)["nodes"]
+                if node["node_id"] == "c"
+            )
+            self.assertEqual(
+                (completed["effective_executor"], completed["effective_model"]),
+                ("claude", "sonnet"),
+            )
 
     def test_completed_claude_node_requires_a_newer_quota_snapshot_before_next_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

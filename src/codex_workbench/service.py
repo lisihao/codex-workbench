@@ -9,7 +9,7 @@ from pathlib import Path
 import socket
 import threading
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 from .artifacts import ArtifactStore
 from .dependency_inputs import (
@@ -87,6 +87,19 @@ class _ClaimRoute:
     quota: QuotaSnapshot | None
     active_claude_models: tuple[str, ...]
     decision: ClaudeDispatchDecision | None
+
+
+@dataclass(frozen=True)
+class _AdmissionWait:
+    """One ready Claude node held before claim by shared capacity."""
+
+    task_id: str
+    node_id: str
+    model: str
+    reason_kind: str
+    resume_condition: str
+    quota_snapshot_id: int
+    decision: ClaudeDispatchDecision
 
 
 @dataclass
@@ -262,12 +275,42 @@ class Coordinator:
                 worker_counter += 1
                 worker_id = f"{socket.gethostname()}-{os.getpid()}-{worker_counter}"
                 quota = self.store.latest_quota()
+                quota_snapshot_id = self._quota_snapshot_reference(quota)
                 active_claude_models = self._active_claude_models()
-                # Capacity saturation is not a reason to leave a global
-                # Workbench worker slot idle.  Claim the ready node and carry
-                # the exact decision into its thread, where it persistently
-                # routes to the governed Codex fallback in the same attempt.
-                claimed = self._claim_next_ready_node(worker_id)
+                admission_waits: dict[tuple[str, str], _AdmissionWait] = {}
+
+                def admissible(spec: dict) -> bool:
+                    pending = self._pending_admission_decision(
+                        spec,
+                        quota,
+                        active_claude_models,
+                    )
+                    if pending is None:
+                        return True
+                    if quota_snapshot_id is None:
+                        raise RuntimeError(
+                            "pending Claude admission has no durable quota snapshot reference"
+                        )
+                    reason_kind, resume_condition, decision = pending
+                    wait = _AdmissionWait(
+                        task_id=str(spec["task_id"]),
+                        node_id=str(spec["node_id"]),
+                        model=str(spec["model"]),
+                        reason_kind=reason_kind,
+                        resume_condition=resume_condition,
+                        quota_snapshot_id=quota_snapshot_id,
+                        decision=decision,
+                    )
+                    admission_waits[(wait.task_id, wait.node_id)] = wait
+                    return False
+
+                # A saturated Claude pool leaves that exact node pending while
+                # the store continues scanning for independent Codex work.
+                claimed = self._claim_next_ready_node(
+                    worker_id,
+                    admissible=admissible,
+                )
+                self._record_admission_waits(admission_waits.values())
                 if claimed is None:
                     break
                 decision = (
@@ -292,7 +335,12 @@ class Coordinator:
         self._pool.shutdown(wait=True, cancel_futures=False)
         self._recovery_thread.join(timeout=30)
 
-    def _claim_next_ready_node(self, worker_id: str) -> dict | None:
+    def _claim_next_ready_node(
+        self,
+        worker_id: str,
+        *,
+        admissible: Callable[[dict], bool] | None = None,
+    ) -> dict | None:
         """Prefer ready, admissible Spark work without reserving idle threads.
 
         The store re-applies task priority, dependency, parallelizability,
@@ -304,6 +352,7 @@ class Coordinator:
             spark = self.store.claim_ready_node(
                 worker_id,
                 self.coordinator_epoch,
+                admissible=admissible,
                 execution_lanes=("spark",),
                 lane_capacities=self._lane_capacities,
             )
@@ -312,9 +361,66 @@ class Coordinator:
         return self.store.claim_ready_node(
             worker_id,
             self.coordinator_epoch,
+            admissible=admissible,
             execution_lanes=("general", "control"),
             lane_capacities=self._lane_capacities,
         )
+
+    def _pending_admission_decision(
+        self,
+        spec: dict,
+        quota: QuotaSnapshot | None,
+        active_models: tuple[str, ...],
+    ) -> tuple[str, str, ClaudeDispatchDecision] | None:
+        """Return transient waits; authentication and reserve refusals fallback."""
+
+        if spec.get("executor") != "claude" or quota is None:
+            return None
+        shared_capacity = (
+            spec.get("routing_strategy") != LEGACY_ROUTING_STRATEGY_VERSION
+        )
+        decision = quota.dispatch_decision(
+            str(spec["model"]),
+            active_models,
+            max_age_seconds=self.quota_ttl_seconds,
+            shared_capacity=shared_capacity,
+        )
+        if decision.action == "defer":
+            return (
+                "temporary-capacity",
+                "a fresh admitted Claude quota snapshot reports enough shared capacity "
+                "for the requested units",
+                decision,
+            )
+        if decision.action != "claude":
+            return None
+        refresh_wait = self._quota_refresh_wait_decision(quota, decision)
+        if refresh_wait is None:
+            return None
+        return (
+            "quota-refresh-required",
+            "the Claude quota snapshot is newer than the most recent Claude completion "
+            "and the route remains admitted",
+            refresh_wait,
+        )
+
+    def _record_admission_waits(self, waits: Iterable[_AdmissionWait]) -> None:
+        for wait in waits:
+            decision = wait.decision
+            self.store.record_node_admission_deferred(
+                wait.task_id,
+                wait.node_id,
+                model=wait.model,
+                reason_kind=wait.reason_kind,
+                quota_snapshot_id=wait.quota_snapshot_id,
+                reason=decision.reason,
+                zone=decision.zone,
+                capacity_units=decision.capacity_units,
+                active_units=decision.active_units,
+                requested_units=decision.requested_units,
+                available_units=decision.available_units,
+                resume_condition=wait.resume_condition,
+            )
 
     def stop(self) -> None:
         self._stop.set()
@@ -425,6 +531,35 @@ class Coordinator:
                     latest = settled_at
         return latest
 
+    def _quota_refresh_wait_decision(
+        self,
+        quota: QuotaSnapshot,
+        admitted: ClaudeDispatchDecision,
+    ) -> ClaudeDispatchDecision | None:
+        """Require post-completion quota evidence without changing providers."""
+
+        last_settled_at = self._latest_completed_claude_at()
+        if last_settled_at is None:
+            return None
+        observed_at = self._timestamp(quota.observed_at)
+        if observed_at is not None and observed_at > last_settled_at:
+            return None
+        observed_text = quota.observed_at if observed_at is not None else "invalid"
+        return ClaudeDispatchDecision(
+            "defer",
+            "unknown",
+            (
+                "Claude quota snapshot must be newer than the most recent "
+                f"Claude completion ({last_settled_at.isoformat()}); "
+                f"observed_at={observed_text}"
+            ),
+            admitted.max_concurrency,
+            capacity_units=admitted.capacity_units,
+            active_units=admitted.active_units,
+            requested_units=admitted.requested_units,
+            available_units=admitted.available_units,
+        )
+
     def _claim_time_decision(
         self,
         spec: dict,
@@ -441,21 +576,21 @@ class Coordinator:
         )
         if decision is None or decision.action != "claude" or quota is None:
             return decision
-        last_settled_at = self._latest_completed_claude_at()
-        if last_settled_at is None:
+        wait = self._quota_refresh_wait_decision(quota, decision)
+        if wait is None:
             return decision
-        observed_at = self._timestamp(quota.observed_at)
-        if observed_at is not None and observed_at > last_settled_at:
-            return decision
-        observed_text = quota.observed_at if observed_at is not None else "invalid"
+        # The pre-claim admission filter normally keeps this node pending. If
+        # a race still reaches claim-time, preserve the established safe Codex
+        # fallback rather than leaving a running lease unowned.
         return ClaudeDispatchDecision(
             "codex",
-            "unknown",
-            (
-                "Claude quota snapshot must be newer than the most recent "
-                f"Claude completion ({last_settled_at.isoformat()}); observed_at={observed_text}"
-            ),
+            wait.zone,
+            wait.reason,
             0,
+            capacity_units=wait.capacity_units,
+            active_units=wait.active_units,
+            requested_units=wait.requested_units,
+            available_units=wait.available_units,
         )
 
     def _runtime_quota_fallback(

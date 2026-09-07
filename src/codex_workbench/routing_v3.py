@@ -579,7 +579,10 @@ def _hard_gate_reasons(
     if _truthy(record.get("deprecated")):
         reasons.append("capability is deprecated")
     if not _truthy(_first(record, "routable", "routing_enabled", "admitted")):
-        reasons.append("capability is not marked routable")
+        reasons.append(
+            _optional_text(record.get("routing_admission_reason"))
+            or "capability is not marked routable"
+        )
     if not _provider_runtime_available(snapshot, record, provider):
         reasons.append(f"provider runtime {provider!r} is unavailable")
     if not _capability_runtime_available(record, status=status):

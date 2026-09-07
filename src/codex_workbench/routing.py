@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+import json
 from typing import Any, Iterable, Literal
 
 from .model import (
@@ -375,6 +376,18 @@ def _snapshot_has_routable_model_family(
     return False
 
 
+def _routable_claude_families(
+    snapshot: Mapping[str, Any], families: Iterable[str]
+) -> tuple[str, ...]:
+    """Return only catalog-proven Claude families in caller preference order."""
+
+    return tuple(
+        family
+        for family in dict.fromkeys(families)
+        if _snapshot_has_routable_family(snapshot, (family,))
+    )
+
+
 def _restricted_catalog_families(
     snapshot: Mapping[str, Any], families: frozenset[str]
 ) -> dict[str, Any]:
@@ -483,11 +496,83 @@ def _filtered_catalog_for_admission(
             provider = str(record.get("provider", "")).lower()
             if provider in {"claude", "anthropic"}:
                 model = record.get("model_id", record.get("model", record.get("id", "")))
-                if not claude_allowed or _model_family(model) not in admitted:
+                family = _model_family(model)
+                statically_routable = (
+                    record.get("status") == "available"
+                    and record.get("routable") is True
+                )
+                if not claude_allowed:
                     record["routable"] = False
+                    if statically_routable:
+                        record["routing_admission_reason"] = (
+                            "Claude is disabled by the immutable task contract"
+                        )
+                elif family not in admitted:
+                    record["routable"] = False
+                    if statically_routable:
+                        label = family or str(model)
+                        record["routing_admission_reason"] = (
+                            f"Claude {label} did not pass current runtime "
+                            "authentication and quota admission"
+                        )
             records.append(record)
         result[name] = records
         break
+    return result
+
+
+def _routing_v3_rejection_details(decision: RoutingV3Decision) -> str:
+    """Render deterministic, catalog-bounded rejection evidence."""
+
+    payload = [
+        {
+            "provider": candidate.provider,
+            "model": candidate.model,
+            "reasons": list(candidate.reasons),
+        }
+        for candidate in decision.rejected_candidates
+    ]
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _has_runtime_admission_rejection(decision: RoutingV3Decision) -> bool:
+    return any(
+        reason.lower().startswith("claude ")
+        and "did not pass current runtime authentication and quota admission"
+        in reason.lower()
+        for candidate in decision.rejected_candidates
+        for reason in candidate.reasons
+    )
+
+
+def _capacity_only_rejection_exists(decision: RoutingV3Decision) -> bool:
+    prefix = "capability concurrency capacity reached"
+    return any(
+        candidate.reasons
+        and all(reason.startswith(prefix) for reason in candidate.reasons)
+        for candidate in decision.rejected_candidates
+    )
+
+
+def _without_active_provider_capacity(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep declared capacity while deferring current occupancy to runtime."""
+
+    result = dict(request)
+    supplied = request.get("provider_capacity")
+    if isinstance(supplied, Mapping):
+        result["provider_capacity"] = {
+            str(provider): (
+                {**raw, "active": 0.0}
+                if isinstance(raw, Mapping)
+                else raw
+            )
+            for provider, raw in supplied.items()
+        }
     return result
 
 
@@ -580,16 +665,21 @@ def _provider_capacity(
                 target["active"] = max(parsed_active, 0.0)
     result["codex"]["capacity"] = max(result["codex"]["capacity"], 4.0)
     if quota_snapshot is not None:
-        quota_decision = quota_snapshot.dispatch_decision(
-            "sonnet",
-            active_models,
-            max_age_seconds=max_age_seconds,
-        )
-        if quota_decision.capacity_units:
+        quota_decision = None
+        for family in ("sonnet", "opus", "fable"):
+            candidate = quota_snapshot.dispatch_decision(
+                family,
+                active_models,
+                max_age_seconds=max_age_seconds,
+            )
+            if candidate.capacity_units:
+                quota_decision = candidate
+                break
+        if quota_decision is not None:
             result["claude"]["capacity"] = min(
                 result["claude"]["capacity"], float(quota_decision.capacity_units)
             )
-        result["claude"]["active"] = float(quota_decision.active_units)
+            result["claude"]["active"] = float(quota_decision.active_units)
     return result
 
 
@@ -739,7 +829,8 @@ def _decision_from_v3(
     if not decision.accepted or decision.selected is None:
         raise ValueError(
             "routing-v3 has no legal worker in pinned catalog "
-            f"{decision.catalog_snapshot_id}: {decision.reason}"
+            f"{decision.catalog_snapshot_id}: {decision.reason}; "
+            f"candidate_rejections={_routing_v3_rejection_details(decision)}"
         )
     selected = decision.selected
     provider = "claude" if selected.provider in {"claude", "anthropic"} else selected.provider
@@ -878,6 +969,30 @@ def _route_catalog_task(
             snapshot=capability_snapshot,
         )
 
+    # Current provider occupancy is not a capability incompatibility. Select
+    # the same statically legal capability now, persist it on the NodeSpec, and
+    # let the coordinator keep that node pending until shared capacity frees.
+    if _capacity_only_rejection_exists(decision):
+        pending_decision = route_capability_snapshot(
+            routing_view,
+            _without_active_provider_capacity(request),
+            active_model_ids=(),
+            policy_version=ROUTING_V3_POLICY_VERSION,
+        )
+        if pending_decision.accepted:
+            return _decision_from_v3(
+                pending_decision,
+                contract=contract,
+                role=selected_role,
+                strategy=strategy,
+                snapshot=capability_snapshot,
+                reason_prefix=(
+                    "selected for persistent runtime admission; current provider "
+                    "capacity is full and execution must remain pending until capacity "
+                    "is available: "
+                ),
+            )
+
     # Claude challenge capacity is deliberately optional.  For cross-module
     # architecture/review/research work, a genuine Claude auth/quota refusal
     # may fall back to the exact, catalog-proven Sol control plane.  This is
@@ -887,8 +1002,9 @@ def _route_catalog_task(
         control_types.add("exploration")
     if selected_role == "challenge" and strategy.task_type in control_types:
         challenge_families = _v3_preferred_families(strategy, role="challenge")
-        claude_families = tuple(
-            family for family in challenge_families if family in CLAUDE_FAMILIES
+        claude_families = _routable_claude_families(
+            capability_snapshot,
+            (family for family in challenge_families if family in CLAUDE_FAMILIES),
         )
         control_reason: str | None = None
         if not strategy.claude_allowed:
@@ -908,6 +1024,12 @@ def _route_catalog_task(
             control_reason = (
                 "Claude challenge was unavailable due to authenticated quota admission; "
                 "using the exact Sol cross-module control plane: "
+            )
+        elif _has_runtime_admission_rejection(decision):
+            control_reason = (
+                "Claude challenge was unavailable because no cataloged challenge model "
+                "passed current runtime authentication and quota admission; using the "
+                "exact Sol cross-module control plane: "
             )
         if control_reason is not None:
             control_request = _v3_request(
@@ -937,7 +1059,8 @@ def _route_catalog_task(
                 )
     raise ValueError(
         "routing-v3 has no legal worker in the pinned catalog; "
-        f"{decision.reason}"
+        f"{decision.reason}; "
+        f"candidate_rejections={_routing_v3_rejection_details(decision)}"
     )
 
 

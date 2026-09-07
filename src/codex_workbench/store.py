@@ -3749,6 +3749,99 @@ class WorkbenchStore:
         with self.transaction() as connection:
             return self._event(connection, event_type, task_id, node_id, payload)
 
+    def record_node_admission_deferred(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        model: str,
+        reason_kind: str,
+        quota_snapshot_id: int,
+        reason: str,
+        zone: str,
+        capacity_units: int,
+        active_units: int,
+        requested_units: int,
+        available_units: int,
+        resume_condition: str,
+    ) -> int | None:
+        """Persist one admission wait per quota snapshot while the node is pending."""
+
+        if reason_kind not in {"temporary-capacity", "quota-refresh-required"}:
+            raise ValueError("unsupported admission wait reason kind")
+        if type(quota_snapshot_id) is not int or quota_snapshot_id < 1:
+            raise ValueError("admission wait quota_snapshot_id must be positive")
+        if not model.strip() or not reason.strip() or not zone.strip():
+            raise ValueError("admission wait model, reason, and zone are required")
+        if not resume_condition.strip():
+            raise ValueError("admission wait resume condition is required")
+        units = (capacity_units, active_units, requested_units, available_units)
+        if any(type(value) is not int or value < 0 for value in units):
+            raise ValueError("admission wait capacity units must be non-negative integers")
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT state, attempt, spec_json FROM nodes
+                WHERE task_id = ? AND node_id = ?
+                """,
+                (task_id, node_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((task_id, node_id))
+            if row["state"] != "pending":
+                return None
+            spec = json.loads(row["spec_json"])
+            if spec.get("executor") != "claude" or str(spec.get("model")) != model:
+                raise StateConflictError(
+                    "admission wait does not match the pending Claude route"
+                )
+            payload = {
+                "provider": "claude",
+                "model": model,
+                "action": "defer",
+                "reason_kind": reason_kind,
+                "reason": reason,
+                "zone": zone,
+                "capacity_units": capacity_units,
+                "active_units": active_units,
+                "requested_units": requested_units,
+                "available_units": available_units,
+                "next_attempt": int(row["attempt"]) + 1,
+                "resume_condition": resume_condition,
+                "quota_snapshot_id": quota_snapshot_id,
+            }
+            previous = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND node_id = ?
+                  AND event_type = 'node.admission_deferred'
+                ORDER BY cursor DESC LIMIT 1
+                """,
+                (task_id, node_id),
+            ).fetchone()
+            if previous is not None:
+                previous_payload = json.loads(previous["payload_json"])
+                if previous_payload == payload:
+                    return int(previous["cursor"])
+            quota = connection.execute(
+                """
+                SELECT 1 FROM quota_snapshots
+                WHERE provider = 'claude' AND id = ?
+                """,
+                (quota_snapshot_id,),
+            ).fetchone()
+            if quota is None:
+                raise StateConflictError(
+                    "admission wait quota snapshot reference does not exist"
+                )
+            return self._event(
+                connection,
+                "node.admission_deferred",
+                task_id,
+                node_id,
+                payload,
+            )
+
     def record_node_route(
         self,
         task_id: str,
@@ -4380,6 +4473,20 @@ class WorkbenchStore:
             lease_epoch = self._next_lease_epoch(connection)
             effective_executor = selected_effective_executor
             effective_model = selected_effective_model
+            admission_wait = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND node_id = ?
+                  AND event_type = 'node.admission_deferred'
+                ORDER BY cursor DESC LIMIT 1
+                """,
+                (selected["task_id"], selected["node_id"]),
+            ).fetchone()
+            admission_wait_cursor: int | None = None
+            if admission_wait is not None:
+                admission_wait_payload = json.loads(admission_wait["payload_json"])
+                if admission_wait_payload.get("next_attempt") == attempt:
+                    admission_wait_cursor = int(admission_wait["cursor"])
             connection.execute(
                 """
                 UPDATE nodes SET state = 'running', attempt = ?, worker_id = ?,
@@ -4436,6 +4543,9 @@ class WorkbenchStore:
                     "lane_capacity": capacities.get(selected_lane),
                     "lane_active_units": running_lane_active[selected_lane] + 1,
                     "claimed_at": timestamp,
+                    **({
+                        "admission_deferred_event_cursor": admission_wait_cursor,
+                    } if admission_wait_cursor is not None else {}),
                     **({
                         "blocked_retry_authorization_event_cursor": selected_blocked_retry_authorization_cursor,
                     } if selected_blocked_retry_authorization_cursor is not None else {}),
