@@ -7,7 +7,7 @@ from typing import Protocol
 
 
 RESEARCH_POLICY_VERSION = "research-skill/v2"
-RESEARCH_SKILL_NAME = "Research"
+RESEARCH_SKILL_NAME = "research"
 RESEARCH_SKILL_REQUIRED_FILES = (
     "SKILL.md",
     "UrlVerificationProtocol.md",

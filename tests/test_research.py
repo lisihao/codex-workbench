@@ -28,7 +28,7 @@ class ResearchRoutingTests(unittest.TestCase):
         for value in cases:
             with self.subTest(task_type=value.task_type, complexity=value.complexity):
                 self.assertEqual(route_research(value).mode, "standard")
-                self.assertIn("Mandatory skill invocation: $Research", research_planner_directive(value))
+                self.assertIn("Mandatory skill invocation: $research", research_planner_directive(value))
 
     def test_source_grounded_scenarios_require_standard_research(self) -> None:
         objectives = (

@@ -104,13 +104,12 @@ Workbench 的 planner/worker 使用 `--ignore-user-config`，所以不能依赖�
 
 ### 2.1 Authority 先决条件与只读预检
 
-Authority 安装器需要：可执行的 Codex CLI 及其同目录的 `codex-code-mode-host`、可读的本机 Codex 订阅认证文件、Python 3.11+、完整的 Research Skill 来源，以及已就绪的 Tailscale 本地 API socket。它不会把用户的全局 Codex 配置、会话或模型缓存复制到 Authority 运行时。
+Authority 安装器需要：可执行的 Codex CLI 及其同目录的 `codex-code-mode-host`、可读的本机 Codex 订阅认证文件、Python 3.11+，以及已就绪的 Tailscale 本地 API socket。仓库自带完整的 Workbench Research Skill；安装器默认从当前受信任源码提交的 `skills/research` 安装，不依赖操作者家目录。它不会把用户的全局 Codex 配置、会话或模型缓存复制到 Authority 运行时。
 
 在 Mac mini 上补充以下变量。`WB_TAILSCALE_SOCKET` 必须是当前 Tailscale 进程实际使用的 Unix socket；不要猜测路径。
 
 ```bash
 export WB_CODEX_BINARY="$HOME/.codex/packages/standalone/current/codex"
-export WB_RESEARCH_SKILL_SOURCE="<ABSOLUTE_PATH_TO_COMPLETE_RESEARCH_SKILL>"
 export WB_TAILSCALE_SOCKET="<ABSOLUTE_PATH_TO_ACTIVE_TAILSCALED_LOCAL_API_SOCKET>"
 ```
 
@@ -121,10 +120,10 @@ test -x "$WB_CODEX_BINARY"
 test -x "$(dirname "$WB_CODEX_BINARY")/codex-code-mode-host"
 test -r "$HOME/.codex/auth.json"
 
-test -f "$WB_RESEARCH_SKILL_SOURCE/SKILL.md"
-test -f "$WB_RESEARCH_SKILL_SOURCE/UrlVerificationProtocol.md"
-test -f "$WB_RESEARCH_SKILL_SOURCE/Workflows/StandardResearch.md"
-test -f "$WB_RESEARCH_SKILL_SOURCE/Workflows/DeepInvestigation.md"
+test -f "$WB_ROOT/skills/research/SKILL.md"
+test -f "$WB_ROOT/skills/research/UrlVerificationProtocol.md"
+test -f "$WB_ROOT/skills/research/Workflows/StandardResearch.md"
+test -f "$WB_ROOT/skills/research/Workflows/DeepInvestigation.md"
 
 command -v tailscale
 command -v zstd
@@ -147,13 +146,12 @@ smbutil statshares -m "$WB_NAS_ARCHIVE_ROOT"
   --source "$WB_ROOT" \
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
-  --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
   --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET" \
   --dry-run
 ```
 
-`--dry-run` 不写文件、不启动 LaunchAgent、不启用 Tailscale Serve、不发起 SSH/MCP 连接。它通过只证明当前安装器能接受本机的来源和目标，不证明模型登录、Claude 配额或远端客户端已经可用。
+`--dry-run` 不写文件、不启动 LaunchAgent、不启用 Tailscale Serve、不发起 SSH/MCP 连接。它通过只证明当前安装器能接受本机的来源和目标，不证明模型登录、Claude 配额或远端客户端已经可用。如需测试自定义 Research Skill，可显式传入 `--research-skill-source <path>`；普通安装不需要该参数。
 
 如需让受控脏工作树恢复完全离线，先在 Authority 准备包含目标锁文件依赖的本地 pnpm store，并在 dry-run 与正式安装中都附加 `--pnpm-store "$WB_PNPM_STORE"`。不提供该参数时，安装器会建立独立空 store；缓存缺包会明确阻断恢复，不会访问 registry 或静默重试。
 
@@ -191,7 +189,6 @@ export WB_CLAUDE_QUOTA_BINARY="$WB_CLAUDE_BINARY"
   --source "$WB_ROOT" \
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
-  --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
   --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET"
 ```
@@ -202,7 +199,6 @@ export WB_CLAUDE_QUOTA_BINARY="$WB_CLAUDE_BINARY"
   --source "$WB_ROOT" \
   --state-root "$WB_STATE_ROOT" \
   --codex-binary "$WB_CODEX_BINARY" \
-  --research-skill-source "$WB_RESEARCH_SKILL_SOURCE" \
   --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
   --tailscale-socket "$WB_TAILSCALE_SOCKET" \
   --claude-binary "$WB_CLAUDE_BINARY" \

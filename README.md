@@ -209,6 +209,7 @@ Claude 没有被当作无限资源。Workbench 以被动方式读取兼容的本
 
 - 一台可常驻运行的 **Mac mini**（Authority）和一台 **MacBook**（cockpit），均为 macOS。
 - Python 3.11+、Git、已认证的 Codex CLI；Claude Code 是可选项。
+- 当前受信任源码提交已经包含安装器所需的完整 Research Skill，不依赖 `~/.agents` 或作者本机文件。
 - MacBook 到 Mac mini 的 SSH 连通性；使用远程 cockpit 时推荐 Tailscale。
 - Node.js 18+（仅在需要 Archify 渲染/验证时）。
 - 已阅读并接受：这是需要由操作者维护的自托管开发控制面，不是多租户托管服务。

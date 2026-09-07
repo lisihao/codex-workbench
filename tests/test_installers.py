@@ -105,7 +105,16 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('"--claude-binary"', source)
         self.assertIn('"--quota-claude-binary"', source)
         self.assertNotIn("CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude", source)
-        self.assertIn('default="~/.agents/skills/research"', source)
+        self.assertIn('source / "skills" / "research"', source)
+        self.assertNotIn('default="~/.agents/skills/research"', source)
+
+    def test_repository_bundles_complete_research_skill(self) -> None:
+        module = self._macos_installer_module()
+        source = Path(__file__).resolve().parents[1] / "skills" / "research"
+
+        self.assertEqual(module.validate_research_skill_source(source), source.resolve())
+        for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
+            self.assertTrue((source / relative).is_file(), relative)
 
     def test_macos_installer_copies_only_managed_research_skill(self) -> None:
         module = self._macos_installer_module()
@@ -1661,11 +1670,6 @@ class InstallerTests(unittest.TestCase):
             auth_source = home / ".codex" / "auth.json"
             auth_source.parent.mkdir(parents=True)
             auth_source.write_text("{}\n")
-            research = root / "research"
-            for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
-                path = research / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(relative)
             codex = root / "codex"
             codex.write_text("#!/bin/sh\n")
             codex.chmod(0o755)
@@ -1696,8 +1700,6 @@ class InstallerTests(unittest.TestCase):
                     str(root / "state"),
                     "--codex-binary",
                     str(codex),
-                    "--research-skill-source",
-                    str(research),
                     "--dry-run",
                 ],
             ), redirect_stdout(output):

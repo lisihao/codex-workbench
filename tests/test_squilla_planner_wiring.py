@@ -21,6 +21,7 @@ def make_contract(*, complexity: str = "standard") -> TaskContract:
         base_sha="abc123",
         objective="bounded implementation",
         allowed_scope=("src", "tests"),
+        acceptance_commands=("true",),
         complexity=complexity,  # type: ignore[arg-type]
         parallelizable=True,
     )

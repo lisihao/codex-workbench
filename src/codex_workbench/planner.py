@@ -28,6 +28,7 @@ from .model import (
     QuotaSnapshot,
     RoutingStrategy,
     TaskContract,
+    deterministic_acceptance_command_index,
     codex_model_long_context_overrides,
     codex_model_profile,
     codex_model_reasoning_effort,
@@ -717,6 +718,16 @@ def normalize_and_validate_plan(
         if executor not in {"codex", "claude", "deterministic", "fixture"}:
             raise PlannerError(f"plan node {node_id} has unsupported executor {executor!r}")
         command = _string_tuple(raw["command"], "command")
+        if executor == "deterministic":
+            try:
+                deterministic_acceptance_command_index(
+                    command,
+                    contract.acceptance_commands,
+                )
+            except ValueError as error:
+                raise PlannerError(
+                    f"plan node {node_id} has an unauthorized deterministic command: {error}"
+                ) from error
         depends_on = tuple(sorted(set(_string_tuple(raw["depends_on"], "depends_on"))))
         read_scopes = _normalized_scopes(raw["read_scopes"], "read_scopes")
         write_scopes = _normalized_scopes(raw["write_scopes"], "write_scopes")
@@ -1312,7 +1323,7 @@ Rules:
 - Claude capacity is shared across the entire coordinator (Sonnet costs one unit; Opus/Fable cost two). Do not serialize otherwise independent nodes merely to manage capacity: the coordinator durably falls back a saturated Claude node to Codex in the same attempt.
 - Use Codex model {default_executor_model} only as the planner's legacy default; the post-compile policy may normalize it.
 - Use Claude only when its exact model family appears in the admitted list; otherwise use Codex.
-- Deterministic nodes must provide an argv command and must not use a shell string.
+- Deterministic nodes must select the exact argv of one caller-declared acceptance command. They may not add a binary, argument, wrapper, or shell invocation that is absent from that contract list.
 - The final node must be exactly one Codex verifier using {verifier_model}.
 - That verifier must depend on every non-verifier node and independently inspect the composed diff and run acceptance commands.
 - The verifier must declare read_scopes that cover every source and test path its evidence depends on, and no write_scopes.

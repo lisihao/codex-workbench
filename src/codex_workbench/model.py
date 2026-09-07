@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 from typing import Any, Literal
 
 from .governance import (
@@ -43,6 +44,43 @@ NodeState = Literal[
     "indeterminate",
     "cancelled",
 ]
+
+
+def acceptance_command_argv(source: object) -> tuple[str, ...]:
+    """Parse one caller-declared acceptance command into an exact argv tuple."""
+
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("acceptance_commands entries must be non-empty strings")
+    try:
+        arguments = tuple(shlex.split(source, posix=True))
+    except ValueError as error:
+        raise ValueError("acceptance_commands entry has invalid shell quoting") from error
+    if not arguments or any(not argument or "\x00" in argument for argument in arguments):
+        raise ValueError("acceptance_commands entry must produce non-empty argv values")
+    return arguments
+
+
+def deterministic_acceptance_command_index(
+    command: object,
+    acceptance_commands: object,
+) -> int:
+    """Return the caller-declared command index or reject planner-controlled argv."""
+
+    if (
+        not isinstance(command, (list, tuple))
+        or not command
+        or any(not isinstance(argument, str) or not argument or "\x00" in argument for argument in command)
+    ):
+        raise ValueError("deterministic command must be a non-empty argv string sequence")
+    if not isinstance(acceptance_commands, (list, tuple)):
+        raise ValueError("deterministic command requires contract acceptance_commands")
+    normalized = tuple(command)
+    for index, source in enumerate(acceptance_commands):
+        if acceptance_command_argv(source) == normalized:
+            return index
+    raise ValueError(
+        "deterministic command must exactly match one declared acceptance_commands entry"
+    )
 
 ClaudeQuotaZone = Literal[
     "green",
@@ -624,6 +662,8 @@ class TaskContract:
             raise ValueError("objective is required")
         if not self.allowed_scope:
             raise ValueError("allowed_scope must not be empty")
+        for command in self.acceptance_commands:
+            acceptance_command_argv(command)
         if bool(self.source_thread_id) != bool(self.context_bundle_ref):
             raise ValueError(
                 "source_thread_id and context_bundle_ref must be supplied together"

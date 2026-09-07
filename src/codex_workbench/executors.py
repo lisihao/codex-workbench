@@ -28,6 +28,7 @@ from .model import (
     codex_model_long_context_overrides,
     codex_model_profile,
     codex_model_reasoning_effort,
+    deterministic_acceptance_command_index,
 )
 from .planner import archify_directive, archify_internal_state
 from .worktrees import WorktreeManager, scope_allows
@@ -1470,6 +1471,10 @@ class DeterministicExecutor(ProcessExecutor):
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
         command = list(request.spec["command"])
+        deterministic_acceptance_command_index(
+            command,
+            request.contract.get("acceptance_commands"),
+        )
         result, artifacts = self._run(
             command,
             cwd=request.worktree,

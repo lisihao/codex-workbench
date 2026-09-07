@@ -1279,8 +1279,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--research-skill-source",
-        default="~/.agents/skills/research",
-        help="complete Research skill copied into the isolated Sol planner home",
+        help="complete Research skill override; defaults to the bundled skills/research",
     )
     parser.add_argument(
         "--tailscale-socket",
@@ -1431,7 +1430,11 @@ def main() -> int:
         refresh_seconds=ai_frontier_refresh_seconds,
     )
     authority_machine_id = macos_machine_id()
-    research_source = validate_research_skill_source(Path(args.research_skill_source))
+    research_source = validate_research_skill_source(
+        Path(args.research_skill_source)
+        if args.research_skill_source
+        else source / "skills" / "research"
+    )
     research_destination = process_home / ".agents" / "skills" / "research"
     assert_no_symlink_ancestors(research_destination, label="Research skill destination")
     assert_directory_target(research_destination.parent, "Research skill parent")

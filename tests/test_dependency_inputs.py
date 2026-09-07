@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -406,6 +408,7 @@ class DependencyInputTests(unittest.TestCase):
                     verifier=True,
                 ),
             ]
+            contract = self._authorize_deterministic_commands(contract, nodes)
             store.create_task(contract, nodes, "dependency-flow-create")
             store.queue_task(contract.task_id)
             coordinator = self._run_to_terminal(store, state, contract.task_id)
@@ -497,6 +500,7 @@ class DependencyInputTests(unittest.TestCase):
                     verifier=True,
                 ),
             ]
+            contract = self._authorize_deterministic_commands(contract, nodes)
             store.create_task(contract, nodes, "dependency-scope-create")
             store.queue_task(contract.task_id)
             self._run_to_terminal(store, state, contract.task_id)
@@ -511,6 +515,20 @@ class DependencyInputTests(unittest.TestCase):
     @staticmethod
     def _command(source: str) -> tuple[str, ...]:
         return (sys.executable, "-c", source)
+
+    @staticmethod
+    def _authorize_deterministic_commands(
+        contract: TaskContract,
+        nodes: list[NodeSpec],
+    ) -> TaskContract:
+        return replace(
+            contract,
+            acceptance_commands=tuple(
+                shlex.join(node.command)
+                for node in nodes
+                if node.executor == "deterministic"
+            ),
+        )
 
     @staticmethod
     def _git(repository: Path, *arguments: str) -> str:

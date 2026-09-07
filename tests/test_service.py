@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1290,14 +1291,6 @@ raise AssertionError("fatal coordinator failure returned")
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
             epoch = store.activate_coordinator("compose", "test-machine")
-            contract = TaskContract(
-                task_id="compose",
-                repository=str(repository),
-                base_sha=base_sha,
-                objective="compose parallel changes",
-                allowed_scope=("tests",),
-                verifier_model="fixture",
-            )
             make_a = (
                 sys.executable,
                 "-c",
@@ -1312,6 +1305,17 @@ raise AssertionError("fatal coordinator failure returned")
                 sys.executable,
                 "-c",
                 "from pathlib import Path; assert Path('tests/a.txt').read_text() == 'A'; assert Path('tests/b.txt').read_text() == 'B'",
+            )
+            contract = TaskContract(
+                task_id="compose",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="compose parallel changes",
+                allowed_scope=("tests",),
+                acceptance_commands=tuple(
+                    shlex.join(command) for command in (make_a, make_b, verify)
+                ),
+                verifier_model="fixture",
             )
             nodes = [
                 NodeSpec("a", "compose", "A", "deterministic", "local", command=make_a, write_scopes=("tests/a.txt",)),
@@ -1458,20 +1462,22 @@ raise AssertionError("fatal coordinator failure returned")
 
             def create_and_run(task_id: str, verification_tier: str = "L3") -> dict:
                 base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+                script = (
+                    "from pathlib import Path; "
+                    f"p=Path({str(counter)!r}); p.write_text((p.read_text() if p.exists() else '')+'run\\n'); "
+                    "assert Path('checked.txt').read_text()"
+                )
+                command = (sys.executable, "-c", script)
                 contract = TaskContract(
                     task_id=task_id,
                     repository=str(repository),
                     base_sha=base_sha,
                     objective="verify the declared input",
                     allowed_scope=("checked.txt",),
+                    acceptance_commands=(shlex.join(command),),
                     required_artifacts=("test-log", "verdict"),
                     verifier_model="fixture",
                     verification_tier=verification_tier,
-                )
-                script = (
-                    "from pathlib import Path; "
-                    f"p=Path({str(counter)!r}); p.write_text((p.read_text() if p.exists() else '')+'run\\n'); "
-                    "assert Path('checked.txt').read_text()"
                 )
                 node = NodeSpec(
                     "verify",
@@ -1479,7 +1485,7 @@ raise AssertionError("fatal coordinator failure returned")
                     "verify",
                     "deterministic",
                     "fixture",
-                    command=(sys.executable, "-c", script),
+                    command=command,
                     read_scopes=("checked.txt",),
                     verifier=True,
                 )

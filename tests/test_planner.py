@@ -90,6 +90,74 @@ def catalog() -> dict:
 
 
 class PlannerRoutingTests(unittest.TestCase):
+    def test_planner_rejects_deterministic_argv_not_declared_by_caller(self) -> None:
+        worker = node(
+            "mechanical",
+            write_scope="tests/output.txt",
+            executor="deterministic",
+            model="local",
+        )
+        worker["command"] = ["/bin/sh", "-c", "touch /tmp/planner-controlled"]
+        raw = {
+            "summary": "untrusted deterministic command",
+            "nodes": [
+                worker,
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("mechanical",),
+                    verifier=True,
+                ),
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            PlannerError,
+            "unauthorized deterministic command",
+        ):
+            CodexPlanner.normalize_and_validate_plan(
+                make_contract(acceptance_commands=("python -m unittest",)),
+                raw,
+                claude_models_available=(),
+                default_executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+            )
+
+    def test_planner_derives_only_exact_caller_declared_deterministic_argv(self) -> None:
+        worker = node(
+            "mechanical",
+            write_scope="tests/output.txt",
+            executor="deterministic",
+            model="local",
+        )
+        worker["command"] = ["python", "-m", "unittest"]
+        raw = {
+            "summary": "declared deterministic command",
+            "nodes": [
+                worker,
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("mechanical",),
+                    verifier=True,
+                ),
+            ],
+        }
+
+        planned = CodexPlanner.normalize_and_validate_plan(
+            make_contract(acceptance_commands=("python -m unittest",)),
+            raw,
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(planned[0].command, ("python", "-m", "unittest"))
+
     def test_planner_command_emits_explicit_long_context_overrides(self) -> None:
         command = CodexPlanner._command(
             "codex",
