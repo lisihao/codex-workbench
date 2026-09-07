@@ -9,6 +9,7 @@ from pathlib import Path
 import plistlib
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -1603,6 +1604,88 @@ class InstallerTests(unittest.TestCase):
                 transaction.rollback()
                 self.assertEqual(target.read_text(), "before\n")
                 self.assertFalse(transaction.root.exists())
+
+    def test_authority_transaction_restores_wal_database_from_online_backup(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            database = root / "state.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("PRAGMA user_version=12")
+            connection.execute("CREATE TABLE records (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO records(value) VALUES ('before')")
+            connection.commit()
+            database.chmod(0o600)
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertTrue(Path(f"{database}-wal").exists())
+
+            transaction = module.InstallTransaction(root)
+            transaction.snapshot_sqlite(database, "Authority state database")
+            backup = transaction.sqlite_backup_path
+            self.assertIsNotNone(backup)
+            assert backup is not None
+            self.assertTrue(backup.is_file())
+            with sqlite3.connect(backup) as backup_connection:
+                self.assertEqual(backup_connection.execute("PRAGMA user_version").fetchone()[0], 12)
+                self.assertEqual(
+                    backup_connection.execute("SELECT value FROM records").fetchall(),
+                    [("before",)],
+                )
+
+            connection.execute("ALTER TABLE records ADD COLUMN introduced_after_snapshot TEXT")
+            connection.execute(
+                "INSERT INTO records(value, introduced_after_snapshot) VALUES ('after', 'new')"
+            )
+            connection.execute("PRAGMA user_version=13")
+            connection.commit()
+            connection.close()
+            Path(f"{database}-wal").write_bytes(b"stale wal sidecar")
+            Path(f"{database}-shm").write_bytes(b"stale shm sidecar")
+
+            transaction.rollback()
+
+            self.assertFalse(Path(f"{database}-wal").exists())
+            self.assertFalse(Path(f"{database}-shm").exists())
+            with sqlite3.connect(database) as restored:
+                self.assertEqual(restored.execute("PRAGMA user_version").fetchone()[0], 12)
+                self.assertEqual(
+                    restored.execute("SELECT value FROM records").fetchall(),
+                    [("before",)],
+                )
+                self.assertEqual(
+                    [column[1] for column in restored.execute("PRAGMA table_info(records)")],
+                    ["value"],
+                )
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(transaction.root.exists())
+
+    def test_authority_transaction_commit_removes_temporary_sqlite_backup(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            database = root / "state.sqlite"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE records (value TEXT NOT NULL)")
+                connection.execute("INSERT INTO records(value) VALUES ('stable')")
+            transaction = module.InstallTransaction(root)
+            transaction.snapshot_sqlite(database, "Authority state database")
+            backup = transaction.sqlite_backup_path
+            transaction_root = transaction.root
+            self.assertIsNotNone(backup)
+            assert backup is not None
+            self.assertTrue(backup.is_file())
+
+            transaction.commit()
+
+            self.assertFalse(transaction_root.exists())
+            self.assertFalse(backup.exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM records").fetchall(),
+                    [("stable",)],
+                )
 
     def test_authority_preserves_existing_previous_app_backup_on_upgrade(self) -> None:
         module = self._macos_installer_module()

@@ -8,12 +8,14 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import sqlite3
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 import uuid
+from urllib.parse import quote
 
 LABEL = "com.lisihao.codex-workbench"
 QUOTA_LABEL = "com.lisihao.codex-workbench-quota"
@@ -228,6 +230,7 @@ class InstallTransaction:
         self.preserved_app: Path | None = None
         self.preserved_app_root: Path | None = None
         self.application_root: Path | None = None
+        self._sqlite_snapshot: tuple[Path, Path, bool, int | None] | None = None
 
     def snapshot(self, path: Path, label: str, *, allow_symlink: bool = False) -> None:
         path = absolute_path(path)
@@ -264,6 +267,139 @@ class InstallTransaction:
         app_root.rename(backup)
         self.preserved_app = backup
         self.preserved_app_root = app_root
+
+    @staticmethod
+    def _sqlite_sidecars(path: Path) -> tuple[Path, Path]:
+        return Path(f"{path}-wal"), Path(f"{path}-shm")
+
+    @staticmethod
+    def _sqlite_read_only_uri(path: Path) -> str:
+        return f"file:{quote(str(path), safe='/')}?mode=ro"
+
+    @staticmethod
+    def _verify_sqlite_integrity(connection: sqlite3.Connection, label: str) -> None:
+        try:
+            row = connection.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError as error:
+            raise SystemExit(f"{label} integrity check failed: {error}") from error
+        if row is None or row[0] != "ok":
+            detail = "no result" if row is None else str(row[0])
+            raise SystemExit(f"{label} integrity check failed: {detail}")
+
+    @property
+    def sqlite_backup_path(self) -> Path | None:
+        """Return the temporary online-backup path, when a database existed."""
+
+        if self._sqlite_snapshot is None or not self._sqlite_snapshot[2]:
+            return None
+        return self._sqlite_snapshot[1]
+
+    def snapshot_sqlite(self, path: Path, label: str = "SQLite database") -> None:
+        """Capture a consistent live SQLite database through the backup API.
+
+        The source is opened read-only so SQLite includes committed WAL pages
+        in the online backup without copying the live database or its sidecar
+        files.  The backup is integrity-checked before it becomes part of the
+        transaction; a missing database is recorded so rollback removes any
+        database created by the failed installation.
+        """
+
+        path = absolute_path(path)
+        if self._sqlite_snapshot is not None:
+            raise SystemExit("installer transaction already has a SQLite snapshot")
+        assert_no_symlink_ancestors(path, label=label)
+        sidecars = self._sqlite_sidecars(path)
+        for sidecar in sidecars:
+            assert_no_symlink_ancestors(sidecar, label=f"{label} sidecar")
+        existed = path.exists() or path.is_symlink()
+        if existed and not path.is_file():
+            raise SystemExit(f"{label} is not a regular file: {path}")
+        mode = path.stat().st_mode & 0o777 if existed else None
+        backup = self.root / "sqlite-state.sqlite"
+        if not existed:
+            self._sqlite_snapshot = (path, backup, False, mode)
+            return
+
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(
+                self._sqlite_read_only_uri(path),
+                uri=True,
+                timeout=30,
+            )
+            self._verify_sqlite_integrity(source, f"live {label}")
+            destination = sqlite3.connect(str(backup), timeout=30)
+            source.backup(destination)
+            destination.commit()
+            self._verify_sqlite_integrity(destination, f"backup {label}")
+        except (OSError, sqlite3.Error, SystemExit) as error:
+            if backup.exists():
+                backup.unlink()
+            raise SystemExit(f"{label} online backup failed: {error}") from error
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        backup.chmod(0o600)
+        self._sqlite_snapshot = (path, backup, True, mode)
+
+    def _restore_sqlite(self) -> None:
+        snapshot = self._sqlite_snapshot
+        if snapshot is None:
+            return
+        path, backup, existed, mode = snapshot
+        assert_no_symlink_ancestors(path, label="SQLite rollback target")
+        sidecars = self._sqlite_sidecars(path)
+        for sidecar in sidecars:
+            assert_no_symlink_ancestors(sidecar, label="SQLite rollback sidecar")
+            if sidecar.exists() or sidecar.is_symlink():
+                remove_path(sidecar)
+        if path.exists() or path.is_symlink():
+            remove_path(path)
+        if not existed:
+            return
+        assert_no_symlink_ancestors(backup, label="SQLite transaction backup")
+        if not backup.is_file():
+            raise SystemExit(f"SQLite transaction backup is missing: {backup}")
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(
+                self._sqlite_read_only_uri(backup),
+                uri=True,
+                timeout=30,
+            )
+            self._verify_sqlite_integrity(source, "SQLite transaction backup")
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination = sqlite3.connect(str(path), timeout=30)
+            source.backup(destination)
+            destination.commit()
+        except (OSError, sqlite3.Error) as error:
+            raise SystemExit(f"SQLite rollback restore failed: {error}") from error
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        if mode is not None:
+            path.chmod(mode)
+        verification: sqlite3.Connection | None = None
+        try:
+            verification = sqlite3.connect(
+                self._sqlite_read_only_uri(path),
+                uri=True,
+                timeout=30,
+            )
+            self._verify_sqlite_integrity(verification, "restored SQLite database")
+        finally:
+            if verification is not None:
+                verification.close()
+        for sidecar in sidecars:
+            assert_no_symlink_ancestors(sidecar, label="SQLite rollback sidecar")
+            if sidecar.exists() or sidecar.is_symlink():
+                remove_path(sidecar)
 
     def rollback(self) -> None:
         errors: list[str] = []
@@ -313,6 +449,10 @@ class InstallTransaction:
                     path.rmdir()
             except OSError:
                 pass
+        try:
+            self._restore_sqlite()
+        except BaseException as error:  # pragma: no cover - catastrophic SQLite/filesystem fault
+            errors.append(str(error))
         self.cleanup()
         if errors:
             raise SystemExit("installer rollback failed: " + "; ".join(errors))
@@ -1581,6 +1721,7 @@ def main() -> int:
         for label in service_labels
     }
     transaction = InstallTransaction(state_root)
+    transaction.snapshot_sqlite(state_root / "state.sqlite", "Authority state database")
     for directory in (
         state_root,
         logs,
@@ -1860,7 +2001,8 @@ def main() -> int:
             )
     except BaseException as error:
         rollback_errors: list[str] = []
-        if services_touched:
+        services_need_stop = services_touched or any(service_was_loaded.values())
+        if services_need_stop:
             for label, path in (
                 (LABEL, plist_path),
                 (QUOTA_LABEL, quota_plist_path),
@@ -1876,7 +2018,7 @@ def main() -> int:
             transaction.rollback()
         except BaseException as rollback_error:
             rollback_errors.append(str(rollback_error))
-        if services_touched:
+        if services_need_stop:
             for label, path in (
                 (LABEL, plist_path),
                 (QUOTA_LABEL, quota_plist_path),
