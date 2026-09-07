@@ -350,7 +350,7 @@ def _parse_usage_text(text: str, observed: datetime) -> dict[str, dict[str, Any]
         reset = match.group("reset")
         if name == "five_hour" and reset is None and used == 0:
             window, precision, fingerprint = "five_hour:idle", "idle", "idle"
-        elif reset is None and used == 0 and name in MODEL_POOL_LABELS.values():
+        elif reset is None and name in MODEL_POOL_LABELS.values():
             weekly = pools["seven_day"]
             window = weekly["window_id"]
             precision = weekly["reset_precision"]

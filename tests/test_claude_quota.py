@@ -206,7 +206,7 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         self.assertEqual(fable["reset_precision"], weekly["reset_precision"])
         self.assertEqual(fable["reset_fingerprint"], weekly["reset_fingerprint"])
 
-    def test_nonzero_fable_without_reset_remains_fail_closed(self) -> None:
+    def test_nonzero_fable_without_reset_inherits_weekly_window(self) -> None:
         text = "\n".join((
             "Current session: 1% used · resets 4 pm (America/Toronto)",
             "Current week (all models): 1% used · resets Sep 9 at 1am (America/Toronto)",
@@ -220,8 +220,13 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
             ),
         }
 
-        with self.assertRaisesRegex(ClaudeQuotaError, "seven_day_fable reset is missing"):
-            self._collector(responses).collect()
+        snapshot = self._collector(responses).collect()
+
+        weekly = snapshot["pools"]["seven_day"]
+        fable = snapshot["pools"]["seven_day_fable"]
+        self.assertEqual(fable["displayed_used_percent"], 1)
+        self.assertEqual(fable["window_id"], weekly["window_id"])
+        self.assertEqual(fable["reset_fingerprint"], weekly["reset_fingerprint"])
 
     def test_passive_usage_rejects_nonzero_subagent_activity(self) -> None:
         payload = json.loads(self._usage())
