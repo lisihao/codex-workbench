@@ -27,6 +27,7 @@ from .model import (
 from .artifacts import ArtifactStore, presentation_format
 from .dependency_inputs import load_recorded_dependency_input
 from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
+from .execution_attribution import ExecutionAttribution
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
 from .planner import propose_archify_reconciliation
@@ -4144,6 +4145,50 @@ class WorkbenchStore:
             )
         return binding
 
+    @staticmethod
+    def _recorded_retry_fallback_route(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        source_attempt: int,
+    ) -> tuple[str, str] | None:
+        """Reuse a durable fallback route without treating it as identity evidence.
+
+        Retry recovery intentionally clears transient ``effective_*`` columns
+        before a new lease.  A Claude-to-Codex fallback is nevertheless a
+        durable route decision for the failed source attempt, recorded in the
+        event ledger.  Replaying that exact decision avoids another Claude
+        dispatch while preserving the new attempt's model observation as a
+        separate typed-attribution question.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = 'node.routed' AND task_id = ? AND node_id = ?
+            ORDER BY cursor DESC
+            """,
+            (task_id, node_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            model = payload.get("model")
+            if (
+                payload.get("attempt") == source_attempt
+                and payload.get("from") == "claude"
+                and payload.get("to") == "codex"
+                and isinstance(model, str)
+                and model
+            ):
+                return "codex", model
+        return None
+
     def claim_ready_node(
         self,
         worker_id: str,
@@ -4247,9 +4292,22 @@ class WorkbenchStore:
                     effective_executor = str(authorization["executor"])
                     effective_model = str(authorization["model"])
                 else:
-                    effective_executor = str(candidate["effective_executor"] or spec["executor"])
-                    effective_model = retry_model(
+                    retry_fallback = (
+                        self._recorded_retry_fallback_route(
+                            connection,
+                            task_id=str(candidate["task_id"]),
+                            node_id=str(candidate["node_id"]),
+                            source_attempt=int(failed_attempt_recovery["source"]["attempt"]),
+                        )
+                        if failed_attempt_recovery is not None
+                        else None
+                    )
+                    effective_executor, selected_model = retry_fallback or (
+                        str(candidate["effective_executor"] or spec["executor"]),
                         str(candidate["effective_model"] or spec["model"]),
+                    )
+                    effective_model = retry_model(
+                        selected_model,
                         candidate_attempt,
                         verifier=bool(spec.get("verifier")),
                         routing_policy_version=spec.get("routing_policy_version"),
@@ -4359,7 +4417,7 @@ class WorkbenchStore:
                     None,
                     {"from": selected["task_state"], "to": "running"},
                 )
-            self._event(
+            started_event_cursor = self._event(
                 connection,
                 "node.started",
                 selected["task_id"],
@@ -4432,6 +4490,8 @@ class WorkbenchStore:
                 "task_id": selected["task_id"],
                 "node_id": selected["node_id"],
                 "attempt": attempt,
+                "started_at": timestamp,
+                "started_event_cursor": started_event_cursor,
                 "coordinator_epoch": coordinator_epoch,
                 "lease_epoch": lease_epoch,
                 "spec": {
@@ -5340,7 +5400,14 @@ class WorkbenchStore:
             ):
                 return signature
             spec = json.loads(row["spec_json"])
-            self._validate_result_contract(spec, row, result)
+            self._validate_result_contract(
+                connection,
+                task_id,
+                node_id,
+                spec,
+                row,
+                result,
+            )
             self._verify_artifact_refs(result.artifacts)
             if spec.get("verifier") and spec.get("executor") != "fixture":
                 for ref in result.evidence:
@@ -5413,6 +5480,15 @@ class WorkbenchStore:
             recovery = self._dirty_worktree_recovery_for_settlement(
                 row["recovery_json"],
                 attempt=attempt,
+            )
+            self._validate_result_contract(
+                connection,
+                task_id,
+                node_id,
+                spec,
+                row,
+                result,
+                verify_artifacts=False,
             )
             if recovery is not None and recovery["state"] == "authorized":
                 self._rollback_authorized_dirty_worktree_recovery(
@@ -5693,20 +5769,162 @@ class WorkbenchStore:
             lease_epoch=int(claimed["lease_epoch"]),
         )
 
+    def _validate_execution_attribution(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+        spec: dict[str, Any],
+        contract: dict[str, Any],
+        result: NodeResult,
+        verify_artifacts: bool = True,
+    ) -> ExecutionAttribution | None:
+        """Validate bounded attribution against this durable node attempt."""
+
+        raw = result.execution_attribution
+        if raw is None:
+            return None
+        try:
+            attribution = ExecutionAttribution.from_dict(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"execution attribution is invalid: {error}") from error
+        state = attribution.state
+        if (state.task_id, state.node_id, state.attempt) != (task_id, node_id, attempt):
+            raise ValueError("execution attribution state does not match the settled node attempt")
+
+        artifact_refs = set(result.artifacts.values())
+        expected_snapshot_ids = {
+            value
+            for value in (
+                spec.get("capability_snapshot_id"),
+                contract.get("capability_snapshot_id"),
+            )
+            if isinstance(value, str) and value
+        }
+        references = (
+            *attribution.references,
+            *attribution.requested_model.provenance.references,
+            *attribution.observed_model.provenance.references,
+            *attribution.physical_call.provenance.references,
+            *attribution.failure.references,
+            *(reference for candidate in attribution.candidate_decisions for reference in candidate.references),
+            *(
+                reference
+                for condition in (
+                    attribution.conditions.dependency,
+                    attribution.conditions.scope,
+                    attribution.conditions.provider_quota,
+                    attribution.conditions.environment_readiness,
+                    attribution.conditions.cpu_wait,
+                    attribution.conditions.memory_wait,
+                    attribution.conditions.io_wait,
+                )
+                for reference in condition.references
+            ),
+        )
+        for reference in references:
+            if reference.kind in {"artifact", "readiness_report", "dependency_report"}:
+                if reference.ref not in artifact_refs:
+                    raise ValueError(
+                        "execution attribution artifact reference is not present in this result"
+                    )
+                if verify_artifacts:
+                    self.artifacts.verify(reference.ref)
+            elif reference.kind == "event":
+                if reference.cursor is None:
+                    raise ValueError("execution attribution event reference requires a cursor")
+                event = connection.execute(
+                    "SELECT event_type, task_id, node_id, payload_json FROM events WHERE cursor = ?",
+                    (reference.cursor,),
+                ).fetchone()
+                try:
+                    event_payload = json.loads(event["payload_json"]) if event is not None else None
+                except (TypeError, json.JSONDecodeError):
+                    event_payload = None
+                if (
+                    event is None
+                    or event["event_type"] != reference.ref
+                    or event["task_id"] != task_id
+                    or event["node_id"] != node_id
+                    or not isinstance(event_payload, dict)
+                    or event_payload.get("attempt") != attempt
+                ):
+                    raise ValueError("execution attribution event reference is not this node attempt")
+            elif reference.kind == "quota_snapshot":
+                prefix, separator, raw_id = reference.ref.partition(":")
+                if prefix != "claude" or not separator or not raw_id.isdigit():
+                    raise ValueError("execution attribution quota reference is invalid")
+                snapshot = connection.execute(
+                    "SELECT id FROM quota_snapshots WHERE provider = 'claude' AND id = ?",
+                    (int(raw_id),),
+                ).fetchone()
+                if snapshot is None:
+                    raise ValueError("execution attribution quota reference is unavailable")
+            elif reference.kind == "scope_contract":
+                if reference.ref != f"task:{task_id}":
+                    raise ValueError("execution attribution scope reference does not match this task")
+            elif reference.kind == "snapshot" and reference.ref not in expected_snapshot_ids:
+                raise ValueError("execution attribution capability snapshot is not pinned by this node")
+            elif reference.kind != "snapshot":
+                raise ValueError("execution attribution reference kind is not persisted by this runtime")
+
+        if state.event_cursor is not None:
+            started = connection.execute(
+                "SELECT event_type, task_id, node_id, payload_json FROM events WHERE cursor = ?",
+                (state.event_cursor,),
+            ).fetchone()
+            try:
+                started_payload = json.loads(started["payload_json"]) if started is not None else None
+            except (TypeError, json.JSONDecodeError):
+                started_payload = None
+            if (
+                started is None
+                or started["event_type"] != "node.started"
+                or started["task_id"] != task_id
+                or started["node_id"] != node_id
+                or not isinstance(started_payload, dict)
+                or started_payload.get("attempt") != attempt
+            ):
+                raise ValueError("execution attribution state cursor is not this node.started event")
+
+        observed = attribution.observed_model
+        if observed.status == "attested" and result.actual_model != observed.model_id:
+            raise ValueError(
+                "legacy actual_model must match an attested observed model when attribution is present"
+            )
+        return attribution
+
     def _validate_result_contract(
         self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
         spec: dict[str, Any],
         row: sqlite3.Row,
         result: NodeResult,
+        *,
+        verify_artifacts: bool = True,
     ) -> None:
         recovery = self._dirty_worktree_recovery_for_settlement(
             row["recovery_json"],
             attempt=int(row["attempt"]),
         )
+        contract = json.loads(row["contract_json"])
+        self._validate_execution_attribution(
+            connection,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=int(row["attempt"]),
+            spec=spec,
+            contract=contract,
+            result=result,
+            verify_artifacts=verify_artifacts,
+        )
         if spec.get("executor") == "fixture" or spec.get("model") == "fixture":
             if recovery is None:
                 return
-        contract = json.loads(row["contract_json"])
         expected_profile, expected_tier = governance_identity(contract)
         if result.governance_profile != expected_profile:
             raise ValueError(
@@ -5769,6 +5987,7 @@ class WorkbenchStore:
             and isinstance(directive, dict)
             and directive.get("schema_version") == 1
             and directive.get("artifact_required") is True
+            and verify_artifacts
         ):
             self._validate_archify_worker_evidence(result)
 
@@ -5934,6 +6153,14 @@ class WorkbenchStore:
         if (
             result.status in {"succeeded", "failed"}
             and executor in {"codex", "claude"}
+            # New coordinator results carry typed attribution.  Codex's
+            # selected CLI argument is not a native observation, so an absent
+            # legacy actual_model is valid only when that attribution records
+            # the identity as unknown/unattested. Legacy direct-store callers
+            # keep the historic stricter requirement below.
+            and not (
+                result.actual_model is None and result.execution_attribution is not None
+            )
             and not WorkbenchStore._actual_model_matches_lease(
                 executor,
                 leased_model,
@@ -6212,6 +6439,26 @@ class WorkbenchStore:
                 """
             ).fetchone()
             return QuotaSnapshot(**json.loads(row["snapshot_json"])) if row else None
+
+    def quota_snapshot_reference(self, snapshot: QuotaSnapshot) -> int | None:
+        """Return the existing immutable snapshot row for attribution.
+
+        The coordinator already received this snapshot through the durable
+        quota ledger.  Returning its row identity lets an attribution record
+        point to that source without embedding a second snapshot copy.
+        """
+
+        snapshot.validate()
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM quota_snapshots
+                WHERE provider = 'claude' AND snapshot_json = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (canonical_json(asdict(snapshot)),),
+            ).fetchone()
+            return int(row["id"]) if row is not None else None
 
     def list_quota_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
         with self.connection() as connection:

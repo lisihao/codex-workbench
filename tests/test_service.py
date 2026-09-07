@@ -447,6 +447,221 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(cursors, sorted(cursors))
             self.assertIn("task.state_changed", {event["event_type"] for event in events})
 
+    def test_readiness_failure_blocks_before_fixture_executor_and_persists_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # This is deliberately a pnpm-shaped target without a linker. The
+            # readiness checker must report the local environment fault and
+            # never attempt an install or a fixture/model execution.
+            (root / "package.json").write_text(json.dumps({"packageManager": "pnpm@11.25.0"}))
+            (root / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("readiness-block", "test-machine")
+            contract = TaskContract(
+                task_id="readiness-block",
+                repository=str(root),
+                base_sha="fixture",
+                objective="block unavailable local dependencies before execution",
+                allowed_scope=("package.json",),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "fixture",
+                "fixture",
+                "would execute only when ready",
+            )
+            store.create_task(contract, verified([node], contract.task_id), "readiness-block-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("readiness-worker", epoch)
+            assert claimed is not None
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            executor = MagicMock()
+            try:
+                with patch.object(coordinator, "_executor", return_value=executor):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            executor.execute.assert_not_called()
+            task = store.get_task(contract.task_id)
+            work = next(item for item in task["nodes"] if item["node_id"] == "work")
+            self.assertEqual((task["state"], work["state"]), ("blocked", "blocked"))
+            result = work["result"]
+            assert isinstance(result, dict)
+            self.assertEqual(result["changed_paths"], [])
+            attribution = result["execution_attribution"]
+            self.assertEqual(attribution["failure"]["origin"], "environment")
+            self.assertEqual(attribution["conditions"]["environment_readiness"]["status"], "observed")
+            self.assertEqual(attribution["observed_model"]["status"], "unknown")
+            report = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["execution-readiness"]).read_text()
+            )
+            self.assertFalse(report["ready"])
+            self.assertTrue(report["failures"])
+
+    def test_readiness_resolves_a_package_from_the_allocated_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            package = repository / "src" / "local_package"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("VALUE = 'target-worktree'\n")
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            subprocess.run(["git", "add", "src/local_package/__init__.py"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("readiness-source", "test-machine")
+            contract = TaskContract(
+                task_id="readiness-source",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="resolve source from the allocated worktree",
+                allowed_scope=("src",),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "codex",
+                "gpt-5.6-luna",
+                "inspect only the local package",
+                read_scopes=("src",),
+            )
+            store.create_task(contract, verified([node], contract.task_id), "readiness-source-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("readiness-source-worker", epoch)
+            assert claimed is not None
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch)
+            executor = MagicMock()
+            executor.execute.return_value = NodeResult(
+                status="succeeded",
+                summary="local source inspected",
+                provider="codex",
+                result_kind="worker",
+                checks=("focused-check",),
+            )
+            try:
+                with patch.object(coordinator, "_executor", return_value=executor):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            executor.execute.assert_called_once()
+            work = next(item for item in store.get_task(contract.task_id)["nodes"] if item["node_id"] == "work")
+            result = work["result"]
+            assert isinstance(result, dict)
+            report = json.loads(
+                coordinator.artifacts.verify(result["artifacts"]["execution-readiness"]).read_text()
+            )
+            source_check = next(check for check in report["checks"] if check["id"] == "source:local_package")
+            self.assertEqual(source_check["status"], "passed")
+            self.assertEqual(
+                source_check["detail"]["origin"],
+                str((Path(work["worktree"]) / "src" / "local_package" / "__init__.py").resolve()),
+            )
+            attribution = result["execution_attribution"]
+            self.assertEqual(attribution["requested_model"]["model_id"], "gpt-5.6-luna")
+            self.assertEqual(attribution["observed_model"]["status"], "unknown")
+
+    def test_verifier_readiness_block_preserves_accepted_worker_patch_without_reexecution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repository, check=True)
+            (repository / "README.md").write_text("base\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+            base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+            state = root / "state"
+            store = WorkbenchStore(state / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("resume-verifier", "test-machine")
+            contract = TaskContract(
+                task_id="resume-verifier",
+                repository=str(repository),
+                base_sha=base_sha,
+                objective="retain accepted worker evidence when verifier readiness blocks",
+                allowed_scope=("package.json", "pnpm-lock.yaml"),
+                required_artifacts=(),
+            )
+            worker = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "codex",
+                "gpt-5.6-luna",
+                "create local package inputs",
+                write_scopes=("package.json", "pnpm-lock.yaml"),
+            )
+            verifier = NodeSpec(
+                "verify",
+                contract.task_id,
+                "verify",
+                "codex",
+                "gpt-5.6-sol",
+                "independently verify the composed patch",
+                depends_on=("work",),
+                verifier=True,
+            )
+            store.create_task(contract, [worker, verifier], "resume-verifier-create")
+            store.queue_task(contract.task_id)
+            coordinator = Coordinator(store, state, coordinator_epoch=epoch)
+            executions: list[str] = []
+
+            class Executor:
+                def execute(self, request: ExecutionRequest) -> NodeResult:
+                    executions.append(request.node_id)
+                    if request.node_id == "work":
+                        assert request.worktree is not None
+                        (request.worktree / "package.json").write_text(
+                            json.dumps({"packageManager": "pnpm@11.25.0"})
+                        )
+                        (request.worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+                        return NodeResult(
+                            status="succeeded",
+                            summary="package inputs created",
+                            provider="codex",
+                            result_kind="worker",
+                            checks=("worker-check",),
+                        )
+                    raise AssertionError("verifier executor must not run after readiness failure")
+
+            executor = Executor()
+            try:
+                with patch.object(coordinator, "_executor", return_value=executor):
+                    claimed_worker = store.claim_ready_node("resume-worker", epoch)
+                    assert claimed_worker is not None
+                    coordinator._execute_claimed(claimed_worker)
+                    claimed_verifier = store.claim_ready_node("resume-verifier", epoch)
+                    assert claimed_verifier is not None
+                    coordinator._execute_claimed(claimed_verifier)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            task = store.get_task(contract.task_id)
+            accepted_worker = next(item for item in task["nodes"] if item["node_id"] == "work")
+            blocked_verifier = next(item for item in task["nodes"] if item["node_id"] == "verify")
+            self.assertEqual(executions, ["work"])
+            self.assertEqual((task["state"], accepted_worker["state"], blocked_verifier["state"]), ("blocked", "accepted", "blocked"))
+            self.assertIn("patch", accepted_worker["result"]["artifacts"])
+            self.assertEqual(blocked_verifier["result"]["changed_paths"], [])
+            self.assertEqual(
+                blocked_verifier["result"]["execution_attribution"]["failure"]["origin"],
+                "environment",
+            )
+
     def test_spark_lane_is_claimed_before_higher_priority_general_work_and_general_borrows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -613,6 +828,19 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(work["effective_model"], "gpt-5.6-luna")
             self.assertEqual(claude.calls, 1)
             self.assertEqual(codex.calls, 1)
+            attribution = work["result"]["execution_attribution"]
+            self.assertEqual(attribution["requested_model"]["model_id"], "gpt-5.6-luna")
+            self.assertEqual(attribution["observed_model"]["status"], "unattested")
+            self.assertIsNone(attribution["physical_call"]["usage_deduplication_key"])
+            decisions = attribution["candidate_decisions"]
+            self.assertEqual(
+                [(decision["candidate_id"], decision["disposition"]) for decision in decisions],
+                [("claude:sonnet", "selected"), ("codex:gpt-5.6-luna", "selected")],
+            )
+            self.assertTrue(all(
+                decision["references"][0]["ref"] == "node.routed"
+                for decision in decisions
+            ))
             routed = [event for event in store.read_events(task_id="fallback") if event["event_type"] == "node.routed"]
             self.assertEqual(routed[0]["payload"]["reason"], "Claude native-subscription authentication is unavailable")
             checks = {check["id"]: check for check in build_acceptance_report(store)["checks"]}
@@ -859,9 +1087,13 @@ raise AssertionError("fatal coordinator failure returned")
 
             claude = ClaudeStub()
             codex = CodexStub()
-            coordinator = Coordinator(
-                store, state, coordinator_epoch=epoch, max_workers=3, poll_seconds=0.01
-            )
+            # This fixture owns its durable green quota snapshot.  Do not let
+            # an ambient service-level snapshot path replace it while testing
+            # shared-capacity routing.
+            with patch.dict(os.environ, {"CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE": ""}):
+                coordinator = Coordinator(
+                    store, state, coordinator_epoch=epoch, max_workers=3, poll_seconds=0.01
+                )
             fixture = FixtureExecutor(coordinator.artifacts)
             with patch.object(
                 coordinator,

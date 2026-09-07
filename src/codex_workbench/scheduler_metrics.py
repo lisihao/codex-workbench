@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Mapping
 
+from .execution_attribution import ExecutionAttribution
 from .model import derive_execution_lane, derive_quota_pool_id
 
 if TYPE_CHECKING:
@@ -16,7 +17,19 @@ _TERMINAL_NODE_EVENTS = {
     "node.failed": "failed",
     "node.blocked": "blocked",
     "node.indeterminate": "indeterminate",
+    "node.cancelled": "cancelled",
 }
+_FAILURE_ORIGINS = (
+    "environment",
+    "auth",
+    "quota",
+    "transport",
+    "model",
+    "verification",
+    "scope",
+    "cancel",
+    "unknown",
+)
 
 
 def execution_lane_for_spec(spec: Mapping[str, Any]) -> str:
@@ -158,11 +171,19 @@ def compute_scheduler_metrics(
                     lanes[lane]["dependency_blocked"] += 1
             elif state == "running":
                 lanes[lane]["inflight"] += 1
+            elif state == "cancelled":
+                # Older ledgers represent cancellation in current node state
+                # rather than a per-attempt settlement event.  Keep that
+                # separately observable instead of inventing an attempt.
+                lanes[lane]["cancelled_current_nodes"] += 1
 
     starts: dict[tuple[str, str, int], dict[str, Any]] = {}
     settlements: dict[tuple[str, str, int], dict[str, Any]] = {}
     retries: dict[tuple[str, str, int], dict[str, Any]] = {}
     reworks: dict[tuple[str, str, int], dict[str, Any]] = {}
+    lane_physical_call_keys: dict[str, dict[str, int]] = {
+        lane: {} for lane in EXECUTION_LANES
+    }
     ordered_events = sorted(events, key=lambda event: int(event.get("cursor", 0)))
     for event in ordered_events:
         event_type = event.get("event_type")
@@ -191,7 +212,11 @@ def compute_scheduler_metrics(
         elif event_type in _TERMINAL_NODE_EVENTS:
             settlements.setdefault(
                 key,
-                {**record, "status": _TERMINAL_NODE_EVENTS[str(event_type)]},
+                {
+                    **record,
+                    "status": _TERMINAL_NODE_EVENTS[str(event_type)],
+                    "attribution": _terminal_attribution(payload),
+                },
             )
         elif event_type == "node.retry_scheduled":
             retries.setdefault(key, record)
@@ -202,6 +227,8 @@ def compute_scheduler_metrics(
         if record["at"] >= window_start:
             lanes[record["lane"]]["started"] += 1
         settled = settlements.get(key)
+        if settled is None and record["at"] >= window_start:
+            lanes[record["lane"]]["unfinished"] += 1
         end = settled["at"] if settled is not None else observed_at
         if end <= record["at"]:
             continue
@@ -212,7 +239,17 @@ def compute_scheduler_metrics(
 
     for key, settled in settlements.items():
         if settled["at"] >= window_start:
-            lanes[settled["lane"]][settled["status"]] += 1
+            lane_metrics = lanes[settled["lane"]]
+            lane_metrics[settled["status"]] += 1
+            attribution = settled.get("attribution")
+            if not isinstance(attribution, Mapping):
+                attribution = _unknown_terminal_attribution()
+            _record_terminal_attribution(
+                lane_metrics,
+                attribution,
+                status=str(settled["status"]),
+                physical_call_keys=lane_physical_call_keys[settled["lane"]],
+            )
     for key, record in retries.items():
         if record["at"] >= window_start:
             lanes[record["lane"]]["retry"] += 1
@@ -232,8 +269,30 @@ def compute_scheduler_metrics(
         metrics["busy_seconds"] = round(metrics["busy_seconds"], 6)
         metrics["accepted_per_hour"] = round(metrics["accepted"] / duration_hours, 6)
         metrics["quota_pool_ids"] = sorted(lane_pools[lane])
+        physical = metrics["attribution"]["physical_call_usage"]
+        physical["unique_attested_physical_calls"] = len(lane_physical_call_keys[lane])
+        physical["deduplicated_retry_or_fallback_attempts"] = sum(
+            max(0, count - 1) for count in lane_physical_call_keys[lane].values()
+        )
 
     global_busy_seconds = sum(float(metrics["busy_seconds"]) for metrics in lanes.values())
+    global_physical_call_keys: dict[str, int] = {}
+    for keys in lane_physical_call_keys.values():
+        for key, count in keys.items():
+            global_physical_call_keys[key] = global_physical_call_keys.get(key, 0) + count
+    global_failure_origins = {
+        origin: sum(int(metrics["failure_origins"][origin]) for metrics in lanes.values())
+        for origin in _FAILURE_ORIGINS
+    }
+    global_attribution = _empty_attribution_metrics()
+    for metrics in lanes.values():
+        _merge_attribution_metrics(global_attribution, metrics["attribution"])
+    global_attribution["physical_call_usage"]["unique_attested_physical_calls"] = len(
+        global_physical_call_keys
+    )
+    global_attribution["physical_call_usage"]["deduplicated_retry_or_fallback_attempts"] = sum(
+        max(0, count - 1) for count in global_physical_call_keys.values()
+    )
     return {
         "status": "ok",
         "source": "append-only-events",
@@ -247,6 +306,15 @@ def compute_scheduler_metrics(
             "max_workers": max_workers,
             "busy_seconds": round(global_busy_seconds, 6),
             "utilization": round(global_busy_seconds / (max_workers * window_seconds), 6),
+            "outcomes": {
+                status: sum(int(metrics[status]) for metrics in lanes.values())
+                for status in ("accepted", "failed", "blocked", "indeterminate", "cancelled", "unfinished")
+            },
+            "cancelled_current_nodes": sum(
+                int(metrics["cancelled_current_nodes"]) for metrics in lanes.values()
+            ),
+            "failure_origins": global_failure_origins,
+            "attribution": global_attribution,
         },
         "lanes": lanes,
         "quota_pools": {
@@ -285,12 +353,130 @@ def _empty_lane_metrics(lane: str, max_workers: int, spark_workers: int) -> dict
         "failed": 0,
         "blocked": 0,
         "indeterminate": 0,
+        "cancelled": 0,
+        "unfinished": 0,
+        "cancelled_current_nodes": 0,
         "retry": 0,
         "rework": 0,
         "busy_seconds": 0.0,
+        "failure_origins": {origin: 0 for origin in _FAILURE_ORIGINS},
+        "attribution": _empty_attribution_metrics(),
         # Active thread occupancy is not a subscription balance.
         "quota_remaining": None,
     }
+
+
+def _unknown_terminal_attribution() -> dict[str, Any]:
+    return {
+        "present": False,
+        "valid": False,
+        "observed_model_status": "unknown",
+        "failure_origin": "unknown",
+        "physical_call_status": "unknown",
+        "physical_call_usage_key": None,
+    }
+
+
+def _terminal_attribution(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract only aggregate-safe attribution facts from a settled result."""
+
+    raw_result = payload.get("result")
+    result = raw_result if isinstance(raw_result, Mapping) else {}
+    raw = result.get("execution_attribution")
+    if raw is None:
+        return _unknown_terminal_attribution()
+    if not isinstance(raw, Mapping):
+        return {**_unknown_terminal_attribution(), "present": True}
+    try:
+        attribution = ExecutionAttribution.from_dict(raw)
+    except (TypeError, ValueError):
+        return {**_unknown_terminal_attribution(), "present": True}
+    return {
+        "present": True,
+        "valid": True,
+        "observed_model_status": attribution.observed_model.status,
+        "failure_origin": attribution.failure.origin,
+        "physical_call_status": attribution.physical_call.status,
+        "physical_call_usage_key": attribution.physical_call.usage_deduplication_key,
+    }
+
+
+def _empty_attribution_metrics() -> dict[str, Any]:
+    return {
+        "attributed_terminal_attempts": 0,
+        "attested_observed_model_attempts": 0,
+        "unattested_observed_model_attempts": 0,
+        "unknown_observed_model_attempts": 0,
+        "invalid_attribution_attempts": 0,
+        "physical_call_usage": {
+            "attested_call_attempts": 0,
+            "unattested_call_attempts": 0,
+            "unknown_call_attempts": 0,
+            "unique_attested_physical_calls": 0,
+            "deduplicated_retry_or_fallback_attempts": 0,
+            # These are deliberately separate unavailable measurements.  A
+            # physical call ID can deduplicate execution evidence but cannot
+            # turn subscription quota or relative routing cost into dollars.
+            "api_dollars": {"status": "unknown", "amount": None, "unit": "USD"},
+            "subscription_tokens": {"status": "unknown", "amount": None, "unit": "tokens"},
+            "quota_estimate": {
+                "status": "unknown",
+                "amount": None,
+                "unit": "provider-specific quota",
+            },
+        },
+    }
+
+
+def _record_terminal_attribution(
+    metrics: dict[str, Any],
+    attribution: Mapping[str, Any],
+    *,
+    status: str,
+    physical_call_keys: dict[str, int],
+) -> None:
+    """Keep infra failure and physical-call evidence out of model routing data."""
+
+    if attribution.get("present"):
+        metrics["attribution"]["attributed_terminal_attempts"] += 1
+        if not attribution.get("valid"):
+            metrics["attribution"]["invalid_attribution_attempts"] += 1
+        else:
+            identity_status = attribution.get("observed_model_status")
+            if identity_status == "attested":
+                metrics["attribution"]["attested_observed_model_attempts"] += 1
+            elif identity_status == "unattested":
+                metrics["attribution"]["unattested_observed_model_attempts"] += 1
+            else:
+                metrics["attribution"]["unknown_observed_model_attempts"] += 1
+    if status != "accepted":
+        origin = attribution.get("failure_origin")
+        metrics["failure_origins"][origin if origin in _FAILURE_ORIGINS else "unknown"] += 1
+    physical = metrics["attribution"]["physical_call_usage"]
+    physical_status = attribution.get("physical_call_status")
+    if physical_status not in {"attested", "unattested", "unknown"}:
+        physical_status = "unknown"
+    physical[f"{physical_status}_call_attempts"] += 1
+    key = attribution.get("physical_call_usage_key")
+    if physical_status == "attested" and isinstance(key, str) and key:
+        physical_call_keys[key] = physical_call_keys.get(key, 0) + 1
+
+
+def _merge_attribution_metrics(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for field in (
+        "attributed_terminal_attempts",
+        "attested_observed_model_attempts",
+        "unattested_observed_model_attempts",
+        "unknown_observed_model_attempts",
+        "invalid_attribution_attempts",
+    ):
+        target[field] += int(source.get(field, 0))
+    source_physical = source.get("physical_call_usage")
+    if not isinstance(source_physical, Mapping):
+        return
+    target_physical = target["physical_call_usage"]
+    for field in ("attested_call_attempts", "unattested_call_attempts", "unknown_call_attempts"):
+        target_physical[field] += int(source_physical.get(field, 0))
 
 
 def _node_specs(tasks: list[dict[str, Any]]) -> dict[tuple[str, str], Mapping[str, Any]]:

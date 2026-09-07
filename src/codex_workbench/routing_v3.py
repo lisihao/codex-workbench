@@ -129,6 +129,11 @@ class RankedCandidate:
     empirical_ranking_reason: str = "no comparable local runtime cohort"
     performance_lower_bound_95: float | None = None
     runtime_sample_count: int = 0
+    # P0 attribution samples are independently attested.  Older calibration
+    # payloads can omit this field, but a payload that supplies it cannot use
+    # unattested samples as local model-quality evidence.
+    attested_runtime_sample_count: int = 0
+    runtime_identity_status: str = "identity-metadata-unavailable"
     performance_first_pass_rate: float | None = None
     performance_rework_rate: float | None = None
     performance_latency_ms: float | None = None
@@ -195,6 +200,8 @@ class RankedCandidate:
             # read PerformanceRegistry.calibrate directly.
             "lower_bound_95": self.performance_lower_bound_95,
             "runtime_sample_count": self.runtime_sample_count,
+            "attested_runtime_sample_count": self.attested_runtime_sample_count,
+            "runtime_identity_status": self.runtime_identity_status,
             "performance_first_pass_rate": self.performance_first_pass_rate,
             "performance_rework_rate": self.performance_rework_rate,
             "performance_latency_ms": self.performance_latency_ms,
@@ -1216,6 +1223,8 @@ def _performance_inputs(
         "lower_bound_95": None,
         "performance_semantic_status": semantic_status,
         "runtime_sample_count": 0,
+        "attested_runtime_sample_count": 0,
+        "runtime_identity_status": "identity-metadata-unavailable",
         "first_pass_rate": None,
         "rework_rate": None,
         "latency_ms": None,
@@ -1280,11 +1289,30 @@ def _performance_inputs(
     samples = _nonnegative_int(
         _first(posterior, "runtime_sample_count", "sample_count", "runtime_samples")
     )
+    has_attestation_count = "attested_observed_model_sample_count" in posterior
+    attested_samples = _nonnegative_int(
+        posterior.get("attested_observed_model_sample_count")
+    )
+    if has_attestation_count:
+        identity_status = (
+            "attested-observed-models"
+            if samples > 0 and attested_samples == samples
+            else "unattested-or-incomplete-observed-models"
+        )
+    else:
+        # Older immutable snapshots predate P0-B.  They remain explicitly
+        # compatibility-only rather than being re-labelled as attested.
+        identity_status = "identity-metadata-unavailable"
     prior_available = _text(prior.get("evidence_status"), default="") == "available"
     # A generic-conservative prior is not evidence and must not masquerade as a
     # Spark quality estimate.  Runtime observations remain valid even for a
     # model with no public benchmark score.
-    usable = lower is not None and 0 <= lower <= 1 and samples > 0
+    usable = (
+        lower is not None
+        and 0 <= lower <= 1
+        and samples > 0
+        and (not has_attestation_count or attested_samples == samples)
+    )
     runtime = candidate.get("runtime")
     runtime = runtime if isinstance(runtime, Mapping) else {}
     first_pass = _rate_value(
@@ -1318,6 +1346,8 @@ def _performance_inputs(
         "performance_semantic_status": semantic_status,
         "lower_bound_95": lower if usable else None,
         "runtime_sample_count": samples if usable else 0,
+        "attested_runtime_sample_count": attested_samples if has_attestation_count else 0,
+        "runtime_identity_status": identity_status,
         "first_pass_rate": first_pass,
         "rework_rate": rework,
         "latency_ms": latency,
@@ -1528,7 +1558,13 @@ def _candidate_inputs(
                 else (
                     "quality source declared-policy; legacy calibration is audit-only"
                     if performance_values["performance_semantic_status"] == "legacy-audit-only"
-                    else "quality source declared-policy; no exact local runtime samples were available"
+                    else (
+                        "quality source declared-policy; local runtime samples lacked complete "
+                        "attested observed-model identity"
+                        if performance_values["runtime_identity_status"]
+                        == "unattested-or-incomplete-observed-models"
+                        else "quality source declared-policy; no exact local runtime samples were available"
+                    )
                 )
             ),
             "quality-equivalence-v1 keeps quality gates authoritative; efficiency only competes inside the risk-specific band",
@@ -1539,6 +1575,10 @@ def _candidate_inputs(
         "performance_semantic_status": performance_values["performance_semantic_status"],
         "performance_lower_bound_95": performance_lower_bound,
         "runtime_sample_count": performance_values["runtime_sample_count"],
+        "attested_runtime_sample_count": performance_values[
+            "attested_runtime_sample_count"
+        ],
+        "runtime_identity_status": performance_values["runtime_identity_status"],
         "performance_first_pass_rate": performance_values["first_pass_rate"],
         "performance_rework_rate": performance_values["rework_rate"],
         "performance_latency_ms": performance_values["latency_ms"],

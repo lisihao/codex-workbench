@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 import unittest
 
 from codex_workbench.claude_quota import (
@@ -10,6 +12,16 @@ from codex_workbench.claude_quota import (
     PRODUCER,
     PRODUCER_SCHEMA_VERSION,
     SUPPORTED_USAGE_VERSION,
+)
+from codex_workbench.execution_attribution import (
+    AttributionReference,
+    ExecutionAttribution,
+    ExecutionStateReference,
+    FailureAttribution,
+    IdentityProvenance,
+    ObservedModelIdentity,
+    PhysicalCallIdentity,
+    RequestedModelIdentity,
 )
 from codex_workbench.model import QuotaSnapshot
 from codex_workbench.performance import (
@@ -20,6 +32,18 @@ from codex_workbench.performance import (
     load_benchmark_baseline,
     read_all_events,
 )
+
+
+# ``unittest discover -s tests`` imports this module as ``test_performance``.
+# A separately installed package named ``tests`` must not redirect sibling
+# fixtures such as ``test_performance_identity_integration`` outside this
+# worktree.  Register the current discovery module under its local package
+# spelling before those siblings are imported.
+if __name__ == "test_performance":
+    local_tests = ModuleType("tests")
+    local_tests.__path__ = [str(Path(__file__).parent)]
+    sys.modules["tests"] = local_tests
+    sys.modules["tests.test_performance"] = sys.modules[__name__]
 
 
 def event(
@@ -58,6 +82,58 @@ def result(
         "agent_version": agent_version,
         "result_kind": "worker",
     }
+
+
+def attributed_result(
+    status: str,
+    *,
+    task_id: str,
+    attempt: int,
+    observed_status: str = "attested",
+    failure_origin: str = "unknown",
+    call_id: str | None = "physical-call-1",
+) -> dict[str, object]:
+    payload = result(status)
+    reference = AttributionReference(kind="receipt", ref=f"receipt-{task_id}-{attempt}")
+    receipt_provenance = IdentityProvenance(
+        source="provider_receipt",
+        references=(reference,),
+    )
+    observed = (
+        ObservedModelIdentity.attested(
+            provider="codex",
+            model_id="gpt-5.6-luna",
+            provenance=receipt_provenance,
+        )
+        if observed_status == "attested"
+        else ObservedModelIdentity.unattested(
+            provider="codex",
+            model_id="gpt-5.6-luna",
+            provenance=IdentityProvenance(source="legacy_result"),
+        )
+    )
+    physical = (
+        PhysicalCallIdentity(
+            status="attested",
+            provider="codex",
+            call_id=call_id,
+            provenance=receipt_provenance,
+        )
+        if call_id is not None
+        else PhysicalCallIdentity.unknown(provider="codex")
+    )
+    payload["execution_attribution"] = ExecutionAttribution(
+        state=ExecutionStateReference(task_id=task_id, node_id="work", attempt=attempt),
+        requested_model=RequestedModelIdentity(
+            provider="codex",
+            model_id="gpt-5.6-luna",
+            provenance=IdentityProvenance(source="routing_decision"),
+        ),
+        observed_model=observed,
+        physical_call=physical,
+        failure=FailureAttribution(origin=failure_origin),  # type: ignore[arg-type]
+    ).to_dict()
+    return payload
 
 
 def task(
@@ -591,6 +667,137 @@ class PerformanceRegistryTests(unittest.TestCase):
         self.assertEqual(metric["runtime"]["quality_calibration"]["successes"], 1)
         self.assertEqual(metric["runtime"]["quality_calibration"]["failures"], 0)
         self.assertEqual(metric["runtime"]["quality_calibration"]["unresolved"], 1)
+
+    def test_attribution_keeps_infrastructure_and_unattested_runs_out_of_quality(self) -> None:
+        events = [
+            event(
+                1,
+                "node.started",
+                task_id="infra",
+                node_id="work",
+                payload={"attempt": 1},
+                created_at="2026-09-03T00:00:00+00:00",
+            ),
+            event(
+                2,
+                "node.failed",
+                task_id="infra",
+                node_id="work",
+                payload={
+                    "attempt": 1,
+                    "result": attributed_result(
+                        "failed",
+                        task_id="infra",
+                        attempt=1,
+                        failure_origin="environment",
+                        call_id="shared-call",
+                    ),
+                },
+                created_at="2026-09-03T00:00:10+00:00",
+            ),
+            event(3, "node.retry_scheduled", task_id="infra", node_id="work", payload={"attempt": 1}),
+            event(
+                4,
+                "node.started",
+                task_id="infra",
+                node_id="work",
+                payload={"attempt": 2},
+                created_at="2026-09-03T00:00:20+00:00",
+            ),
+            event(
+                5,
+                "node.accepted",
+                task_id="infra",
+                node_id="work",
+                payload={
+                    "attempt": 2,
+                    "result": attributed_result(
+                        "succeeded",
+                        task_id="infra",
+                        attempt=2,
+                        call_id="shared-call",
+                    ),
+                },
+                created_at="2026-09-03T00:00:30+00:00",
+            ),
+            event(6, "task.state_changed", task_id="infra", payload={"to": "accepted"}),
+            event(7, "node.started", task_id="unattested", node_id="work", payload={"attempt": 1}),
+            event(
+                8,
+                "node.accepted",
+                task_id="unattested",
+                node_id="work",
+                payload={
+                    "attempt": 1,
+                    "result": attributed_result(
+                        "succeeded",
+                        task_id="unattested",
+                        attempt=1,
+                        observed_status="unattested",
+                        call_id=None,
+                    ),
+                },
+            ),
+            event(9, "task.state_changed", task_id="unattested", payload={"to": "accepted"}),
+        ]
+
+        snapshot = build_performance_snapshot(
+            events,
+            [task("infra"), task("unattested")],
+            catalog(),
+        )
+
+        self.assertEqual(len(snapshot["metrics"]), 1)
+        metric = snapshot["metrics"][0]
+        self.assertEqual(
+            set(metric["key"]),
+            {
+                "provider",
+                "model_id",
+                "agent_name",
+                "agent_version",
+                "reasoning_effort",
+                "task_type",
+                "complexity",
+                "harness",
+                "score_kind",
+            },
+        )
+        self.assertEqual(metric["runtime"]["attempt_count"], 2)
+        self.assertEqual(metric["runtime"]["quality_calibration"]["sample_count"], 1)
+        self.assertEqual(metric["runtime"]["quality_calibration"]["failures"], 0)
+        self.assertEqual(
+            metric["runtime"]["quality_calibration"]["attested_observed_model_sample_count"],
+            1,
+        )
+        self.assertEqual(
+            metric["runtime"]["quality_calibration"]["excluded"]["infrastructure-environment"],
+            1,
+        )
+        outcomes = snapshot["ledger"]["system_outcomes"]
+        self.assertEqual(outcomes["outcomes"]["failed"], 1)
+        self.assertEqual(outcomes["outcomes"]["accepted"], 2)
+        self.assertEqual(outcomes["failure_origins"]["environment"], 1)
+        self.assertEqual(outcomes["identity_observation"]["unattested_observed_model_attempts"], 1)
+        self.assertEqual(outcomes["physical_call_usage"]["unique_attested_physical_calls"], 1)
+        self.assertEqual(outcomes["physical_call_usage"]["deduplicated_retry_or_fallback_attempts"], 1)
+        self.assertIsNone(outcomes["physical_call_usage"]["api_dollars"]["amount"])
+        self.assertEqual(
+            snapshot["ledger"]["excluded_terminal_attempts"]["observed_model_unattested"],
+            1,
+        )
+
+    def test_cancelled_current_state_is_retained_without_an_invented_terminal_event(self) -> None:
+        cancelled_task = task("cancelled", state="cancelled")
+        cancelled_task["nodes"][0]["state"] = "cancelled"  # type: ignore[index]
+
+        snapshot = build_performance_snapshot([], [cancelled_task], catalog())
+
+        outcomes = snapshot["ledger"]["system_outcomes"]
+        self.assertEqual(outcomes["outcomes"]["cancelled"], 1)
+        self.assertEqual(outcomes["cancelled_current_nodes"], 1)
+        self.assertEqual(outcomes["cancelled_current_state_only"], 1)
+        self.assertEqual(outcomes["terminal_attempts"], 0)
 
     def test_calibrate_exposes_runtime_metrics_and_matrix_keeps_dag_contexts_exact(self) -> None:
         events = [
