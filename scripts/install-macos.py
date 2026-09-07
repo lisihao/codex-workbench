@@ -204,6 +204,14 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def install_runtime_component(source: Path, destination: Path) -> None:
+    """Copy one runtime component unless the managed destination is its source."""
+
+    if destination.exists() and source.samefile(destination):
+        return
+    shutil.copy2(source, destination)
+
+
 class InstallTransaction:
     """Small reversible transaction for local files touched by the authority installer."""
 
@@ -1650,8 +1658,8 @@ def main() -> int:
         config_file.chmod(0o600)
         codex_binary = runtime_binary
         codex_host = runtime_root / "codex-code-mode-host"
-        shutil.copy2(codex_source, codex_binary)
-        shutil.copy2(codex_host_source, codex_host)
+        install_runtime_component(codex_source, codex_binary)
+        install_runtime_component(codex_host_source, codex_host)
         codex_binary.chmod(0o755)
         codex_host.chmod(0o755)
         codex_version = run(str(codex_binary), "--version").stdout.strip()

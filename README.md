@@ -385,7 +385,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.14.1`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+源码版本/合同为 `1.14.2`。恢复模板会验证完整、带输入签名的 root 与 package-local linker 快照：若上一次恢复被中断而只留下 `.pnpm`，恢复器只移除该受控 worktree 内不完整的目录并以 APFS 写时复制重建；同输入模板命中不再重新链接 936 个工作区包。托管 Codex Worker 与恢复阶段的验收命令都对常规 `pnpm exec <已安装工具>` 直接调用该 worktree 的 `.bin`，其余 pnpm 命令仍固定在 Workbench 已验证的离线运行时，既不改用户 shell，也不共享另一个 worktree 的链接图。首次遇到新依赖指纹仍会建立一次受限模板；已有完整恢复工作树可直接作为模板种子。
+
+1.14.2 修复 Authority 原地升级把受管 Codex runtime 同时作为来源与目标时触发的 `SameFileError`。安装器会核验两条路径确实指向同一现有文件后跳过自拷贝，仍保留事务快照、运行时探测、旧应用目录和失败回滚；回归测试连续执行两次完整安装流程，第二次明确使用已安装 runtime。
 
 1.14.1 修复 routing-v3 将动态 Claude 准入误报成静态能力缺失的问题：高复杂度 exploration 在 Opus 已准入时保持 Claude challenge，运行时认证/配额未准入时明确回落到精确 Sol 控制面，真实不兼容则输出逐候选拒绝原因。共享容量用满或完成后的新配额快照尚未到达时，节点保持 `pending`，以去重的 `node.admission_deferred` 记录配额引用、所需单位和恢复条件；恢复后继续固定的 Claude 模型，不再因临时繁忙改派 Luna。
 

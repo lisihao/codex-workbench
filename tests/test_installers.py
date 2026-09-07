@@ -1943,7 +1943,7 @@ class InstallerTests(unittest.TestCase):
                 state = kwargs["state_root"]
                 assert isinstance(state, Path)
                 catalog = state / "capabilities" / "generations"
-                catalog.mkdir(parents=True)
+                catalog.mkdir(parents=True, exist_ok=True)
                 (catalog / "fixture.json").write_text("{}\n")
 
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
@@ -1970,9 +1970,22 @@ class InstallerTests(unittest.TestCase):
                 ],
             ):
                 self.assertEqual(module.main(), 0)
+                calls.clear()
+                module.sys.argv[:] = [
+                    "install-macos.py",
+                    "--source",
+                    str(source),
+                    "--state-root",
+                    str(state_root),
+                    "--codex-binary",
+                    str(state_root / "runtime" / "codex"),
+                    "--research-skill-source",
+                    str(research),
+                ]
+                self.assertEqual(module.main(), 0)
 
-            self.assertEqual(len(refreshes), 1)
-            refresh = refreshes[0]
+            self.assertEqual(len(refreshes), 2)
+            refresh = refreshes[-1]
             self.assertEqual(refresh["app_root"], state_root / "app")
             self.assertEqual(refresh["codex_home"], state_root / "codex-home")
             self.assertEqual(refresh["codex_binary"], state_root / "runtime" / "codex")
