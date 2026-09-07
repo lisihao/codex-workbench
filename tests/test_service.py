@@ -2007,10 +2007,19 @@ raise AssertionError("fatal coordinator failure returned")
                 for event in store.read_events(task_id=contract.task_id)
                 if event["event_type"] == "node.started" and event["node_id"] == "c"
             )
-            self.assertEqual(
-                resumed["payload"]["admission_deferred_event_cursor"],
-                refresh_wait["cursor"],
+            resumed_deferred_cursor = resumed["payload"]["admission_deferred_event_cursor"]
+            resumed_deferred = next(
+                event
+                for event in store.read_events(task_id=contract.task_id)
+                if event["cursor"] == resumed_deferred_cursor
             )
+            self.assertEqual(resumed_deferred["event_type"], "node.admission_deferred")
+            self.assertEqual(resumed_deferred["node_id"], "c")
+            self.assertEqual(
+                resumed_deferred["payload"]["reason_kind"],
+                "quota-refresh-required",
+            )
+            self.assertGreaterEqual(resumed_deferred_cursor, refresh_wait["cursor"])
             completed = next(
                 node
                 for node in store.get_task(contract.task_id)["nodes"]
