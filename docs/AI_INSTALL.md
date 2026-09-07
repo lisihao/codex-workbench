@@ -479,14 +479,19 @@ codex-workbench worktree send <allocation-id> --host "$WB_AUTHORITY_ALIAS"
 升级前应先确保没有需要人工决定的活跃任务，并在两台机器使用同一个候选 ref。不要在运行中的交互式 Codex 回合中升级。
 
 1. Authority 上先执行 `doctor`、`harness health`、`capabilities status` 和 `git status --porcelain`；若工作树不干净，停止。
-2. 将 `$WB_STATE_ROOT` 复制到一个操作者指定、受访问控制的本地备份目录。备份仅用于恢复，不得上传或提交：
+2. 将 `$WB_STATE_ROOT` 复制到一个操作者指定、受访问控制的本地备份目录，并另外用 SQLite online backup 生成一致的账本快照。目录复制用于恢复应用、配置与工件；数据库回滚必须使用 `state.sqlite.consistent`，不得把运行中逐文件复制的 SQLite/WAL 当作一致快照。备份仅用于恢复，不得上传或提交：
 
 ```bash
 export WB_BACKUP_ROOT="<ABSOLUTE_EMPTY_LOCAL_BACKUP_DIRECTORY>"
 test ! -e "$WB_BACKUP_ROOT"
 mkdir -p "$WB_BACKUP_ROOT"
+sqlite3 "$WB_STATE_ROOT/state.sqlite" ".backup '$WB_BACKUP_ROOT/state.sqlite.consistent'"
+test "$(sqlite3 "$WB_BACKUP_ROOT/state.sqlite.consistent" 'PRAGMA integrity_check;')" = "ok"
+test -n "$(sqlite3 "$WB_BACKUP_ROOT/state.sqlite.consistent" "SELECT value FROM metadata WHERE key='schema_version';")"
 ditto "$WB_STATE_ROOT" "$WB_BACKUP_ROOT/state-root"
 ```
+
+若升级后的 release 提升了 schema，应用回退时先停止 Authority，再恢复 `state-root` 中的应用与配置，并用 `state.sqlite.consistent` 覆盖目标 `state.sqlite`；应用版本和数据库快照必须成对回退。不要让旧二进制尝试打开已升级的账本。
 
 3. 在 Authority 与 MacBook 各自执行 `git fetch --tags --prune origin`，核对候选 ref，再用 `git checkout --detach "$WB_NEXT_REF"` 切换。
 4. 先重跑相应 `--dry-run`，再重跑 Authority 或 Cockpit 安装器。
