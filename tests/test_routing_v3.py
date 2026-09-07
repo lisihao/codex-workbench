@@ -677,6 +677,26 @@ class RoutingV3Tests(unittest.TestCase):
         self.assertEqual(decision.selected.performance_rework_rate, 0.10)  # type: ignore[union-attr]
         self.assertEqual(decision.selected.performance_latency_ms, 100)  # type: ignore[union-attr]
 
+    def test_attestation_metadata_cannot_promote_unattested_runtime_samples(self) -> None:
+        luna = capability("codex", "gpt-5.6-luna", quality=80, cost=1)
+        candidate = self._calibrated_candidate("codex", "gpt-5.6-luna", 0.99)
+        candidate["quality"]["posterior"]["attested_observed_model_sample_count"] = 0  # type: ignore[index]
+        catalog = snapshot(luna)
+        catalog["performance_calibration"] = self._calibration(candidate)
+
+        decision = route_capability_snapshot(catalog, request())
+
+        selected = decision.selected
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected.quality_source, "declared-policy")
+        self.assertEqual(selected.runtime_sample_count, 0)
+        self.assertEqual(selected.attested_runtime_sample_count, 0)
+        self.assertEqual(
+            selected.runtime_identity_status,
+            "unattested-or-incomplete-observed-models",
+        )
+
     def test_performance_cannot_bypass_quality_or_capability_hard_gates(self) -> None:
         low_quality = capability("codex", "gpt-5.6-luna", quality=60)
         good = capability("codex", "gpt-5.6-terra", quality=80)

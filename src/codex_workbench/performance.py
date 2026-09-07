@@ -25,6 +25,7 @@ import tempfile
 from typing import Any, Iterable
 
 from .ai_frontier import ai_frontier_public_evidence_records
+from .execution_attribution import ExecutionAttribution
 from .model_identities import catalog_with_model_identities, derive_model_identities
 from .radar import radar_public_evidence_records
 from .store import WorkbenchStore
@@ -45,10 +46,46 @@ _GENERATION_ID = re.compile(r"^performance-[0-9a-f]{16,64}$")
 _CODING_TASK_TYPES = frozenset({"implementation", "debugging", "tests", "docs"})
 _REASONING_TASK_TYPES = frozenset({"architecture", "review", "research", "exploration"})
 _TERMINAL_EVENTS = frozenset(
-    {"node.accepted", "node.failed", "node.blocked", "node.indeterminate"}
+    {
+        "node.accepted",
+        "node.failed",
+        "node.blocked",
+        "node.indeterminate",
+        "node.cancelled",
+    }
 )
 _FINAL_TASK_STATES = frozenset({"accepted", "needs_fix"})
 _PERFORMANCE_TASK_STATES = frozenset({"accepted", "needs_fix", "blocked", "cancelled"})
+_FAILURE_ORIGINS = frozenset(
+    {
+        "environment",
+        "auth",
+        "quota",
+        "transport",
+        "model",
+        "verification",
+        "scope",
+        "cancel",
+        "unknown",
+    }
+)
+# These origins describe admission, local execution, or provider transport
+# rather than the quality of a model answer.  They remain in the system-outcome
+# ledger, but cannot increase a model's Beta failure denominator.
+_INFRASTRUCTURE_FAILURE_ORIGINS = frozenset(
+    {"environment", "auth", "quota", "transport", "cancel"}
+)
+_QUALITY_FAILURE_ORIGINS = frozenset({"model", "scope"})
+_ATTRIBUTION_CONDITION_KINDS = (
+    "dependency",
+    "scope",
+    "provider_quota",
+    "environment_readiness",
+    "cpu_wait",
+    "memory_wait",
+    "io_wait",
+)
+_ATTRIBUTION_PHASES = ("queue", "prepare", "execute", "verify")
 _PUBLIC_COMPARISON_FIELDS = (
     "benchmark",
     "benchmark_version",
@@ -260,6 +297,348 @@ class _Attempt:
     task_state: str | None
     duration_seconds: float | None
     quality_outcome_eligible: bool
+    quality_exclusion_reason: str | None
+    quality_identity_attested: bool
+
+
+@dataclass(frozen=True)
+class _AttributionFacts:
+    """Only the bounded attribution facts usable by the local ledger.
+
+    The performance snapshot intentionally retains aggregates and opaque,
+    hashed physical-call keys only.  It never copies a provider response,
+    artifact, readiness report, or state snapshot out of the result envelope.
+    """
+
+    present: bool
+    valid: bool
+    observed_model_status: str
+    observed_provider: str | None
+    observed_model_id: str | None
+    failure_origin: str
+    physical_call_status: str
+    physical_call_usage_key: str | None
+    phase_statuses: Mapping[str, str]
+    phase_duration_ms: Mapping[str, int | None]
+    condition_statuses: Mapping[str, str]
+    condition_duration_ms: Mapping[str, int | None]
+
+
+def _unknown_attribution_facts(*, present: bool = False, valid: bool = False) -> _AttributionFacts:
+    return _AttributionFacts(
+        present=present,
+        valid=valid,
+        observed_model_status="unknown" if present else "legacy",
+        observed_provider=None,
+        observed_model_id=None,
+        failure_origin="unknown",
+        physical_call_status="unknown",
+        physical_call_usage_key=None,
+        phase_statuses={phase: "unknown" for phase in _ATTRIBUTION_PHASES},
+        phase_duration_ms={phase: None for phase in _ATTRIBUTION_PHASES},
+        condition_statuses={kind: "unknown" for kind in _ATTRIBUTION_CONDITION_KINDS},
+        condition_duration_ms={kind: None for kind in _ATTRIBUTION_CONDITION_KINDS},
+    )
+
+
+def _attribution_facts(
+    result: Mapping[str, Any],
+    *,
+    task_id: str,
+    node_id: str,
+    attempt: int,
+) -> _AttributionFacts:
+    """Read a typed P0 attribution record without trusting its raw shape.
+
+    Store settlement validates the same object against durable sources.  This
+    defensive second parse lets imported/legacy ledgers remain inspectable: a
+    malformed or mismatched record becomes explicit unknown system evidence,
+    never a model-quality observation.
+    """
+
+    raw = result.get("execution_attribution")
+    if raw is None:
+        return _unknown_attribution_facts()
+    if not isinstance(raw, Mapping):
+        return _unknown_attribution_facts(present=True)
+    try:
+        attribution = ExecutionAttribution.from_dict(raw)
+    except (TypeError, ValueError):
+        return _unknown_attribution_facts(present=True)
+    state = attribution.state
+    if (state.task_id, state.node_id, state.attempt) != (task_id, node_id, attempt):
+        return _unknown_attribution_facts(present=True)
+
+    timings = attribution.timings
+    phases = {
+        "queue": timings.queue,
+        "prepare": timings.prepare,
+        "execute": timings.execute,
+        "verify": timings.verify,
+    }
+    conditions = attribution.conditions
+    condition_values = {
+        "dependency": conditions.dependency,
+        "scope": conditions.scope,
+        "provider_quota": conditions.provider_quota,
+        "environment_readiness": conditions.environment_readiness,
+        "cpu_wait": conditions.cpu_wait,
+        "memory_wait": conditions.memory_wait,
+        "io_wait": conditions.io_wait,
+    }
+    observed = attribution.observed_model
+    physical = attribution.physical_call
+    return _AttributionFacts(
+        present=True,
+        valid=True,
+        observed_model_status=observed.status,
+        observed_provider=_text(observed.provider),
+        observed_model_id=_text(observed.model_id),
+        failure_origin=attribution.failure.origin,
+        physical_call_status=physical.status,
+        physical_call_usage_key=physical.usage_deduplication_key,
+        phase_statuses={name: phase.status for name, phase in phases.items()},
+        phase_duration_ms={name: phase.duration_ms for name, phase in phases.items()},
+        condition_statuses={name: condition.status for name, condition in condition_values.items()},
+        condition_duration_ms={
+            name: condition.duration_ms for name, condition in condition_values.items()
+        },
+    )
+
+
+def _quality_eligibility(
+    *,
+    event_type: str,
+    result: Mapping[str, Any],
+    agent_version: str,
+    attribution: _AttributionFacts,
+) -> tuple[bool, str | None]:
+    """Return whether an attempt can enter the local model-quality denominator."""
+
+    if event_type not in {"node.accepted", "node.failed"}:
+        return False, "non-quality-terminal-status"
+    exit_code = result.get("exit_code")
+    if (
+        not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or int(exit_code) != 0
+    ):
+        return False, "nonzero-or-unknown-process-exit"
+    if agent_version == "unattested":
+        return False, "agent-version-unattested"
+    # Pre-P0 records have no typed attribution.  Preserve their historic
+    # compatibility behavior, while marking that path separately in the
+    # ledger.  Every record carrying the new contract must have a direct,
+    # attested observed identity before it can affect a quality bucket.
+    if not attribution.present:
+        return True, None
+    if not attribution.valid:
+        return False, "invalid-execution-attribution"
+    if attribution.observed_model_status != "attested":
+        return False, f"observed-model-{attribution.observed_model_status}"
+    if event_type == "node.failed":
+        if attribution.failure_origin in _INFRASTRUCTURE_FAILURE_ORIGINS:
+            return False, f"infrastructure-{attribution.failure_origin}"
+        if attribution.failure_origin not in _QUALITY_FAILURE_ORIGINS:
+            return False, f"failure-origin-{attribution.failure_origin}"
+    return True, None
+
+
+def _system_outcomes(
+    starts: Mapping[tuple[str, str, int], Mapping[str, Any]],
+    terminals: Mapping[tuple[str, str, int], Mapping[str, Any]],
+    tasks: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate all observable system outcomes independently of calibration.
+
+    This is intentionally global rather than model-bucketed: unknown or
+    unattested identities, provider faults, cancelled work, and unfinished
+    attempts must remain observable without becoming model-quality samples.
+    """
+
+    outcome_counts = {
+        "accepted": 0,
+        "failed": 0,
+        "blocked": 0,
+        "indeterminate": 0,
+        "cancelled": 0,
+    }
+    failure_origins = {origin: 0 for origin in sorted(_FAILURE_ORIGINS)}
+    identity_observation = {
+        "attributed_terminal_attempts": 0,
+        "attested_observed_model_attempts": 0,
+        "unattested_observed_model_attempts": 0,
+        "unknown_observed_model_attempts": 0,
+        "legacy_result_attempts": 0,
+        "invalid_attribution_attempts": 0,
+    }
+    phase_statuses = {
+        phase: {"complete": 0, "partial": 0, "unknown": 0, "duration_observed": 0,
+                "duration_unknown": 0, "duration_ms": []}
+        for phase in _ATTRIBUTION_PHASES
+    }
+    conditions = {
+        kind: {"observed": 0, "unknown": 0, "duration_observed": 0,
+               "duration_unknown": 0, "duration_ms": []}
+        for kind in _ATTRIBUTION_CONDITION_KINDS
+    }
+    physical_call_keys: dict[str, int] = defaultdict(int)
+    physical_call_statuses = {"attested": 0, "unattested": 0, "unknown": 0}
+    end_to_end_durations: list[float] = []
+    end_to_end_unknown = 0
+
+    for (task_id, node_id, attempt), terminal in sorted(
+        terminals.items(), key=lambda item: (int(item[1].get("cursor", 0)), item[0])
+    ):
+        event_type = str(terminal.get("event_type", ""))
+        status = event_type.removeprefix("node.")
+        if status not in outcome_counts:
+            continue
+        outcome_counts[status] += 1
+        payload = terminal.get("payload")
+        payload_mapping = payload if isinstance(payload, Mapping) else {}
+        raw_result = payload_mapping.get("result")
+        result = raw_result if isinstance(raw_result, Mapping) else {}
+        attribution = _attribution_facts(
+            result,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=attempt,
+        )
+        if attribution.present:
+            identity_observation["attributed_terminal_attempts"] += 1
+            if not attribution.valid:
+                identity_observation["invalid_attribution_attempts"] += 1
+            elif attribution.observed_model_status == "attested":
+                identity_observation["attested_observed_model_attempts"] += 1
+            elif attribution.observed_model_status == "unattested":
+                identity_observation["unattested_observed_model_attempts"] += 1
+            else:
+                identity_observation["unknown_observed_model_attempts"] += 1
+        else:
+            identity_observation["legacy_result_attempts"] += 1
+
+        if status != "accepted":
+            origin = attribution.failure_origin if attribution.valid else "unknown"
+            failure_origins[origin if origin in _FAILURE_ORIGINS else "unknown"] += 1
+
+        physical_status = attribution.physical_call_status
+        if physical_status not in physical_call_statuses:
+            physical_status = "unknown"
+        physical_call_statuses[physical_status] += 1
+        if attribution.physical_call_usage_key is not None:
+            physical_call_keys[attribution.physical_call_usage_key] += 1
+
+        for phase in _ATTRIBUTION_PHASES:
+            value = phase_statuses[phase]
+            status_value = attribution.phase_statuses.get(phase, "unknown")
+            value[status_value if status_value in {"complete", "partial", "unknown"} else "unknown"] += 1
+            duration = attribution.phase_duration_ms.get(phase)
+            if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0:
+                value["duration_observed"] += 1
+                value["duration_ms"].append(duration)
+            else:
+                value["duration_unknown"] += 1
+        for kind in _ATTRIBUTION_CONDITION_KINDS:
+            value = conditions[kind]
+            status_value = attribution.condition_statuses.get(kind, "unknown")
+            value[status_value if status_value in {"observed", "unknown"} else "unknown"] += 1
+            duration = attribution.condition_duration_ms.get(kind)
+            if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0:
+                value["duration_observed"] += 1
+                value["duration_ms"].append(duration)
+            elif kind in {"cpu_wait", "memory_wait", "io_wait"}:
+                value["duration_unknown"] += 1
+
+        duration = _duration_seconds(starts.get((task_id, node_id, attempt)), terminal)
+        if duration is None:
+            end_to_end_unknown += 1
+        else:
+            end_to_end_durations.append(duration)
+
+    terminal_cancelled_nodes = {
+        (task_id, node_id)
+        for (task_id, node_id, _attempt), terminal in terminals.items()
+        if terminal.get("event_type") == "node.cancelled"
+    }
+    current_cancelled_node_keys = {
+        (task_id, str(node.get("node_id")))
+        for task_id, task in tasks.items()
+        for node in task.get("nodes", ())
+        if (
+            isinstance(node, Mapping)
+            and node.get("state") == "cancelled"
+            and node.get("node_id") is not None
+        )
+    }
+    current_cancelled_nodes = len(current_cancelled_node_keys)
+    cancelled_current_state_only = len(
+        current_cancelled_node_keys - terminal_cancelled_nodes
+    )
+    outcome_counts["cancelled"] += cancelled_current_state_only
+    cancelled_tasks = sum(1 for task in tasks.values() if task.get("state") == "cancelled")
+    unfinished_started_attempts = len(set(starts) - set(terminals))
+    phase_summary = {
+        phase: {
+            "complete": int(value["complete"]),
+            "partial": int(value["partial"]),
+            "unknown": int(value["unknown"]),
+            "duration_ms": _duration_summary([float(item) for item in value["duration_ms"]]),
+            "duration_observed": int(value["duration_observed"]),
+            "duration_unknown": int(value["duration_unknown"]),
+        }
+        for phase, value in phase_statuses.items()
+    }
+    condition_summary = {
+        kind: {
+            "observed": int(value["observed"]),
+            "unknown": int(value["unknown"]),
+            "duration_ms": _duration_summary([float(item) for item in value["duration_ms"]]),
+            "duration_observed": int(value["duration_observed"]),
+            "duration_unknown": int(value["duration_unknown"]),
+        }
+        for kind, value in conditions.items()
+    }
+    return {
+        "schema_version": 1,
+        "source": "terminal-node-events-and-typed-attribution",
+        "started_attempts": len(starts),
+        "terminal_attempts": len(terminals),
+        "outcomes": outcome_counts,
+        "failure_origins": failure_origins,
+        "unfinished_started_attempts": unfinished_started_attempts,
+        # Cancellation has no per-attempt settlement event in older ledgers.
+        # Keep its current-state basis visible alongside the de-duplicated
+        # aggregate outcome rather than pretending every cancellation was an
+        # event-backed attempt.
+        "cancelled_current_nodes": current_cancelled_nodes,
+        "cancelled_current_state_only": cancelled_current_state_only,
+        "cancelled_tasks": cancelled_tasks,
+        "end_to_end_duration_seconds": _duration_summary(end_to_end_durations),
+        "end_to_end_duration_unknown_terminal_attempts": end_to_end_unknown,
+        "identity_observation": identity_observation,
+        "phase_timings": phase_summary,
+        "conditions": condition_summary,
+        "physical_call_usage": {
+            "attested_call_attempts": physical_call_statuses["attested"],
+            "unique_attested_physical_calls": len(physical_call_keys),
+            "deduplicated_retry_or_fallback_attempts": sum(
+                max(0, count - 1) for count in physical_call_keys.values()
+            ),
+            "unattested_call_attempts": physical_call_statuses["unattested"],
+            "unknown_call_attempts": physical_call_statuses["unknown"],
+            # No result contract currently supplies priced usage or a token
+            # ledger.  Keep independent unknown fields rather than converting
+            # subscription quota, relative costs, or call counts into dollars.
+            "api_dollars": {"status": "unknown", "amount": None, "unit": "USD"},
+            "subscription_tokens": {"status": "unknown", "amount": None, "unit": "tokens"},
+            "quota_estimate": {
+                "status": "unknown",
+                "amount": None,
+                "unit": "provider-specific quota",
+            },
+        },
+    }
 
 
 def compute_runtime_metrics(
@@ -327,13 +706,24 @@ def compute_runtime_metrics(
         if event_type in _TERMINAL_EVENTS:
             attempt = _attempt_number(payload_mapping)
             if attempt is not None:
-                terminals[(key[0], key[1], attempt)] = event
+                # An append replay may repeat a durable event.  Preserve the
+                # first settlement for this attempt so it cannot become a
+                # second system outcome or calibration sample.
+                terminals.setdefault((key[0], key[1], attempt), event)
 
     for task_id, state in terminal_states_from_events.items():
         task_states.setdefault(task_id, state)
         if task_states.get(task_id) is None:
             task_states[task_id] = state
 
+    system_tasks = {
+        task_id: {
+            **task,
+            "state": task_states.get(task_id, task.get("state")),
+        }
+        for task_id, task in task_index.items()
+    }
+    system_outcomes = _system_outcomes(starts, terminals, system_tasks)
     excluded: dict[str, int] = defaultdict(int)
     attempts: list[_Attempt] = []
     for (task_id, node_id, attempt), event in sorted(
@@ -361,13 +751,44 @@ def compute_runtime_metrics(
         if result.get("result_kind") == "verifier":
             excluded["verifier_result"] += 1
             continue
-        model_id = _text(result.get("actual_model"))
-        if model_id is None:
-            excluded["missing_actual_model"] += 1
+        attribution = _attribution_facts(
+            result,
+            task_id=task_id,
+            node_id=node_id,
+            attempt=attempt,
+        )
+        if attribution.present and not attribution.valid:
+            excluded["invalid_execution_attribution"] += 1
             continue
-        provider = _text(result.get("provider")) or _text(spec.get("executor"))
+        if attribution.present and attribution.observed_model_status != "attested":
+            excluded[f"observed_model_{attribution.observed_model_status}"] += 1
+            continue
+        # New P0 records are grouped only by an independently attested model;
+        # legacy records retain their documented compatibility behavior until
+        # they are replaced by an attributed terminal result.
+        model_id = (
+            attribution.observed_model_id
+            if attribution.present
+            else _text(result.get("actual_model"))
+        )
+        if model_id is None:
+            excluded[
+                "missing_attested_observed_model"
+                if attribution.present
+                else "missing_actual_model"
+            ] += 1
+            continue
+        provider = (
+            attribution.observed_provider
+            if attribution.present
+            else _text(result.get("provider")) or _text(spec.get("executor"))
+        )
         if provider not in {"codex", "claude"}:
-            excluded["unsupported_provider"] += 1
+            excluded[
+                "unsupported_attested_observed_provider"
+                if attribution.present
+                else "unsupported_provider"
+            ] += 1
             continue
         task = task_index.get(task_id, {})
         contract = task.get("contract") if isinstance(task.get("contract"), Mapping) else {}
@@ -404,6 +825,12 @@ def compute_runtime_metrics(
             or _text(contract.get("score_kind"))
             or LOCAL_OUTCOME_SCORE_KIND
         )
+        quality_outcome_eligible, quality_exclusion_reason = _quality_eligibility(
+            event_type=str(event.get("event_type", "")),
+            result=result,
+            agent_version=agent_version,
+            attribution=attribution,
+        )
         attempts.append(
             _Attempt(
                 task_id=task_id,
@@ -422,18 +849,12 @@ def compute_runtime_metrics(
                 score_kind=score_kind,
                 task_state=task_states.get(task_id),
                 duration_seconds=_duration_seconds(start, event),
-                # A successful process can still produce a semantically bad
-                # worker result (for example invalid structured output), which
-                # is useful quality evidence.  A non-zero/unknown process exit,
-                # auth/quota block, timeout, or indeterminate result is an
-                # operational outcome until an explicit failure-origin receipt
-                # exists; do not silently charge it to model quality.
-                quality_outcome_eligible=(
-                    event.get("event_type") in {"node.accepted", "node.failed"}
-                    and isinstance(result.get("exit_code"), int)
-                    and not isinstance(result.get("exit_code"), bool)
-                    and int(result["exit_code"]) == 0
-                    and agent_version != "unattested"
+                quality_outcome_eligible=quality_outcome_eligible,
+                quality_exclusion_reason=quality_exclusion_reason,
+                quality_identity_attested=(
+                    attribution.present
+                    and attribution.valid
+                    and attribution.observed_model_status == "attested"
                 ),
             )
         )
@@ -451,6 +872,8 @@ def compute_runtime_metrics(
             group["indeterminate_count"] += 1
         if attempt.duration_seconds is not None:
             group["durations"].append(attempt.duration_seconds)
+        if attempt.quality_exclusion_reason is not None:
+            group["quality_exclusions"][attempt.quality_exclusion_reason] += 1
         logical[(attempt.task_id, attempt.node_id)].append(attempt)
 
     for node_attempts in logical.values():
@@ -486,10 +909,13 @@ def compute_runtime_metrics(
                 group["quality_unresolved"] += 1
             elif index < len(node_attempts) - 1:
                 group["quality_failures"] += 1
+                _record_quality_identity_sample(group, node_attempt)
             elif node_attempt.task_state == "accepted" and node_attempt.status == "accepted":
                 group["quality_successes"] += 1
+                _record_quality_identity_sample(group, node_attempt)
             elif node_attempt.task_state == "needs_fix":
                 group["quality_failures"] += 1
+                _record_quality_identity_sample(group, node_attempt)
             else:
                 group["quality_unresolved"] += 1
 
@@ -508,6 +934,14 @@ def compute_runtime_metrics(
             "eligible_terminal_attempts": len(attempts),
             "excluded_terminal_attempts": dict(sorted(excluded.items())),
             "logical_nodes": len(logical),
+            "quality_identity_policy": {
+                "new_attribution_requires_attested_observed_model": True,
+                "legacy_actual_model_compatibility": "pre-attribution terminal records only",
+                "infrastructure_failure_origins_excluded": sorted(
+                    _INFRASTRUCTURE_FAILURE_ORIGINS
+                ),
+            },
+            "system_outcomes": system_outcomes,
         },
         # Scan progress is useful operational evidence, but it is explicitly
         # outside the content-addressed body.  A quota heartbeat or unrelated
@@ -1020,6 +1454,8 @@ class PerformanceRegistry:
                         "runtime_sample_count": 0,
                         "runtime_successes": 0,
                         "runtime_failures": 0,
+                        "attested_observed_model_sample_count": 0,
+                        "legacy_actual_model_compatibility_sample_count": 0,
                         "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
                         "local_outcomes_only": True,
                         "harness": LOCAL_OUTCOME_HARNESS,
@@ -1041,6 +1477,16 @@ class PerformanceRegistry:
                     )
                 successes = int(quality_calibration.get("successes", 0))
                 failures = int(quality_calibration.get("failures", 0))
+                attested_samples = _nonnegative_count(
+                    quality_calibration.get("attested_observed_model_sample_count")
+                )
+                legacy_samples = (
+                    _nonnegative_count(
+                        quality_calibration.get("legacy_actual_model_compatibility_sample_count")
+                    )
+                    if "legacy_actual_model_compatibility_sample_count" in quality_calibration
+                    else successes + failures
+                )
                 quality = {
                     "prior": prior,
                     "posterior": {
@@ -1051,6 +1497,8 @@ class PerformanceRegistry:
                         "runtime_sample_count": successes + failures,
                         "runtime_successes": successes,
                         "runtime_failures": failures,
+                        "attested_observed_model_sample_count": attested_samples,
+                        "legacy_actual_model_compatibility_sample_count": legacy_samples,
                         "semantic_version": PERFORMANCE_SEMANTIC_VERSION,
                         "local_outcomes_only": True,
                         "harness": LOCAL_OUTCOME_HARNESS,
@@ -1076,11 +1524,24 @@ class PerformanceRegistry:
                         "complexity": complexity,
                         "harness": LOCAL_OUTCOME_HARNESS,
                         "score_kind": LOCAL_OUTCOME_SCORE_KIND,
+                        "observed_model_identity": "attested-required-for-p0",
                     },
                     "public_evidence": candidate_public_evidence,
                     "routable": record.get("routable") is True,
                     "quality": quality,
                     "runtime": runtime,
+                    "quality_identity": {
+                        "attested_observed_model_sample_count": _nonnegative_count(
+                            quality["posterior"].get(
+                                "attested_observed_model_sample_count"
+                            )
+                        ),
+                        "legacy_actual_model_compatibility_sample_count": _nonnegative_count(
+                            quality["posterior"].get(
+                                "legacy_actual_model_compatibility_sample_count"
+                            )
+                        ),
+                    },
                 }
             )
 
@@ -1170,6 +1631,18 @@ class PerformanceRegistry:
             raise
 
 
+def _record_quality_identity_sample(
+    group: dict[str, Any],
+    attempt: _Attempt,
+) -> None:
+    """Account for a completed Beta sample without upgrading legacy evidence."""
+
+    if attempt.quality_identity_attested:
+        group["attested_quality_sample_count"] += 1
+    else:
+        group["legacy_quality_sample_count"] += 1
+
+
 def _attempt_group_key(attempt: _Attempt) -> tuple[str, str, str, str, str, str, str, str, str]:
     return (
         attempt.provider,
@@ -1211,6 +1684,9 @@ def _empty_group(attempt: _Attempt) -> dict[str, Any]:
         "quality_successes": 0,
         "quality_failures": 0,
         "quality_unresolved": 0,
+        "quality_exclusions": defaultdict(int),
+        "attested_quality_sample_count": 0,
+        "legacy_quality_sample_count": 0,
         "durations": [],
     }
 
@@ -1247,9 +1723,16 @@ def _finish_group(group: Mapping[str, Any]) -> dict[str, Any]:
                 "failures": failures,
                 "unresolved": int(group["quality_unresolved"]),
                 "sample_count": successes + failures,
+                "attested_observed_model_sample_count": int(
+                    group["attested_quality_sample_count"]
+                ),
+                "legacy_actual_model_compatibility_sample_count": int(
+                    group["legacy_quality_sample_count"]
+                ),
                 "local_outcomes_only": True,
                 "harness": key["harness"],
                 "score_kind": key["score_kind"],
+                "excluded": dict(sorted(group["quality_exclusions"].items())),
             },
             "duration_seconds": _duration_summary(durations),
         },
@@ -1659,6 +2142,12 @@ def _duration_summary(durations: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def _nonnegative_count(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
 def _empty_runtime_metrics() -> dict[str, Any]:
     """Explicit zero-value runtime contract for a bucket with no observations."""
 
@@ -1674,6 +2163,9 @@ def _empty_runtime_metrics() -> dict[str, Any]:
             "failures": 0,
             "unresolved": 0,
             "sample_count": 0,
+            "attested_observed_model_sample_count": 0,
+            "legacy_actual_model_compatibility_sample_count": 0,
+            "excluded": {},
         },
         "duration_seconds": _duration_summary([]),
     }

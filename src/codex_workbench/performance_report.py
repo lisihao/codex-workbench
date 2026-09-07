@@ -121,6 +121,7 @@ def build_model_performance_report(
         generated_at=generated_at,
         catalog_index=catalog_index,
     )
+    runtime_system_outcomes = _runtime_system_outcomes(performance_snapshot)
     observations.extend(runtime_rows)
     source_snapshots["local_runtime"] = _runtime_source(
         performance_snapshot,
@@ -223,6 +224,11 @@ def build_model_performance_report(
         },
         "models": models,
         "source_snapshots": source_snapshots,
+        # Model buckets answer a deliberately narrow quality question.  These
+        # aggregate system outcomes retain infrastructure, cancellation, and
+        # unfinished-work evidence without assigning it to a model or merging
+        # it with Radar/AI Frontier measurements.
+        "runtime_system_outcomes": runtime_system_outcomes,
         # ``sources`` is a convenient ordered view for consumers that prefer
         # an array; ``source_snapshots`` remains the canonical keyed mapping.
         "sources": [source_snapshots[name] for name in sorted(source_snapshots)],
@@ -994,12 +1000,20 @@ def _runtime_observations(
         catalog = catalog_index.get((provider, model_id or ""), {})
         agent_version = _text(key.get("agent_version"))
         quality_sample_count = _nonnegative_int(quality.get("sample_count"))
+        attested_identity_sample_count = _nonnegative_int(
+            quality.get("attested_observed_model_sample_count")
+        )
+        legacy_identity_sample_count = _nonnegative_int(
+            quality.get("legacy_actual_model_compatibility_sample_count")
+        )
         attempt_count = _nonnegative_int(runtime.get("attempt_count"))
         flags: list[str] = []
         if agent_version in {None, "unattested", "unknown"}:
             flags.append("agent_version_unattested")
         if quality_sample_count == 0 and (attempt_count or 0) > 0:
             flags.append("quality_denominator_zero")
+        if (quality_sample_count or 0) > 0 and attested_identity_sample_count == 0:
+            flags.append("quality_identity_legacy_compatibility")
         same_model_other_provider = any(
             item_key[1] == model_id and item_key[0] != provider
             for item_key in catalog_index
@@ -1080,6 +1094,8 @@ def _runtime_observations(
                     "task_type": _text(key.get("task_type")),
                     "complexity": _text(key.get("complexity")),
                     "quality_status": quality_status,
+                    "attested_observed_model_sample_count": attested_identity_sample_count,
+                    "legacy_actual_model_compatibility_sample_count": legacy_identity_sample_count,
                     "quality_note": (
                         "metadata-unattested; acceptance denominator is zero"
                         if "agent_version_unattested" in flags
@@ -1089,6 +1105,26 @@ def _runtime_observations(
             )
         )
     return report
+
+
+def _runtime_system_outcomes(snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Expose compact local system evidence without fabricating usage units."""
+
+    if not isinstance(snapshot, Mapping):
+        return {
+            "status": "unavailable",
+            "reason": "performance snapshot is unavailable",
+        }
+    ledger = snapshot.get("ledger")
+    outcomes = ledger.get("system_outcomes") if isinstance(ledger, Mapping) else None
+    if not isinstance(outcomes, Mapping):
+        return {
+            "status": "unavailable",
+            "reason": "system outcome aggregates are not present in this generation",
+        }
+    # The performance module creates this mapping from bounded counts and
+    # durations only; report consumers receive no task snapshot or transcript.
+    return {"status": "observed", **_json_value(outcomes)}
 
 
 def _make_observation(
@@ -1313,6 +1349,7 @@ def _runtime_source(snapshot: Mapping[str, Any] | None, rows: list[Mapping[str, 
             "source_updated_at": None,
             "source_url": None,
             "source_urls": [],
+            "system_outcomes_status": "unavailable",
             "missing_data": ["snapshot"],
         }
     captured = _runtime_captured_at(snapshot)
@@ -1321,6 +1358,7 @@ def _runtime_source(snapshot: Mapping[str, Any] | None, rows: list[Mapping[str, 
         missing.append("metrics")
     if captured is None:
         missing.append("captured_at")
+    system_outcomes = _runtime_system_outcomes(snapshot)
     return {
         "source": "local_runtime",
         "snapshot_id": _text(snapshot.get("snapshot_id")),
@@ -1329,6 +1367,7 @@ def _runtime_source(snapshot: Mapping[str, Any] | None, rows: list[Mapping[str, 
         "source_updated_at": None,
         "source_url": None,
         "source_urls": [],
+        "system_outcomes_status": system_outcomes["status"],
         "missing_data": missing,
     }
 

@@ -1020,6 +1020,10 @@ class NodeResult:
     status: Literal["succeeded", "failed", "blocked", "indeterminate"]
     summary: str
     artifacts: dict[str, str] = field(default_factory=dict)
+    # Compatibility field for pre-attribution consumers.  A typed result may
+    # retain this legacy claim for audit compatibility, but callers that score
+    # model quality must use ``execution_attribution.observed_model`` rather
+    # than treating this field as an independent attestation.
     actual_model: str | None = None
     exit_code: int | None = None
     retryable: bool = False
@@ -1040,6 +1044,10 @@ class NodeResult:
     capability_snapshot_id: str | None = None
     model_capability_id: str | None = None
     agent_capability_id: str | None = None
+    # P0 attribution remains inside the established result/event envelope.
+    # The value is the serialized ExecutionAttribution contract rather than a
+    # second scheduler or state store; WorkbenchStore validates it on settle.
+    execution_attribution: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

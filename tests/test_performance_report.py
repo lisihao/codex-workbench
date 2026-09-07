@@ -243,6 +243,48 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("agent_version_unattested", runtime["data_quality_flags"])
         self.assertIn("quality_denominator_zero", runtime["data_quality_flags"])
 
+    def test_system_outcomes_stay_separate_from_model_quality_and_cost_units(self) -> None:
+        snapshot = self.values["performance_snapshot"]
+        assert isinstance(snapshot, dict)
+        snapshot["ledger"] = {
+            "system_outcomes": {
+                "schema_version": 1,
+                "outcomes": {
+                    "accepted": 1,
+                    "failed": 0,
+                    "blocked": 1,
+                    "indeterminate": 0,
+                    "cancelled": 1,
+                },
+                "failure_origins": {"environment": 1, "model": 0},
+                "unfinished_started_attempts": 1,
+                "physical_call_usage": {
+                    "unique_attested_physical_calls": 1,
+                    "deduplicated_retry_or_fallback_attempts": 1,
+                    "api_dollars": {"status": "unknown", "amount": None, "unit": "USD"},
+                    "subscription_tokens": {"status": "unknown", "amount": None, "unit": "tokens"},
+                    "quota_estimate": {
+                        "status": "unknown",
+                        "amount": None,
+                        "unit": "provider-specific quota",
+                    },
+                },
+            }
+        }
+
+        report = build_model_performance_report(**self.values)  # type: ignore[arg-type]
+
+        outcomes = report["runtime_system_outcomes"]
+        self.assertEqual(outcomes["status"], "observed")
+        self.assertEqual(outcomes["outcomes"]["blocked"], 1)
+        self.assertEqual(outcomes["failure_origins"]["environment"], 1)
+        usage = outcomes["physical_call_usage"]
+        self.assertEqual(usage["deduplicated_retry_or_fallback_attempts"], 1)
+        self.assertIsNone(usage["api_dollars"]["amount"])
+        self.assertIsNone(usage["subscription_tokens"]["amount"])
+        self.assertIsNone(usage["quota_estimate"]["amount"])
+        self.assertEqual(report["source_snapshots"]["local_runtime"]["system_outcomes_status"], "observed")
+
     def test_csv_and_html_have_explicit_units_dates_and_escaped_text(self) -> None:
         rows = list(csv.DictReader(io.StringIO(report_to_csv(self.report))))
         astra = next(row for row in rows if row["model_id"] == "gpt-6-astra")

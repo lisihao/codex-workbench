@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -24,6 +24,28 @@ from .dependency_inputs import (
     validate_dependency_input_lineage,
 )
 from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
+from .execution_attribution import (
+    AttributionReference,
+    CandidateDecision,
+    ExecutionAttribution,
+    ExecutionCondition,
+    ExecutionConditions,
+    ExecutionStateReference,
+    ExecutionTimings,
+    FailureAttribution,
+    IdentityProvenance,
+    ObservedModelIdentity,
+    PhaseTiming,
+    PhysicalCallIdentity,
+    RequestedModelIdentity,
+    TimingBoundary,
+)
+from .execution_readiness import (
+    ExecutionReadinessRequest,
+    ExecutionReadinessReport,
+    SourceResolutionRequirement,
+    assess_execution_readiness,
+)
 from .executors import (
     ClaudeExecutor,
     CodexExecutor,
@@ -44,6 +66,7 @@ from .model import (
     canonical_json,
     codex_model_profile,
     codex_model_reasoning_effort,
+    now_iso,
 )
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
@@ -64,6 +87,38 @@ class _ClaimRoute:
     quota: QuotaSnapshot | None
     active_claude_models: tuple[str, ...]
     decision: ClaudeDispatchDecision | None
+
+
+@dataclass
+class _ExecutionAttributionContext:
+    """Observed coordinator boundaries for one durable node attempt.
+
+    The context holds only bounded pointers and timestamps captured by this
+    coordinator turn.  It deliberately does not retain prompt text, provider
+    transcripts, or an inferred physical-call identifier.
+    """
+
+    claim_event_cursor: int | None = None
+    queue_finished_at: str | None = None
+    prepare_started_at: str | None = None
+    prepare_finished_at: str | None = None
+    prepare_duration_ms: int | None = None
+    execute_started_at: str | None = None
+    execute_finished_at: str | None = None
+    execute_duration_ms: int | None = None
+    readiness_report_ref: str | None = None
+    readiness_report: ExecutionReadinessReport | None = None
+    dependency_input_ref: str | None = None
+    scope_checked: bool = False
+    quota_snapshot_id: int | None = None
+    route_event_cursors: list[int] = field(default_factory=list)
+    candidate_decisions: list[CandidateDecision] = field(default_factory=list)
+    # These are captured from the current executor return before coordinator
+    # receipts are added.  A retry must not promote recovery or cached Evidence
+    # into direct provider identity evidence.
+    direct_artifact_refs: frozenset[str] = field(default_factory=frozenset)
+    failure_origin: str | None = None
+    failure_detail: str | None = None
 
 
 class Coordinator:
@@ -432,6 +487,541 @@ class Coordinator:
             return decision
         return None
 
+    @staticmethod
+    def _bounded_attribution_text(value: object, *, limit: int = 512) -> str:
+        """Keep coordinator-derived details inside the attribution contract bounds."""
+
+        return " ".join(str(value).split())[:limit] or "no additional detail was observed"
+
+    @staticmethod
+    def _event_reference(event_type: str, cursor: int | None) -> AttributionReference | None:
+        if cursor is None:
+            return None
+        return AttributionReference(kind="event", ref=event_type, cursor=cursor)
+
+    @staticmethod
+    def _artifact_reference(kind: str, ref: str | None) -> AttributionReference | None:
+        if not isinstance(ref, str) or not ref:
+            return None
+        return AttributionReference(kind=kind, ref=ref)
+
+    def _execution_attribution_context(self, claimed: dict) -> _ExecutionAttributionContext:
+        cursor = claimed.get("started_event_cursor")
+        return _ExecutionAttributionContext(
+            claim_event_cursor=cursor if isinstance(cursor, int) and cursor > 0 else None,
+            queue_finished_at=(
+                claimed.get("started_at")
+                if isinstance(claimed.get("started_at"), str)
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _readiness_request(worktree: Path) -> ExecutionReadinessRequest:
+        """Build explicit, local-only readiness requirements for this target.
+
+        A generic task does not implicitly become a Node or Python task.  A
+        pnpm project is recognized by the contract checker itself, while each
+        conventional ``src/<package>/__init__.py`` package is resolved from the
+        allocated worktree using the checker's isolated, no-import probe.
+        """
+
+        source_root = worktree / "src"
+        source_resolutions: list[SourceResolutionRequirement] = []
+        try:
+            children = sorted(source_root.iterdir(), key=lambda path: path.name)
+        except OSError:
+            children = []
+        for child in children:
+            if (
+                child.is_dir()
+                and child.name.isidentifier()
+                and (child / "__init__.py").is_file()
+            ):
+                source_resolutions.append(
+                    SourceResolutionRequirement(child.name, ("src",))
+                )
+        return ExecutionReadinessRequest(
+            worktree=worktree,
+            source_resolutions=tuple(source_resolutions),
+        )
+
+    def _assess_readiness(
+        self,
+        worktree: Path,
+        context: _ExecutionAttributionContext,
+    ) -> ExecutionReadinessReport:
+        report = assess_execution_readiness(self._readiness_request(worktree))
+        report_ref = self.artifacts.put_text(
+            canonical_json(report.to_dict()),
+            "execution-readiness.json",
+        )
+        context.readiness_report = report
+        context.readiness_report_ref = report_ref
+        return report
+
+    @staticmethod
+    def _readiness_fingerprint(report: ExecutionReadinessReport) -> dict:
+        """Return stable readiness inputs for the existing Evidence fingerprint.
+
+        Elapsed wall time is intentionally omitted: it is an observation for
+        attribution, not an input that changes source/configuration/runtime
+        compatibility of a cached verifier result.
+        """
+
+        payload = report.to_dict()
+        payload.pop("elapsed_ms", None)
+        return payload
+
+    def _quota_snapshot_reference(self, snapshot: QuotaSnapshot | None) -> int | None:
+        if not isinstance(snapshot, QuotaSnapshot):
+            return None
+        resolver = getattr(self.store, "quota_snapshot_reference", None)
+        if not callable(resolver):
+            return None
+        try:
+            candidate = resolver(snapshot)
+        except (OSError, ValueError):
+            return None
+        return candidate if isinstance(candidate, int) and candidate > 0 else None
+
+    def _candidate_decision(
+        self,
+        spec: dict,
+        *,
+        disposition: str,
+        reason: str,
+        event_cursor: int | None,
+        event_type: str = "node.started",
+    ) -> CandidateDecision:
+        executor = str(spec.get("executor") or "unknown")
+        model = spec.get("model")
+        model_id = str(model) if isinstance(model, str) and model else None
+        references: list[AttributionReference] = []
+        event_reference = self._event_reference(event_type, event_cursor)
+        if event_reference is not None:
+            references.append(event_reference)
+        snapshot_id = spec.get("capability_snapshot_id")
+        if isinstance(snapshot_id, str) and snapshot_id:
+            references.append(AttributionReference(kind="snapshot", ref=snapshot_id))
+        reasons = [self._bounded_attribution_text(reason)]
+        policy = spec.get("routing_policy_version") or spec.get("routing_strategy")
+        if isinstance(policy, str) and policy:
+            reasons.append(self._bounded_attribution_text(f"routing policy {policy} governed this route"))
+        return CandidateDecision(
+            candidate_id=f"{executor}:{model_id or 'unknown'}",
+            disposition=disposition,  # type: ignore[arg-type]
+            reasons=tuple(reasons),
+            provider=executor if executor != "unknown" else None,
+            model_id=model_id,
+            references=tuple(references),
+        )
+
+    def _ensure_selected_candidate(
+        self,
+        context: _ExecutionAttributionContext,
+        spec: dict,
+        *,
+        reason: str,
+    ) -> None:
+        executor = str(spec.get("executor") or "unknown")
+        model = str(spec.get("model") or "unknown")
+        candidate_id = f"{executor}:{model}"
+        if any(
+            candidate.candidate_id == candidate_id and candidate.disposition == "selected"
+            for candidate in context.candidate_decisions
+        ):
+            return
+        context.candidate_decisions.append(
+            self._candidate_decision(
+                spec,
+                disposition="selected",
+                reason=reason,
+                event_cursor=context.claim_event_cursor,
+            )
+        )
+
+    def _readiness_failure_result(
+        self,
+        *,
+        spec: dict,
+        contract: dict,
+        report: ExecutionReadinessReport,
+        context: _ExecutionAttributionContext,
+    ) -> NodeResult:
+        context.failure_origin = "environment"
+        context.failure_detail = report.summary
+        checks = tuple(
+            f"BLOCKED: readiness {failure.check_id} ({failure.code})"
+            for failure in report.failures
+        ) or ("BLOCKED: execution readiness did not produce a passing report",)
+        verifier = bool(spec.get("verifier"))
+        return NodeResult(
+            status="blocked",
+            summary=report.summary,
+            artifacts={"execution-readiness": str(context.readiness_report_ref)},
+            result_kind="verifier" if verifier else "worker",
+            changed_paths=(),
+            checks=checks,
+            verdict="blocked" if verifier else None,
+            **governance_receipt_fields(contract),
+        )
+
+    def _validated_executor_attribution(
+        self,
+        result: NodeResult,
+        *,
+        claimed: dict,
+        request: ExecutionRequest | None,
+        context: _ExecutionAttributionContext,
+    ) -> ExecutionAttribution | None:
+        """Return direct executor evidence only when it belongs to this call.
+
+        An executor may provide a fully typed attribution record, but the
+        coordinator must not turn an arbitrary flag, a previous attempt, or a
+        routing/legacy field into attestation.  Retained direct identities
+        therefore need a contract-valid record for this exact durable attempt,
+        compatible effective/result providers, and a direct artifact reference
+        returned by this executor invocation rather than recovery or cache
+        enrichment.
+        """
+
+        raw = result.execution_attribution
+        if raw is None:
+            return None
+        try:
+            supplied = ExecutionAttribution.from_dict(raw)
+        except (TypeError, ValueError):
+            return None
+
+        state = supplied.state
+        if (state.task_id, state.node_id, state.attempt) != (
+            str(claimed["task_id"]),
+            str(claimed["node_id"]),
+            int(claimed["attempt"]),
+        ):
+            return None
+        if (
+            state.event_cursor is not None
+            and context.claim_event_cursor is not None
+            and state.event_cursor != context.claim_event_cursor
+        ):
+            return None
+
+        result_provider = (
+            result.provider
+            if isinstance(result.provider, str) and result.provider
+            else None
+        )
+        effective_provider = None
+        if request is not None:
+            candidate = request.spec.get("executor")
+            effective_provider = candidate if isinstance(candidate, str) and candidate else None
+        if effective_provider is None:
+            candidate = claimed["spec"].get("executor")
+            effective_provider = candidate if isinstance(candidate, str) and candidate else None
+
+        direct_artifacts = context.direct_artifact_refs
+        for identity in (supplied.observed_model, supplied.physical_call):
+            if identity.status != "attested":
+                continue
+            if (
+                identity.provider is not None
+                and result_provider is not None
+                and identity.provider != result_provider
+            ):
+                return None
+            if (
+                identity.provider is not None
+                and effective_provider not in {None, "fixture"}
+                and identity.provider != effective_provider
+            ):
+                return None
+            artifact_references = tuple(
+                reference
+                for reference in identity.provenance.references
+                if reference.kind == "artifact"
+            )
+            if (
+                not artifact_references
+                or any(reference.ref not in direct_artifacts for reference in artifact_references)
+            ):
+                return None
+        if (
+            supplied.observed_model.status == "attested"
+            and isinstance(result.actual_model, str)
+            and result.actual_model
+            and supplied.observed_model.model_id != result.actual_model
+        ):
+            return None
+        return supplied
+
+    @staticmethod
+    def _direct_executor_artifact_refs(result: NodeResult) -> frozenset[str]:
+        """Freeze only the refs returned by this executor invocation."""
+
+        return frozenset(
+            ref for ref in result.artifacts.values() if isinstance(ref, str) and ref
+        )
+
+    @staticmethod
+    def _with_failed_attempt_recovery_artifacts(
+        result: NodeResult,
+        recovery_artifacts: dict[str, str],
+    ) -> NodeResult:
+        """Retain recovery provenance without permitting a retry to overwrite it."""
+
+        overlaps = sorted(set(result.artifacts) & set(recovery_artifacts))
+        if overlaps:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt recovery artifacts conflict with executor artifacts: "
+                + ", ".join(overlaps)
+            )
+        return replace(
+            result,
+            artifacts={**result.artifacts, **recovery_artifacts},
+        )
+
+    def _observed_model_identity(
+        self,
+        result: NodeResult,
+        supplied: ExecutionAttribution | None,
+    ) -> ObservedModelIdentity:
+        """Preserve validated direct evidence; legacy fields stay unattested."""
+
+        if supplied is not None:
+            return supplied.observed_model
+        model = result.actual_model
+        provider = result.provider
+        if isinstance(model, str) and model:
+            # Older integrations and fixture stubs may still populate the
+            # legacy compatibility field.  Preserve that audit fact without
+            # promoting it to an independently attested model identity.
+            return ObservedModelIdentity.unattested(
+                provider=provider if isinstance(provider, str) and provider else None,
+                model_id=model,
+                provenance=IdentityProvenance(source="legacy_result"),
+            )
+        return ObservedModelIdentity.unknown()
+
+    def _failure_origin(
+        self,
+        result: NodeResult,
+        *,
+        verifier: bool,
+        context: _ExecutionAttributionContext,
+    ) -> str:
+        if result.status == "succeeded":
+            return "unknown"
+        if context.failure_origin is not None:
+            return context.failure_origin
+        detail = result.summary.lower()
+        if "cancel" in detail:
+            return "cancel"
+        if "quota" in detail:
+            return "quota"
+        if any(token in detail for token in ("authentication", "auth", "logged in", "login")):
+            return "auth"
+        if any(token in detail for token in ("timed out", "timeout", "transport", "network")):
+            return "transport"
+        if "scope" in detail or "changed paths outside" in detail:
+            return "scope"
+        if verifier and result.status == "failed":
+            return "verification"
+        # A worker-declared failure with a direct structured response is a
+        # model outcome. Other failures remain explicitly unknown rather than
+        # being guessed from a free-form summary.
+        if (
+            result.status == "failed"
+            and result.provider in {"claude", "codex"}
+            and "structured-result" in result.artifacts
+        ):
+            return "model"
+        return "unknown"
+
+    def _attach_execution_attribution(
+        self,
+        *,
+        claimed: dict,
+        request: ExecutionRequest | None,
+        result: NodeResult,
+        context: _ExecutionAttributionContext,
+    ) -> NodeResult:
+        spec = request.spec if request is not None else claimed["spec"]
+        supplied = self._validated_executor_attribution(
+            result,
+            claimed=claimed,
+            request=request,
+            context=context,
+        )
+        verifier = bool(spec.get("verifier"))
+        self._ensure_selected_candidate(
+            context,
+            spec,
+            reason="the durable coordinator claim selected this effective route",
+        )
+        claim_reference = self._event_reference("node.started", context.claim_event_cursor)
+        requested_model = result.requested_model
+        if not isinstance(requested_model, str) or not requested_model:
+            raw_model = spec.get("model")
+            requested_model = raw_model if isinstance(raw_model, str) and raw_model else None
+        requested_provider = result.provider
+        if not isinstance(requested_provider, str) or not requested_provider:
+            raw_provider = spec.get("executor")
+            requested_provider = raw_provider if isinstance(raw_provider, str) else None
+        requested = RequestedModelIdentity(
+            provider=requested_provider,
+            model_id=requested_model,
+            provenance=IdentityProvenance(
+                source="routing_decision",
+                references=(claim_reference,) if claim_reference is not None else (),
+            ),
+        )
+
+        readiness_reference = self._artifact_reference(
+            "readiness_report", context.readiness_report_ref
+        )
+        dependency_reference = self._artifact_reference(
+            "dependency_report", context.dependency_input_ref
+        )
+        scope_reference = AttributionReference(
+            kind="scope_contract",
+            ref=f"task:{claimed['task_id']}",
+        )
+        quota_reference = (
+            AttributionReference(
+                kind="quota_snapshot",
+                ref=f"claude:{context.quota_snapshot_id}",
+            )
+            if context.quota_snapshot_id is not None
+            else self._event_reference(
+                "node.routed",
+                context.route_event_cursors[-1] if context.route_event_cursors else None,
+            )
+        )
+        conditions = ExecutionConditions(
+            dependency=(
+                ExecutionCondition(
+                    kind="dependency",
+                    status="observed",
+                    detail="accepted dependency input was materialized for this attempt",
+                    references=(dependency_reference,),
+                )
+                if dependency_reference is not None
+                else ExecutionCondition.unknown("dependency")
+            ),
+            scope=(
+                ExecutionCondition(
+                    kind="scope",
+                    status="observed",
+                    detail="worker output was checked against the durable scope contract",
+                    references=(scope_reference,),
+                )
+                if context.scope_checked
+                else ExecutionCondition.unknown("scope")
+            ),
+            provider_quota=(
+                ExecutionCondition(
+                    kind="provider_quota",
+                    status="observed",
+                    detail="provider admission evidence is referenced from durable state",
+                    references=(quota_reference,),
+                )
+                if quota_reference is not None
+                else ExecutionCondition.unknown("provider_quota")
+            ),
+            environment_readiness=(
+                ExecutionCondition(
+                    kind="environment_readiness",
+                    status="observed",
+                    detail=(
+                        "bounded target-worktree readiness passed"
+                        if context.readiness_report is not None and context.readiness_report.ready
+                        else "bounded target-worktree readiness reported an environment failure"
+                    ),
+                    references=(readiness_reference,),
+                )
+                if readiness_reference is not None
+                else ExecutionCondition.unknown("environment_readiness")
+            ),
+        )
+        queue = PhaseTiming(
+            finished=TimingBoundary(context.queue_finished_at),
+        )
+        prepare = PhaseTiming(
+            started=TimingBoundary(context.prepare_started_at),
+            finished=TimingBoundary(context.prepare_finished_at),
+            duration_ms=context.prepare_duration_ms,
+        )
+        execution_phase = PhaseTiming(
+            started=TimingBoundary(context.execute_started_at),
+            finished=TimingBoundary(context.execute_finished_at),
+            duration_ms=context.execute_duration_ms,
+        )
+        timings = ExecutionTimings(
+            queue=queue,
+            prepare=prepare,
+            execute=PhaseTiming() if verifier else execution_phase,
+            verify=execution_phase if verifier else PhaseTiming(),
+        )
+
+        failure_origin = self._failure_origin(result, verifier=verifier, context=context)
+        failure_references: list[AttributionReference] = []
+        if result.status != "succeeded":
+            if failure_origin == "environment" and readiness_reference is not None:
+                failure_references.append(readiness_reference)
+            elif failure_origin == "scope":
+                failure_references.append(scope_reference)
+            elif failure_origin == "quota" and quota_reference is not None:
+                failure_references.append(quota_reference)
+            else:
+                structured_reference = self._artifact_reference(
+                    "artifact", result.artifacts.get("structured-result")
+                )
+                if structured_reference is not None:
+                    failure_references.append(structured_reference)
+                elif claim_reference is not None:
+                    failure_references.append(claim_reference)
+        failure_detail = context.failure_detail or result.summary
+        observed_model = self._observed_model_identity(result, supplied)
+        attribution = ExecutionAttribution(
+            state=ExecutionStateReference(
+                task_id=str(claimed["task_id"]),
+                node_id=str(claimed["node_id"]),
+                attempt=int(claimed["attempt"]),
+                event_cursor=context.claim_event_cursor,
+            ),
+            requested_model=requested,
+            observed_model=observed_model,
+            physical_call=(
+                supplied.physical_call
+                if supplied is not None
+                else PhysicalCallIdentity.unknown()
+            ),
+            candidate_decisions=tuple(context.candidate_decisions),
+            failure=FailureAttribution(
+                origin=failure_origin,  # type: ignore[arg-type]
+                detail=(
+                    self._bounded_attribution_text(failure_detail)
+                    if result.status != "succeeded"
+                    else None
+                ),
+                references=tuple(failure_references),
+            ),
+            conditions=conditions,
+            timings=timings,
+            references=(scope_reference,),
+        )
+        return replace(
+            result,
+            actual_model=(
+                observed_model.model_id
+                if observed_model.status == "attested" and result.actual_model is None
+                else result.actual_model
+            ),
+            execution_attribution=attribution.to_dict(),
+        )
+
     def _execute_claimed(
         self,
         claimed: dict,
@@ -440,16 +1030,19 @@ class Coordinator:
         if claimed.get("blocked_worktree_recovery") is not None:
             self._execute_blocked_worktree_recovery(claimed)
             return
-        request: ExecutionRequest
+        context = self._execution_attribution_context(claimed)
+        request: ExecutionRequest | None = None
         failed_attempt_recovery = claimed.get("failed_attempt_recovery")
         failed_attempt_assigned = False
+        recovery_artifacts: dict[str, str] = {}
         try:
             spec = claimed["spec"]
             contract = claimed["contract"]
             worktree: Path | None = None
             dependency_input: DependencyInput | None = None
             input_receipt_ref: str | None = None
-            recovery_artifacts: dict[str, str] = {}
+            prepare_started_monotonic = time.monotonic()
+            context.prepare_started_at = now_iso()
             if failed_attempt_recovery is not None:
                 (
                     worktree,
@@ -484,6 +1077,7 @@ class Coordinator:
                 input_receipt_ref = self.artifacts.put_text(
                     canonical_json(dependency_input.receipt), "dependency-input.json"
                 )
+            context.dependency_input_ref = input_receipt_ref
             request = ExecutionRequest(
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],
@@ -503,7 +1097,50 @@ class Coordinator:
                     request,
                     archify_receipts=self._archify_receipt_packets(claimed["task_id"]),
                 )
-            cache_spec = effective_spec_with_dependency_input(spec, dependency_input)
+            readiness_worktree = worktree or Path(contract["repository"])
+            readiness = self._assess_readiness(readiness_worktree, context)
+            context.prepare_finished_at = now_iso()
+            context.prepare_duration_ms = max(
+                0,
+                int((time.monotonic() - prepare_started_monotonic) * 1_000),
+            )
+            if not readiness.ready:
+                result = self._readiness_failure_result(
+                    spec=spec,
+                    contract=contract,
+                    report=readiness,
+                    context=context,
+                )
+                if input_receipt_ref is not None:
+                    result = self._with_dependency_input_receipt(result, input_receipt_ref)
+                if recovery_artifacts:
+                    result = self._with_failed_attempt_recovery_artifacts(
+                        result,
+                        recovery_artifacts,
+                    )
+                    recovery_artifacts = {}
+                result = self._attach_execution_attribution(
+                    claimed=claimed,
+                    request=request,
+                    result=result,
+                    context=context,
+                )
+                try:
+                    self.store.settle_node(
+                        claimed["task_id"],
+                        claimed["node_id"],
+                        result,
+                        attempt=claimed["attempt"],
+                        coordinator_epoch=claimed["coordinator_epoch"],
+                        lease_epoch=claimed["lease_epoch"],
+                    )
+                except StateConflictError:
+                    pass
+                return
+            cache_spec = {
+                **effective_spec_with_dependency_input(spec, dependency_input),
+                "execution_readiness": self._readiness_fingerprint(readiness),
+            }
             cache_key = reusable_evidence_key(contract, cache_spec, worktree, request.steering)
             cached = self.store.cached_evidence(cache_key) if cache_key else None
             if cached is not None:
@@ -518,10 +1155,18 @@ class Coordinator:
                 if cached is not None:
                     result = NodeResult.from_dict(cached["result"])
                     if recovery_artifacts:
-                        result = replace(
+                        result = self._with_failed_attempt_recovery_artifacts(
                             result,
-                            artifacts={**recovery_artifacts, **result.artifacts},
+                            recovery_artifacts,
                         )
+                        recovery_artifacts = {}
+                    result = replace(
+                        result,
+                        artifacts={
+                            **result.artifacts,
+                            "execution-readiness": str(context.readiness_report_ref),
+                        },
+                    )
                     if input_receipt_ref is not None:
                         result = self._with_dependency_input_receipt(result, input_receipt_ref)
                     if packet_refs:
@@ -529,6 +1174,12 @@ class Coordinator:
                             result,
                             evidence=tuple(dict.fromkeys((*result.evidence, *packet_refs))),
                         )
+                    result = self._attach_execution_attribution(
+                        claimed=claimed,
+                        request=request,
+                        result=result,
+                        context=context,
+                    )
                     self.store.record_evidence_reuse(
                         cache_key,
                         claimed["task_id"],
@@ -550,7 +1201,11 @@ class Coordinator:
                     (),
                     self._claim_time_decision(spec, contract, quota, ()),
                 )
+            if spec.get("executor") == "claude":
+                context.quota_snapshot_id = self._quota_snapshot_reference(claim_route.quota)
             decision = claim_route.decision
+            execute_started_monotonic = time.monotonic()
+            context.execute_started_at = now_iso()
             if decision is not None and decision.action != "claude":
                 fallback_kind = (
                     "claude-capacity-overflow"
@@ -565,6 +1220,7 @@ class Coordinator:
                     decision.reason,
                     decision.zone,
                     fallback_kind=fallback_kind,
+                    attribution_context=context,
                 )
             else:
                 runtime_decision = self._runtime_quota_fallback(spec, contract, claim_route)
@@ -575,6 +1231,7 @@ class Coordinator:
                         runtime_decision.reason,
                         runtime_decision.zone,
                         fallback_kind="runtime-quota-change",
+                        attribution_context=context,
                     )
                 else:
                     result = self._executor(spec["executor"]).execute(request)
@@ -585,10 +1242,35 @@ class Coordinator:
                             result.summary,
                             decision.zone if decision is not None else "unknown",
                             fallback_kind=f"claude-executor-{result.status}",
+                            attribution_context=context,
                         )
+                    else:
+                        self._ensure_selected_candidate(
+                            context,
+                            request.spec,
+                            reason="the selected route completed without a provider fallback",
+                        )
+            context.direct_artifact_refs = self._direct_executor_artifact_refs(result)
+            context.execute_finished_at = now_iso()
+            context.execute_duration_ms = max(
+                0,
+                int((time.monotonic() - execute_started_monotonic) * 1_000),
+            )
             if worktree is not None and not spec.get("verifier") and result.status in {"failed", "blocked"}:
                 result = self._with_observed_failure_paths(request, result)
+            scope_before = result.status == "succeeded" and request.worktree is not None
             result = validate_worker_scope(self.worktrees, request, result)
+            context.scope_checked = scope_before
+            if scope_before and result.status == "failed":
+                context.failure_origin = "scope"
+                context.failure_detail = result.summary
+            result = replace(
+                result,
+                artifacts={
+                    **result.artifacts,
+                    "execution-readiness": str(context.readiness_report_ref),
+                },
+            )
             if worktree is not None and result.status == "succeeded" and not spec.get("verifier"):
                 patch = self.worktrees.diff_patch(
                     worktree, request.input_tree_sha or contract["base_sha"]
@@ -602,13 +1284,20 @@ class Coordinator:
                         },
                     )
             if recovery_artifacts:
-                result = replace(
+                result = self._with_failed_attempt_recovery_artifacts(
                     result,
-                    artifacts={**recovery_artifacts, **result.artifacts},
+                    recovery_artifacts,
                 )
+                recovery_artifacts = {}
             if input_receipt_ref is not None:
                 result = self._with_dependency_input_receipt(result, input_receipt_ref)
             if cache_key and result.status == "succeeded":
+                result = self._attach_execution_attribution(
+                    claimed=claimed,
+                    request=request,
+                    result=result,
+                    context=context,
+                )
                 self.store.save_evidence(
                     cache_key,
                     result,
@@ -616,6 +1305,8 @@ class Coordinator:
                     claimed["node_id"],
                 )
         except DependencyInputError as error:
+            context.failure_origin = "environment"
+            context.failure_detail = f"dependency inputs unavailable: {error}"
             if failed_attempt_recovery is not None and not failed_attempt_assigned:
                 result = self._failed_attempt_recovery_failure(
                     claimed, f"failed-attempt recovery dependency lineage is unavailable: {error}"
@@ -629,6 +1320,8 @@ class Coordinator:
                     **governance_receipt_fields(claimed["contract"]),
                 )
         except WorktreeError as error:
+            context.failure_origin = "environment"
+            context.failure_detail = f"worktree unavailable: {error}"
             if failed_attempt_recovery is not None and not failed_attempt_assigned:
                 result = self._failed_attempt_recovery_failure(
                     claimed, f"failed-attempt recovery rejected: {error}"
@@ -642,6 +1335,7 @@ class Coordinator:
                     **governance_receipt_fields(claimed["contract"]),
                 )
         except Exception as error:
+            context.failure_detail = f"worker crashed: {type(error).__name__}: {error}"
             if failed_attempt_recovery is not None and not failed_attempt_assigned:
                 result = self._failed_attempt_recovery_failure(
                     claimed,
@@ -654,6 +1348,33 @@ class Coordinator:
                     result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
                     **governance_receipt_fields(claimed["contract"]),
                 )
+        if context.readiness_report_ref is not None and "execution-readiness" not in result.artifacts:
+            result = replace(
+                result,
+                artifacts={
+                    **result.artifacts,
+                    "execution-readiness": context.readiness_report_ref,
+                },
+            )
+        if (
+            context.dependency_input_ref is not None
+            and "dependency-input" not in result.artifacts
+        ):
+            result = self._with_dependency_input_receipt(
+                result,
+                context.dependency_input_ref,
+            )
+        if recovery_artifacts:
+            result = self._with_failed_attempt_recovery_artifacts(
+                result,
+                recovery_artifacts,
+            )
+        result = self._attach_execution_attribution(
+            claimed=claimed,
+            request=request,
+            result=result,
+            context=context,
+        )
         try:
             self.store.settle_node(
                 claimed["task_id"],
@@ -975,9 +1696,14 @@ class Coordinator:
     def _execute_blocked_worktree_recovery(self, claimed: dict) -> None:
         """Run a blocked-worktree receipt without invoking any model executor."""
 
+        context = self._execution_attribution_context(claimed)
+        context.prepare_started_at = now_iso()
+        started = time.monotonic()
         try:
             result = self._run_blocked_worktree_recovery(claimed)
         except (DirtyWorktreeRecoveryError, WorktreeError, ValueError, OSError) as error:
+            context.failure_origin = "environment"
+            context.failure_detail = f"blocked-worktree recovery blocked: {error}"
             result = self._blocked_worktree_recovery_failure(
                 claimed,
                 f"blocked-worktree recovery blocked: {error}",
@@ -985,10 +1711,26 @@ class Coordinator:
         except Exception as error:
             # Before a2 is assigned, failures must restore the a1 receipt
             # rather than leaving the recovery node running or indeterminate.
+            context.failure_origin = "environment"
+            context.failure_detail = f"blocked-worktree recovery crashed: {type(error).__name__}: {error}"
             result = self._blocked_worktree_recovery_failure(
                 claimed,
                 f"blocked-worktree recovery crashed: {type(error).__name__}: {error}",
             )
+        context.prepare_finished_at = now_iso()
+        context.prepare_duration_ms = max(0, int((time.monotonic() - started) * 1_000))
+        dependency_ref = result.artifacts.get("dependency-input")
+        context.dependency_input_ref = dependency_ref if isinstance(dependency_ref, str) else None
+        context.scope_checked = result.status == "succeeded"
+        if result.status == "failed":
+            context.failure_origin = "verification"
+            context.failure_detail = result.summary
+        result = self._attach_execution_attribution(
+            claimed=claimed,
+            request=None,
+            result=result,
+            context=context,
+        )
         try:
             self.store.settle_node(
                 claimed["task_id"],
@@ -1226,6 +1968,7 @@ class Coordinator:
         zone: str,
         *,
         fallback_kind: str,
+        attribution_context: _ExecutionAttributionContext | None = None,
     ) -> tuple[ExecutionRequest, NodeResult]:
         contract = TaskContract.from_dict(request.contract)
         node_strategy = strategy_for_node(contract, request.spec)
@@ -1236,7 +1979,7 @@ class Coordinator:
         )
         with self._routing_lock:
             self._routed_to_codex.add(f"{claimed['task_id']}/{claimed['node_id']}")
-        self.store.record_node_route(
+        route_cursor = self.store.record_node_route(
             claimed["task_id"],
             claimed["node_id"],
             executor="codex",
@@ -1275,6 +2018,36 @@ class Coordinator:
             input_receipt=request.input_receipt,
             input_receipt_ref=request.input_receipt_ref,
         )
+        if attribution_context is not None:
+            if isinstance(route_cursor, int) and route_cursor > 0:
+                attribution_context.route_event_cursors.append(route_cursor)
+            original_was_executed = fallback_kind.startswith("claude-executor-")
+            attribution_context.candidate_decisions.append(
+                self._candidate_decision(
+                    request.spec,
+                    disposition="selected" if original_was_executed else "rejected",
+                    reason=(
+                        f"the selected provider executed before fallback: {reason}"
+                        if original_was_executed
+                        else f"the candidate was rejected before execution: {reason}"
+                    ),
+                    event_cursor=route_cursor if isinstance(route_cursor, int) else None,
+                    event_type="node.routed",
+                )
+            )
+            attribution_context.candidate_decisions.append(
+                self._candidate_decision(
+                    routed_request.spec,
+                    disposition="selected",
+                    reason=f"Codex fallback selected because {fallback_kind}: {reason}",
+                    event_cursor=route_cursor if isinstance(route_cursor, int) else None,
+                    event_type="node.routed",
+                )
+            )
+            if attribution_context.quota_snapshot_id is None:
+                attribution_context.quota_snapshot_id = self._quota_snapshot_reference(
+                    self.store.latest_quota()
+                )
         return routed_request, self._executor("codex").execute(routed_request)
 
     def _prepare_dependency_input(

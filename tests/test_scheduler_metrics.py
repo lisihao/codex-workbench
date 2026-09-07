@@ -3,6 +3,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import unittest
 
+from codex_workbench.execution_attribution import (
+    AttributionReference,
+    ExecutionAttribution,
+    ExecutionStateReference,
+    FailureAttribution,
+    IdentityProvenance,
+    ObservedModelIdentity,
+    PhysicalCallIdentity,
+    RequestedModelIdentity,
+)
 from codex_workbench.scheduler_metrics import (
     build_scheduler_metrics,
     compute_scheduler_metrics,
@@ -266,6 +276,59 @@ class SchedulerMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["lanes"]["general"]["queue_depth"], 0)
         self.assertEqual(metrics["lanes"]["general"]["dependency_blocked"], 0)
 
+    def test_attribution_preserves_failure_cancellation_and_unfinished_system_outcomes(self) -> None:
+        now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+        tasks = [
+            {
+                "task_id": "task",
+                "state": "cancelled",
+                "nodes": [
+                    {"node_id": "failed", "executor": "codex", "model": "gpt-5.6-luna", "state": "failed"},
+                    {"node_id": "unfinished", "executor": "codex", "model": "gpt-5.6-luna", "state": "running"},
+                    {"node_id": "cancelled", "executor": "codex", "model": "gpt-5.6-luna", "state": "cancelled"},
+                ],
+            }
+        ]
+        failed = _event(2, "node.failed", "task", "failed", now - timedelta(minutes=5), 1, execution_lane="general")
+        failed["payload"]["result"] = {  # type: ignore[index]
+            "execution_attribution": _attribution("task", "failed", 1, "environment", "shared-call")
+        }
+        accepted_retry = _event(4, "node.accepted", "task", "failed", now - timedelta(minutes=2), 2, execution_lane="general")
+        accepted_retry["payload"]["result"] = {  # type: ignore[index]
+            "execution_attribution": _attribution("task", "failed", 2, "unknown", "shared-call")
+        }
+        events = [
+            _event(1, "node.started", "task", "failed", now - timedelta(minutes=10), 1, execution_lane="general"),
+            failed,
+            _event(3, "node.started", "task", "failed", now - timedelta(minutes=4), 2, execution_lane="general"),
+            accepted_retry,
+            _event(5, "node.started", "task", "unfinished", now - timedelta(minutes=1), 1, execution_lane="general"),
+            _event(6, "node.cancelled", "task", "cancelled", now - timedelta(minutes=1), 1, execution_lane="general"),
+        ]
+
+        metrics = compute_scheduler_metrics(
+            tasks,
+            events,
+            now=now,
+            window_seconds=3600,
+            max_workers=4,
+            spark_workers=0,
+        )
+
+        general = metrics["lanes"]["general"]
+        self.assertEqual(general["failed"], 1)
+        self.assertEqual(general["accepted"], 1)
+        self.assertEqual(general["cancelled"], 1)
+        self.assertEqual(general["unfinished"], 1)
+        self.assertEqual(general["cancelled_current_nodes"], 1)
+        self.assertEqual(general["failure_origins"]["environment"], 1)
+        usage = general["attribution"]["physical_call_usage"]
+        self.assertEqual(usage["unique_attested_physical_calls"], 1)
+        self.assertEqual(usage["deduplicated_retry_or_fallback_attempts"], 1)
+        self.assertIsNone(usage["api_dollars"]["amount"])
+        self.assertEqual(metrics["global"]["outcomes"]["unfinished"], 1)
+        self.assertEqual(metrics["global"]["failure_origins"]["environment"], 1)
+
 
 def _event(
     cursor: int,
@@ -286,6 +349,37 @@ def _event(
         "created_at": at.isoformat(),
         "payload": {attempt_field: attempt, "execution_lane": execution_lane},
     }
+
+
+def _attribution(
+    task_id: str,
+    node_id: str,
+    attempt: int,
+    failure_origin: str,
+    call_id: str,
+) -> dict[str, object]:
+    reference = AttributionReference(kind="receipt", ref=f"receipt-{task_id}-{node_id}-{attempt}")
+    provenance = IdentityProvenance(source="provider_receipt", references=(reference,))
+    return ExecutionAttribution(
+        state=ExecutionStateReference(task_id=task_id, node_id=node_id, attempt=attempt),
+        requested_model=RequestedModelIdentity(
+            provider="codex",
+            model_id="gpt-5.6-luna",
+            provenance=IdentityProvenance(source="routing_decision"),
+        ),
+        observed_model=ObservedModelIdentity.attested(
+            provider="codex",
+            model_id="gpt-5.6-luna",
+            provenance=provenance,
+        ),
+        physical_call=PhysicalCallIdentity(
+            status="attested",
+            provider="codex",
+            call_id=call_id,
+            provenance=provenance,
+        ),
+        failure=FailureAttribution(origin=failure_origin),  # type: ignore[arg-type]
+    ).to_dict()
 
 
 if __name__ == "__main__":
