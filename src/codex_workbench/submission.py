@@ -367,10 +367,71 @@ _PUBLIC_COMPILED_RESULT_FIELDS = (
     "routing_strategy",
     "routing_policy",
     "capability_registry",
-    "performance",
     "research",
     "governance",
 )
+
+
+_PUBLIC_PERFORMANCE_FIELDS = (
+    "status",
+    "snapshot_id",
+    "digest",
+    "policy",
+    "activated",
+    "unchanged",
+    "event_cursor",
+    "external_priors",
+    "advisory_only",
+    "hard_capability_gates_required",
+)
+
+_PUBLIC_CALIBRATION_FIELDS = (
+    "status",
+    "task_type",
+    "complexity",
+    "snapshot_id",
+    "digest",
+    "performance_snapshot_id",
+    "performance_digest",
+    "semantic_version",
+    "advisory_only",
+    "hard_capability_gates_required",
+    "quality_gate_bypass_permitted",
+    "calibration_policy",
+)
+
+
+def _public_performance_result(value: Any) -> dict[str, Any] | None:
+    """Return a bounded performance snapshot projection for old and new rows."""
+
+    if not isinstance(value, Mapping):
+        return None
+    public = {
+        key: _public_projection(value[key])
+        for key in _PUBLIC_PERFORMANCE_FIELDS
+        if key in value
+    }
+    calibration = value.get("calibration")
+    if isinstance(calibration, Mapping):
+        compact = {
+            key: _public_projection(calibration[key])
+            for key in _PUBLIC_CALIBRATION_FIELDS
+            if key in calibration
+        }
+        raw_contexts = calibration.get("contexts")
+        raw_candidates = calibration.get("candidates")
+        matrix_count = calibration.get("matrix_context_count")
+        candidate_count = calibration.get("candidate_count")
+        if isinstance(matrix_count, int) and not isinstance(matrix_count, bool):
+            compact["matrix_context_count"] = matrix_count
+        elif isinstance(raw_contexts, (list, tuple)):
+            compact["matrix_context_count"] = len(raw_contexts)
+        if isinstance(candidate_count, int) and not isinstance(candidate_count, bool):
+            compact["candidate_count"] = candidate_count
+        elif isinstance(raw_candidates, (list, tuple)):
+            compact["candidate_count"] = len(raw_candidates)
+        public["calibration"] = compact
+    return public
 
 
 def _public_compiled_result(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -381,6 +442,9 @@ def _public_compiled_result(result: Mapping[str, Any]) -> dict[str, Any]:
         for key in _PUBLIC_COMPILED_RESULT_FIELDS
         if key in result
     }
+    performance = _public_performance_result(result.get("performance"))
+    if performance is not None:
+        public["performance"] = performance
     raw_nodes = result.get("nodes")
     if isinstance(raw_nodes, (list, tuple)):
         public["node_count"] = len(raw_nodes)

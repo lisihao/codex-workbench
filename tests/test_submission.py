@@ -420,6 +420,44 @@ class SubmissionTests(unittest.TestCase):
                     },
                 )
 
+    def test_planning_receipt_compacts_legacy_performance_candidates(self) -> None:
+        receipt = planning_request_receipt(
+            {
+                "command_id": "legacy-performance-command",
+                "task_id": "legacy-performance-task",
+                "state": "succeeded",
+                "result": {
+                    "ok": True,
+                    "task_id": "legacy-performance-task",
+                    "command_id": "legacy-performance-command",
+                    "performance": {
+                        "status": "ok",
+                        "snapshot_id": "performance-legacy",
+                        "digest": "a" * 64,
+                        "policy": "local-outcomes-only-v2",
+                        "external_priors": {"codex_radar": {"state": "fresh"}},
+                        "calibration": {
+                            "status": "ok",
+                            "task_type": "review",
+                            "complexity": "low",
+                            "contexts": [{"large": "private-context-table"}] * 24,
+                            "candidates": [{"large": "private-candidate-table"}] * 8,
+                        },
+                    },
+                },
+            }
+        )
+
+        serialized = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+        calibration = receipt["result"]["performance"]["calibration"]
+        self.assertNotIn("private-context-table", serialized)
+        self.assertNotIn("private-candidate-table", serialized)
+        self.assertNotIn("contexts", calibration)
+        self.assertNotIn("candidates", calibration)
+        self.assertEqual(calibration["matrix_context_count"], 24)
+        self.assertEqual(calibration["candidate_count"], 8)
+        self.assertLess(len(serialized), 5_000)
+
     def test_imported_context_is_persisted_in_contract_and_bound_to_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
