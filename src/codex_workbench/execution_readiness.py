@@ -24,6 +24,7 @@ from pathlib import Path, PureWindowsPath
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Literal, Mapping
 
@@ -861,7 +862,18 @@ class ExecutionReadinessChecker:
                 detail={"binary": binary, "binary_source": binary_source},
             )
         else:
-            outcome = self._probe((executable, "--version"), worktree, request, deadline)
+            # pnpm may honor the target repository's packageManager field even
+            # for --version and transparently select that project version.
+            # Observe the authority runtime in a neutral directory, matching
+            # the offline materializer, then compare its major with the
+            # repository declaration below.
+            probe_directory = Path(tempfile.gettempdir()).resolve()
+            outcome = self._probe(
+                (executable, "--version"),
+                probe_directory,
+                request,
+                deadline,
+            )
             if self._record_probe_outcome(
                 outcome,
                 check_id=toolchain_check,
@@ -933,6 +945,7 @@ class ExecutionReadinessChecker:
                         detail={
                             "binary": executable,
                             "binary_source": binary_source,
+                            "probe_cwd": str(probe_directory),
                             "argv": list(outcome.command),
                             "declared_version": declared_version,
                             "actual_version": actual_version,

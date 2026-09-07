@@ -65,7 +65,7 @@ class ExecutionReadinessTests(unittest.TestCase):
 
         self.assertTrue(report.ready, report.to_dict())
         self.assertEqual(calls[0]["command"], ("/managed/pnpm", "--version"))
-        self.assertEqual(calls[0]["cwd"], worktree.resolve())
+        self.assertEqual(calls[0]["cwd"], Path(tempfile.gettempdir()).resolve())
         self.assertEqual(calls[0]["timeout"], 10)
         self.assertTrue(all("install" not in command and "login" not in command for command in (item["command"] for item in calls)))
         linker = next(check for check in report.checks if check.check_id == "pnpm:linker")
@@ -117,6 +117,33 @@ class ExecutionReadinessTests(unittest.TestCase):
         self.assertEqual(calls, [("/managed/pnpm", "--version")])
         toolchain = next(check for check in report.checks if check.check_id == "pnpm:toolchain")
         self.assertEqual(toolchain.detail["binary_source"], "CODEX_WORKBENCH_PNPM")
+
+    def test_pnpm_version_probe_cannot_be_downgraded_by_project_package_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            self._pnpm_project(worktree)
+            self._complete_root_linker(worktree)
+            probe_directories: list[Path] = []
+
+            def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                cwd = Path(str(kwargs["cwd"])).resolve()
+                probe_directories.append(cwd)
+                observed = "11.7.0\n" if cwd == worktree.resolve() else "11.25.0\n"
+                return subprocess.CompletedProcess(command, 0, observed, "")
+
+            report = assess_execution_readiness(
+                ExecutionReadinessRequest(worktree=worktree),
+                runner=runner,
+                which=lambda executable: "/managed/pnpm" if executable == "pnpm" else None,
+                environment={},
+            )
+
+        self.assertTrue(report.ready, report.to_dict())
+        self.assertEqual(probe_directories, [Path(tempfile.gettempdir()).resolve()])
+        toolchain = next(check for check in report.checks if check.check_id == "pnpm:toolchain")
+        self.assertEqual(toolchain.detail["declared_version"], "11.7.0")
+        self.assertEqual(toolchain.detail["actual_version"], "11.25.0")
+        self.assertEqual(toolchain.detail["probe_cwd"], str(Path(tempfile.gettempdir()).resolve()))
 
     def test_missing_pnpm_linker_never_attempts_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
