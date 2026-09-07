@@ -15,6 +15,9 @@ from unittest.mock import patch
 from codex_workbench import plugin_cache_upgrade as upgrade
 
 
+PHYSICAL_TMP = str(Path(tempfile.gettempdir()).resolve())
+
+
 class FakeCodex:
     def __init__(
         self,
@@ -159,7 +162,7 @@ class PluginCacheUpgradeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
             prefix="plugin-cache-upgrade-",
-            dir="/private/tmp",
+            dir=PHYSICAL_TMP,
         )
         self.root = Path(self.temporary.name)
         self.codex_home = self.root / "home" / ".codex"
