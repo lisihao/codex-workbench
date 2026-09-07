@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 import json
 import subprocess
@@ -377,6 +378,47 @@ class SubmissionTests(unittest.TestCase):
         self.assertNotIn("unexpected", receipt["result"])
         self.assertEqual(receipt["status_tool"], "workbench_get_request")
         self.assertTrue(receipt["ok"])
+
+    def test_failed_and_indeterminate_receipts_redact_internal_diagnostics(self) -> None:
+        diagnostic = (
+            "planner stderr: private context excerpt=customer-secret; "
+            "private prompt=do not disclose; raw subprocess output"
+        )
+        expected_ref = "sha256:" + sha256(diagnostic.encode("utf-8")).hexdigest()
+        for state, error_type, summary in (
+            (
+                "failed",
+                "planning-failed",
+                "Planning failed; inspect authorized local diagnostics before retrying.",
+            ),
+            (
+                "indeterminate",
+                "planning-indeterminate",
+                "Planning did not settle; inspect authorized local diagnostics before retrying.",
+            ),
+        ):
+            with self.subTest(state=state):
+                receipt = planning_request_receipt(
+                    {
+                        "command_id": "diagnostic-command",
+                        "task_id": "diagnostic-task",
+                        "state": state,
+                        "error": diagnostic,
+                    }
+                )
+
+                public_text = json.dumps(receipt, sort_keys=True)
+                self.assertNotIn("customer-secret", public_text)
+                self.assertNotIn("private prompt", public_text)
+                self.assertNotIn("raw subprocess output", public_text)
+                self.assertEqual(
+                    receipt["error"],
+                    {
+                        "type": error_type,
+                        "summary": summary,
+                        "error_ref": expected_ref,
+                    },
+                )
 
     def test_imported_context_is_persisted_in_contract_and_bound_to_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

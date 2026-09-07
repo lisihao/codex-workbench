@@ -201,6 +201,45 @@ class StoreTests(unittest.TestCase):
             )
 
         migrated = WorkbenchStore(path)
+        original_schema_write = WorkbenchStore._schema_write
+
+        def fail_after_planning_table(
+            connection: sqlite3.Connection,
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor:
+            if "planning_requests_task_id_unique_idx" in statement:
+                raise RuntimeError("injected v12-to-v13 migration fault")
+            return original_schema_write(connection, statement, parameters)
+
+        with mock.patch.object(migrated, "_schema_write", side_effect=fail_after_planning_table):
+            with self.assertRaisesRegex(RuntimeError, "injected v12-to-v13 migration fault"):
+                migrated.initialize()
+
+        with migrated.connection() as connection:
+            schema_after_fault = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            planning_after_fault = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'planning_requests'"
+            ).fetchone()
+            index_after_fault = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'planning_requests_task_id_unique_idx'"
+            ).fetchone()
+            evidence_after_fault = connection.execute(
+                "SELECT result_json FROM evidence_cache WHERE cache_key = 'schema-12-evidence'"
+            ).fetchone()
+        self.assertEqual(schema_after_fault, "12")
+        self.assertIsNone(planning_after_fault)
+        self.assertIsNone(index_after_fault)
+        assert evidence_after_fault is not None
+        self.assertEqual(evidence_after_fault["result_json"], evidence_json)
+        self.assertEqual(
+            hashlib.sha256(evidence_after_fault["result_json"].encode()).hexdigest(),
+            evidence_digest,
+        )
+
         migrated.initialize()
         self.assertEqual(migrated.health()["schema_version"], 13)
         with migrated.connection() as connection:
@@ -233,11 +272,33 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(cached["result_json"], evidence_json)
         self.assertEqual(hashlib.sha256(cached["result_json"].encode()).hexdigest(), evidence_digest)
 
-    def test_unknown_newer_schema_is_rejected(self) -> None:
-        with self.store.connection() as connection:
-            connection.execute("UPDATE metadata SET value = '14' WHERE key = 'schema_version'")
+    def test_unknown_newer_schema_is_rejected_before_any_ddl(self) -> None:
+        path = Path(self.temp.name) / "unknown-newer-schema.sqlite"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '14');
+                """
+            )
+
+        unknown = WorkbenchStore(path)
         with self.assertRaisesRegex(RuntimeError, "unsupported schema version 14; expected 13"):
-            self.store.initialize()
+            unknown.initialize()
+
+        with sqlite3.connect(path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            planning_index = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'planning_requests_task_id_unique_idx'"
+            ).fetchone()
+        self.assertEqual(tables, {"metadata"})
+        self.assertIsNone(planning_index)
 
     def test_schema_nine_migrates_steering_sequence_by_legacy_timestamp_and_id(self) -> None:
         path = Path(self.temp.name) / "schema-nine.sqlite"
@@ -353,6 +414,33 @@ class StoreTests(unittest.TestCase):
                 "different-task",
                 {"objective": "must fail before any model work"},
             )
+
+    def test_direct_create_task_cannot_take_planning_reserved_task_or_command(self) -> None:
+        self.store.enqueue_planning_request(
+            "plan-reserved-command",
+            "plan-reserved-task",
+            {"objective": "compile later"},
+        )
+        reserved_contract = self._planning_contract("plan-reserved-task")
+        with self.assertRaisesRegex(CommandConflictError, "reserves task"):
+            self.store.create_task(
+                reserved_contract,
+                self._planning_nodes(reserved_contract.task_id),
+                "direct-command",
+            )
+
+        other_contract = self._planning_contract("different-direct-task")
+        with self.assertRaisesRegex(CommandConflictError, "plan-reserved-command"):
+            self.store.create_task(
+                other_contract,
+                self._planning_nodes(other_contract.task_id),
+                "plan-reserved-command",
+            )
+
+        with self.assertRaises(KeyError):
+            self.store.get_task("plan-reserved-task")
+        with self.assertRaises(KeyError):
+            self.store.get_task("different-direct-task")
 
     def test_planning_request_claims_once_and_completes_with_durable_event(self) -> None:
         self.store.enqueue_planning_request(

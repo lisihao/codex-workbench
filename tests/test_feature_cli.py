@@ -84,6 +84,29 @@ class FeatureCLITests(unittest.TestCase):
         self.assertEqual(payload["status"], "succeeded")
         store.get_planning_request.assert_called_once_with("planning-command")
 
+    def test_request_status_cli_redacts_internal_planning_error(self) -> None:
+        args = build_parser().parse_args(["request-status", "planning-command"])
+        store = mock.Mock()
+        store.get_planning_request.return_value = {
+            "command_id": "planning-command",
+            "task_id": "planning-task",
+            "state": "failed",
+            "error": "planner stderr private context=customer-secret private prompt=do not expose",
+            "result": None,
+        }
+        with (
+            mock.patch("codex_workbench.cli._config", return_value=mock.Mock()),
+            mock.patch("codex_workbench.cli._store", return_value=store),
+        ):
+            code, payload = self._run(command_request_status, args)
+
+        public_text = json.dumps(payload, sort_keys=True)
+        self.assertEqual(code, 0)
+        self.assertNotIn("customer-secret", public_text)
+        self.assertNotIn("private prompt", public_text)
+        self.assertEqual(payload["error"]["type"], "planning-failed")
+        self.assertTrue(payload["error"]["error_ref"].startswith("sha256:"))
+
     def test_performance_list_exports_missing_astra_without_task_store_or_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             args = build_parser().parse_args(["--home", directory, "performance", "list", "--format", "json"])

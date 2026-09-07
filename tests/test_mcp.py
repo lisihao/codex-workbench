@@ -537,6 +537,36 @@ class MCPTests(unittest.TestCase):
         self.assertNotIn("context_excerpt", result["request"])
         self.assertFalse(result["context_excerpt_present"])
 
+    def test_get_request_redacts_internal_planning_failure_diagnostics(self) -> None:
+        command_id = "mcp-private-diagnostic"
+        diagnostic = "planner stderr private context=customer-secret private prompt=never expose"
+        self.store.enqueue_planning_request(
+            command_id,
+            "mcp-private-task",
+            {"objective": "bounded planning"},
+        )
+        claimed = self.store.claim_planning_request(self.epoch)
+        self.assertIsNotNone(claimed)
+        self.store.fail_planning_request(
+            command_id,
+            int(claimed["attempt"]),
+            self.epoch,
+            diagnostic,
+        )
+
+        result = json.loads(
+            self.call(
+                "workbench_get_request",
+                {"command_id": command_id},
+            )["content"][0]["text"]
+        )
+
+        public_text = json.dumps(result, sort_keys=True)
+        self.assertNotIn("customer-secret", public_text)
+        self.assertNotIn("private prompt", public_text)
+        self.assertEqual(result["error"]["type"], "planning-failed")
+        self.assertTrue(result["error"]["error_ref"].startswith("sha256:"))
+
     def test_inspects_controls_and_reads_evidence_without_a_model_call(self) -> None:
         contract = TaskContract(
             task_id="mcp-task",

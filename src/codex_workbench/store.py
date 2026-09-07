@@ -130,12 +130,154 @@ class WorkbenchStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def _schema_migration_transaction(
+        self,
+        connection: sqlite3.Connection,
+    ) -> Iterator[None]:
+        """Keep schema DDL and its version marker in one SQLite transaction."""
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _schema_write(
+        connection: sqlite3.Connection,
+        statement: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> sqlite3.Cursor:
+        """Execute one schema mutation; tests may fault this durable boundary."""
+
+        return connection.execute(statement, parameters)
+
+    @staticmethod
+    def _preflight_schema_version(connection: sqlite3.Connection) -> int | None:
+        """Read and validate the current schema without issuing DDL."""
+
+        metadata = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
+        ).fetchone()
+        if metadata is None:
+            return None
+        current = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if current is None:
+            return None
+        raw_version = current["value"]
+        try:
+            schema_version = int(raw_version)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"unsupported schema version {raw_version}; expected {SCHEMA_VERSION}"
+            ) from error
+        if schema_version not in range(1, SCHEMA_VERSION + 1):
+            raise RuntimeError(
+                f"unsupported schema version {raw_version}; expected {SCHEMA_VERSION}"
+            )
+        return schema_version
+
+    def _apply_schema_migration(
+        self,
+        connection: sqlite3.Connection,
+        prior_schema_version: int | None,
+    ) -> None:
+        """Apply metadata and legacy-column migration after base DDL exists."""
+
+        if prior_schema_version is None:
+            self._schema_write(
+                connection,
+                "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+        elif prior_schema_version < SCHEMA_VERSION:
+            node_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+            if "effective_executor" not in node_columns:
+                self._schema_write(connection, "ALTER TABLE nodes ADD COLUMN effective_executor TEXT")
+            if "effective_model" not in node_columns:
+                self._schema_write(connection, "ALTER TABLE nodes ADD COLUMN effective_model TEXT")
+            if "coordinator_epoch" not in node_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE nodes ADD COLUMN coordinator_epoch INTEGER NOT NULL DEFAULT 0",
+                )
+            if "lease_epoch" not in node_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE nodes ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0",
+                )
+            if "recovery_json" not in node_columns:
+                self._schema_write(connection, "ALTER TABLE nodes ADD COLUMN recovery_json TEXT")
+            task_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "priority" not in task_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                )
+            steering_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(task_steering)").fetchall()
+            }
+            if "sequence" not in steering_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE task_steering ADD COLUMN sequence INTEGER",
+                )
+            # v9 had no explicit sequence. Its durable semantics were
+            # chronological steering with the stable steering ID as the
+            # tie-breaker; rowid reflected insertion/storage order only and
+            # can be reversed by import/rebuild paths.
+            steering_rows = connection.execute(
+                """
+                SELECT rowid, task_id, steering_id, created_at, sequence
+                FROM task_steering
+                ORDER BY task_id, created_at, steering_id, rowid
+                """
+            ).fetchall()
+            next_sequences: dict[str, int] = {}
+            for steering_row in steering_rows:
+                task_id = str(steering_row["task_id"])
+                current_sequence = next_sequences.get(task_id, 0)
+                stored_sequence = steering_row["sequence"]
+                if stored_sequence is None or int(stored_sequence) <= current_sequence:
+                    stored_sequence = current_sequence + 1
+                    self._schema_write(
+                        connection,
+                        "UPDATE task_steering SET sequence = ? WHERE rowid = ?",
+                        (stored_sequence, steering_row["rowid"]),
+                    )
+                next_sequences[task_id] = int(stored_sequence)
+            self._schema_write(
+                connection,
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            # v8 binds reusable Evidence to the code-as-harness governance
+            # receipt; only rows that actually predate v8 lack that proof.
+            if prior_schema_version < 8:
+                self._schema_write(connection, "DELETE FROM evidence_cache")
+        self._schema_write(
+            connection,
+            "CREATE INDEX IF NOT EXISTS task_steering_task_sequence_idx "
+            "ON task_steering(task_id, sequence)",
+        )
+
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._init_lock, self.connection() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(
-                """
+            schema_sql = """
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -315,92 +457,15 @@ class WorkbenchStore:
                 CREATE INDEX IF NOT EXISTS worktree_archives_state_idx
                     ON worktree_archives(state, updated_at);
                 """
-            )
-            current = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            if current is None:
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            elif int(current["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
-                prior_schema_version = int(current["value"])
-                node_columns = {
-                    row["name"]
-                    for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
-                }
-                if "effective_executor" not in node_columns:
-                    connection.execute("ALTER TABLE nodes ADD COLUMN effective_executor TEXT")
-                if "effective_model" not in node_columns:
-                    connection.execute("ALTER TABLE nodes ADD COLUMN effective_model TEXT")
-                if "coordinator_epoch" not in node_columns:
-                    connection.execute(
-                        "ALTER TABLE nodes ADD COLUMN coordinator_epoch INTEGER NOT NULL DEFAULT 0"
-                    )
-                if "lease_epoch" not in node_columns:
-                    connection.execute(
-                        "ALTER TABLE nodes ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
-                    )
-                if "recovery_json" not in node_columns:
-                    connection.execute("ALTER TABLE nodes ADD COLUMN recovery_json TEXT")
-                task_columns = {
-                    row["name"]
-                    for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
-                }
-                if "priority" not in task_columns:
-                    connection.execute(
-                        "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
-                    )
-                steering_columns = {
-                    row["name"]
-                    for row in connection.execute(
-                        "PRAGMA table_info(task_steering)"
-                    ).fetchall()
-                }
-                if "sequence" not in steering_columns:
-                    connection.execute(
-                        "ALTER TABLE task_steering ADD COLUMN sequence INTEGER"
-                    )
-                # v9 had no explicit sequence.  Its durable semantics were
-                # chronological steering with the stable steering ID as the
-                # tie-breaker; rowid reflected insertion/storage order only
-                # and can be reversed by import/rebuild paths.
-                steering_rows = connection.execute(
-                    """
-                    SELECT rowid, task_id, steering_id, created_at, sequence
-                    FROM task_steering
-                    ORDER BY task_id, created_at, steering_id, rowid
-                    """
-                ).fetchall()
-                next_sequences: dict[str, int] = {}
-                for steering_row in steering_rows:
-                    task_id = str(steering_row["task_id"])
-                    current_sequence = next_sequences.get(task_id, 0)
-                    stored_sequence = steering_row["sequence"]
-                    if stored_sequence is None or int(stored_sequence) <= current_sequence:
-                        stored_sequence = current_sequence + 1
-                        connection.execute(
-                            "UPDATE task_steering SET sequence = ? WHERE rowid = ?",
-                            (stored_sequence, steering_row["rowid"]),
-                        )
-                    next_sequences[task_id] = int(stored_sequence)
-                connection.execute(
-                    "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-                    (str(SCHEMA_VERSION),),
-                )
-                # v8 binds reusable Evidence to the code-as-harness governance
-                # receipt; only rows that actually predate v8 lack that proof.
-                if prior_schema_version < 8:
-                    connection.execute("DELETE FROM evidence_cache")
-            elif int(current["value"]) != SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"unsupported schema version {current['value']}; expected {SCHEMA_VERSION}"
-                )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS task_steering_task_sequence_idx "
-                "ON task_steering(task_id, sequence)"
-            )
+            # Read-only version fencing precedes every DDL statement. An
+            # unknown newer database must remain untouched by an older binary.
+            prior_schema_version = self._preflight_schema_version(connection)
+            connection.execute("PRAGMA journal_mode = WAL")
+            with self._schema_migration_transaction(connection):
+                for statement in schema_sql.split(";"):
+                    if statement.strip():
+                        self._schema_write(connection, statement)
+                self._apply_schema_migration(connection, prior_schema_version)
         self.path.chmod(0o600)
 
     @property
@@ -1072,6 +1137,22 @@ class WorkbenchStore:
         prepared = self._prepare_task_materialization(contract, nodes)
         timestamp = now_iso()
         with self.transaction() as connection:
+            planning_reservation = connection.execute(
+                """
+                SELECT command_id, task_id, state FROM planning_requests
+                WHERE (task_id = ? OR command_id = ?)
+                  AND state IN ('pending', 'running', 'succeeded', 'failed', 'indeterminate')
+                ORDER BY command_id
+                LIMIT 1
+                """,
+                (contract.task_id, command_id),
+            ).fetchone()
+            if planning_reservation is not None:
+                raise CommandConflictError(
+                    f"planning request {planning_reservation['command_id']!r} "
+                    f"in state {planning_reservation['state']!r} reserves task "
+                    f"{planning_reservation['task_id']!r}"
+                )
             receipt = connection.execute(
                 "SELECT request_hash, task_id FROM command_receipts WHERE command_id = ?",
                 (command_id,),

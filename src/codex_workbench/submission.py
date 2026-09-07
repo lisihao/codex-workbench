@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
 import subprocess
@@ -390,6 +391,34 @@ def _public_compiled_result(result: Mapping[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _public_planning_error(value: Any, state: object) -> dict[str, str]:
+    """Project an internal diagnostic to a fixed public failure summary.
+
+    Planner and subprocess diagnostics can include their input or provider
+    output.  Their durable text remains available to authorized local repair
+    tooling, while the MCP and CLI surface receives only a state-derived
+    category and a content fingerprint for support correlation.
+    """
+
+    if isinstance(value, str):
+        digest_source = value.encode("utf-8")
+    else:
+        # Store-generated diagnostics are strings.  Keep malformed imported
+        # data non-disclosive too, without attempting to serialize it here.
+        digest_source = type(value).__name__.encode("utf-8")
+    if state == "indeterminate":
+        return {
+            "type": "planning-indeterminate",
+            "summary": "Planning did not settle; inspect authorized local diagnostics before retrying.",
+            "error_ref": "sha256:" + sha256(digest_source).hexdigest(),
+        }
+    return {
+        "type": "planning-failed",
+        "summary": "Planning failed; inspect authorized local diagnostics before retrying.",
+        "error_ref": "sha256:" + sha256(digest_source).hexdigest(),
+    }
+
+
 def planning_request_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     """Expose the stable public status vocabulary for a planning receipt."""
 
@@ -401,6 +430,8 @@ def planning_request_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     public["status_tool"] = "workbench_get_request"
     if "status" not in public and isinstance(state, str):
         public["status"] = state
+    if receipt.get("error") is not None:
+        public["error"] = _public_planning_error(receipt["error"], state)
     request = public.get("request")
     raw_request = receipt.get("request")
     if isinstance(request, dict):
