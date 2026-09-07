@@ -543,6 +543,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         store.mkdir()
         for worktree in (first, second, changed, interrupted):
             worktree.mkdir()
+            (worktree / "native" / "fixture").mkdir(parents=True)
             (worktree / "packages" / "fixture").mkdir(parents=True)
             (worktree / "package.json").write_text(
                 json.dumps({"packageManager": "pnpm@11.7.0"}),
@@ -574,6 +575,9 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             package_linker = cwd / "packages" / "fixture" / "node_modules"
             package_linker.mkdir()
             (package_linker / "fixture.txt").write_text("package-ready\n", encoding="utf-8")
+            native_linker = cwd / "native" / "fixture" / "node_modules"
+            native_linker.mkdir()
+            (native_linker / "fixture.txt").write_text("native-ready\n", encoding="utf-8")
             return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
 
         materializer = PnpmOfflineMaterializer(
@@ -600,6 +604,12 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
                 encoding="utf-8"
             ),
             "package-ready\n",
+        )
+        self.assertEqual(
+            (second / "native" / "fixture" / "node_modules" / "fixture.txt").read_text(
+                encoding="utf-8"
+            ),
+            "native-ready\n",
         )
         self.assertTrue((interrupted / "node_modules" / ".modules.yaml").is_file())
         self.assertEqual((second / "node_modules" / "workspace").resolve(), (second / "packages" / "fixture").resolve())

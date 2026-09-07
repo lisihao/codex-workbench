@@ -486,7 +486,7 @@ class PnpmOfflineMaterializer:
                 )
             paths.append(relative)
         normalized = tuple(sorted(set(paths), key=str))
-        if not normalized or normalized[0] != Path("node_modules"):
+        if Path("node_modules") not in normalized:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm dependency template is missing root node_modules: {template_directory}"
             )
