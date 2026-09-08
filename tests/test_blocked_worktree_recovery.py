@@ -199,7 +199,8 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
 
     def test_mcp_resume_recovers_dirty_blocked_attempt_without_losing_changes(self) -> None:
         command = (
-            f"{sys.executable} -c \"from pathlib import Path; "
+            f"PYTHONPATH=src {sys.executable} -c \"import os; from pathlib import Path; "
+            "assert os.environ['PYTHONPATH'] == 'src'; "
             "assert Path('src/value.txt').read_text() == 'patched\\n'\""
         )
         contract, blocked, source, source_patch = self._blocked_task(
@@ -282,6 +283,13 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             ),
             "patched\n",
         )
+
+    def test_recovery_acceptance_environment_rejects_path_override(self) -> None:
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError,
+            "environment variable PATH is not permitted",
+        ):
+            DirtyWorktreeRecovery._parse_command("PATH=/tmp python -V")
 
     def test_cli_and_mcp_share_the_same_blocked_capture_path(self) -> None:
         command = f"{sys.executable} -c \"raise SystemExit(0)\""

@@ -31,6 +31,15 @@ class DirtyWorktreeRecoveryError(WorktreeError):
     """A blocked dirty worktree cannot be resumed without losing provenance."""
 
 
+_RECOVERY_ACCEPTANCE_ENVIRONMENT = frozenset(
+    {
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "PYTHONPYCACHEPREFIX",
+    }
+)
+
+
 def is_python_bytecode_residue_path(value: object) -> bool:
     """Return whether a Git-relative path is a generated Python cache file."""
 
@@ -910,19 +919,28 @@ class DirtyWorktreeRecovery:
                 )
             outcomes: list[CommandOutcome] = []
             for command_source in acceptance_commands:
-                command = self._parse_command(command_source)
-                outcome = self._run_command(command, target, timeout_seconds)
+                declared_command, command, environment_overrides = self._parse_command(
+                    command_source
+                )
+                outcome = self._run_command(
+                    declared_command,
+                    target,
+                    timeout_seconds,
+                    executable=command,
+                    environment_overrides=environment_overrides,
+                )
                 outcomes.append(outcome)
                 checks.append(
                     ("PASS" if outcome.exit_code == 0 else "FAIL")
-                    + f": {' '.join(command)} (exit {outcome.exit_code})"
+                    + f": {' '.join(declared_command)} (exit {outcome.exit_code})"
                 )
                 if outcome.exit_code != 0:
                     log_ref = self._store_logs(materialization, outcomes)
                     self._validate_snapshot(repository, str(source), recovery)
                     return RecoveryOutcome(
                         "failed",
-                        f"declared recovery acceptance command failed: {' '.join(command)}",
+                        "declared recovery acceptance command failed: "
+                        + " ".join(declared_command),
                         {
                             "recovery-snapshot": str(recovery["patch_ref"]),
                             "dependency-materialization": materialization_ref,
@@ -1671,16 +1689,59 @@ class DirtyWorktreeRecovery:
         return path
 
     @staticmethod
-    def _parse_command(source: str) -> tuple[str, ...]:
+    def _parse_command(
+        source: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]:
         try:
-            command = tuple(shlex.split(source))
+            declared = tuple(shlex.split(source))
         except ValueError as error:
             raise DirtyWorktreeRecoveryError(f"invalid acceptance command: {error}") from error
-        if not command or any(token in {"|", "||", "&&", ";", ">", "<"} for token in command):
+        if not declared or any(
+            token in {"|", "||", "&&", ";", ">", "<"}
+            for token in declared
+        ):
             raise DirtyWorktreeRecoveryError("recovery acceptance command must be an argv-only command")
-        return command
+        environment: list[tuple[str, str]] = []
+        command_start = 0
+        for token in declared:
+            if "=" not in token:
+                break
+            name, value = token.split("=", 1)
+            if (
+                not name
+                or not (name[0].isalpha() or name[0] == "_")
+                or not all(character.isalnum() or character == "_" for character in name)
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    f"invalid recovery acceptance environment assignment: {token}"
+                )
+            if name not in _RECOVERY_ACCEPTANCE_ENVIRONMENT:
+                raise DirtyWorktreeRecoveryError(
+                    f"recovery acceptance environment variable {name} is not permitted"
+                )
+            if any(existing == name for existing, _ in environment):
+                raise DirtyWorktreeRecoveryError(
+                    f"recovery acceptance environment variable {name} is duplicated"
+                )
+            environment.append((name, value))
+            command_start += 1
+        command = declared[command_start:]
+        if not command:
+            raise DirtyWorktreeRecoveryError(
+                "recovery acceptance command requires an executable after environment assignments"
+            )
+        return declared, command, tuple(environment)
 
-    def _run_command(self, command: tuple[str, ...], cwd: Path, timeout_seconds: int) -> CommandOutcome:
+    def _run_command(
+        self,
+        declared_command: tuple[str, ...],
+        cwd: Path,
+        timeout_seconds: int,
+        *,
+        executable: tuple[str, ...] | None = None,
+        environment_overrides: tuple[tuple[str, str], ...] = (),
+    ) -> CommandOutcome:
+        command = executable or declared_command
         try:
             # Recovery first materializes an independent worktree-local linker.
             # Its acceptance command must use the same process-local pnpm shim
@@ -1695,6 +1756,7 @@ class DirtyWorktreeRecovery:
                     "NO_UPDATE_NOTIFIER": "1",
                     "npm_config_offline": "true",
                 })
+                environment.update(environment_overrides)
                 completed = self.runner(
                     list(command),
                     cwd=cwd,
@@ -1705,8 +1767,16 @@ class DirtyWorktreeRecovery:
                     check=False,
                 )
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise DirtyWorktreeRecoveryError(f"cannot run recovery acceptance command {' '.join(command)}: {error}") from error
-        return CommandOutcome(command, int(completed.returncode), _bounded(completed.stdout or ""), _bounded(completed.stderr or ""))
+            raise DirtyWorktreeRecoveryError(
+                "cannot run recovery acceptance command "
+                f"{' '.join(declared_command)}: {error}"
+            ) from error
+        return CommandOutcome(
+            declared_command,
+            int(completed.returncode),
+            _bounded(completed.stdout or ""),
+            _bounded(completed.stderr or ""),
+        )
 
     def _store_logs(self, materialization: Mapping[str, object], outcomes: list[CommandOutcome]) -> str:
         return self.artifacts.put_text(

@@ -48,6 +48,8 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 7. 再次核对 source 未漂移、target patch 哈希一致，然后以 lease CAS 写入 allocation。
 8. 只有 assignment 成功后才调用原 Worker 执行器。
 
+恢复验收仍以无 shell 的 argv 方式执行。合同命令可以在可执行文件之前声明 `PYTHONPATH`、`PYTHONPYCACHEPREFIX` 或 `PYTHONDONTWRITEBYTECODE`；恢复器把这些前缀写入该子进程环境，同时在 Evidence 中保留完整原始命令。`PATH`、`HOME`、加载器变量及其他环境覆盖会在执行前被拒绝，不能借环境前缀绕过 argv 治理。
+
 已验收祖先保持原 attempt 和 accepted 状态，不重新执行。tracked 与合法普通 untracked 文件均可恢复。`__pycache__/*.pyc` 是唯一可自动分类的 ignored 残留：它必须已出现在失败回执中，且物理对象必须是工作树内的普通非符号链接文件；恢复器会先把每个文件的字节、SHA-256 和路径写入 ArtifactStore，再删除缓存并只重放业务补丁。缓存已在捕获前被清理时，收据显式记录 missing path，不再把它误判为业务补丁漂移。其他 ignored 文件、符号链接、越权路径、来源漂移、丢失 allocation、错误 branch/base 或哈希不一致仍会 fail closed，原失败 attempt 仍是权威状态。
 
 `blocked` 并非一律自动重试。只有由可信执行边界产生且显式带 `retryable=true` 的 Worker 结果，才可在 `retry_limit` 内进入与失败 attempt 相同的内容捕获和新工作树恢复路径。模型自报阻断、凭据、权限、配额、需求歧义、verifier 阻断和 `indeterminate` 结果均保持显式终态，防止无界循环或重复副作用。

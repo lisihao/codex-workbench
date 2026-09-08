@@ -389,7 +389,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.15.6`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+源码版本/合同为 `1.15.7`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+
+1.15.7 修复受控恢复把 `PYTHONPATH=src` 等合同环境前缀误当成可执行文件的问题。恢复器继续禁止 shell，只允许三项 Python 验收环境变量并保留完整命令 Evidence；`PATH`、`HOME` 及其他覆盖在执行前 fail closed。
 
 1.15.6 让可安全恢复的 `blocked` Worker 进入受限重试，而不是把整个任务永久停在终态；历史阻断可通过 MCP `resume` 按精确 revision、node、attempt 和显式副作用确认进入现有内容寻址恢复路径。CLI 与 MCP 共用同一事务外捕获实现，业务补丁、合法 untracked 文件和已归档的 Python bytecode 残留均由收据固定；不确定或外部副作用继续 fail closed。
 
