@@ -13,6 +13,7 @@ from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
+from codex_workbench.executors import ExecutionRequest
 from codex_workbench.mcp import WorkbenchMCPServer
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
@@ -30,7 +31,7 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
         subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=self.repository, check=True)
         subprocess.run(["git", "config", "user.name", "Fixture"], cwd=self.repository, check=True)
         (self.repository / ".gitignore").write_text(
-            ".workbench-ignored/\n",
+            ".workbench-ignored/\n__pycache__/\n",
             encoding="utf-8",
         )
         (self.repository / "src" / "value.txt").write_text("base\n", encoding="utf-8")
@@ -87,6 +88,8 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
         unsafe_path: str | None = None,
         symlink_path: str | None = None,
         retryable: bool = False,
+        python_residue: bool = False,
+        result_status: str = "failed",
     ) -> tuple[TaskContract, Path]:
         contract = TaskContract(
             task_id=task_id,
@@ -207,10 +210,15 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to("value.txt")
             changed_paths.append(symlink_path)
+        if python_residue:
+            residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+            residue.parent.mkdir(parents=True)
+            residue.write_bytes(b"failed-attempt bytecode\0")
+            changed_paths.append("tests/__pycache__/fixture.cpython-313.pyc")
         self.store.settle_claimed(
             claimed_worker,
             NodeResult(
-                "failed",
+                result_status,  # type: ignore[arg-type]
                 "fixture failed after a recoverable dirty change",
                 artifacts={"dependency-input": dependency_ref},
                 changed_paths=tuple(sorted(changed_paths)),
@@ -489,12 +497,13 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
         self.assertEqual(claimed["steering"], ())
 
     def test_retryable_dirty_failure_queues_the_same_recovery_path(self) -> None:
-        contract, source = self._dirty_failed_task(retryable=True)
+        contract, source = self._dirty_failed_task(retryable=True, python_residue=True)
         task = self.store.get_task(contract.task_id)
         worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
 
         self.assertEqual(task["state"], "queued")
         self.assertEqual((worker["state"], worker["attempt"], worker["worktree"]), ("pending", 1, None))
+        self.assertTrue((source / "tests" / "__pycache__" / "fixture.cpython-313.pyc").exists())
         observed: dict[str, str] = {}
         coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
         try:
@@ -534,11 +543,115 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
                 "untracked": "untracked prior attempt\n",
             },
         )
+        self.assertFalse((source / "tests" / "__pycache__").exists())
         completed = self.store.get_task(contract.task_id)
         completed_worker = next(
             node for node in completed["nodes"] if node["node_id"] == "worker"
         )
         self.assertEqual((completed_worker["state"], completed_worker["attempt"]), ("accepted", 2))
+
+    def test_typed_retryable_block_restores_changes_instead_of_becoming_terminal(self) -> None:
+        contract, source = self._dirty_failed_task(
+            task_id="retryable-blocked-attempt",
+            retryable=True,
+            python_residue=True,
+            result_status="blocked",
+        )
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((task["state"], worker["state"]), ("queued", "pending"))
+
+        observed: dict[str, str] = {}
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("typed-blocked-retry")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 2))
+
+            def execute(request: object) -> NodeResult:
+                worktree = request.worktree  # type: ignore[attr-defined]
+                assert worktree is not None
+                observed["tracked"] = (worktree / "src" / "value.txt").read_text(
+                    encoding="utf-8"
+                )
+                observed["untracked"] = (worktree / "src" / "continuation.txt").read_text(
+                    encoding="utf-8"
+                )
+                return NodeResult(
+                    "succeeded",
+                    "typed blocked retry continued from the captured patch",
+                    checks=("fixture",),
+                )
+
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = execute
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        self.assertEqual(
+            observed,
+            {
+                "tracked": "dirty prior attempt\n",
+                "untracked": "untracked prior attempt\n",
+            },
+        )
+        self.assertFalse((source / "tests" / "__pycache__").exists())
+        completed = self.store.get_task(contract.task_id)
+        completed_worker = next(
+            node for node in completed["nodes"] if node["node_id"] == "worker"
+        )
+        self.assertEqual((completed_worker["state"], completed_worker["attempt"]), ("accepted", 2))
+
+    def test_coordinator_marks_only_safe_local_partial_blocks_retryable(self) -> None:
+        contract, source = self._dirty_failed_task(
+            task_id="coordinator-classified-block",
+            python_residue=True,
+        )
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        dependency_ref = worker["result"]["artifacts"]["dependency-input"]
+        dependency_receipt = json.loads(
+            self.artifacts.verify(dependency_ref).read_text(encoding="utf-8")
+        )
+        request = ExecutionRequest(
+            task_id=contract.task_id,
+            node_id="worker",
+            attempt=1,
+            contract=contract.to_dict(),
+            spec=worker,
+            worktree=source,
+            input_tree_sha=dependency_receipt["input_tree_sha"],
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            classified = coordinator._with_observed_failure_paths(
+                request,
+                NodeResult("blocked", "local worker stopped after making progress"),
+            )
+            external_request = ExecutionRequest(
+                **{
+                    **request.__dict__,
+                    "contract": {
+                        **request.contract,
+                        "external_write_permission": True,
+                    },
+                }
+            )
+            external = coordinator._with_observed_failure_paths(
+                external_request,
+                NodeResult("blocked", "external operation may have run"),
+            )
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        self.assertTrue(classified.retryable)
+        self.assertIn("src/value.txt", classified.changed_paths)
+        self.assertIn(
+            "tests/__pycache__/fixture.cpython-313.pyc",
+            classified.changed_paths,
+        )
+        self.assertFalse(external.retryable)
 
     def test_incompatible_source_allocation_blocks_queue_without_mutation(self) -> None:
         contract, _ = self._dirty_failed_task()

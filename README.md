@@ -304,7 +304,7 @@ Sol planner ──► TaskContract + scope-aware DAG
 independent Sol verifier
         │
         ├── accepted: required diff, checks, verdict and Evidence agree
-        └── needs_fix / needs_approval / blocked: durable state, not a hidden retry
+        └── needs_fix / needs_approval / blocked: durable state; only typed retryable worker blocks use a bounded visible retry
 ```
 
 示例：从命令行提交一个边界明确的任务。将 scope 和验收命令替换为你的仓库实际边界。

@@ -44,7 +44,12 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         subprocess.run(["git", "config", "user.name", "Fixture"], cwd=self.repository, check=True)
         (self.repository / "src" / "value.txt").write_text("base\n", encoding="utf-8")
         (self.repository / "other.txt").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "add", "src/value.txt", "other.txt"], cwd=self.repository, check=True)
+        (self.repository / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", ".gitignore", "src/value.txt", "other.txt"],
+            cwd=self.repository,
+            check=True,
+        )
         subprocess.run(["git", "commit", "-m", "base"], cwd=self.repository, check=True, capture_output=True)
         self.base_sha = self._git(self.repository, "rev-parse", "HEAD")
         self.state_root = self.root / "state"
@@ -80,6 +85,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         patch_path: str = "src/value.txt",
         allowed_scope: tuple[str, ...] = ("src",),
         write_scopes: tuple[str, ...] = ("src",),
+        python_residue: bool = False,
     ) -> tuple[TaskContract, dict, Path, bytes]:
         contract = TaskContract(
             task_id="blocked-worktree",
@@ -128,6 +134,12 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         target_file = source / patch_path
         target_file.parent.mkdir(parents=True, exist_ok=True)
         target_file.write_text("patched\n", encoding="utf-8")
+        changed_paths = [patch_path]
+        if python_residue:
+            residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+            residue.parent.mkdir(parents=True)
+            residue.write_bytes(b"fixture bytecode\0")
+            changed_paths.append("tests/__pycache__/fixture.cpython-313.pyc")
         patch_before = subprocess.run(
             ["git", "-C", str(source), "diff", "--binary", self.base_sha],
             check=True,
@@ -140,7 +152,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
                 "fixture execution stopped after writing a recoverable tracked patch",
                 actual_model="fixture",
                 result_kind="worker",
-                changed_paths=(patch_path,),
+                changed_paths=tuple(sorted(changed_paths)),
                 checks=("fixture blocked after tracked patch",),
                 governance_profile=contract.governance_profile,
                 verification_tier=contract.verification_tier,
@@ -158,7 +170,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             attempt=int(worker["attempt"]),
             expected_changed_paths=tuple(worker["result"]["changed_paths"]),
         )
-        return self.store.resume_blocked_worktree(
+        authorization = self.store.resume_blocked_worktree(
             contract.task_id,
             "worker",
             expected_revision=int(blocked["state_revision"]),
@@ -166,6 +178,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             reason="preserve a1 and verify its tracked patch on clean a2",
             recovery=recovery,
         )
+        return {**authorization, "recovery": recovery}
 
     def _blocked_dependent_task(
         self,
@@ -723,6 +736,122 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(allocations[2]["state"], "active")
         events = [event["event_type"] for event in self.store.read_events(task_id=contract.task_id)]
         self.assertIn("node.blocked_worktree_recovery_consumed", events)
+
+    def test_python_bytecode_residue_is_archived_then_excluded_from_recovery_patch(self) -> None:
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'\""
+        )
+        contract, blocked, source, source_patch = self._blocked_task(
+            acceptance_command=command,
+            python_residue=True,
+        )
+        residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+
+        authorization = self._authorize(contract, blocked, source)
+        recovery = authorization["recovery"]
+        self.assertEqual(recovery["schema_version"], 4)
+        self.assertEqual(recovery["changed_paths"], ["src/value.txt"])
+        self.assertEqual(
+            recovery["generated_residue_paths"],
+            ["tests/__pycache__/fixture.cpython-313.pyc"],
+        )
+        self.assertFalse(residue.exists())
+        residue_receipt = json.loads(
+            self.store.artifacts.verify(recovery["generated_residue_ref"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(residue_receipt["missing_paths"], [])
+        content_ref = residue_receipt["observed_files"][0]["content_ref"]
+        self.assertEqual(self.store.artifacts.verify(content_ref).read_bytes(), b"fixture bytecode\0")
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("generated-residue-recovery")
+            assert claimed is not None
+            coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(
+            (worker["state"], worker["attempt"]),
+            ("accepted", 2),
+            task["blocker"],
+        )
+        self.assertEqual(
+            worker["result"]["artifacts"]["generated-residue"],
+            recovery["generated_residue_ref"],
+        )
+        self.assertFalse((Path(worker["worktree"]) / "tests" / "__pycache__").exists())
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(source), "diff", "--binary", self.base_sha],
+                check=True,
+                capture_output=True,
+            ).stdout,
+            source_patch,
+        )
+
+    def test_already_removed_reported_bytecode_residue_does_not_wedge_recovery(self) -> None:
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'\""
+        )
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=command,
+            python_residue=True,
+        )
+        residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+        residue.unlink()
+        residue.parent.rmdir()
+
+        authorization = self._authorize(contract, blocked, source)
+        recovery = authorization["recovery"]
+        residue_receipt = json.loads(
+            self.store.artifacts.verify(recovery["generated_residue_ref"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            residue_receipt["missing_paths"],
+            ["tests/__pycache__/fixture.cpython-313.pyc"],
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("missing-residue-recovery")
+            assert claimed is not None
+            coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(
+            (worker["state"], worker["attempt"]),
+            ("accepted", 2),
+            task["blocker"],
+        )
+
+    def test_bytecode_named_symlink_is_not_treated_as_disposable_residue(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            python_residue=True,
+        )
+        residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+        residue.unlink()
+        residue.symlink_to(source / "src" / "value.txt")
+
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError,
+            "regular non-symlink",
+        ):
+            self._authorize(contract, blocked, source)
+
+        self.assertTrue(residue.is_symlink())
+        task = self.store.get_task(contract.task_id)
+        self.assertEqual(task["state"], "blocked")
 
     def test_dependent_recovery_replays_recorded_input_and_only_worker_delta(self) -> None:
         contract, blocked, source, dependency_input_ref, source_worker_patch = self._blocked_dependent_task()

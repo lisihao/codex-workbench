@@ -7,10 +7,11 @@ from hashlib import sha256
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -28,6 +29,30 @@ from .worktrees import WorktreeError, WorktreeManager
 
 class DirtyWorktreeRecoveryError(WorktreeError):
     """A blocked dirty worktree cannot be resumed without losing provenance."""
+
+
+def is_python_bytecode_residue_path(value: object) -> bool:
+    """Return whether a Git-relative path is a generated Python cache file."""
+
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and str(path) == value
+        and ".." not in path.parts
+        and "__pycache__" in path.parts[:-1]
+        and path.suffix == ".pyc"
+    )
+
+
+def partition_recovery_paths(paths: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Separate recoverable source edits from narrowly classified bytecode residue."""
+
+    generated = tuple(sorted(path for path in paths if is_python_bytecode_residue_path(path)))
+    generated_set = set(generated)
+    recoverable = tuple(sorted(path for path in paths if path not in generated_set))
+    return recoverable, generated
 
 
 @dataclass(frozen=True)
@@ -709,6 +734,7 @@ class DirtyWorktreeRecovery:
         input_tree_sha: str | None = None,
         dependency_input_ref: str | None = None,
         preserve_untracked_paths: tuple[str, ...] = (),
+        expected_generated_residue_paths: tuple[str, ...] = (),
     ) -> dict[str, object]:
         """Capture only the blocked worker's own patch.
 
@@ -747,17 +773,28 @@ class DirtyWorktreeRecovery:
                 "input_tree_sha": comparison_tree,
                 "dependency_input_ref": dependency_input_ref,
             }
+        reported_recoverable, reported_generated = partition_recovery_paths(
+            tuple(sorted(expected_changed_paths))
+        )
+        expected_generated = tuple(
+            sorted(set(reported_generated) | set(expected_generated_residue_paths))
+        )
+        if any(
+            not is_python_bytecode_residue_path(relative_path)
+            for relative_path in expected_generated
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "generated residue receipt contains a non-bytecode path"
+            )
         changed_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
-        if changed_paths != tuple(sorted(expected_changed_paths)):
+        if changed_paths != reported_recoverable:
             raise DirtyWorktreeRecoveryError(
                 "worktree changed paths do not match the blocked worker receipt"
             )
-        ignored_paths = self.ignored_paths(path)
-        if ignored_paths:
-            raise DirtyWorktreeRecoveryError(
-                "dirty worktree contains ignored paths that cannot be recovered safely: "
-                + ", ".join(ignored_paths)
-            )
+        generated_residue_ref = self.discard_generated_residue(
+            path,
+            expected_generated,
+        )
         untracked_paths = self.untracked_paths(path)
         requested_untracked = tuple(sorted(preserve_untracked_paths))
         if untracked_paths:
@@ -779,6 +816,13 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError(
                 "explicit untracked preservation paths no longer match the dirty worktree"
             )
+        if generated_residue_ref is not None:
+            recovery_context = {
+                **recovery_context,
+                "schema_version": {1: 4, 2: 5, 3: 6}[int(recovery_context["schema_version"])],
+                "generated_residue_paths": list(expected_generated),
+                "generated_residue_ref": generated_residue_ref,
+            }
         check = self._git_text(path, "diff", "--check", comparison_tree)
         if check:
             raise DirtyWorktreeRecoveryError(f"dirty worktree fails git diff --check: {check}")
@@ -1064,6 +1108,13 @@ class DirtyWorktreeRecovery:
         current_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if current_paths != tuple(sorted(changed_paths)):
             raise DirtyWorktreeRecoveryError("dirty worktree changed paths drifted after recovery was scheduled")
+        ignored_paths = self.ignored_paths(path)
+        if ignored_paths:
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree acquired ignored paths after recovery was scheduled: "
+                + ", ".join(ignored_paths)
+            )
+        self._validate_generated_residue_receipt(recovery)
         untracked_paths = self.untracked_paths(path)
         if untracked_paths != self._recovery_untracked_paths(recovery):
             raise DirtyWorktreeRecoveryError(
@@ -1088,7 +1139,7 @@ class DirtyWorktreeRecovery:
         base_sha = recovery.get("base_sha")
         if not isinstance(base_sha, str) or not base_sha:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid base_sha")
-        if schema_version == 1:
+        if schema_version in {1, 4}:
             legacy = {
                 "schema_version",
                 "source_attempt",
@@ -1099,6 +1150,8 @@ class DirtyWorktreeRecovery:
                 "patch_ref",
                 "patch_sha256",
             }
+            if schema_version == 4:
+                legacy |= {"generated_residue_paths", "generated_residue_ref"}
             if set(recovery) != legacy:
                 raise DirtyWorktreeRecoveryError("blocked legacy recovery receipt has an invalid shape")
             return (
@@ -1107,7 +1160,7 @@ class DirtyWorktreeRecovery:
                 None,
                 None,
             )
-        if schema_version not in {2, 3}:
+        if schema_version not in {2, 3, 5, 6}:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt schema is unsupported")
         required = {
             "schema_version",
@@ -1123,8 +1176,10 @@ class DirtyWorktreeRecovery:
             "patch_ref",
             "patch_sha256",
         }
-        if schema_version == 3:
+        if schema_version in {3, 6}:
             required.add("untracked_paths")
+        if schema_version in {5, 6}:
+            required |= {"generated_residue_paths", "generated_residue_ref"}
         if set(recovery) != required:
             raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt has an invalid shape")
         task_id = recovery["source_task_id"]
@@ -1143,6 +1198,87 @@ class DirtyWorktreeRecovery:
             node_id,
             dependency_input_ref,
         )
+
+    def _validate_generated_residue_receipt(
+        self,
+        recovery: Mapping[str, object],
+    ) -> None:
+        schema_version = recovery.get("schema_version")
+        if schema_version not in {4, 5, 6}:
+            return
+        paths = recovery.get("generated_residue_paths")
+        ref = recovery.get("generated_residue_ref")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or not all(is_python_bytecode_residue_path(path) for path in paths)
+            or tuple(paths) != tuple(sorted(set(paths)))
+            or not isinstance(ref, str)
+            or not ref
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "blocked recovery receipt has invalid generated residue evidence"
+            )
+        try:
+            receipt = json.loads(self.artifacts.verify(ref).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise DirtyWorktreeRecoveryError(
+                f"generated residue evidence is unavailable: {error}"
+            ) from error
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_version") != 1
+            or receipt.get("kind") != "python-bytecode-generated-residue"
+            or receipt.get("expected_paths") != paths
+            or not isinstance(receipt.get("observed_files"), list)
+            or not isinstance(receipt.get("missing_paths"), list)
+        ):
+            raise DirtyWorktreeRecoveryError("generated residue evidence is invalid")
+        observed_files = receipt["observed_files"]
+        missing_paths = receipt["missing_paths"]
+        if (
+            not all(isinstance(path, str) for path in missing_paths)
+            or tuple(missing_paths) != tuple(sorted(set(missing_paths)))
+        ):
+            raise DirtyWorktreeRecoveryError("generated residue missing-path evidence is invalid")
+        observed_paths: list[str] = []
+        for entry in observed_files:
+            if not isinstance(entry, dict):
+                raise DirtyWorktreeRecoveryError("generated residue file evidence is invalid")
+            path = entry.get("path")
+            digest = entry.get("sha256")
+            size = entry.get("bytes")
+            content_ref = entry.get("content_ref")
+            if (
+                not is_python_bytecode_residue_path(path)
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(content_ref, str)
+                or not content_ref
+            ):
+                raise DirtyWorktreeRecoveryError("generated residue file evidence is invalid")
+            try:
+                payload = self.artifacts.verify(content_ref).read_bytes()
+            except (OSError, ValueError) as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue content is unavailable: {error}"
+                ) from error
+            if len(payload) != size or sha256(payload).hexdigest() != digest:
+                raise DirtyWorktreeRecoveryError(
+                    "generated residue content does not match its evidence"
+                )
+            observed_paths.append(path)
+        if (
+            tuple(observed_paths) != tuple(sorted(set(observed_paths)))
+            or set(observed_paths).intersection(missing_paths)
+            or tuple(sorted((*observed_paths, *missing_paths))) != tuple(paths)
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "generated residue evidence does not cover its declared paths"
+            )
 
     @staticmethod
     def ignored_paths(worktree: Path) -> tuple[str, ...]:
@@ -1163,6 +1299,138 @@ class DirtyWorktreeRecovery:
                 if item
             )
         )
+
+    def discard_generated_residue(
+        self,
+        worktree: Path,
+        expected_paths: tuple[str, ...],
+    ) -> str | None:
+        """Archive and remove only receipt-declared Python bytecode residue.
+
+        Git-ignored content remains unsafe by default.  The sole exception is
+        a canonical ``__pycache__/*.pyc`` path already named by the failed
+        result.  Every present regular file is copied into ArtifactStore and
+        hashed before unlinking; symlinks, path escapes, unexpected ignored
+        files, and files that change during capture abort recovery.
+        """
+
+        expected = tuple(sorted(set(expected_paths)))
+        ignored = self.ignored_paths(worktree)
+        unexpected = tuple(
+            path for path in ignored if not is_python_bytecode_residue_path(path)
+        )
+        if unexpected:
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree contains ignored paths that cannot be recovered safely: "
+                + ", ".join(unexpected)
+            )
+        observed = tuple(path for path in ignored if is_python_bytecode_residue_path(path))
+        undeclared = tuple(sorted(set(observed) - set(expected)))
+        if undeclared:
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree contains unreported generated residue: "
+                + ", ".join(undeclared)
+            )
+        if not expected and not observed:
+            return None
+
+        root = worktree.resolve(strict=True)
+        entries: list[dict[str, object]] = []
+        snapshots: dict[str, tuple[int, int, int, int, str]] = {}
+        for relative_path in observed:
+            candidate = root / relative_path
+            try:
+                metadata = candidate.lstat()
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue path is unavailable or escapes the worktree: {relative_path}"
+                ) from error
+            if candidate.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue path must be a regular non-symlink file: {relative_path}"
+                )
+            try:
+                payload = candidate.read_bytes()
+                after_read = candidate.lstat()
+            except OSError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"cannot capture generated residue {relative_path}: {error}"
+                ) from error
+            identity = (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+            )
+            if identity != (
+                int(after_read.st_dev),
+                int(after_read.st_ino),
+                int(after_read.st_size),
+                int(after_read.st_mtime_ns),
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue changed during capture: {relative_path}"
+                )
+            digest = sha256(payload).hexdigest()
+            content_ref = self.artifacts.put_bytes(payload, "python-bytecode.pyc")
+            snapshots[relative_path] = (*identity, digest)
+            entries.append(
+                {
+                    "path": relative_path,
+                    "sha256": digest,
+                    "bytes": len(payload),
+                    "content_ref": content_ref,
+                }
+            )
+
+        receipt = {
+            "schema_version": 1,
+            "kind": "python-bytecode-generated-residue",
+            "expected_paths": list(expected),
+            "observed_files": entries,
+            "missing_paths": list(sorted(set(expected) - set(observed))),
+        }
+        receipt_ref = self.artifacts.put_text(
+            json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "generated-residue.json",
+        )
+        for relative_path in observed:
+            candidate = root / relative_path
+            try:
+                metadata = candidate.lstat()
+                payload = candidate.read_bytes()
+            except OSError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue changed before removal: {relative_path}: {error}"
+                ) from error
+            expected_identity = snapshots[relative_path]
+            current_identity = (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+                sha256(payload).hexdigest(),
+            )
+            if candidate.is_symlink() or current_identity != expected_identity:
+                raise DirtyWorktreeRecoveryError(
+                    f"generated residue changed before removal: {relative_path}"
+                )
+            candidate.unlink()
+            cache_directory = candidate.parent
+            if cache_directory.name == "__pycache__":
+                try:
+                    cache_directory.rmdir()
+                except OSError:
+                    pass
+        remaining = self.ignored_paths(worktree)
+        if remaining:
+            raise DirtyWorktreeRecoveryError(
+                "dirty worktree acquired ignored paths during generated-residue capture: "
+                + ", ".join(remaining)
+            )
+        return receipt_ref
 
     @staticmethod
     def untracked_paths(worktree: Path) -> tuple[str, ...]:
@@ -1273,7 +1541,7 @@ class DirtyWorktreeRecovery:
 
     @staticmethod
     def _recovery_untracked_paths(recovery: Mapping[str, object]) -> tuple[str, ...]:
-        if recovery.get("schema_version") in {1, 2}:
+        if recovery.get("schema_version") in {1, 2, 4, 5}:
             return ()
         paths = recovery.get("untracked_paths")
         if (

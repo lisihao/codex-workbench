@@ -29,6 +29,7 @@ from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
     PnpmOfflineMaterializer,
+    partition_recovery_paths,
 )
 from .execution_attribution import (
     AttributionReference,
@@ -1933,12 +1934,18 @@ class Coordinator:
         source_branch = source.get("branch")
         source_base = source.get("base_sha")
         expected_paths = source.get("changed_paths")
+        expected_generated_residue_paths = source.get("generated_residue_paths", [])
         if not (
             isinstance(source_worktree, str)
             and isinstance(source_branch, str)
             and isinstance(source_base, str)
             and isinstance(expected_paths, list)
             and all(isinstance(path, str) and path for path in expected_paths)
+            and isinstance(expected_generated_residue_paths, list)
+            and all(
+                isinstance(path, str) and path
+                for path in expected_generated_residue_paths
+            )
         ):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery source is invalid")
         if source_base != contract["base_sha"]:
@@ -1952,10 +1959,24 @@ class Coordinator:
             branch=source_branch,
         )
         ignored_paths = self.failed_attempt_recovery.ignored_paths(source_path)
-        if ignored_paths:
+        unsafe_ignored, observed_generated_residue = partition_recovery_paths(
+            ignored_paths
+        )
+        if unsafe_ignored:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt source contains ignored paths that cannot be recovered safely: "
-                + ", ".join(ignored_paths)
+                + ", ".join(unsafe_ignored)
+            )
+        unreported_generated = tuple(
+            sorted(
+                set(observed_generated_residue)
+                - set(expected_generated_residue_paths)
+            )
+        )
+        if unreported_generated:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt source contains unreported generated residue: "
+                + ", ".join(unreported_generated)
             )
         try:
             source_result = json.loads(str(binding["source_result_json"]))
@@ -2025,6 +2046,10 @@ class Coordinator:
         )
         if not actual_paths:
             try:
+                generated_residue_ref = self.failed_attempt_recovery.discard_generated_residue(
+                    source_path,
+                    tuple(expected_generated_residue_paths),
+                )
                 # Even a clean failed attempt reproduces its immutable input rather
                 # than recomputing accepted ancestors from a potentially changed
                 # task snapshot.
@@ -2059,7 +2084,16 @@ class Coordinator:
                     recovery_ref=None,
                     prepared_recovery=None,
                 )
-                return target, dependency_input, dependency_ref, {}
+                return (
+                    target,
+                    dependency_input,
+                    dependency_ref,
+                    (
+                        {"generated-residue": generated_residue_ref}
+                        if generated_residue_ref is not None
+                        else {}
+                    ),
+                )
             except Exception:
                 self._archive_failed_recovery_target(
                     contract=contract,
@@ -2083,6 +2117,9 @@ class Coordinator:
                 input_tree_sha=dependency_input.input_tree_sha,
                 dependency_input_ref=dependency_ref,
                 preserve_untracked_paths=untracked_paths,
+                expected_generated_residue_paths=tuple(
+                    expected_generated_residue_paths
+                ),
             )
             recovered_paths = tuple(recovery.get("changed_paths", ()))
             if recovered_paths != actual_paths:
@@ -2136,6 +2173,11 @@ class Coordinator:
                 {
                     "failed-attempt-recovery": recovery_ref,
                     "failed-attempt-recovery-snapshot": str(recovery["patch_ref"]),
+                    **(
+                        {"generated-residue": str(recovery["generated_residue_ref"])}
+                        if isinstance(recovery.get("generated_residue_ref"), str)
+                        else {}
+                    ),
                 },
             )
         except Exception:
@@ -2177,19 +2219,28 @@ class Coordinator:
     def _with_observed_failure_paths(self, request: ExecutionRequest, result: NodeResult) -> NodeResult:
         if request.worktree is None:
             return result
-        paths = tuple(
-            sorted(
-                (
-                    changed_paths_since_input_tree(request.worktree, request.input_tree_sha)
-                    if request.input_tree_sha is not None
-                    else self.worktrees.changed_paths(
-                        request.worktree, request.contract["base_sha"]
-                    )
-                )
-                | set(DirtyWorktreeRecovery.ignored_paths(request.worktree))
+        recoverable_paths = (
+            changed_paths_since_input_tree(request.worktree, request.input_tree_sha)
+            if request.input_tree_sha is not None
+            else self.worktrees.changed_paths(
+                request.worktree, request.contract["base_sha"]
             )
         )
-        return replace(result, changed_paths=paths)
+        ignored_paths = DirtyWorktreeRecovery.ignored_paths(request.worktree)
+        unsafe_ignored, _ = partition_recovery_paths(ignored_paths)
+        paths = tuple(sorted(recoverable_paths | set(ignored_paths)))
+        coordinator_retryable = (
+            result.status == "blocked"
+            and bool(recoverable_paths)
+            and not unsafe_ignored
+            and request.contract.get("external_write_permission") is False
+            and request.contract.get("destructive_action_permission") is False
+        )
+        return replace(
+            result,
+            changed_paths=paths,
+            retryable=result.retryable or coordinator_retryable,
+        )
 
     def _failed_attempt_recovery_failure(self, claimed: dict, summary: str) -> NodeResult:
         binding = claimed.get("failed_attempt_recovery")
@@ -2296,6 +2347,11 @@ class Coordinator:
         artifacts = {
             **outcome.artifacts,
             "recovery-snapshot": str(recovery["patch_ref"]),
+            **(
+                {"generated-residue": str(recovery["generated_residue_ref"])}
+                if isinstance(recovery.get("generated_residue_ref"), str)
+                else {}
+            ),
         }
         checks = (
             "PASS: source a1 remained read-only recovery evidence",
