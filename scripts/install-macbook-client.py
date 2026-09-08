@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import shutil
 import socket
@@ -23,6 +24,20 @@ DEFAULT_TAILSCALE_NATIVE_SSH_PORT = 10022
 DEFAULT_LAN_SSH_PORT = 22
 DEFAULT_LOCATION_PROBE_TIMEOUT_SECONDS = 3
 LOCATION_AWARE_HOST_KEY_ALIAS = "codex-workbench-authority"
+MCP_REGISTRATION_NAME = "codex-workbench"
+MCP_STARTUP_TIMEOUT_SECONDS = 60
+MCP_TOOL_TIMEOUT_SECONDS = 3600
+MCP_REGISTRATION_TABLE = re.compile(
+    r"^\s*\[\s*mcp_servers\s*\.\s*(?:codex-workbench|\"codex-workbench\"|'codex-workbench')\s*\]\s*(?:#.*)?$"
+)
+MCP_TIMEOUT_SETTING = re.compile(
+    r"^(?P<indent>\s*)(?P<key>"
+    r"startup_timeout_sec|startup_timeout_ms|tool_timeout_sec|"
+    r"\"startup_timeout_sec\"|'startup_timeout_sec'|"
+    r"\"startup_timeout_ms\"|'startup_timeout_ms'|"
+    r"\"tool_timeout_sec\"|'tool_timeout_sec'"
+    r")\s*="
+)
 
 
 class LocationAwareTransport:
@@ -292,6 +307,12 @@ def absolute_path(path: Path) -> Path:
 
     path = path.expanduser()
     return path if path.is_absolute() else Path.cwd() / path
+
+
+def codex_mcp_config_path() -> Path:
+    """Return the user-level configuration where the Codex CLI stores MCP entries."""
+
+    return absolute_path(Path.home() / ".codex" / "config.toml")
 
 
 def assert_no_symlink_ancestors(path: Path, *, label: str) -> None:
@@ -683,12 +704,111 @@ def read_mcp_registration(codex: str, name: str) -> dict[str, object] | None:
     return value
 
 
+def _toml_line_ending(line: str, default: str) -> str:
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return default
+
+
+def _toml_timeout_comment(line: str) -> str:
+    content = line.removesuffix("\r\n").removesuffix("\n")
+    _, marker, comment = content.partition("#")
+    return f" #{comment}" if marker else ""
+
+
+def with_mcp_timeouts(configuration: str) -> str:
+    """Set Workbench's MCP timeouts without rewriting unrelated Codex settings."""
+
+    lines = configuration.splitlines(keepends=True)
+    table_start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if MCP_REGISTRATION_TABLE.match(line.removesuffix("\r\n").removesuffix("\n"))
+        ),
+        None,
+    )
+    if table_start is None:
+        raise SystemExit(
+            "Codex MCP registration did not create [mcp_servers.codex-workbench] in config.toml"
+        )
+    table_end = next(
+        (
+            index
+            for index in range(table_start + 1, len(lines))
+            if lines[index].lstrip().startswith("[")
+        ),
+        len(lines),
+    )
+    line_ending = "\r\n" if "\r\n" in configuration else "\n"
+    values = {
+        "startup_timeout_sec": MCP_STARTUP_TIMEOUT_SECONDS,
+        "tool_timeout_sec": MCP_TOOL_TIMEOUT_SECONDS,
+    }
+    seen: set[str] = set()
+    index = table_start + 1
+    while index < table_end:
+        line = lines[index]
+        match = MCP_TIMEOUT_SETTING.match(line)
+        if match is None:
+            index += 1
+            continue
+        key = match.group("key").strip("\"'")
+        if key == "startup_timeout_ms":
+            del lines[index]
+            table_end -= 1
+            continue
+        value = values[key]
+        lines[index] = (
+            f"{match.group('indent')}{key} = {value}{_toml_timeout_comment(line)}"
+            f"{_toml_line_ending(line, line_ending)}"
+        )
+        seen.add(key)
+        index += 1
+    if table_end and not lines[table_end - 1].endswith(("\n", "\r")):
+        lines[table_end - 1] += line_ending
+    additions = [
+        f"{key} = {value}{line_ending}"
+        for key, value in values.items()
+        if key not in seen
+    ]
+    lines[table_end:table_end] = additions
+    return "".join(lines)
+
+
+def persist_mcp_timeouts(configuration_path: Path) -> None:
+    """Atomically persist the bounded startup and tool limits for the Workbench entry."""
+
+    configuration_path = absolute_path(configuration_path)
+    assert_file_target(configuration_path, "Codex MCP configuration")
+    if not configuration_path.is_file():
+        raise SystemExit(f"Codex MCP registration did not create config file: {configuration_path}")
+    try:
+        existing = configuration_path.read_text()
+        updated = with_mcp_timeouts(existing)
+    except OSError as error:
+        raise SystemExit(f"cannot update Codex MCP configuration: {error}") from error
+    temporary = configuration_path.with_name(
+        f".{configuration_path.name}.codex-workbench-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(updated)
+        temporary.chmod(configuration_path.stat().st_mode & 0o777)
+        os.replace(temporary, configuration_path)
+    except OSError as error:
+        raise SystemExit(f"cannot persist Codex MCP timeouts: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def mcp_add_command(codex: str, registration: dict[str, object]) -> list[str]:
     transport = registration.get("transport")
     if not isinstance(transport, dict):
         raise SystemExit("existing Codex MCP registration has no transport")
     transport_type = transport.get("type")
-    command = [codex, "mcp", "add", "codex-workbench"]
+    command = [codex, "mcp", "add", MCP_REGISTRATION_NAME]
     if transport_type == "stdio":
         raw_env = transport.get("env")
         if isinstance(raw_env, dict):
@@ -856,6 +976,7 @@ def main() -> int:
     heartbeat_runtime = client_libexec / "workbench-client-heartbeat.py"
     location_config = client_root / "transport.json"
     location_status = client_root / "status.json"
+    codex_config = codex_mcp_config_path()
     dynamic_transport = location_aware_enabled(
         args.ssh_transport,
         lan_host=args.authority_lan_host,
@@ -906,6 +1027,7 @@ def main() -> int:
         assert_file_target(heartbeat_runtime, "location-aware heartbeat runtime")
     assert_file_target(location_config, "location-aware transport config")
     assert_file_target(location_status, "location-aware transport status")
+    assert_file_target(codex_config, "Codex MCP configuration")
     domain = f"gui/{run('id', '-u').stdout.strip()}"
     client_id = "macbook-" + "".join(
         character if character.isalnum() or character in ".-_" else "-"
@@ -933,7 +1055,7 @@ def main() -> int:
         raise SystemExit("Codex CLI is required to register the Workbench MCP entry")
     preflight_global_agent_targets(Path.home())
     preflight_managed_agent_skills(source)
-    mcp_before = read_mcp_registration(codex, "codex-workbench")
+    mcp_before = read_mcp_registration(codex, MCP_REGISTRATION_NAME)
     if not args.dry_run:
         if dynamic_transport:
             assert source_location_proxy is not None and location_transport is not None
@@ -1002,6 +1124,7 @@ def main() -> int:
         (Path.home() / ".claude" / "skills" / "code-as-harness", "Claude Code-as-Harness skill"),
         (Path.home() / ".claude" / "CLAUDE.md", "Claude policy"),
         (Path.home() / ".claude" / "skills" / "archify", "Claude Archify skill"),
+        (codex_config, "Codex MCP configuration"),
     ]
     snapshot_paths.extend(
         (
@@ -1072,12 +1195,12 @@ def main() -> int:
             run("launchctl", "kickstart", "-k", f"{domain}/{label}")
         remote_command = f"exec {remote_shell_quote(remote_binary)} mcp"
         mcp_touched = True
-        run(codex, "mcp", "remove", "codex-workbench", check=False)
+        run(codex, "mcp", "remove", MCP_REGISTRATION_NAME, check=False)
         run(
             codex,
             "mcp",
             "add",
-            "codex-workbench",
+            MCP_REGISTRATION_NAME,
             "--",
             "ssh",
             "-T",
@@ -1093,11 +1216,12 @@ def main() -> int:
             authority_ssh_alias,
             remote_command,
         )
+        persist_mcp_timeouts(codex_config)
     except BaseException as error:
         rollback_errors: list[str] = []
         if mcp_touched:
             try:
-                run(codex, "mcp", "remove", "codex-workbench", check=False)
+                run(codex, "mcp", "remove", MCP_REGISTRATION_NAME, check=False)
                 if mcp_before is not None:
                     run(*mcp_add_command(codex, mcp_before))
             except BaseException as rollback_error:

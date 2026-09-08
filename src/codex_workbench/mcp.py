@@ -19,6 +19,27 @@ from .submission import enqueue_natural_language_request, planning_request_recei
 from .sync import RepositorySynchronizer, RepositorySyncError
 
 
+LIST_TASKS_DEFAULT_LIMIT = 10
+LIST_TASKS_MAX_LIMIT = 25
+LIST_TASKS_MAX_RESPONSE_BYTES = 64 * 1024
+_LIST_TASKS_MAX_TASK_ID_CHARS = 64
+_LIST_TASKS_MAX_STATE_CHARS = 24
+_LIST_TASKS_MAX_CONTRACT_HASH_CHARS = 64
+_LIST_TASKS_MAX_TIMESTAMP_CHARS = 40
+_LIST_TASKS_MAX_CURSOR = 9_223_372_036_854_775_807
+_LIST_TASKS_NODE_STATES = (
+    "pending",
+    "queued",
+    "running",
+    "verifying",
+    "accepted",
+    "failed",
+    "blocked",
+    "indeterminate",
+    "cancelled",
+)
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "workbench_request",
@@ -128,21 +149,40 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_list_tasks",
-        "description": "List durable Workbench tasks and their current DAG state.",
+        "description": "List a deterministic, bounded page of durable Workbench task summaries. Use next_cursor as cursor for the next page; prompts, results, worktrees, and artifacts are available only from workbench_inspect_task.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+            "properties": {
+                "cursor": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9][0-9]{0,18})$",
+                    "maxLength": 19,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": LIST_TASKS_MAX_LIMIT,
+                    "default": LIST_TASKS_DEFAULT_LIMIT,
+                },
+            },
         },
     },
     {
         "name": "workbench_inspect_task",
-        "description": "Inspect one task, including nodes, revisions, results, and Evidence refs.",
+        "description": "Inspect one task, including nodes, revisions, results, and Evidence refs. task_ref is the bounded reference returned by workbench_list_tasks when its display task_id is shortened.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["task_id"],
-            "properties": {"task_id": {"type": "string"}},
+            "anyOf": [{"required": ["task_id"]}, {"required": ["task_ref"]}],
+            "properties": {
+                "task_id": {"type": "string"},
+                "task_ref": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]{0,18}$",
+                    "maxLength": 19,
+                },
+            },
         },
     },
     {
@@ -486,6 +526,173 @@ class WorkbenchMCPServer:
         )
         return {"ok": True, "action": "retry-blocked", **resumed}
 
+    @staticmethod
+    def _bounded_summary_text(value: Any, maximum: int) -> tuple[str, bool]:
+        text = str(value)
+        if len(text) <= maximum:
+            return text, False
+        return f"{text[: maximum - 1]}…", True
+
+    @staticmethod
+    def _list_tasks_arguments(arguments: dict[str, Any]) -> tuple[int, int]:
+        limit = arguments.get("limit", LIST_TASKS_DEFAULT_LIMIT)
+        if type(limit) is not int:
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= LIST_TASKS_MAX_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {LIST_TASKS_MAX_LIMIT}"
+            )
+
+        cursor = arguments.get("cursor", "0")
+        return limit, WorkbenchMCPServer._sqlite_row_reference(
+            cursor, "cursor", allow_zero=True
+        )
+
+    @staticmethod
+    def _sqlite_row_reference(
+        value: Any, label: str, *, allow_zero: bool = False
+    ) -> int:
+        if type(value) is not str or not value.isascii() or not value.isdecimal():
+            raise ValueError(f"{label} must be a decimal string")
+        if len(value) > 1 and value.startswith("0"):
+            raise ValueError(f"{label} must not contain leading zeroes")
+        parsed = int(value)
+        minimum = 0 if allow_zero else 1
+        if not minimum <= parsed <= _LIST_TASKS_MAX_CURSOR:
+            raise ValueError(f"{label} is outside the SQLite row reference range")
+        return parsed
+
+    def _list_task_summaries(self, limit: int, cursor: int) -> dict[str, Any]:
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                """
+                WITH page AS (
+                    SELECT
+                        rowid AS task_ref,
+                        task_id,
+                        state,
+                        state_revision,
+                        priority,
+                        contract_hash,
+                        created_at,
+                        updated_at
+                    FROM tasks
+                    WHERE rowid > ?
+                    ORDER BY rowid ASC
+                    LIMIT ?
+                )
+                SELECT
+                    page.task_ref,
+                    page.task_id,
+                    page.state,
+                    page.state_revision,
+                    page.priority,
+                    page.contract_hash,
+                    page.created_at,
+                    page.updated_at,
+                    COUNT(nodes.node_id) AS node_total,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'pending' THEN 1 ELSE 0 END), 0) AS node_pending,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'queued' THEN 1 ELSE 0 END), 0) AS node_queued,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'running' THEN 1 ELSE 0 END), 0) AS node_running,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'verifying' THEN 1 ELSE 0 END), 0) AS node_verifying,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'accepted' THEN 1 ELSE 0 END), 0) AS node_accepted,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'failed' THEN 1 ELSE 0 END), 0) AS node_failed,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'blocked' THEN 1 ELSE 0 END), 0) AS node_blocked,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'indeterminate' THEN 1 ELSE 0 END), 0) AS node_indeterminate,
+                    COALESCE(SUM(CASE WHEN nodes.state = 'cancelled' THEN 1 ELSE 0 END), 0) AS node_cancelled
+                FROM page
+                LEFT JOIN nodes ON nodes.task_id = page.task_id
+                GROUP BY
+                    page.task_ref,
+                    page.task_id,
+                    page.state,
+                    page.state_revision,
+                    page.priority,
+                    page.contract_hash,
+                    page.created_at,
+                    page.updated_at
+                ORDER BY page.task_ref ASC
+                """,
+                (cursor, limit + 1),
+            ).fetchall()
+
+        summaries: list[tuple[int, dict[str, Any]]] = []
+        for row in rows[:limit]:
+            task_id, task_id_truncated = self._bounded_summary_text(
+                row["task_id"], _LIST_TASKS_MAX_TASK_ID_CHARS
+            )
+            state, _ = self._bounded_summary_text(
+                row["state"], _LIST_TASKS_MAX_STATE_CHARS
+            )
+            contract_hash, _ = self._bounded_summary_text(
+                row["contract_hash"], _LIST_TASKS_MAX_CONTRACT_HASH_CHARS
+            )
+            created_at, _ = self._bounded_summary_text(
+                row["created_at"], _LIST_TASKS_MAX_TIMESTAMP_CHARS
+            )
+            updated_at, _ = self._bounded_summary_text(
+                row["updated_at"], _LIST_TASKS_MAX_TIMESTAMP_CHARS
+            )
+            summaries.append(
+                (
+                    int(row["task_ref"]),
+                    {
+                        "task_id": task_id,
+                        "task_id_truncated": task_id_truncated,
+                        "task_ref": str(row["task_ref"]),
+                        "state": state,
+                        "state_revision": int(row["state_revision"]),
+                        "priority": int(row["priority"]),
+                        "contract_hash": contract_hash,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                        "node_counts": {
+                            "total": int(row["node_total"]),
+                            **{
+                                state_name: int(row[f"node_{state_name}"])
+                                for state_name in _LIST_TASKS_NODE_STATES
+                            },
+                        },
+                    },
+                )
+            )
+
+        while summaries:
+            has_more = len(rows) > len(summaries)
+            payload = {
+                "tasks": [summary for _, summary in summaries],
+                "next_cursor": str(summaries[-1][0]) if has_more else None,
+            }
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            if len(serialized) <= LIST_TASKS_MAX_RESPONSE_BYTES:
+                return payload
+            summaries.pop()
+
+        if rows:
+            raise ValueError("task summary cannot fit within the response limit")
+        return {"tasks": [], "next_cursor": None}
+
+    def _inspect_task_id(self, arguments: dict[str, Any]) -> str:
+        has_task_id = "task_id" in arguments
+        has_task_ref = "task_ref" in arguments
+        if has_task_id and has_task_ref:
+            raise ValueError("pass either task_id or task_ref, not both")
+        if has_task_id:
+            task_id = arguments["task_id"]
+            if type(task_id) is not str:
+                raise ValueError("task_id must be a string")
+            return task_id
+        if not has_task_ref:
+            raise ValueError("task_id or task_ref is required")
+        task_ref = self._sqlite_row_reference(arguments["task_ref"], "task_ref")
+        with self.store.connection() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM tasks WHERE rowid = ?", (task_ref,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"task_ref not found: {task_ref}")
+        return str(row["task_id"])
+
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "workbench_request":
             source_thread_id = arguments.get("source_thread_id")
@@ -574,9 +781,10 @@ class WorkbenchMCPServer:
                 )
             )
         if name == "workbench_list_tasks":
-            return self._text(self.store.list_tasks(limit=int(arguments.get("limit", 100))))
+            limit, cursor = self._list_tasks_arguments(arguments)
+            return self._text(self._list_task_summaries(limit, cursor))
         if name == "workbench_inspect_task":
-            return self._text(self.store.get_task(arguments["task_id"]))
+            return self._text(self.store.get_task(self._inspect_task_id(arguments)))
         if name == "workbench_read_events":
             return self._text(
                 self.store.read_events(

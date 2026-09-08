@@ -24,7 +24,11 @@ from codex_workbench.governance import (
     CODE_AS_HARNESS_POLICY_START,
     CODE_AS_HARNESS_PROFILE,
 )
-from codex_workbench.mcp import WorkbenchMCPServer
+from codex_workbench.mcp import (
+    LIST_TASKS_MAX_LIMIT,
+    LIST_TASKS_MAX_RESPONSE_BYTES,
+    WorkbenchMCPServer,
+)
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.store import WorkbenchStore
 
@@ -53,6 +57,46 @@ class MCPTests(unittest.TestCase):
         )
         self.assertIsNotNone(response)
         return response["result"]
+
+    def _create_list_task(
+        self,
+        task_id: str,
+        *,
+        objective: str = "list task fixture",
+        prompt: str = "fixture work",
+    ) -> TaskContract:
+        contract = TaskContract(
+            task_id=task_id,
+            repository=str(self.root),
+            base_sha="fixture-base",
+            objective=objective,
+            allowed_scope=("tests",),
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec(
+                    "work",
+                    task_id,
+                    "work",
+                    "fixture",
+                    "fixture",
+                    prompt,
+                ),
+                NodeSpec(
+                    "verify",
+                    task_id,
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    depends_on=("work",),
+                    verifier=True,
+                ),
+            ],
+            f"{task_id}-create",
+        )
+        return contract
 
     @staticmethod
     def _harness_binaries(home: Path) -> tuple[str, str]:
@@ -136,6 +180,129 @@ class MCPTests(unittest.TestCase):
             self.call("workbench_reclaim_worktrees", {"max_items": 1})["content"][0]["text"]
         )
         self.assertEqual(swept["status"], "idle")
+
+    def test_list_tasks_has_deterministic_bounded_pagination(self) -> None:
+        for task_id in ("mcp-list-c", "mcp-list-a", "mcp-list-b"):
+            self._create_list_task(task_id)
+
+        first_text = self.call("workbench_list_tasks", {"limit": 2})["content"][0]["text"]
+        first_page = json.loads(first_text)
+        repeated_page = json.loads(
+            self.call("workbench_list_tasks", {"limit": 2})["content"][0]["text"]
+        )
+
+        self.assertEqual(first_page, repeated_page)
+        self.assertEqual(
+            [task["task_id"] for task in first_page["tasks"]],
+            ["mcp-list-c", "mcp-list-a"],
+        )
+        self.assertEqual(len(first_page["tasks"]), 2)
+        self.assertIsInstance(first_page["next_cursor"], str)
+        self.assertTrue(first_page["next_cursor"].isdigit())
+        self.assertGreater(int(first_page["next_cursor"]), 0)
+        self.assertEqual(
+            set(first_page["tasks"][0]),
+            {
+                "task_id",
+                "task_id_truncated",
+                "task_ref",
+                "state",
+                "state_revision",
+                "priority",
+                "contract_hash",
+                "created_at",
+                "updated_at",
+                "node_counts",
+            },
+        )
+        self.assertEqual(first_page["tasks"][0]["node_counts"]["total"], 2)
+        self.assertEqual(first_page["tasks"][0]["node_counts"]["pending"], 2)
+
+        second_page = json.loads(
+            self.call(
+                "workbench_list_tasks",
+                {"limit": 2, "cursor": first_page["next_cursor"]},
+            )["content"][0]["text"]
+        )
+        self.assertEqual([task["task_id"] for task in second_page["tasks"]], ["mcp-list-b"])
+        self.assertIsNone(second_page["next_cursor"])
+
+        invalid_limit = self.call(
+            "workbench_list_tasks", {"limit": LIST_TASKS_MAX_LIMIT + 1}
+        )
+        self.assertTrue(invalid_limit["isError"])
+        self.assertIn("limit must be between", invalid_limit["content"][0]["text"])
+
+    def test_list_tasks_omits_unbounded_node_payloads_and_caps_response(self) -> None:
+        private_objective = "LIST_OBJECTIVE_MUST_NOT_LEAK"
+        private_prompt = "LIST_PROMPT_MUST_NOT_LEAK"
+        private_result = "LIST_RESULT_MUST_NOT_LEAK"
+        private_artifact = "LIST_ARTIFACT_BODY_MUST_NOT_LEAK"
+        task_id = "mcp-list-" + ("very-long-task-id-" * 32)
+        contract = self._create_list_task(
+            task_id,
+            objective=private_objective,
+            prompt=private_prompt,
+        )
+        changed_paths = tuple(
+            f"node_modules/fixture-{index:05d}/generated-output-file.js"
+            for index in range(12_000)
+        )
+        private_artifact_ref = ArtifactStore(self.root / "artifacts").put_text(
+            private_artifact, "txt"
+        )
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("fixture-worker", self.epoch)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["node_id"], "work")
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "succeeded",
+                private_result,
+                artifacts={"worker-output": private_artifact_ref},
+                changed_paths=changed_paths,
+            ),
+        )
+
+        response = self.call("workbench_list_tasks", {"limit": 1})
+        serialized = response["content"][0]["text"]
+        listed = json.loads(serialized)
+        summary = listed["tasks"][0]
+
+        self.assertLessEqual(
+            len(serialized.encode("utf-8")), LIST_TASKS_MAX_RESPONSE_BYTES
+        )
+        self.assertLess(len(serialized.encode("utf-8")), 8 * 1024)
+        self.assertTrue(summary["task_id_truncated"])
+        self.assertTrue(summary["task_id"].endswith("…"))
+        self.assertNotIn("node_modules", serialized)
+        for private_value in (
+            private_objective,
+            private_prompt,
+            private_result,
+            private_artifact,
+        ):
+            self.assertNotIn(private_value, serialized)
+        for forbidden_field in (
+            '"prompt"',
+            '"result"',
+            '"worktree"',
+            '"artifacts"',
+            '"changed_paths"',
+        ):
+            self.assertNotIn(forbidden_field, serialized)
+
+        inspected = json.loads(
+            self.call(
+                "workbench_inspect_task", {"task_ref": summary["task_ref"]}
+            )["content"][0]["text"]
+        )
+        work_node = next(node for node in inspected["nodes"] if node["node_id"] == "work")
+        self.assertEqual(inspected["task_id"], task_id)
+        self.assertEqual(work_node["prompt"], private_prompt)
+        self.assertEqual(work_node["result"]["summary"], private_result)
+        self.assertEqual(len(work_node["result"]["changed_paths"]), len(changed_paths))
 
     def test_continue_session_appends_steering_without_terminating_active_task(self) -> None:
         context_ref = "sha256:" + "e" * 64 + ":tar.gz"

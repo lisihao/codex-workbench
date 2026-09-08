@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -542,29 +543,34 @@ class InstallerTests(unittest.TestCase):
     def test_macbook_installer_preflights_codex_before_harness_write(self) -> None:
         module = self._macbook_installer_module()
         source = Path(__file__).resolve().parents[1]
-        with mock.patch.object(module, "run") as run, mock.patch.object(
-            module.shutil, "which", return_value=None
-        ), mock.patch.object(module, "install_code_as_harness") as install, mock.patch.object(
-            module.sys,
-            "argv",
-            ["install-macbook-client.py", "--source", str(source), "--ssh-transport", "system"],
-        ):
-            run.return_value = subprocess.CompletedProcess(
-                ["fixture"],
-                0,
-                stdout="501\n",
-                stderr="",
-            )
-            with self.assertRaisesRegex(SystemExit, "Codex CLI is required"):
-                module.main()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run"
+            ) as run, mock.patch.object(
+                module.shutil, "which", return_value=None
+            ), mock.patch.object(module, "install_code_as_harness") as install, mock.patch.object(
+                module.sys,
+                "argv",
+                ["install-macbook-client.py", "--source", str(source), "--ssh-transport", "system"],
+            ):
+                run.return_value = subprocess.CompletedProcess(
+                    ["fixture"],
+                    0,
+                    stdout="501\n",
+                    stderr="",
+                )
+                with self.assertRaisesRegex(SystemExit, "Codex CLI is required"):
+                    module.main()
 
-        install.assert_not_called()
+            install.assert_not_called()
 
     def test_macos_installer_preflights_codex_before_harness_write(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
+            home = root / "home"
             research = root / "research"
             for relative in module.RESEARCH_SKILL_REQUIRED_FILES:
                 path = research / relative
@@ -572,9 +578,9 @@ class InstallerTests(unittest.TestCase):
                 path.write_text(relative)
             state_root = root / "state"
             missing_codex = root / "missing-codex"
-            with mock.patch.object(module, "macos_machine_id", return_value="fixture-machine"), mock.patch.object(
-                module, "install_code_as_harness"
-            ) as install, mock.patch.object(
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "macos_machine_id", return_value="fixture-machine"
+            ), mock.patch.object(module, "install_code_as_harness") as install, mock.patch.object(
                 module.sys,
                 "argv",
                 [
@@ -1279,6 +1285,14 @@ class InstallerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
                 if command[:2] == ("launchctl", "print"):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if len(command) >= 3 and command[1:3] == ("mcp", "add"):
+                    mcp_config = home / ".codex" / "config.toml"
+                    mcp_config.parent.mkdir(parents=True, exist_ok=True)
+                    mcp_config.write_text(
+                        "[mcp_servers.codex-workbench]\n"
+                        'command = "ssh"\n'
+                        'args = ["-T", "fixture-authority"]\n'
+                    )
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             def fake_which(name: str) -> str | None:
@@ -1368,6 +1382,169 @@ class InstallerTests(unittest.TestCase):
                 str(status),
             )
 
+    def test_macbook_install_persists_timeouts_for_slow_ssh_mcp_startup(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        slow_ssh_startup_seconds = 45
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            configuration = home / ".codex" / "config.toml"
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                if command[:2] == ("launchctl", "print"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if len(command) >= 3 and command[1:3] == ("mcp", "add"):
+                    configuration.parent.mkdir(parents=True, exist_ok=True)
+                    configuration.write_text(
+                        'model = "gpt-fixture"\n\n'
+                        "[mcp_servers.codex-workbench]\n"
+                        'command = "ssh"\n'
+                        'args = ["-T", "fixture-slow-ssh"]\n\n'
+                        "[mcp_servers.unrelated]\n"
+                        'url = "https://example.test/mcp"\n'
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "preflight_remote_mcp", return_value="/remote/codex-workbench"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--ssh-transport",
+                    "system",
+                ],
+            ):
+                self.assertEqual(module.main(), 0)
+
+            payload = tomllib.loads(configuration.read_text())
+            registration = payload["mcp_servers"]["codex-workbench"]
+            self.assertEqual(registration["startup_timeout_sec"], 60)
+            self.assertEqual(registration["tool_timeout_sec"], 3600)
+            self.assertGreater(registration["startup_timeout_sec"], slow_ssh_startup_seconds)
+            self.assertEqual(
+                payload["mcp_servers"]["unrelated"]["url"],
+                "https://example.test/mcp",
+            )
+            mcp_add = next(
+                command for command in calls if len(command) >= 3 and command[1:3] == ("mcp", "add")
+            )
+            self.assertIn("fixture-slow-ssh", configuration.read_text())
+            self.assertIn("ssh", mcp_add)
+
+    def test_macbook_mcp_timeout_config_rolls_back_to_existing_registration(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            configuration = home / ".codex" / "config.toml"
+            configuration.parent.mkdir(parents=True)
+            original = (
+                'model = "gpt-fixture"\n\n'
+                "[mcp_servers.codex-workbench]\n"
+                'command = "ssh"\n'
+                'args = ["-T", "original-authority"]\n'
+                "startup_timeout_sec = 17\n"
+                "tool_timeout_sec = 91\n\n"
+                "[mcp_servers.unrelated]\n"
+                'url = "https://example.test/mcp"\n'
+            )
+            configuration.write_text(original)
+            registered_configs: list[str] = []
+            mcp_add_count = 0
+
+            def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+                nonlocal mcp_add_count
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=json.dumps(
+                            {
+                                "transport": {
+                                    "type": "stdio",
+                                    "command": "ssh",
+                                    "args": ["-T", "original-authority"],
+                                },
+                                "startup_timeout_sec": 17,
+                                "tool_timeout_sec": 91,
+                            }
+                        ),
+                        stderr="",
+                    )
+                if command[:2] == ("launchctl", "print"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if len(command) >= 3 and command[1:3] == ("mcp", "add"):
+                    mcp_add_count += 1
+                    configuration.write_text(
+                        "[mcp_servers.codex-workbench]\n"
+                        'command = "ssh"\n'
+                        'args = ["-T", "replacement-authority"]\n'
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            real_persist_mcp_timeouts = module.persist_mcp_timeouts
+
+            def persist_then_fail(path: Path) -> None:
+                real_persist_mcp_timeouts(path)
+                registered_configs.append(configuration.read_text())
+                raise RuntimeError("injected post-registration failure")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module, "run", side_effect=fake_run
+            ), mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "preflight_remote_mcp", return_value="/remote/codex-workbench"
+            ), mock.patch.object(module, "install_code_as_harness"), mock.patch.object(
+                module, "install_archify"
+            ), mock.patch.object(
+                module, "persist_mcp_timeouts", side_effect=persist_then_fail
+            ), mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "install-macbook-client.py",
+                    "--source",
+                    str(source),
+                    "--ssh-transport",
+                    "system",
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected post-registration failure"):
+                    module.main()
+
+            self.assertEqual(mcp_add_count, 2)
+            self.assertEqual(len(registered_configs), 1)
+            registered = tomllib.loads(registered_configs[0])["mcp_servers"]["codex-workbench"]
+            self.assertEqual(registered["startup_timeout_sec"], 60)
+            self.assertEqual(registered["tool_timeout_sec"], 3600)
+            self.assertEqual(configuration.read_text(), original)
+            restored = tomllib.loads(configuration.read_text())["mcp_servers"]["codex-workbench"]
+            self.assertEqual(restored["startup_timeout_sec"], 17)
+            self.assertEqual(restored["tool_timeout_sec"], 91)
+
     def test_macbook_static_install_disables_stale_location_profile_for_git_sync(self) -> None:
         module = self._macbook_installer_module()
         source = Path(__file__).resolve().parents[1]
@@ -1389,6 +1566,14 @@ class InstallerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
                 if command[:2] == ("launchctl", "print"):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
+                if len(command) >= 3 and command[1:3] == ("mcp", "add"):
+                    mcp_config = home / ".codex" / "config.toml"
+                    mcp_config.parent.mkdir(parents=True, exist_ok=True)
+                    mcp_config.write_text(
+                        "[mcp_servers.codex-workbench]\n"
+                        'command = "ssh"\n'
+                        'args = ["-T", "fixture-authority"]\n'
+                    )
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
