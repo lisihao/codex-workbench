@@ -33,6 +33,7 @@ from codex_workbench.service import Coordinator, _ClaimRoute
 from codex_workbench.submission import CompiledNaturalLanguageRequest
 from codex_workbench.executors import ExecutionRequest, FixtureExecutor
 from codex_workbench.planner import PlannerError, archify_internal_directive
+from codex_workbench.routing import ROUTING_V3_POLICY_VERSION
 from codex_workbench.store import CommandConflictError, WorkbenchStore
 
 
@@ -203,6 +204,200 @@ class ServiceTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.action, "codex")
         self.assertIn("does not admit Claude", decision.reason)
+
+    def test_runtime_v3_claude_node_rechecks_quota_without_legacy_routing(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-v3",
+            repository="/tmp/runtime-v3",
+            base_sha="base",
+            objective="pinned Claude worker",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-runtime-v3",
+            capability_digest="a" * 64,
+        )
+        spec = {
+            "executor": "claude",
+            "model": "sonnet",
+            "routing_policy_version": ROUTING_V3_POLICY_VERSION,
+            "capability_snapshot_id": contract.capability_snapshot_id,
+            "capability_digest": contract.capability_digest,
+        }
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+
+        with patch("codex_workbench.service.route_task") as legacy_route:
+            decision = Coordinator._claude_decision(spec, contract.to_dict(), quota)
+
+        assert decision is not None
+        self.assertEqual(decision.action, "claude")
+        self.assertEqual(decision.requested_units, 1)
+        legacy_route.assert_not_called()
+
+    def test_runtime_v3_claude_node_defers_when_shared_capacity_is_full(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-v3-capacity",
+            repository="/tmp/runtime-v3-capacity",
+            base_sha="base",
+            objective="pinned Claude worker",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-runtime-v3",
+            capability_digest="a" * 64,
+        )
+        spec = {
+            "executor": "claude",
+            "model": "sonnet",
+            "routing_policy_version": ROUTING_V3_POLICY_VERSION,
+            "capability_snapshot_id": contract.capability_snapshot_id,
+            "capability_digest": contract.capability_digest,
+        }
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+
+        with patch("codex_workbench.service.route_task") as legacy_route:
+            decision = Coordinator._claude_decision(
+                spec,
+                contract.to_dict(),
+                quota,
+                active_models=("opus",),
+            )
+
+        assert decision is not None
+        self.assertEqual(decision.action, "defer")
+        self.assertEqual(decision.available_units, 0)
+        legacy_route.assert_not_called()
+
+    def test_runtime_v3_claude_node_falls_back_for_stale_or_protected_quota(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-v3-guard",
+            repository="/tmp/runtime-v3-guard",
+            base_sha="base",
+            objective="pinned Claude worker",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-runtime-v3",
+            capability_digest="a" * 64,
+        )
+        spec = {
+            "executor": "claude",
+            "model": "sonnet",
+            "routing_policy_version": ROUTING_V3_POLICY_VERSION,
+            "capability_snapshot_id": contract.capability_snapshot_id,
+            "capability_digest": contract.capability_digest,
+        }
+        for label, quota in (
+            (
+                "stale",
+                QuotaSnapshot(
+                    observed_at=(datetime.now(UTC) - timedelta(seconds=901)).isoformat(),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=80,
+                    weekly_all_remaining=80,
+                    weekly_sonnet_remaining=80,
+                    **compatible_provenance(),
+                ),
+            ),
+            (
+                "protected",
+                QuotaSnapshot(
+                    observed_at=now_iso(),
+                    auth_ok=True,
+                    auth_method="native-subscription",
+                    five_hour_remaining=25,
+                    weekly_all_remaining=80,
+                    weekly_sonnet_remaining=80,
+                    **compatible_provenance(),
+                ),
+            ),
+        ):
+            with self.subTest(label=label), patch("codex_workbench.service.route_task") as legacy_route:
+                decision = Coordinator._claude_decision(spec, contract.to_dict(), quota)
+
+            assert decision is not None
+            self.assertEqual(decision.action, "codex")
+            legacy_route.assert_not_called()
+
+    def test_runtime_v3_claude_node_fails_closed_on_capability_binding_mismatch(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-v3-binding",
+            repository="/tmp/runtime-v3-binding",
+            base_sha="base",
+            objective="pinned Claude worker",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-runtime-v3",
+            capability_digest="b" * 64,
+        )
+        spec = {
+            "executor": "claude",
+            "model": "sonnet",
+            "routing_policy_version": ROUTING_V3_POLICY_VERSION,
+            "capability_snapshot_id": contract.capability_snapshot_id,
+            "capability_digest": "a" * 64,
+        }
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+
+        with patch("codex_workbench.service.route_task") as legacy_route:
+            decision = Coordinator._claude_decision(spec, contract.to_dict(), quota)
+
+        assert decision is not None
+        self.assertEqual(decision.action, "codex")
+        self.assertIn("does not match", decision.reason)
+        legacy_route.assert_not_called()
+
+    def test_runtime_v3_claude_node_fails_closed_on_missing_capability_binding(self) -> None:
+        contract = TaskContract(
+            task_id="runtime-v3-missing-binding",
+            repository="/tmp/runtime-v3-missing-binding",
+            base_sha="base",
+            objective="pinned Claude worker",
+            allowed_scope=("src",),
+            capability_snapshot_id="catalog-runtime-v3",
+            capability_digest="a" * 64,
+        )
+        spec = {
+            "executor": "claude",
+            "model": "sonnet",
+            "routing_policy_version": ROUTING_V3_POLICY_VERSION,
+            "capability_snapshot_id": contract.capability_snapshot_id,
+        }
+        quota = QuotaSnapshot(
+            observed_at=now_iso(),
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=80,
+            weekly_all_remaining=80,
+            weekly_sonnet_remaining=80,
+            **compatible_provenance(),
+        )
+
+        with patch("codex_workbench.service.route_task") as legacy_route:
+            decision = Coordinator._claude_decision(spec, contract.to_dict(), quota)
+
+        assert decision is not None
+        self.assertEqual(decision.action, "codex")
+        self.assertIn("missing", decision.reason)
+        legacy_route.assert_not_called()
 
     def test_codex_fallback_uses_high_architecture_node_tier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

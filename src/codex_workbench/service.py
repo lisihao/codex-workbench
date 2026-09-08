@@ -78,7 +78,12 @@ from .model import (
 from .planner import PlannerError
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
-from .routing import codex_fallback_model, route_task, strategy_for_node
+from .routing import (
+    ROUTING_V3_POLICY_VERSION,
+    codex_fallback_model,
+    route_task,
+    strategy_for_node,
+)
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import compile_natural_language_request
 from .worktrees import WorktreeError, WorktreeManager, scope_allows
@@ -758,6 +763,14 @@ class Coordinator:
     ) -> ClaudeDispatchDecision | None:
         if spec["executor"] != "claude":
             return None
+        if spec.get("routing_policy_version") == ROUTING_V3_POLICY_VERSION:
+            return Coordinator._pinned_v3_claude_decision(
+                spec,
+                contract_raw,
+                quota,
+                active_models,
+                quota_ttl_seconds=quota_ttl_seconds,
+            )
         if quota is None:
             return ClaudeDispatchDecision(
                 "codex",
@@ -793,6 +806,67 @@ class Coordinator:
             active_models,
             max_age_seconds=quota_ttl_seconds,
             shared_capacity=shared_capacity,
+        )
+
+    @staticmethod
+    def _pinned_v3_claude_decision(
+        spec: dict,
+        contract_raw: dict,
+        quota: QuotaSnapshot | None,
+        active_models: tuple[str, ...],
+        *,
+        quota_ttl_seconds: int,
+    ) -> ClaudeDispatchDecision:
+        """Recheck only runtime admission for a frozen routing-v3 Claude node.
+
+        The planner has already selected the provider and capability against an
+        immutable catalog.  Re-running the legacy strategy here could silently
+        replace that selection at claim time, so this path verifies the two
+        durable catalog bindings and delegates only freshness, reserve, and
+        shared-capacity checks to the quota receipt.
+        """
+
+        spec_snapshot_id = spec.get("capability_snapshot_id")
+        spec_digest = spec.get("capability_digest")
+        contract_snapshot_id = contract_raw.get("capability_snapshot_id")
+        contract_digest = contract_raw.get("capability_digest")
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                spec_snapshot_id,
+                spec_digest,
+                contract_snapshot_id,
+                contract_digest,
+            )
+        ):
+            return ClaudeDispatchDecision(
+                "codex",
+                "unknown",
+                "routing-v3 Claude node is missing its pinned capability binding",
+                0,
+            )
+        if (
+            spec_snapshot_id != contract_snapshot_id
+            or spec_digest != contract_digest
+        ):
+            return ClaudeDispatchDecision(
+                "codex",
+                "unknown",
+                "routing-v3 Claude node capability binding does not match its task contract",
+                0,
+            )
+        if quota is None:
+            return ClaudeDispatchDecision(
+                "codex",
+                "unknown",
+                "Claude quota is unknown",
+                0,
+            )
+        return quota.dispatch_decision(
+            str(spec["model"]),
+            active_models,
+            max_age_seconds=quota_ttl_seconds,
+            shared_capacity=True,
         )
 
     @staticmethod
