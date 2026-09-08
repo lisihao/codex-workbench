@@ -480,6 +480,9 @@ def _capture_blocked_worktree_recovery(
                 branch=str(source["branch"]),
                 attempt=expected_attempt,
                 expected_changed_paths=tuple(source["changed_paths"]),
+                expected_generated_residue_paths=tuple(
+                    source.get("generated_residue_paths", ())
+                ),
                 **capture_kwargs,
             )
             _validate_blocked_worktree_recovery_receipt(
@@ -508,6 +511,9 @@ def _capture_blocked_worktree_recovery(
         branch=str(source["branch"]),
         attempt=expected_attempt,
         expected_changed_paths=tuple(source["changed_paths"]),
+        expected_generated_residue_paths=tuple(
+            source.get("generated_residue_paths", ())
+        ),
         **capture_kwargs,
     )
     return {
@@ -543,15 +549,19 @@ def _validate_blocked_worktree_recovery_receipt(
     schema_version = recovery.get("schema_version")
     if schema_version == 1:
         required = common
-    elif schema_version in {2, 3}:
+    elif schema_version in {2, 3, 5, 6}:
         required = common | {
             "source_task_id",
             "source_node_id",
             "input_tree_sha",
             "dependency_input_ref",
         }
-        if schema_version == 3:
+        if schema_version in {3, 6}:
             required.add("untracked_paths")
+        if schema_version in {5, 6}:
+            required |= {"generated_residue_paths", "generated_residue_ref"}
+    elif schema_version == 4:
+        required = common | {"generated_residue_paths", "generated_residue_ref"}
     else:
         raise ValueError("blocked-worktree recovery receipt schema is unsupported")
     if set(recovery) != required:
@@ -559,7 +569,7 @@ def _validate_blocked_worktree_recovery_receipt(
     if recovery["source_attempt"] != expected_attempt:
         raise ValueError("blocked-worktree recovery receipt source attempt is invalid")
     fields = ["source_worktree", "source_branch", "base_sha", "patch_ref", "patch_sha256"]
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 5, 6}:
         fields.extend(["source_task_id", "source_node_id", "input_tree_sha", "dependency_input_ref"])
     for field in fields:
         if not isinstance(recovery[field], str) or not recovery[field]:
@@ -571,7 +581,7 @@ def _validate_blocked_worktree_recovery_receipt(
         or not all(isinstance(item, str) and item for item in changed_paths)
     ):
         raise ValueError("blocked-worktree recovery changed_paths are invalid")
-    if schema_version == 3:
+    if schema_version in {3, 6}:
         untracked_paths = recovery.get("untracked_paths")
         if (
             not isinstance(untracked_paths, list)
@@ -581,6 +591,17 @@ def _validate_blocked_worktree_recovery_receipt(
             or not set(untracked_paths).issubset(changed_paths)
         ):
             raise ValueError("blocked-worktree recovery untracked_paths are invalid")
+    source_residue = tuple(source.get("generated_residue_paths", ()))
+    if source_residue:
+        if (
+            schema_version not in {4, 5, 6}
+            or tuple(recovery.get("generated_residue_paths", ())) != source_residue
+            or not isinstance(recovery.get("generated_residue_ref"), str)
+            or not recovery["generated_residue_ref"]
+        ):
+            raise ValueError("blocked-worktree recovery generated residue is invalid")
+    elif schema_version in {4, 5, 6}:
+        raise ValueError("blocked-worktree recovery has unexpected generated residue")
     if (
         recovery["source_worktree"] != source["worktree"]
         or recovery["source_branch"] != source["branch"]

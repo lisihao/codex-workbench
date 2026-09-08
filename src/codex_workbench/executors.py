@@ -210,6 +210,10 @@ def subscription_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("OPENAI_API_KEY", None)
     environment.pop("ANTHROPIC_API_KEY", None)
+    # Worker commands run inside recoverable Git worktrees. Python bytecode is
+    # disposable process residue, not a source edit, and must never become an
+    # ignored-path obstacle for failed-attempt capture.
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 

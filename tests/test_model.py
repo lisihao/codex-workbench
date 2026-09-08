@@ -638,6 +638,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(environment["HOME"], "/private/workbench-home")
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
 
     def test_codex_worker_environment_pins_the_qualified_pnpm_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

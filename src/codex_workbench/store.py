@@ -26,7 +26,11 @@ from .model import (
 )
 from .artifacts import ArtifactStore, presentation_format
 from .dependency_inputs import load_recorded_dependency_input
-from .dirty_worktree_recovery import DirtyWorktreeRecovery, DirtyWorktreeRecoveryError
+from .dirty_worktree_recovery import (
+    DirtyWorktreeRecovery,
+    DirtyWorktreeRecoveryError,
+    partition_recovery_paths,
+)
 from .execution_attribution import ExecutionAttribution
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
@@ -1771,8 +1775,8 @@ class WorkbenchStore:
             spec = json.loads(str(node["spec_json"]))
         except (TypeError, json.JSONDecodeError) as error:
             raise StateConflictError("failed node recovery receipt is invalid JSON") from error
-        if not isinstance(result, dict) or result.get("status") != "failed":
-            raise StateConflictError("failed node lacks a failed result receipt")
+        if not isinstance(result, dict) or result.get("status") not in {"failed", "blocked"}:
+            raise StateConflictError("retryable node lacks a failed or blocked result receipt")
         if not isinstance(spec, dict):
             raise StateConflictError("failed node specification is invalid")
         changed_paths = result.get("changed_paths")
@@ -1782,6 +1786,9 @@ class WorkbenchStore:
             or tuple(changed_paths) != tuple(sorted(set(changed_paths)))
         ):
             raise StateConflictError("failed node changed_paths are not a canonical explicit list")
+        recoverable_paths, generated_residue_paths = partition_recovery_paths(
+            tuple(changed_paths)
+        )
 
         allocation = connection.execute(
             """
@@ -1835,7 +1842,7 @@ class WorkbenchStore:
             and all(isinstance(scope, str) for scope in write_scopes)
         ):
             raise StateConflictError("failed node recovery scopes are invalid")
-        for relative_path in changed_paths:
+        for relative_path in recoverable_paths:
             try:
                 task_allowed = scope_allows(relative_path, allowed_scope, forbidden_scope)
                 node_allowed = scope_allows(relative_path, write_scopes, [])
@@ -1866,7 +1873,8 @@ class WorkbenchStore:
                 "worktree": str(allocation["current_path"]),
                 "branch": str(allocation["branch"]),
                 "base_sha": base_sha,
-                "changed_paths": list(changed_paths),
+                "changed_paths": list(recoverable_paths),
+                "generated_residue_paths": list(generated_residue_paths),
             },
         }
 
@@ -2189,6 +2197,9 @@ class WorkbenchStore:
             )
         if not all(isinstance(path, str) and path for path in changed_paths):
             raise StateConflictError("blocked node changed_paths are invalid")
+        recoverable_paths, generated_residue_paths = partition_recovery_paths(
+            tuple(sorted(set(changed_paths)))
+        )
         allocation = connection.execute(
             """
             SELECT * FROM worktree_allocations
@@ -2235,7 +2246,8 @@ class WorkbenchStore:
                 "worktree": str(allocation["current_path"]),
                 "branch": str(allocation["branch"]),
                 "base_sha": str(contract["base_sha"]),
-                "changed_paths": tuple(sorted(changed_paths)),
+                "changed_paths": recoverable_paths,
+                "generated_residue_paths": generated_residue_paths,
                 "allocation_id": str(allocation["allocation_id"]),
             },
             "source_result_json": str(node["result_json"]),
@@ -2300,15 +2312,19 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             required = common
-        elif schema_version in {2, 3}:
+        elif schema_version in {2, 3, 5, 6}:
             required = common | {
                 "source_task_id",
                 "source_node_id",
                 "input_tree_sha",
                 "dependency_input_ref",
             }
-            if schema_version == 3:
+            if schema_version in {3, 6}:
                 required.add("untracked_paths")
+            if schema_version in {5, 6}:
+                required |= {"generated_residue_paths", "generated_residue_ref"}
+        elif schema_version == 4:
+            required = common | {"generated_residue_paths", "generated_residue_ref"}
         else:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         if set(recovery) != required:
@@ -2323,6 +2339,21 @@ class WorkbenchStore:
             raise StateConflictError(
                 "dirty-worktree recovery receipt does not match the blocked allocation"
             )
+        source_residue = source.get("generated_residue_paths", ())
+        if source_residue:
+            if (
+                schema_version not in {4, 5, 6}
+                or tuple(recovery.get("generated_residue_paths", ())) != source_residue
+                or not isinstance(recovery.get("generated_residue_ref"), str)
+                or not recovery["generated_residue_ref"]
+            ):
+                raise StateConflictError(
+                    "dirty-worktree recovery receipt does not bind generated residue"
+                )
+        elif schema_version in {4, 5, 6}:
+            raise StateConflictError(
+                "dirty-worktree recovery receipt has unexpected generated residue"
+            )
         for field in (
             "source_worktree",
             "source_branch",
@@ -2334,7 +2365,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 5, 6}:
             for field in (
                 "source_task_id",
                 "source_node_id",
@@ -2346,7 +2377,7 @@ class WorkbenchStore:
                         f"dirty-worktree recovery receipt field {field!r} is invalid"
                     )
         expected_untracked: tuple[str, ...] = ()
-        if schema_version == 3:
+        if schema_version in {3, 6}:
             raw_untracked = recovery.get("untracked_paths")
             if (
                 not isinstance(raw_untracked, list)
@@ -2376,6 +2407,8 @@ class WorkbenchStore:
             receipt_source = Path(str(recovery["source_worktree"])).expanduser().resolve(strict=True)
             artifacts = ArtifactStore(self.path.parent / "artifacts")
             patch = artifacts.verify(str(recovery["patch_ref"])).read_bytes()
+            if schema_version in {4, 5, 6}:
+                artifacts.verify(str(recovery["generated_residue_ref"]))
             source_result = json.loads(candidate["source_result_json"])
             actual_untracked = DirtyWorktreeRecovery.untracked_paths(source_path)
         except (OSError, ValueError, DirtyWorktreeRecoveryError, json.JSONDecodeError) as error:
@@ -2405,7 +2438,7 @@ class WorkbenchStore:
         if actual_untracked != expected_untracked:
             raise StateConflictError("dirty-worktree recovery source untracked paths drifted")
         comparison_tree = base_sha
-        if schema_version == 1:
+        if schema_version in {1, 4}:
             if recorded_dependency_ref is not None:
                 raise StateConflictError(
                     "legacy dirty-worktree recovery cannot reproduce recorded dependency input"
@@ -4822,15 +4855,22 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             receipt_fields = common_fields
-        elif schema_version in {2, 3}:
+        elif schema_version in {2, 3, 5, 6}:
             receipt_fields = common_fields | {
                 "source_task_id",
                 "source_node_id",
                 "input_tree_sha",
                 "dependency_input_ref",
             }
-            if schema_version == 3:
+            if schema_version in {3, 6}:
                 receipt_fields.add("untracked_paths")
+            if schema_version in {5, 6}:
+                receipt_fields |= {"generated_residue_paths", "generated_residue_ref"}
+        elif schema_version == 4:
+            receipt_fields = common_fields | {
+                "generated_residue_paths",
+                "generated_residue_ref",
+            }
         else:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         if set(recovery) != receipt_fields:
@@ -4852,7 +4892,7 @@ class WorkbenchStore:
             "patch_ref",
             "patch_sha256",
         ]
-        if schema_version in {2, 3}:
+        if schema_version in {2, 3, 5, 6}:
             fields.extend(
                 [
                     "source_task_id",
@@ -4866,7 +4906,22 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
-        if schema_version == 3:
+        if schema_version in {4, 5, 6}:
+            generated_paths = recovery.get("generated_residue_paths")
+            generated_ref = recovery.get("generated_residue_ref")
+            if (
+                not isinstance(generated_paths, list)
+                or not generated_paths
+                or not all(isinstance(path, str) for path in generated_paths)
+                or partition_recovery_paths(tuple(generated_paths))[1] != tuple(generated_paths)
+                or tuple(generated_paths) != tuple(sorted(set(generated_paths)))
+                or not isinstance(generated_ref, str)
+                or not generated_ref
+            ):
+                raise StateConflictError(
+                    "dirty-worktree recovery generated residue evidence is invalid"
+                )
+        if schema_version in {3, 6}:
             untracked_paths = recovery.get("untracked_paths")
             if (
                 not isinstance(untracked_paths, list)
@@ -4948,15 +5003,24 @@ class WorkbenchStore:
             source_result = json.loads(authorization["source_result_json"])
         except json.JSONDecodeError as error:
             raise StateConflictError("failed-attempt recovery source result is invalid JSON") from error
-        if not isinstance(source_result, dict) or source_result.get("status") != "failed":
-            raise StateConflictError("failed-attempt recovery source result is not failed")
+        if not isinstance(source_result, dict) or source_result.get("status") not in {
+            "failed",
+            "blocked",
+        }:
+            raise StateConflictError(
+                "failed-attempt recovery source result is not failed or blocked"
+            )
         source = authorization["source"]
-        if not isinstance(source, dict) or set(source) != {
+        source_fields = {
             "attempt",
             "worktree",
             "branch",
             "base_sha",
             "changed_paths",
+        }
+        if not isinstance(source, dict) or frozenset(source) not in {
+            frozenset(source_fields),
+            frozenset(source_fields | {"generated_residue_paths"}),
         }:
             raise StateConflictError("failed-attempt recovery source is invalid")
         source_attempt = source["attempt"]
@@ -4976,6 +5040,15 @@ class WorkbenchStore:
             or tuple(changed_paths) != tuple(sorted(set(changed_paths)))
         ):
             raise StateConflictError("failed-attempt recovery source does not match the next attempt")
+        generated_residue_paths = source.get("generated_residue_paths", [])
+        if (
+            not isinstance(generated_residue_paths, list)
+            or not all(isinstance(path, str) for path in generated_residue_paths)
+            or tuple(generated_residue_paths) != tuple(sorted(set(generated_residue_paths)))
+            or partition_recovery_paths(tuple(generated_residue_paths))[1]
+            != tuple(generated_residue_paths)
+        ):
+            raise StateConflictError("failed-attempt recovery generated residue paths are invalid")
         binding: dict[str, Any] = {
             "state": state,
             "authorization_revision": int(authorization["authorization_revision"]),
@@ -5004,6 +5077,10 @@ class WorkbenchStore:
                 or recovery.get("source_branch") != source["branch"]
                 or recovery.get("base_sha") != source["base_sha"]
                 or recovery.get("changed_paths") != changed_paths
+                or (
+                    generated_residue_paths
+                    and recovery.get("generated_residue_paths") != generated_residue_paths
+                )
             ):
                 raise StateConflictError("failed-attempt recovery assignment does not match its source")
             binding.update(
@@ -5452,7 +5529,7 @@ class WorkbenchStore:
                 "dirty-worktree recovery patch artifact does not match the captured receipt"
             )
         comparison_tree = recovery["base_sha"]
-        if recovery.get("schema_version") in {2, 3}:
+        if recovery.get("schema_version") in {2, 3, 5, 6}:
             if recovery.get("source_task_id") != task_id or recovery.get("source_node_id") != node_id:
                 raise StateConflictError("dependency recovery receipt belongs to another node")
             try:
@@ -5472,7 +5549,7 @@ class WorkbenchStore:
                     "dependency recovery input tree does not match the recovery receipt"
                 )
             comparison_tree = dependency_input.input_tree_sha
-        elif recovery.get("schema_version") != 1:
+        elif recovery.get("schema_version") not in {1, 4}:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         expected_branch = WorktreeManager.branch_name(task_id, node_id, attempt)
         if self._recovery_git_bytes(target, "rev-parse", "HEAD").decode().strip() != recovery["base_sha"]:
@@ -5812,6 +5889,11 @@ class WorkbenchStore:
                     or recovery.get("source_branch") != source["branch"]
                     or recovery.get("base_sha") != source["base_sha"]
                     or recovery.get("changed_paths") != source["changed_paths"]
+                    or (
+                        source.get("generated_residue_paths")
+                        and recovery.get("generated_residue_paths")
+                        != source["generated_residue_paths"]
+                    )
                     or not isinstance(recovery.get("patch_ref"), str)
                     or not recovery["patch_ref"]
                     or not isinstance(recovery.get("patch_sha256"), str)
@@ -6417,7 +6499,7 @@ class WorkbenchStore:
             retry_recovery: dict[str, Any] | None = None
             retry_recovery_error: str | None = None
             if (
-                node_state == "failed"
+                node_state in {"failed", "blocked"}
                 and not spec.get("verifier")
                 and result.retryable
                 and int(row["attempt"]) <= int(contract.get("retry_limit", 0))
@@ -6516,6 +6598,51 @@ class WorkbenchStore:
             elif node_state == "indeterminate":
                 next_state = "needs_approval"
                 blocker = f"node {node_id} has an indeterminate result"
+            elif retry_recovery_error is not None:
+                next_state = "needs_fix"
+                blocker = f"retryable attempt requires manual recovery: {retry_recovery_error}"
+                self._event(
+                    connection,
+                    "node.retry_recovery_rejected",
+                    task_id,
+                    node_id,
+                    {"attempt": int(row["attempt"]), "reason": retry_recovery_error},
+                )
+            elif retry_recovery is not None:
+                next_state = "queued"
+                self._event(
+                    connection,
+                    "node.retry_scheduled",
+                    task_id,
+                    node_id,
+                    {
+                        "attempt": int(row["attempt"]),
+                        "next_attempt": int(row["attempt"]) + 1,
+                        "failed_attempt_recovery": "capture_pending",
+                        "source_allocation_id": retry_recovery["source_allocation_id"],
+                    },
+                )
+            elif (
+                node_state == "blocked"
+                and result.retryable
+                and int(row["attempt"]) <= int(contract.get("retry_limit", 0))
+            ):
+                connection.execute(
+                    """
+                    UPDATE nodes SET state = 'pending', worker_id = NULL,
+                                     started_at = NULL, settled_at = NULL, updated_at = ?
+                    WHERE task_id = ? AND node_id = ?
+                    """,
+                    (timestamp, task_id, node_id),
+                )
+                next_state = "queued"
+                self._event(
+                    connection,
+                    "node.retry_scheduled",
+                    task_id,
+                    node_id,
+                    {"attempt": row["attempt"], "typed_blocked_result": True},
+                )
             elif node_state == "blocked":
                 next_state = "blocked"
                 blocker = result.summary
@@ -6563,30 +6690,6 @@ class WorkbenchStore:
                         {
                             "verifier_attempt": int(row["attempt"]),
                             "feedback_steering_id": steering_id,
-                        },
-                    )
-                elif retry_recovery_error is not None:
-                    next_state = "needs_fix"
-                    blocker = f"retryable failed attempt requires manual recovery: {retry_recovery_error}"
-                    self._event(
-                        connection,
-                        "node.retry_recovery_rejected",
-                        task_id,
-                        node_id,
-                        {"attempt": int(row["attempt"]), "reason": retry_recovery_error},
-                    )
-                elif retry_recovery is not None:
-                    next_state = "queued"
-                    self._event(
-                        connection,
-                        "node.retry_scheduled",
-                        task_id,
-                        node_id,
-                        {
-                            "attempt": int(row["attempt"]),
-                            "next_attempt": int(row["attempt"]) + 1,
-                            "failed_attempt_recovery": "capture_pending",
-                            "source_allocation_id": retry_recovery["source_allocation_id"],
                         },
                     )
                 elif result.retryable and int(row["attempt"]) <= int(contract.get("retry_limit", 0)):
