@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from collections import OrderedDict, deque
+import hmac
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
+import math
 import os
 from pathlib import Path
+import threading
+import time
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
@@ -23,6 +29,61 @@ from .scheduler_metrics import build_scheduler_metrics
 from .store import StateConflictError, WorkbenchStore
 
 
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; base-uri 'self'; form-action 'self'; "
+    "frame-ancestors 'none'; object-src 'none'"
+)
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 60.0
+LOGIN_FAILURE_TRACKER_LIMIT = 256
+ANONYMOUS_MAX_COLLECTION_ITEMS = 50
+ANONYMOUS_MAX_STRING_LENGTH = 256
+ANONYMOUS_MAX_DEPTH = 6
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_TAILSCALE_IPV4_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_IPV6_NETWORK = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+_ANONYMOUS_SENSITIVE_FIELDS = frozenset(
+    {
+        "access_token",
+        "acceptance_commands",
+        "allowed_scope",
+        "api_key",
+        "artifact",
+        "artifact_ref",
+        "artifacts",
+        "authorization",
+        "blocker",
+        "changed_paths",
+        "command",
+        "command_id",
+        "cookie",
+        "credential",
+        "credentials",
+        "execution_attribution",
+        "forbidden_scope",
+        "instruction",
+        "instructions",
+        "objective",
+        "password",
+        "payload",
+        "prompt",
+        "refresh_token",
+        "repository",
+        "read_scopes",
+        "result",
+        "secret",
+        "stderr",
+        "stdout",
+        "summary",
+        "token",
+        "traceback",
+        "verdict",
+        "write_scopes",
+        "worktree",
+    }
+)
+
+
 class WorkbenchHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -31,6 +92,38 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.store = store
         self.artifacts = ArtifactStore(config.state_root / "artifacts")
+        self._login_failures: OrderedDict[str, deque[float]] = OrderedDict()
+        self._login_failures_lock = threading.Lock()
+
+    def record_failed_login(self, client_address: str) -> int | None:
+        """Record one failed login, or return the bounded retry delay."""
+
+        now = time.monotonic()
+        cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+        with self._login_failures_lock:
+            attempts = self._login_failures.get(client_address)
+            if attempts is not None:
+                while attempts and attempts[0] <= cutoff:
+                    attempts.popleft()
+                if not attempts:
+                    self._login_failures.pop(client_address, None)
+                    attempts = None
+            if attempts is not None and len(attempts) >= LOGIN_FAILURE_LIMIT:
+                self._login_failures.move_to_end(client_address)
+                retry_after = attempts[0] + LOGIN_FAILURE_WINDOW_SECONDS - now
+                return max(1, math.ceil(retry_after))
+            if attempts is None:
+                if len(self._login_failures) >= LOGIN_FAILURE_TRACKER_LIMIT:
+                    self._login_failures.popitem(last=False)
+                attempts = deque()
+                self._login_failures[client_address] = attempts
+            attempts.append(now)
+            self._login_failures.move_to_end(client_address)
+        return None
+
+    def clear_login_failures(self, client_address: str) -> None:
+        with self._login_failures_lock:
+            self._login_failures.pop(client_address, None)
 
 
 class WorkbenchHandler(BaseHTTPRequestHandler):
@@ -39,7 +132,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         return
 
+    def end_headers(self) -> None:
+        self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
+
     def do_GET(self) -> None:
+        if not self._host_allowed():
+            return self._json({"error": "host not allowed"}, HTTPStatus.BAD_REQUEST)
         parsed = urlparse(self.path)
         if parsed.path == "/":
             return self._html(self._static("index.html"))
@@ -153,12 +253,23 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self._host_allowed():
+            return self._json({"error": "host not allowed"}, HTTPStatus.BAD_REQUEST)
         parsed = urlparse(self.path)
         if parsed.path == "/login":
             body = parse_qs(self._read_body().decode())
             token = body.get("token", [""])[0]
-            if token != self.server.config.token():
+            expected_token = self.server.config.token()
+            if not hmac.compare_digest(token, expected_token):
+                retry_after = self.server.record_failed_login(self.client_address[0])
+                if retry_after is not None:
+                    return self._html(
+                        self._login_page("登录请求过于频繁，请稍后再试"),
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        headers={"Retry-After": str(retry_after)},
+                    )
                 return self._html(self._login_page("控制令牌无效"), HTTPStatus.UNAUTHORIZED)
+            self.server.clear_login_failures(self.client_address[0])
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/")
             self.send_header("Set-Cookie", f"workbench_token={quote(token)}; HttpOnly; SameSite=Strict; Path=/")
@@ -305,11 +416,111 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _authenticated(self) -> bool:
         authorization = self.headers.get("Authorization", "")
-        if authorization == f"Bearer {self.server.config.token()}":
+        token = self.server.config.token()
+        if hmac.compare_digest(authorization, f"Bearer {token}"):
             return True
         cookie = SimpleCookie(self.headers.get("Cookie"))
         value = cookie.get("workbench_token")
-        return value is not None and unquote(value.value) == self.server.config.token()
+        return value is not None and hmac.compare_digest(unquote(value.value), token)
+
+    def _host_allowed(self) -> bool:
+        host = self._request_host()
+        if host is None:
+            return False
+        configured_host = self._canonical_host(str(self.server.config.host))
+        if host in _LOCAL_HOSTS:
+            return True
+        if configured_host not in {"", "0.0.0.0", "::"} and host == configured_host:
+            return True
+        return self._is_tailscale_host(host)
+
+    def _request_host(self) -> str | None:
+        values = self.headers.get_all("Host") or []
+        if len(values) != 1:
+            return None
+        value = values[0]
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(character in value for character in "\x00\r\n\t /\\@,?#")
+        ):
+            return None
+        if value.startswith("["):
+            closing = value.find("]")
+            if closing <= 1:
+                return None
+            host = value[1:closing]
+            suffix = value[closing + 1 :]
+            if suffix and (
+                not suffix.startswith(":") or not self._valid_host_port(suffix[1:])
+            ):
+                return None
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                return None
+        else:
+            if value.count(":") > 1:
+                return None
+            host, separator, port = value.partition(":")
+            if separator and not self._valid_host_port(port):
+                return None
+        return self._canonical_host(host)
+
+    @staticmethod
+    def _valid_host_port(port: str) -> bool:
+        return port.isascii() and port.isdecimal() and 0 < int(port) <= 65535
+
+    @staticmethod
+    def _canonical_host(value: str) -> str:
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
+        return value.rstrip(".").lower()
+
+    @staticmethod
+    def _is_tailscale_host(host: str) -> bool:
+        if host.endswith(".ts.net"):
+            return True
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return address in _TAILSCALE_IPV4_NETWORK or address in _TAILSCALE_IPV6_NETWORK
+
+    @staticmethod
+    def _anonymous_field_is_sensitive(key: str) -> bool:
+        normalized = key.casefold().replace("-", "_")
+        return normalized in _ANONYMOUS_SENSITIVE_FIELDS or normalized.endswith(
+            ("_prompt", "_instruction", "_password", "_secret", "_token")
+        )
+
+    def _anonymous_projection(self, value: object, depth: int = 0) -> object:
+        """Return a finite public projection without task execution detail."""
+
+        if depth >= ANONYMOUS_MAX_DEPTH:
+            return "[redacted]"
+        if isinstance(value, dict):
+            projection: dict[str, object] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= ANONYMOUS_MAX_COLLECTION_ITEMS:
+                    break
+                key_text = str(key)
+                if self._anonymous_field_is_sensitive(key_text):
+                    continue
+                projection[key_text] = self._anonymous_projection(item, depth + 1)
+            return projection
+        if isinstance(value, (list, tuple)):
+            return [
+                self._anonymous_projection(item, depth + 1)
+                for item in value[:ANONYMOUS_MAX_COLLECTION_ITEMS]
+            ]
+        if isinstance(value, str) and len(value) > ANONYMOUS_MAX_STRING_LENGTH:
+            return value[: ANONYMOUS_MAX_STRING_LENGTH - 1] + "…"
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return None
 
     def _static(self, name: str) -> str:
         return (Path(__file__).parent / "static" / name).read_text()
@@ -561,6 +772,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         <button type='submit'>登录控制面</button></form></main></body></html>"""
 
     def _json(self, value, status: HTTPStatus = HTTPStatus.OK) -> None:
+        if not self._authenticated():
+            value = self._anonymous_projection(value)
         data = json.dumps(value, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -569,29 +782,43 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self, value: str, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self._text(value, "text/html; charset=utf-8", status)
+    def _html(
+        self,
+        value: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._text(value, "text/html; charset=utf-8", status, headers)
 
     def _bytes(
         self,
         data: bytes,
         content_type: str,
         status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "private, no-store")
+        for header, header_value in (headers or {}).items():
+            self.send_header(header, header_value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def _text(
-        self, value: str, content_type: str, status: HTTPStatus = HTTPStatus.OK
+        self,
+        value: str,
+        content_type: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
     ) -> None:
         data = value.encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        for header, header_value in (headers or {}).items():
+            self.send_header(header, header_value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

@@ -384,12 +384,16 @@ codex-workbench deliver <task-id> --base-branch <branch>
 - Workbench 是可复用的自托管开发控制面；仓库源码不包含运行账本、会话、认证文件、配额快照或控制令牌。
 - 受控执行器使用既有的 Codex/Claude 原生订阅登录态；不读取或转发 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`，也不以 API key 作为订阅失败的回退。
 - Authority 默认只监听本机回环地址。远程 cockpit 通过你配置的 SSH/Tailscale 通道访问，而不是把 SQLite 服务公开到互联网。
+- HTTP 控制面只接受 localhost、配置的绑定主机以及 Tailscale IP/MagicDNS（`.ts.net`）的 `Host`；其他 `Host` 返回 `400`。页面和 API 响应均发送 CSP（包括 `frame-ancestors 'none'`）和 `X-Frame-Options: DENY`，不能嵌入 frame。
+- 未认证的只读 API 输出是有限的公开投影：会删除 prompt、objective、instruction、凭据和 artifact 等执行细节，并限制集合与字符串大小；使用 Bearer token 或登录 cookie 后保留完整当前响应。登录失败按来源地址在内存中以滚动 60 秒窗口限制为 5 次，之后返回 `429` 和 `Retry-After`；该追踪最多保存 256 个地址，窗口到期（或进程重启）后恢复。
 - MacBook 和离线端不创建第二个 Authority；它们只能读取、控制或准备后续同步。
 - 该项目仅支持 macOS；手机 Remote Control 的接线已经实现，但未完成真实手机配对就不能声称手机旅程通过。页面关闭后的 Web Push 仍在 [backlog](docs/backlog.md)。
 
 ## 状态与文档
 
-源码版本/合同为 `1.15.7`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+源码版本/合同为 `1.15.8`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+
+1.15.8 收紧 HTTP 控制面：拒绝非 localhost、非配置绑定主机和非 Tailscale 的 `Host`，统一发送 CSP 与 frame 拒绝头；未认证只读响应删除执行指令、路径、结果和凭据字段并限制数据规模。Bearer token、登录 cookie 和登录表单都使用常数时间比较，登录失败按来源地址执行有界滚动窗口限流。
 
 1.15.7 修复受控恢复把 `PYTHONPATH=src` 等合同环境前缀误当成可执行文件的问题。恢复器继续禁止 shell，只允许三项 Python 验收环境变量并保留完整命令 Evidence；`PATH`、`HOME` 及其他覆盖在执行前 fail closed。
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from http import HTTPStatus
 import json
 from pathlib import Path
@@ -8,9 +9,16 @@ import threading
 import unittest
 from unittest import mock
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from codex_workbench.api import WorkbenchHTTPServer
+from codex_workbench.api import (
+    ANONYMOUS_MAX_COLLECTION_ITEMS,
+    ANONYMOUS_MAX_STRING_LENGTH,
+    LOGIN_FAILURE_LIMIT,
+    LOGIN_FAILURE_WINDOW_SECONDS,
+    WorkbenchHTTPServer,
+)
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.claude_quota import (
     COMPATIBLE_SOURCE,
@@ -546,6 +554,174 @@ class APITests(unittest.TestCase):
                     store.get_task("atomic-queue")["steering"][0]["instruction"],
                     "保留公开接口并补测试",
                 )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_host_allowlist_and_security_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+
+            def login_request(host: str) -> Request:
+                return Request(
+                    f"http://127.0.0.1:{port}/login",
+                    headers={"Host": host},
+                )
+
+            try:
+                for host in (
+                    f"localhost:{port}",
+                    f"control.example.ts.net:{port}",
+                    f"100.64.0.9:{port}",
+                ):
+                    with urlopen(login_request(host), timeout=2) as response:
+                        self.assertEqual(response.status, HTTPStatus.OK)
+                        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+                        self.assertIn(
+                            "frame-ancestors 'none'",
+                            response.headers["Content-Security-Policy"],
+                        )
+
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(login_request(f"untrusted.example:{port}"), timeout=2)
+                self.assertEqual(caught.exception.code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(caught.exception.headers["X-Frame-Options"], "DENY")
+                caught.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_anonymous_task_projection_is_bounded_and_authenticated_detail_is_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            private_task = {
+                "task_id": "private-task",
+                "objective": "private objective",
+                "display": "s" * (ANONYMOUS_MAX_STRING_LENGTH + 1),
+                "blocker": "private blocker",
+                "notes": list(range(ANONYMOUS_MAX_COLLECTION_ITEMS + 1)),
+                "nodes": [
+                    {
+                        "node_id": "private-node",
+                        "prompt": "private node prompt",
+                        "system_prompt": "private system prompt",
+                        "command": ["/bin/sh", "-c", "private command"],
+                        "worktree": "/private/absolute/worktree",
+                        "state": "queued",
+                        "result": {
+                            "status": "accepted",
+                            "summary": "private process output",
+                            "checks": ["private check output"],
+                        },
+                    }
+                ],
+            }
+            url = f"http://127.0.0.1:{port}/api/tasks/private-task"
+            try:
+                with mock.patch.object(store, "get_task", return_value=private_task):
+                    with urlopen(url, timeout=2) as response:
+                        anonymous = json.load(response)
+                    self.assertNotIn("objective", anonymous)
+                    self.assertNotIn("blocker", anonymous)
+                    self.assertNotIn("prompt", anonymous["nodes"][0])
+                    self.assertNotIn("system_prompt", anonymous["nodes"][0])
+                    self.assertNotIn("command", anonymous["nodes"][0])
+                    self.assertNotIn("worktree", anonymous["nodes"][0])
+                    self.assertNotIn("result", anonymous["nodes"][0])
+                    self.assertEqual(
+                        len(anonymous["notes"]), ANONYMOUS_MAX_COLLECTION_ITEMS
+                    )
+                    self.assertLessEqual(
+                        len(anonymous["display"]), ANONYMOUS_MAX_STRING_LENGTH
+                    )
+
+                    request = Request(
+                        url,
+                        headers={"Authorization": f"Bearer {config.token()}"},
+                    )
+                    original_compare_digest = hmac.compare_digest
+                    with mock.patch(
+                        "codex_workbench.api.hmac.compare_digest",
+                        wraps=original_compare_digest,
+                    ) as compare_digest:
+                        with urlopen(request, timeout=2) as response:
+                            authenticated = json.load(response)
+                    self.assertTrue(compare_digest.called)
+                    self.assertEqual(authenticated, private_task)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_login_throttling_limits_and_recovers_at_window_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            clock = [1000.0]
+
+            def failed_login() -> HTTPError:
+                request = Request(
+                    f"http://127.0.0.1:{port}/login",
+                    data=urlencode({"token": "incorrect"}).encode(),
+                    method="POST",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                return caught.exception
+
+            try:
+                with mock.patch(
+                    "codex_workbench.api.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ):
+                    for _ in range(LOGIN_FAILURE_LIMIT):
+                        failure = failed_login()
+                        self.assertEqual(failure.code, HTTPStatus.UNAUTHORIZED)
+                        failure.close()
+
+                    throttled = failed_login()
+                    self.assertEqual(throttled.code, HTTPStatus.TOO_MANY_REQUESTS)
+                    self.assertEqual(
+                        throttled.headers["Retry-After"],
+                        str(int(LOGIN_FAILURE_WINDOW_SECONDS)),
+                    )
+                    throttled.close()
+
+                    clock[0] += LOGIN_FAILURE_WINDOW_SECONDS - 0.001
+                    before_boundary = failed_login()
+                    self.assertEqual(before_boundary.code, HTTPStatus.TOO_MANY_REQUESTS)
+                    before_boundary.close()
+
+                    clock[0] += 0.001
+                    at_boundary = failed_login()
+                    self.assertEqual(at_boundary.code, HTTPStatus.UNAUTHORIZED)
+                    at_boundary.close()
             finally:
                 server.shutdown()
                 server.server_close()

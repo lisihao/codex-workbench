@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.config import WorkbenchConfig
@@ -72,8 +72,12 @@ def _legacy_audit_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
     )
 
 
-def _get_performance(base_url: str) -> dict[str, object]:
-    with urlopen(f"{base_url}/api/performance", timeout=2) as response:
+def _get_performance(base_url: str, token: str) -> dict[str, object]:
+    request = Request(
+        f"{base_url}/api/performance",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urlopen(request, timeout=2) as response:
         return json.load(response)
 
 
@@ -88,7 +92,7 @@ class PerformanceSemanticsAPITests(unittest.TestCase):
             refreshed = PerformanceRegistry(config.state_root).refresh(store, _CATALOG)
 
             with _running_server(root) as (_, _, base_url):
-                payload = _get_performance(base_url)
+                payload = _get_performance(base_url, config.token())
 
             active = payload["active"]
             self.assertTrue(payload["ok"])
@@ -118,7 +122,7 @@ class PerformanceSemanticsAPITests(unittest.TestCase):
             registry._activate(legacy["snapshot_id"])
 
             with _running_server(root) as (_, _, base_url):
-                payload = _get_performance(base_url)
+                payload = _get_performance(base_url, config.token())
 
             active = payload["active"]
             self.assertTrue(payload["ok"])
