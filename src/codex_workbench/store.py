@@ -2270,6 +2270,134 @@ class WorkbenchStore:
                 expected_attempt=expected_attempt,
             )
 
+    def capture_and_resume_blocked_worktree(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+        preserve_untracked: bool = False,
+    ) -> dict[str, Any]:
+        """Capture a blocked attempt outside SQLite, then authorize its retry."""
+
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("dirty-worktree recovery reason must be non-empty")
+        candidate = self.blocked_worktree_recovery_candidate(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+        )
+        source = candidate["source"]
+        task = self.get_task(task_id)
+        contract = task.get("contract")
+        if not isinstance(contract, dict) or not isinstance(contract.get("repository"), str):
+            raise StateConflictError("blocked-worktree recovery task contract is invalid")
+        base_sha = str(source["base_sha"])
+        nodes = task.get("nodes")
+        if not isinstance(nodes, list):
+            raise StateConflictError("blocked-worktree recovery task nodes are invalid")
+        node = next(
+            (
+                item
+                for item in nodes
+                if isinstance(item, dict) and item.get("node_id") == node_id
+            ),
+            None,
+        )
+        if not isinstance(node, dict) or not isinstance(node.get("result"), dict):
+            raise StateConflictError("blocked-worktree recovery source result is invalid")
+        raw_artifacts = node["result"].get("artifacts")
+        if not isinstance(raw_artifacts, dict):
+            raise StateConflictError("blocked-worktree recovery source artifacts are invalid")
+
+        capture_kwargs: dict[str, object] = {}
+        dependency_input_ref = raw_artifacts.get("dependency-input")
+        if dependency_input_ref is not None:
+            if not isinstance(dependency_input_ref, str) or not dependency_input_ref:
+                raise StateConflictError(
+                    "blocked-worktree recovery dependency input ref is invalid"
+                )
+            dependency_input = load_recorded_dependency_input(
+                self.artifacts,
+                dependency_input_ref,
+                task_id=task_id,
+                node_id=node_id,
+                base_sha=base_sha,
+            )
+            capture_kwargs = {
+                "task_id": task_id,
+                "node_id": node_id,
+                "input_tree_sha": dependency_input.input_tree_sha,
+                "dependency_input_ref": dependency_input_ref,
+            }
+
+        if preserve_untracked:
+            if dependency_input_ref is None:
+                raise StateConflictError(
+                    "explicit untracked preservation requires a dependent blocked worker"
+                )
+            source_path = Path(str(source["worktree"])).expanduser().resolve(strict=True)
+            untracked_paths = DirtyWorktreeRecovery.untracked_paths(source_path)
+            if not untracked_paths:
+                raise StateConflictError(
+                    "explicit untracked preservation requested but source has no untracked files"
+                )
+            allowed_scope = contract.get("allowed_scope")
+            forbidden_scope = contract.get("forbidden_scope")
+            write_scopes = node.get("write_scopes")
+            if not (
+                isinstance(allowed_scope, list)
+                and all(isinstance(scope, str) for scope in allowed_scope)
+                and isinstance(forbidden_scope, list)
+                and all(isinstance(scope, str) for scope in forbidden_scope)
+                and isinstance(write_scopes, list)
+                and all(isinstance(scope, str) for scope in write_scopes)
+            ):
+                raise StateConflictError("blocked-worktree recovery scopes are invalid")
+            for relative_path in untracked_paths:
+                if not scope_allows(relative_path, allowed_scope, forbidden_scope):
+                    raise StateConflictError(
+                        "untracked recovery path is outside the task contract scope: "
+                        + relative_path
+                    )
+                if not scope_allows(relative_path, write_scopes, []):
+                    raise StateConflictError(
+                        "untracked recovery path is outside the blocked node write scope: "
+                        + relative_path
+                    )
+            capture_kwargs["preserve_untracked_paths"] = untracked_paths
+
+        recovery = DirtyWorktreeRecovery(
+            self.artifacts,
+            WorktreeManager(self.path.parent / "worktrees"),
+        ).capture(
+            repository=contract["repository"],
+            base_sha=base_sha,
+            worktree=str(source["worktree"]),
+            branch=str(source["branch"]),
+            attempt=expected_attempt,
+            expected_changed_paths=tuple(source["changed_paths"]),
+            expected_generated_residue_paths=tuple(
+                source.get("generated_residue_paths", ())
+            ),
+            **capture_kwargs,
+        )
+        return {
+            **self.resume_blocked_worktree(
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+                reason=reason,
+                recovery=recovery,
+            ),
+            "recovery": recovery,
+        }
+
     @staticmethod
     def _recovery_git_bytes(worktree: Path, *arguments: str) -> bytes:
         try:

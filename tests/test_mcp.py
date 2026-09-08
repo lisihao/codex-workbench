@@ -281,6 +281,105 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(steered["revision"], 4)
         self.assertIn("delivery", steered)
 
+    def test_control_resume_retries_clean_block_only_after_explicit_assertion(self) -> None:
+        contract = TaskContract(
+            task_id="mcp-clean-blocked-resume",
+            repository=str(self.root),
+            base_sha="fixture",
+            objective="resume a clean blocked attempt",
+            allowed_scope=("tests",),
+            executor_model="fixture",
+            verifier_model="fixture",
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec(
+                    "work",
+                    contract.task_id,
+                    "work",
+                    "fixture",
+                    "fixture",
+                    "block without side effects",
+                ),
+                NodeSpec(
+                    "verify",
+                    contract.task_id,
+                    "verify",
+                    "fixture",
+                    "fixture",
+                    "accepted",
+                    depends_on=("work",),
+                    verifier=True,
+                ),
+            ],
+            "mcp-clean-blocked-resume-create",
+        )
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("fixture-worker", self.epoch)
+        assert claimed is not None
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "blocked",
+                "fixture stopped before side effects",
+                actual_model="fixture",
+                result_kind="worker",
+                changed_paths=(),
+                checks=("fixture",),
+            ),
+        )
+        blocked = self.store.get_task(contract.task_id)
+
+        missing_assertion = self.call(
+            "workbench_control_task",
+            {
+                "task_id": contract.task_id,
+                "action": "resume",
+                "expected_revision": blocked["state_revision"],
+                "node_id": "work",
+                "expected_attempt": 1,
+                "reason": "retry the clean local attempt",
+            },
+        )
+        self.assertTrue(missing_assertion["isError"])
+        self.assertIn("no-side-effects", missing_assertion["content"][0]["text"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
+        stale = self.call(
+            "workbench_control_task",
+            {
+                "task_id": contract.task_id,
+                "action": "resume",
+                "expected_revision": blocked["state_revision"] - 1,
+                "node_id": "work",
+                "expected_attempt": 1,
+                "reason": "retry the clean local attempt",
+                "confirm_no_side_effects": True,
+            },
+        )
+        self.assertTrue(stale["isError"])
+        self.assertIn("expected task revision", stale["content"][0]["text"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
+        resumed = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "resume",
+                    "expected_revision": blocked["state_revision"],
+                    "node_id": "work",
+                    "expected_attempt": 1,
+                    "reason": "retry the clean local attempt",
+                    "confirm_no_side_effects": True,
+                },
+            )["content"][0]["text"]
+        )
+        self.assertEqual(resumed["action"], "retry-blocked")
+        self.assertEqual(resumed["task"]["state"], "queued")
+        self.assertEqual(resumed["next_attempt"], 2)
+
     def test_harness_health_requires_real_skill_and_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             home = Path(directory)

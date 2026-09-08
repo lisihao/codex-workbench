@@ -88,6 +88,8 @@ Worker 失败后，Workbench 不再把“重新排队”等同于“从空白重
 
 所有外部 queue、resume、pause、cancel 和 steer 操作必须携带调用方刚读取的 expected_revision。带指导的 queue/resume 会先校验 1–500 字符的 instruction，再在同一事务中保存指导和启动状态；任一校验或 CAS 失败时两者都不发生。运行节点在 claim 时取得指导快照，因此之后追加的指导回执会明确返回 not_delivered、current_attempt_received=false 和后续生效点，而不会宣称实时注入现有进程。精确 attempt 的送达记录可从 cursor events 审计。
 
+历史 `blocked` attempt 不再被通用 queue 路径永久卡住：MCP `resume` 对有修改的本地工作树要求精确 node/attempt、恢复理由和显式 `confirm_recovery`，先在事务外保存补丁与生成残留 Evidence，再 CAS 到一次新 attempt；无修改的阻断则要求 `confirm_no_side_effects`。
+
 恢复准备、Git/文件捕获、Artifact 哈希和仓库身份解析都在 SQLite 写事务之外完成；写事务只提交短时、带 lease/revision 的状态变更。恢复 target 在 assignment 前发生进程重启时会原子回滚到原失败 attempt，并写入可重放的 orphan cleanup receipt；coordinator 启动恢复在事务外归档 target，失败或再次重启会继续重放，直到记录 resolved。assignment 后进程状态不确定时会保留 target 和 allocation、进入人工裁决，自动 retry 明确拒绝，防止同一工作树被重复派发。完整操作与故障语义见 [任务控制与失败恢复](docs/task-control-recovery.md)。
 
 ### 可恢复的 Worktree 回收与 NAS 归档
@@ -387,7 +389,9 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 ## 状态与文档
 
-源码版本/合同为 `1.15.5`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+源码版本/合同为 `1.15.6`。自然语言入口先把固定请求写入 Authority 的 planning ledger 并立即返回；后台规划以 attempt 与 coordinator epoch 隔离，只有一个原子事务可以创建任务、排队、绑定会话并完成回执。中断结果保持 `indeterminate`，不会重复调用模型；公开状态只给出安全错误摘要与诊断哈希。成功回执只保留性能快照摘要、矩阵规模与候选数量，不把完整候选校准表注入会话上下文；同一投影也会压缩 1.15.0 已存储的旧回执。schema 12→13 的 DDL、索引、Evidence 保留和版本标记在同一事务中迁移，部署回滚必须同时恢复 v1.14.5 应用与迁移前数据库备份。
+
+1.15.6 让可安全恢复的 `blocked` Worker 进入受限重试，而不是把整个任务永久停在终态；历史阻断可通过 MCP `resume` 按精确 revision、node、attempt 和显式副作用确认进入现有内容寻址恢复路径。CLI 与 MCP 共用同一事务外捕获实现，业务补丁、合法 untracked 文件和已归档的 Python bytecode 残留均由收据固定；不确定或外部副作用继续 fail closed。
 
 1.15.5 修复模型专属配额池的非对称回退：Claude CLI 只显示 Fable 或 Sonnet 其中一个专属池时，未显示的模型使用可信的全模型周池，不再把可用 Sonnet 错判为未知；已显示的专属池仍与全模型池共同执行保护门禁。
 

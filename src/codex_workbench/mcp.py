@@ -147,7 +147,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_control_task",
-        "description": "Queue, pause, resume, cancel, steer, or explicitly resolve an indeterminate node. Queue/resume may include an instruction, which is validated and persisted atomically before launch.",
+        "description": "Queue, pause, resume, cancel, steer, or explicitly resolve an indeterminate node. Queue/resume may include an instruction, which is validated and persisted atomically before launch. Resuming a blocked task requires an exact node attempt plus an explicit recovery or no-side-effects assertion.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -166,9 +166,14 @@ TOOLS: list[dict[str, Any]] = [
                     ]
                 },
                 "expected_revision": {"type": "integer"},
+                "expected_attempt": {"type": "integer", "minimum": 1},
                 "priority": {"type": "integer", "minimum": -10, "maximum": 10},
                 "instruction": {"type": "string", "minLength": 1, "maxLength": 500},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 500},
                 "node_id": {"type": "string"},
+                "confirm_recovery": {"type": "boolean"},
+                "preserve_untracked": {"type": "boolean"},
+                "confirm_no_side_effects": {"type": "boolean"},
                 "resolution": {"enum": ["retry", "fail", "cancel"]},
             },
         },
@@ -371,6 +376,116 @@ class WorkbenchMCPServer:
             raise ValueError("instruction must contain 1 to 500 characters")
         return normalized
 
+    @staticmethod
+    def _required_blocked_resume_text(arguments: dict[str, Any], name: str) -> str:
+        value = arguments.get(name)
+        if type(value) is not str:
+            raise ValueError(f"{name} must be a string")
+        normalized = value.strip()
+        if not normalized or len(normalized) > 500:
+            raise ValueError(f"{name} must contain 1 to 500 characters")
+        return normalized
+
+    @staticmethod
+    def _required_blocked_resume_attempt(arguments: dict[str, Any]) -> int:
+        value = arguments.get("expected_attempt")
+        if type(value) is not int or value < 1:
+            raise ValueError("expected_attempt must be a positive integer")
+        return value
+
+    @staticmethod
+    def _optional_strict_boolean(arguments: dict[str, Any], name: str) -> bool:
+        if name not in arguments:
+            return False
+        value = arguments[name]
+        if type(value) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+        return value
+
+    def _resume_blocked_task(
+        self,
+        task_id: str,
+        arguments: dict[str, Any],
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        if "instruction" in arguments:
+            raise ValueError(
+                "blocked resume uses a durable recovery reason; steer the blocked task first "
+                "if the next attempt also needs a new instruction"
+            )
+        node_id = arguments.get("node_id")
+        if type(node_id) is not str or not node_id.strip():
+            raise ValueError("node_id is required to resume a blocked task")
+        node_id = node_id.strip()
+        expected_attempt = self._required_blocked_resume_attempt(arguments)
+        reason = self._required_blocked_resume_text(arguments, "reason")
+        confirm_recovery = self._optional_strict_boolean(arguments, "confirm_recovery")
+        preserve_untracked = self._optional_strict_boolean(arguments, "preserve_untracked")
+        confirm_no_side_effects = self._optional_strict_boolean(
+            arguments,
+            "confirm_no_side_effects",
+        )
+
+        task = self.store.get_task(task_id)
+        nodes = task.get("nodes")
+        if not isinstance(nodes, list):
+            raise StateConflictError("blocked task nodes are invalid")
+        node = next(
+            (
+                item
+                for item in nodes
+                if isinstance(item, dict) and item.get("node_id") == node_id
+            ),
+            None,
+        )
+        if not isinstance(node, dict) or node.get("state") != "blocked":
+            raise StateConflictError(f"node {node_id} is not blocked")
+        result = node.get("result")
+        changed_paths = result.get("changed_paths") if isinstance(result, dict) else None
+        if not isinstance(changed_paths, list):
+            raise StateConflictError(
+                "blocked node result must contain changed_paths as an explicit list"
+            )
+
+        if changed_paths:
+            if not confirm_recovery:
+                raise ValueError(
+                    "dirty blocked resume requires confirm_recovery=true"
+                )
+            if confirm_no_side_effects:
+                raise ValueError(
+                    "confirm_no_side_effects cannot authorize a dirty blocked resume"
+                )
+            resumed = self.store.capture_and_resume_blocked_worktree(
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+                reason=reason,
+                preserve_untracked=preserve_untracked,
+            )
+            return {
+                "ok": True,
+                "action": "resume-blocked-worktree",
+                "operator_confirmed": True,
+                **resumed,
+            }
+
+        if confirm_recovery or preserve_untracked:
+            raise ValueError(
+                "clean blocked resume does not accept recovery or untracked-preservation assertions"
+            )
+        resumed = self.store.retry_blocked_node(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            reason=reason,
+            confirm_no_side_effects=confirm_no_side_effects,
+        )
+        return {"ok": True, "action": "retry-blocked", **resumed}
+
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "workbench_request":
             source_thread_id = arguments.get("source_thread_id")
@@ -555,6 +670,14 @@ class WorkbenchMCPServer:
             action = arguments["action"]
             expected_revision = self._required_expected_revision(arguments)
             if action in {"queue", "resume"}:
+                if action == "resume" and self.store.get_task(task_id)["state"] == "blocked":
+                    return self._text(
+                        self._resume_blocked_task(
+                            task_id,
+                            arguments,
+                            expected_revision=expected_revision,
+                        )
+                    )
                 instruction = self._control_instruction(arguments)
                 if instruction is not None:
                     receipt = self.store.queue_task_with_instruction(

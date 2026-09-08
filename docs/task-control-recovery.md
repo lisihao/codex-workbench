@@ -52,6 +52,8 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 
 `blocked` 并非一律自动重试。只有由可信执行边界产生且显式带 `retryable=true` 的 Worker 结果，才可在 `retry_limit` 内进入与失败 attempt 相同的内容捕获和新工作树恢复路径。模型自报阻断、凭据、权限、配额、需求歧义、verifier 阻断和 `indeterminate` 结果均保持显式终态，防止无界循环或重复副作用。
 
+MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不是把通用 `resume` 直接交给只接受 `paused`/`needs_fix` 的 queue 路径。调用方必须同时提交最新 `expected_revision`、精确 `node_id`、`expected_attempt` 和持久化 `reason`。若 receipt 含业务修改，调用方还必须声明 `confirm_recovery=true`；Workbench 在 SQLite 写事务之外捕获内容寻址补丁，再用 revision/attempt CAS 授权一次新 attempt。若 receipt 明确没有修改，只能以 `confirm_no_side_effects=true` 授权原路重试。合法 untracked 文件仍需显式 `preserve_untracked=true`，未知副作用或不确定捕获继续 fail closed。`instruction` 仍是模型指导而不是恢复理由；需要新指导时先 `steer`，再以更新后的 revision 执行 `resume`。
+
 ## 崩溃与重复请求
 
 - assignment 前重启：recover_interrupted() 将 capture_pending 原子回滚到原失败 attempt 和 needs_fix，并在同一事务写入 orphan cleanup receipt。协调器在 SQLite 事务外把可能残留的 target 移入私有 recovery archive；归档失败或进程再次重启时，未 resolved 的 receipt 会继续重放。下一次合法 queue 再重建恢复绑定。

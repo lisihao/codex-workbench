@@ -27,6 +27,7 @@ from codex_workbench.dirty_worktree_recovery import (
     DirtyWorktreeRecoveryError,
     PnpmOfflineMaterializer,
 )
+from codex_workbench.mcp import WorkbenchMCPServer
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
@@ -65,6 +66,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.epoch = self.store.activate_coordinator("blocked-worktree-test", "fixture-machine")
         self.worktrees = WorktreeManager(self.state_root / "worktrees")
         self.recovery = DirtyWorktreeRecovery(self.store.artifacts, self.worktrees)
+        self.mcp = WorkbenchMCPServer(self.config, self.store)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -179,6 +181,138 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             recovery=recovery,
         )
         return {**authorization, "recovery": recovery}
+
+    def _call_control(self, arguments: dict) -> dict:
+        response = self.mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_control_task",
+                    "arguments": arguments,
+                },
+            }
+        )
+        assert response is not None
+        return response["result"]
+
+    def test_mcp_resume_recovers_dirty_blocked_attempt_without_losing_changes(self) -> None:
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'\""
+        )
+        contract, blocked, source, source_patch = self._blocked_task(
+            acceptance_command=command,
+            python_residue=True,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+
+        missing_confirmation = self._call_control(
+            {
+                "task_id": contract.task_id,
+                "action": "resume",
+                "expected_revision": blocked["state_revision"],
+                "node_id": "worker",
+                "expected_attempt": worker["attempt"],
+                "reason": "resume the owned local attempt",
+            }
+        )
+        self.assertTrue(missing_confirmation["isError"])
+        self.assertIn("confirm_recovery", missing_confirmation["content"][0]["text"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
+        resumed = json.loads(
+            self._call_control(
+                {
+                    "task_id": contract.task_id,
+                    "action": "resume",
+                    "expected_revision": blocked["state_revision"],
+                    "node_id": "worker",
+                    "expected_attempt": worker["attempt"],
+                    "reason": "resume the owned local attempt",
+                    "confirm_recovery": True,
+                }
+            )["content"][0]["text"]
+        )
+        self.assertEqual(resumed["action"], "resume-blocked-worktree")
+        self.assertEqual(resumed["task"]["state"], "queued")
+        self.assertEqual(resumed["next_attempt"], 2)
+        self.assertEqual(
+            resumed["recovery"]["generated_residue_paths"],
+            ["tests/__pycache__/fixture.cpython-313.pyc"],
+        )
+        self.assertFalse(
+            (source / "tests" / "__pycache__" / "fixture.cpython-313.pyc").exists()
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(source), "diff", "--binary", self.base_sha],
+                check=True,
+                capture_output=True,
+            ).stdout,
+            source_patch,
+        )
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("mcp-blocked-recovery")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("recovery must not dispatch a model"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        recovered = self.store.get_task(contract.task_id)
+        recovered_worker = next(
+            node for node in recovered["nodes"] if node["node_id"] == "worker"
+        )
+        self.assertEqual(
+            (recovered_worker["state"], recovered_worker["attempt"]),
+            ("accepted", 2),
+        )
+        self.assertEqual(
+            (Path(recovered_worker["worktree"]) / "src" / "value.txt").read_text(
+                encoding="utf-8"
+            ),
+            "patched\n",
+        )
+
+    def test_cli_and_mcp_share_the_same_blocked_capture_path(self) -> None:
+        command = f"{sys.executable} -c \"raise SystemExit(0)\""
+        contract, blocked, _, _ = self._blocked_task(acceptance_command=command)
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        args = build_parser().parse_args(
+            [
+                "--home",
+                str(self.state_root),
+                "task",
+                "resume-blocked-worktree",
+                contract.task_id,
+                "worker",
+                "--expected-revision",
+                str(blocked["state_revision"]),
+                "--expected-attempt",
+                str(worker["attempt"]),
+                "--reason",
+                "resume through the shared capture path",
+                "--confirm-recovery",
+            ]
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(command_task(args), 0)
+        receipt = json.loads(output.getvalue())
+
+        self.assertEqual(receipt["action"], "resume-blocked-worktree")
+        self.assertEqual(receipt["task"]["state"], "queued")
+        self.assertEqual(receipt["next_attempt"], 2)
+        self.assertEqual(self.store.get_task(contract.task_id)["state"], "queued")
 
     def _blocked_dependent_task(
         self,

@@ -405,6 +405,16 @@ def _capture_blocked_worktree_recovery(
     dry_run: bool,
     preserve_untracked: bool,
 ) -> dict[str, object]:
+    if not dry_run:
+        return store.capture_and_resume_blocked_worktree(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            reason=reason,
+            preserve_untracked=preserve_untracked,
+        )
+
     candidate = store.blocked_worktree_recovery_candidate(
         task_id,
         node_id,
@@ -501,33 +511,7 @@ def _capture_blocked_worktree_recovery(
                 "recovery": recovery,
                 "reason": reason.strip(),
             }
-    recovery = DirtyWorktreeRecovery(
-        ArtifactStore(artifact_root),
-        WorktreeManager(config.state_root / "worktrees"),
-    ).capture(
-        repository=contract["repository"],
-        base_sha=base_sha,
-        worktree=str(source["worktree"]),
-        branch=str(source["branch"]),
-        attempt=expected_attempt,
-        expected_changed_paths=tuple(source["changed_paths"]),
-        expected_generated_residue_paths=tuple(
-            source.get("generated_residue_paths", ())
-        ),
-        **capture_kwargs,
-    )
-    return {
-        **store.resume_blocked_worktree(
-            task_id,
-            node_id,
-            expected_revision=expected_revision,
-            expected_attempt=expected_attempt,
-            reason=reason,
-            recovery=recovery,
-            dry_run=False,
-        ),
-        "recovery": recovery,
-    }
+    raise AssertionError("non-dry-run blocked recovery returned before dry-run preparation")
 
 
 def _validate_blocked_worktree_recovery_receipt(
