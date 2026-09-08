@@ -1186,7 +1186,7 @@ class QuotaSnapshot:
     def remaining_for(self, model: str) -> tuple[float | None, ...]:
         values: list[float | None] = [self.five_hour_remaining, self.weekly_all_remaining]
         lower = model.lower()
-        if "sonnet" in lower:
+        if "sonnet" in lower and self.weekly_sonnet_remaining is not None:
             values.append(self.weekly_sonnet_remaining)
         # Claude /usage exposes the all-model pool plus one model-specific
         # pool depending on the subscription. Missing model-specific pools

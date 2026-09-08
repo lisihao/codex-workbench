@@ -778,6 +778,22 @@ class ModelTests(unittest.TestCase):
         )
         self.assertTrue(healthy.permits("sonnet")[0])
 
+    def test_missing_model_pool_uses_the_shared_weekly_ceiling(self) -> None:
+        fable_only = QuotaSnapshot(
+            observed_at="2026-09-08T14:20:33+00:00",
+            auth_ok=True,
+            auth_method="native-subscription",
+            five_hour_remaining=99,
+            weekly_all_remaining=96,
+            weekly_sonnet_remaining=None,
+            weekly_fable_remaining=99,
+            **compatible_provenance(),
+        )
+
+        self.assertTrue(fable_only.permits("sonnet")[0])
+        self.assertTrue(fable_only.permits("fable")[0])
+        self.assertTrue(fable_only.permits("opus")[0])
+
     def test_manual_quota_snapshot_cannot_admit_formal_claude_dispatch(self) -> None:
         manual = QuotaSnapshot(
             observed_at=now_iso(),
