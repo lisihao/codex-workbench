@@ -43,9 +43,24 @@ REQUIREMENTS = {
     "A12": "Claude 网页端仍可使用保留额度完成 PPT 写作",
 }
 
+_GLOBAL_ACCEPTANCE_EVENT_TYPES = (
+    "acceptance.attested",
+    "client.heartbeat",
+    "client.observed",
+    "coordinator.started",
+    "node.accepted",
+    "node.failed",
+    "node.routed",
+    "quota.updated",
+    "task.repair_scheduled",
+)
+
 def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
     tasks = store.list_tasks(limit=500)
-    events = store.read_events(after=0, limit=10_000)
+    events, event_coverage = store.read_event_projection(
+        task_ids=tuple(str(task["task_id"]) for task in tasks),
+        event_types=_GLOBAL_ACCEPTANCE_EVENT_TYPES,
+    )
     legacy_remediations = store.legacy_evidence_remediations()
     quota = _runtime_quota_evidence(store.list_quota_snapshots(limit=5_000))
     authority = store.authority_status()
@@ -70,6 +85,7 @@ def build_acceptance_report(store: WorkbenchStore) -> dict[str, Any]:
         "counts": counts,
         "checks": [check.to_dict() for check in checks],
         "backlog": [check.to_dict() for check in backlog],
+        "event_coverage": event_coverage,
     }
 
 

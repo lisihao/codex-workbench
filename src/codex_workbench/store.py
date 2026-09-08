@@ -3654,6 +3654,59 @@ class WorkbenchStore:
                 for row in rows
             ]
 
+    def read_event_projection(
+        self,
+        *,
+        task_ids: tuple[str, ...],
+        event_types: tuple[str, ...],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Read a complete event subset and expose its ledger cursor coverage."""
+
+        selected_tasks = tuple(sorted(set(task_ids)))
+        selected_types = tuple(sorted(set(event_types)))
+        if len(selected_tasks) + len(selected_types) > 900:
+            raise ValueError("event projection exceeds the bounded SQLite parameter set")
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if selected_tasks:
+            clauses.append("task_id IN (" + ",".join("?" for _ in selected_tasks) + ")")
+            parameters.extend(selected_tasks)
+        if selected_types:
+            clauses.append("event_type IN (" + ",".join("?" for _ in selected_types) + ")")
+            parameters.extend(selected_types)
+        where = " OR ".join(clauses) if clauses else "0"
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            ledger = connection.execute(
+                "SELECT MIN(cursor) AS first_cursor, MAX(cursor) AS last_cursor FROM events"
+            ).fetchone()
+            rows = connection.execute(
+                f"SELECT * FROM events WHERE {where} ORDER BY cursor",
+                tuple(parameters),
+            ).fetchall()
+        events = [
+            {
+                "cursor": row["cursor"],
+                "event_type": row["event_type"],
+                "task_id": row["task_id"],
+                "node_id": row["node_id"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+        return events, {
+            "mode": "complete-task-and-event-type-projection",
+            "ledger_first_cursor": int(ledger["first_cursor"] or 0),
+            "ledger_last_cursor": int(ledger["last_cursor"] or 0),
+            "selected_first_cursor": int(events[0]["cursor"]) if events else 0,
+            "selected_last_cursor": int(events[-1]["cursor"]) if events else 0,
+            "selected_event_count": len(events),
+            "task_count": len(selected_tasks),
+            "global_event_types": list(selected_types),
+            "truncated": False,
+        }
+
     def _events_for_task(self, task_id: str, *, event_type: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as connection:
             if event_type is None:
