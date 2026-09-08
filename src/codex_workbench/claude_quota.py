@@ -503,8 +503,8 @@ def _week_window_id(name: str, value: str, observed: datetime) -> tuple[str, str
                 candidate = candidate.replace(year=year + 1)
         except ValueError as error:
             raise ClaudeQuotaError("weekly reset date is invalid") from error
-        if candidate - local_observed <= timedelta(hours=24):
-            raise ClaudeQuotaError("weekly reset must be more than 24 hours away")
+        if candidate <= local_observed:
+            raise ClaudeQuotaError("weekly reset must be in the future")
         return f"weekly:{candidate.date().isoformat()}@{zone.key}", "precise"
     match = _DATE_RESET.fullmatch(value)
     if match is None:
@@ -519,6 +519,6 @@ def _week_window_id(name: str, value: str, observed: datetime) -> tuple[str, str
             candidate = candidate.replace(year=year + 1)
     except ValueError as error:
         raise ClaudeQuotaError("weekly reset date is invalid") from error
-    if candidate - local_observed <= timedelta(hours=24):
-        raise ClaudeQuotaError("weekly reset must be more than 24 hours away")
+    if candidate <= local_observed:
+        raise ClaudeQuotaError("weekly reset must be in the future")
     return f"weekly:{candidate.date().isoformat()}@{zone.key}", "date-only-compatible"

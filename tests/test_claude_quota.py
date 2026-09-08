@@ -14,6 +14,7 @@ from codex_workbench.claude_quota import (
     ClaudeQuotaError,
     COMPATIBLE_SOURCE,
     _five_hour_window_id,
+    _week_window_id,
     scrubbed_environment,
     watch_claude_quota,
 )
@@ -33,6 +34,16 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         )
 
         self.assertEqual(window, "five_hour:2026-09-03T17:19:00Z")
+        self.assertEqual(precision, "precise")
+
+    def test_weekly_window_accepts_a_reset_within_twenty_four_hours(self) -> None:
+        window, precision = _week_window_id(
+            "seven_day",
+            "Sep 9 at 12:59am (America/Toronto)",
+            datetime(2026, 9, 8, 14, 0, tzinfo=UTC),
+        )
+
+        self.assertEqual(window, "weekly:2026-09-09@America/Toronto")
         self.assertEqual(precision, "precise")
 
     def setUp(self) -> None:
