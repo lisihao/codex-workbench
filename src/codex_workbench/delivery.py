@@ -37,6 +37,9 @@ class GitHubDeliveryRequest:
 
 
 class GitHubDelivery:
+    _REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+    _RELEASE_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@+=%-]*\Z")
+
     def __init__(
         self,
         store: WorkbenchStore,
@@ -48,16 +51,17 @@ class GitHubDelivery:
         self.runner = runner
 
     def deliver(self, request: GitHubDeliveryRequest) -> dict:
-        if request.release_tag and not request.merge:
-            raise ValueError("release_tag requires merge=true")
-        receipt = self.store.begin_delivery(request.task_id, request.command_id, request.to_dict())
-        if receipt["state"] in {"merged", "released"}:
-            return receipt
+        self._validate_request(request)
         task = self.store.get_task(request.task_id)
         verifier = next((node for node in task["nodes"] if node.get("verifier")), None)
         if verifier is None or not verifier.get("worktree"):
             raise DeliveryError("accepted task has no verifier integration worktree")
         worktree = Path(verifier["worktree"]).resolve(strict=True)
+        self._require_named_remote(worktree, request.remote)
+
+        receipt = self.store.begin_delivery(request.task_id, request.command_id, request.to_dict())
+        if receipt["state"] in {"merged", "released"}:
+            return receipt
         branch = f"codex-workbench/integration/{self._safe(request.task_id)}"
         try:
             if receipt["state"] == "accepted":
@@ -72,7 +76,16 @@ class GitHubDelivery:
 
             if receipt["state"] == "prepared":
                 pushed = self._run(
-                    ["git", "-C", str(worktree), "push", "--set-upstream", request.remote, f"HEAD:{branch}"],
+                    [
+                        "git",
+                        "-C",
+                        str(worktree),
+                        "push",
+                        "--set-upstream",
+                        "--",
+                        request.remote,
+                        f"HEAD:{branch}",
+                    ],
                     timeout=120,
                 )
                 receipt = self.store.update_delivery(
@@ -149,6 +162,45 @@ class GitHubDelivery:
             raise ValueError("task_id cannot form a Git branch")
         return normalized[:80]
 
+    @classmethod
+    def _validate_request(cls, request: GitHubDeliveryRequest) -> None:
+        remote = request.remote
+        if (
+            not isinstance(remote, str)
+            or not cls._REMOTE_NAME.fullmatch(remote)
+            or remote.endswith(".")
+            or ".." in remote
+            or remote.lower().endswith(".lock")
+        ):
+            raise ValueError("remote must be a simple named Git remote")
+
+        tag = request.release_tag
+        if tag is None:
+            return
+        if not request.merge:
+            raise ValueError("release_tag requires merge=true")
+        if (
+            not isinstance(tag, str)
+            or not cls._RELEASE_TAG.fullmatch(tag)
+            or tag.startswith("refs/")
+            or tag == "@"
+            or "@{" in tag
+            or tag.endswith((".", "/"))
+            or ".." in tag
+            or "//" in tag
+            or any(part.startswith(".") or part.lower().endswith(".lock") for part in tag.split("/"))
+        ):
+            raise ValueError("release_tag must be a safe Git tag name")
+
+    def _require_named_remote(self, worktree: Path, remote: str) -> None:
+        result = self._run(
+            ["git", "-C", str(worktree), "remote", "get-url", "--", remote],
+            timeout=60,
+            allow_nonzero=True,
+        )
+        if result.returncode:
+            raise DeliveryError("named Git remote does not exist")
+
     def _prepare(self, worktree: Path, task: dict, branch: str) -> str:
         base_sha = task["contract"]["base_sha"]
         self._run(["git", "-C", str(worktree), "switch", "-C", branch], timeout=60)
@@ -161,7 +213,7 @@ class GitHubDelivery:
             )
         commit = self._run(["git", "-C", str(worktree), "rev-parse", "HEAD"], timeout=60).stdout.strip()
         changed = self._run(
-            ["git", "-C", str(worktree), "diff", "--quiet", base_sha, commit],
+            ["git", "-C", str(worktree), "diff", "--quiet", base_sha, commit, "--"],
             timeout=60,
             allow_nonzero=True,
         )
@@ -201,7 +253,7 @@ class GitHubDelivery:
 
     def _ensure_release(self, worktree: Path, tag: str, merge_sha: str) -> subprocess.CompletedProcess[str]:
         existing = self._run(
-            ["gh", "release", "view", tag, "--json", "tagName", "--jq", ".tagName"],
+            ["gh", "release", "view", "--json", "tagName", "--jq", ".tagName", "--", tag],
             cwd=worktree,
             timeout=60,
             allow_nonzero=True,
@@ -213,10 +265,11 @@ class GitHubDelivery:
                 "gh",
                 "release",
                 "create",
-                tag,
                 "--target",
                 merge_sha,
                 "--generate-notes",
+                "--",
+                tag,
             ],
             cwd=worktree,
             timeout=180,
@@ -238,6 +291,7 @@ class GitHubDelivery:
             timeout=timeout,
             env=subscription_environment(),
             check=False,
+            shell=False,
         )
         if result.returncode and not allow_nonzero:
             raise DeliveryError(result.stderr.strip() or result.stdout.strip() or f"command exited {result.returncode}")
