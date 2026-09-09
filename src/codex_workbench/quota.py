@@ -46,6 +46,11 @@ class JsonFileQuotaAdapter:
             source=self.source,
             five_hour_window_id=_optional_text(raw.get("five_hour_window_id")),
             weekly_window_id=_optional_text(raw.get("weekly_window_id")),
+            collection_state=(
+                "failed"
+                if raw.get("auth_ok") is True and raw.get("quota_ok") is False
+                else None
+            ),
         )
         snapshot.validate()
         return snapshot
@@ -72,6 +77,11 @@ class JsonFileQuotaAdapter:
                 producer=str(producer["producer"]),
                 producer_schema_version=int(producer["producer_schema_version"]),
                 claude_version=str(producer["claude_version"]),
+                collection_state=(
+                    "failed"
+                    if producer["auth_ok"] is True and producer.get("quota_ok") is False
+                    else None
+                ),
             )
             snapshot.validate()
             return snapshot
@@ -101,6 +111,7 @@ class JsonFileQuotaAdapter:
             producer=str(producer["producer"]),
             producer_schema_version=int(producer["producer_schema_version"]),
             claude_version=str(producer["claude_version"]),
+            collection_state="complete",
         )
         snapshot.validate()
         return snapshot
@@ -126,7 +137,9 @@ class QuotaRefresher:
         snapshot = self.adapter.read()
         if snapshot is None:
             return False
-        digest = canonical_hash(snapshot.__dict__)
+        # Selection metadata is read-time only.  De-duplicate collector
+        # evidence, never an effective projection of an older row.
+        digest = canonical_hash(snapshot.raw_payload())
         if digest == self._last_digest:
             return False
         self.store.write_quota(snapshot)

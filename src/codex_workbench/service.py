@@ -102,6 +102,9 @@ class _ClaimRoute:
     quota: QuotaSnapshot | None
     active_claude_models: tuple[str, ...]
     decision: ClaudeDispatchDecision | None
+    # Claude admission must point to the exact immutable ledger row selected
+    # by the effective-observation projection.
+    quota_snapshot_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -302,7 +305,7 @@ class Coordinator:
             while len(self._futures) < self.max_workers:
                 worker_counter += 1
                 worker_id = f"{socket.gethostname()}-{os.getpid()}-{worker_counter}"
-                quota = self.store.latest_quota()
+                quota = self._latest_quota()
                 quota_snapshot_id = self._quota_snapshot_reference(quota)
                 active_claude_models = self._active_claude_models()
                 admission_waits: dict[tuple[str, str], _AdmissionWait] = {}
@@ -316,9 +319,10 @@ class Coordinator:
                     if pending is None:
                         return True
                     if quota_snapshot_id is None:
-                        raise RuntimeError(
-                            "pending Claude admission has no durable quota snapshot reference"
-                        )
+                        # Claim-time turns this into a Codex fallback.  An
+                        # admission wait may not rely on an unresolved
+                        # effective projection.
+                        return True
                     reason_kind, resume_condition, decision = pending
                     wait = _AdmissionWait(
                         task_id=str(spec["task_id"]),
@@ -348,7 +352,19 @@ class Coordinator:
                         claimed["spec"], claimed["contract"], quota, active_claude_models
                     )
                 )
-                claim_route = _ClaimRoute(quota, active_claude_models, decision)
+                if (
+                    claimed["spec"].get("executor") == "claude"
+                    and decision is not None
+                    and decision.action == "claude"
+                    and quota_snapshot_id is None
+                ):
+                    decision = self._missing_quota_reference_decision(decision)
+                claim_route = _ClaimRoute(
+                    quota,
+                    active_claude_models,
+                    decision,
+                    quota_snapshot_id,
+                )
                 active_claude_model = (
                     claimed["spec"]["model"]
                     if decision is not None and decision.action == "claude"
@@ -977,9 +993,11 @@ class Coordinator:
 
         if claim_route.decision is None or claim_route.decision.action != "claude":
             return None
-        latest = self.store.latest_quota()
-        if latest == claim_route.quota:
-            return None
+        # Re-evaluate immediately before the provider boundary.  Equality of
+        # projected pool values is insufficient: a newer raw row can change
+        # recovery ordering or auth/collection diagnostics without changing
+        # the selected complete snapshot's fields.
+        latest = self._latest_quota()
         decision = self._claude_decision(
             spec,
             contract,
@@ -987,8 +1005,11 @@ class Coordinator:
             claim_route.active_claude_models,
             quota_ttl_seconds=self.quota_ttl_seconds,
         )
-        if decision is not None and decision.action == "codex":
-            return decision
+        if decision is not None:
+            if decision.action == "codex":
+                return decision
+            if decision.action == "claude" and self._quota_snapshot_reference(latest) is None:
+                return self._missing_quota_reference_decision(decision)
         return None
 
     @staticmethod
@@ -1130,9 +1151,31 @@ class Coordinator:
             return None
         try:
             candidate = resolver(snapshot)
-        except (OSError, ValueError):
+        except (OSError, ValueError, StateConflictError):
             return None
         return candidate if isinstance(candidate, int) and candidate > 0 else None
+
+    @staticmethod
+    def _missing_quota_reference_decision(
+        admitted: ClaudeDispatchDecision,
+    ) -> ClaudeDispatchDecision:
+        """Fail closed when quota admission is not tied to a ledger row."""
+
+        return ClaudeDispatchDecision(
+            "codex",
+            "unknown",
+            "Claude quota evidence has no durable snapshot reference",
+            0,
+            capacity_units=admitted.capacity_units,
+            active_units=admitted.active_units,
+            requested_units=admitted.requested_units,
+            available_units=admitted.available_units,
+        )
+
+    def _latest_quota(self) -> QuotaSnapshot | None:
+        """Read effective quota under this coordinator's existing TTL policy."""
+
+        return self.store.latest_quota(max_age_seconds=self.quota_ttl_seconds)
 
     def _candidate_decision(
         self,
@@ -1759,15 +1802,35 @@ class Coordinator:
                     )
                     return
             if claim_route is None:
-                quota = self.store.latest_quota()
+                quota = self._latest_quota()
+                quota_snapshot_id = self._quota_snapshot_reference(quota)
+                decision = self._claim_time_decision(spec, contract, quota, ())
+                if (
+                    spec.get("executor") == "claude"
+                    and decision is not None
+                    and decision.action == "claude"
+                    and quota_snapshot_id is None
+                ):
+                    decision = self._missing_quota_reference_decision(decision)
                 claim_route = _ClaimRoute(
                     quota,
                     (),
-                    self._claim_time_decision(spec, contract, quota, ()),
+                    decision,
+                    quota_snapshot_id,
                 )
             if spec.get("executor") == "claude":
+                # Resolve again beside the provider boundary.  The raw row is
+                # immutable, but a projection with a missing/mismatched ID
+                # must never authorize a Claude call.
                 context.quota_snapshot_id = self._quota_snapshot_reference(claim_route.quota)
             decision = claim_route.decision
+            if (
+                spec.get("executor") == "claude"
+                and decision is not None
+                and decision.action == "claude"
+                and context.quota_snapshot_id is None
+            ):
+                decision = self._missing_quota_reference_decision(decision)
             execute_started_monotonic = time.monotonic()
             context.execute_started_at = now_iso()
             if decision is not None and decision.action != "claude":
@@ -2645,6 +2708,11 @@ class Coordinator:
             attempt=claimed["attempt"],
             coordinator_epoch=claimed["coordinator_epoch"],
             lease_epoch=claimed["lease_epoch"],
+            quota_snapshot_id=(
+                attribution_context.quota_snapshot_id
+                if attribution_context is not None
+                else None
+            ),
         )
         routed_request = ExecutionRequest(
             task_id=request.task_id,
@@ -2693,7 +2761,7 @@ class Coordinator:
             )
             if attribution_context.quota_snapshot_id is None:
                 attribution_context.quota_snapshot_id = self._quota_snapshot_reference(
-                    self.store.latest_quota()
+                    self._latest_quota()
                 )
         return routed_request, self._executor("codex").execute(routed_request)
 
@@ -2825,7 +2893,7 @@ class Coordinator:
         if kind == "claude":
             return ClaudeExecutor(
                 self.artifacts,
-                self.store.latest_quota(),
+                self._latest_quota(),
                 os.environ.get("CODEX_WORKBENCH_CLAUDE") or "claude",
                 self.quota_ttl_seconds,
             )
