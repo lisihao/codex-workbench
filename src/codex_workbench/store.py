@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import math
 import re
 from pathlib import Path
 import sqlite3
 import subprocess
 import threading
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
+from uuid import uuid4
 
 from .model import (
+    DEFAULT_QUOTA_TTL_SECONDS,
     NodeResult,
     NodeSpec,
     QuotaSnapshot,
@@ -27,6 +30,23 @@ from .model import (
 )
 from .artifacts import ArtifactStore, presentation_format
 from .dependency_inputs import load_recorded_dependency_input
+from .delivery_lifecycle import (
+    DeliveryAdmissionBusy,
+    DELIVERY_RECEIPT_STATES,
+    DELIVERY_STAGES,
+    IDENTITY_FIELDS,
+    required_completion_identities,
+    required_delivery_stages,
+    merge_identities,
+    normalize_budget,
+    normalize_identities,
+    normalize_objective_request,
+    normalize_stage,
+    normalize_timestamp,
+    normalize_wait_reason,
+    recovery_action_for_failure,
+    validate_live_verification_receipt,
+)
 from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
@@ -41,6 +61,7 @@ from .scheduler_metrics import (
     execution_lane_for_spec,
     quota_pool_id_for_spec,
 )
+from .scope_isolation import scope_entity_alias_conflicts
 from .worktrees import (
     WorktreeManager,
     normalize_scope,
@@ -53,6 +74,7 @@ from .worktrees import (
 SCHEMA_VERSION = 13
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
+_DELIVERY_LEASE_SECONDS = 60 * 60
 
 _DIRTY_WORKTREE_RECOVERY_KIND = "blocked-worktree-recovery"
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
@@ -278,6 +300,16 @@ class WorkbenchStore:
             "CREATE INDEX IF NOT EXISTS task_steering_task_sequence_idx "
             "ON task_steering(task_id, sequence)",
         )
+        # Schema v13 is already the public compatibility fence.  The
+        # lifecycle tables above are additive, idempotent DDL in the same
+        # transaction; an older v13 binary ignores this marker and its tables,
+        # which keeps a rollback read/write compatible instead of requiring a
+        # destructive down-migration.
+        self._schema_write(
+            connection,
+            "INSERT INTO metadata(key, value) VALUES('delivery_lifecycle_schema_version', '1') "
+            "ON CONFLICT(key) DO NOTHING",
+        )
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -378,6 +410,108 @@ class WorkbenchStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                -- The lifecycle overlay deliberately does not foreign-key
+                -- task_id: a planning reservation owns its task ID before
+                -- materialization creates the immutable task contract.
+                CREATE TABLE IF NOT EXISTS delivery_objectives (
+                    objective_id TEXT PRIMARY KEY,
+                    command_id TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL UNIQUE,
+                    request_hash TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    stage_attempt INTEGER NOT NULL,
+                    state_revision INTEGER NOT NULL,
+                    next_action_json TEXT NOT NULL,
+                    owner_id TEXT,
+                    coordinator_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    due_at TEXT NOT NULL,
+                    next_wakeup_at TEXT,
+                    last_material_progress_at TEXT NOT NULL,
+                    last_progress_json TEXT NOT NULL,
+                    wait_reason_json TEXT,
+                    budget_json TEXT NOT NULL,
+                    evidence_fingerprints_json TEXT NOT NULL,
+                    identities_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS delivery_stage_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    objective_id TEXT NOT NULL REFERENCES delivery_objectives(objective_id)
+                        ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    stage_attempt INTEGER NOT NULL,
+                    receipt_hash TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    evidence_fingerprint TEXT,
+                    identities_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(objective_id, stage, stage_attempt, receipt_hash)
+                );
+                -- Intent is durable before an authority-owned adapter can
+                -- cause an external effect.  A restart therefore reconciles
+                -- or freezes an uncertain dispatch instead of replaying it.
+                CREATE TABLE IF NOT EXISTS delivery_stage_dispatches (
+                    dispatch_id TEXT PRIMARY KEY,
+                    objective_id TEXT NOT NULL REFERENCES delivery_objectives(objective_id)
+                        ON DELETE CASCADE,
+                    task_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    stage_attempt INTEGER NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    adapter_name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    receipt_id TEXT,
+                    rollback_state TEXT,
+                    rollback_receipt_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(objective_id, stage, stage_attempt)
+                );
+                CREATE TABLE IF NOT EXISTS delivery_authorization_receipts (
+                    authorization_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                    objective_id TEXT REFERENCES delivery_objectives(objective_id),
+                    request_hash TEXT NOT NULL,
+                    scope_json TEXT NOT NULL,
+                    authority_json TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    granted_by TEXT NOT NULL,
+                    expires_at TEXT,
+                    revoked_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS node_admission_waits (
+                    task_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    wait_fingerprint TEXT NOT NULL,
+                    reason_kind TEXT NOT NULL,
+                    reason_json TEXT NOT NULL,
+                    next_action_json TEXT NOT NULL,
+                    blocking_json TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    next_wakeup_at TEXT NOT NULL,
+                    event_cursor INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, node_id),
+                    FOREIGN KEY(task_id, node_id) REFERENCES nodes(task_id, node_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS delivery_leases (
+                    command_id TEXT PRIMARY KEY REFERENCES delivery_receipts(command_id)
+                        ON DELETE CASCADE,
+                    fence TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS evidence_cache (
                     cache_key TEXT PRIMARY KEY,
                     result_json TEXT NOT NULL,
@@ -455,6 +589,16 @@ class WorkbenchStore:
                 CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks(state, updated_at);
                 CREATE INDEX IF NOT EXISTS task_steering_task_created_idx
                     ON task_steering(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS delivery_objectives_wakeup_idx
+                    ON delivery_objectives(state, next_wakeup_at, due_at);
+                CREATE INDEX IF NOT EXISTS delivery_stage_receipts_objective_idx
+                    ON delivery_stage_receipts(objective_id, stage, stage_attempt);
+                CREATE INDEX IF NOT EXISTS delivery_stage_dispatches_objective_idx
+                    ON delivery_stage_dispatches(objective_id, stage, stage_attempt, state);
+                CREATE INDEX IF NOT EXISTS delivery_authorization_task_idx
+                    ON delivery_authorization_receipts(task_id, decision, expires_at);
+                CREATE INDEX IF NOT EXISTS node_admission_waits_wakeup_idx
+                    ON node_admission_waits(next_wakeup_at, due_at);
                 CREATE INDEX IF NOT EXISTS context_import_thread_created_idx
                     ON context_import_receipts(source_thread_id, created_at);
                 CREATE INDEX IF NOT EXISTS worktree_allocations_state_idx
@@ -633,11 +777,26 @@ class WorkbenchStore:
             if task["state"] != "accepted":
                 raise StateConflictError(f"task {task_id} is {task['state']}, expected accepted")
             contract = json.loads(task["contract_json"])
+            authorization: dict[str, Any] | None = None
             if not contract.get("external_write_permission", False):
-                raise StateConflictError(
-                    f"task {task_id} contract does not authorize external GitHub writes"
+                authorization = self._matching_delivery_authorization(
+                    connection,
+                    task_id,
+                    request,
+                    timestamp=timestamp,
                 )
-            details = {"request": request}
+                if authorization is None:
+                    raise StateConflictError(
+                        f"task {task_id} contract does not authorize external GitHub writes"
+                    )
+            details = {
+                "request": request,
+                **(
+                    {"delivery_authorization_id": authorization["authorization_id"]}
+                    if authorization is not None
+                    else {}
+                ),
+            }
             connection.execute(
                 """
                 INSERT INTO delivery_receipts(
@@ -651,7 +810,15 @@ class WorkbenchStore:
                 "delivery.accepted",
                 task_id,
                 None,
-                {"command_id": command_id, "request_hash": request_hash},
+                {
+                    "command_id": command_id,
+                    "request_hash": request_hash,
+                    **(
+                        {"delivery_authorization_id": authorization["authorization_id"]}
+                        if authorization is not None
+                        else {}
+                    ),
+                },
             )
             row = connection.execute(
                 "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
@@ -659,12 +826,2294 @@ class WorkbenchStore:
             assert row is not None
             return self._delivery_row(row)
 
+    @staticmethod
+    def _delivery_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "command_id": row["command_id"],
+            "request_hash": row["request_hash"],
+            "task_id": row["task_id"],
+            "state": row["state"],
+            "details": json.loads(row["details_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _delivery_stage_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "receipt_id": str(row["receipt_id"]),
+            "objective_id": str(row["objective_id"]),
+            "task_id": str(row["task_id"]),
+            "stage": str(row["stage"]),
+            "attempt": int(row["stage_attempt"]),
+            "request_hash": str(row["receipt_hash"]),
+            "state": str(row["state"]),
+            "receipt": json.loads(str(row["receipt_json"])),
+            "evidence_fingerprint": row["evidence_fingerprint"],
+            "identities": json.loads(str(row["identities_json"])),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _delivery_stage_dispatch_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "dispatch_id": str(row["dispatch_id"]),
+            "objective_id": str(row["objective_id"]),
+            "task_id": str(row["task_id"]),
+            "stage": str(row["stage"]),
+            "attempt": int(row["stage_attempt"]),
+            "request_hash": str(row["request_hash"]),
+            "adapter_name": str(row["adapter_name"]),
+            "state": str(row["state"]),
+            "receipt_id": row["receipt_id"],
+            "rollback": (
+                {
+                    "state": str(row["rollback_state"]),
+                    "receipt": (
+                        json.loads(str(row["rollback_receipt_json"]))
+                        if row["rollback_receipt_json"] is not None
+                        else None
+                    ),
+                }
+                if row["rollback_state"] is not None
+                else None
+            ),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _delivery_authorization_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "authorization_id": str(row["authorization_id"]),
+            "task_id": str(row["task_id"]),
+            "objective_id": row["objective_id"],
+            "request_hash": str(row["request_hash"]),
+            "scope": json.loads(str(row["scope_json"])),
+            "authority": json.loads(str(row["authority_json"])),
+            "decision": str(row["decision"]),
+            "granted_by": str(row["granted_by"]),
+            "expires_at": row["expires_at"],
+            "revoked_at": row["revoked_at"],
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _delivery_objective_row(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        include_receipts: bool = True,
+        include_authorizations: bool = True,
+    ) -> dict[str, Any]:
+        request = json.loads(str(row["request_json"]))
+        result: dict[str, Any] = {
+            "objective_id": str(row["objective_id"]),
+            "command_id": str(row["command_id"]),
+            "task_id": str(row["task_id"]),
+            "request_hash": str(row["request_hash"]),
+            "requested_endpoints": request["requested_endpoints"],
+            "scope": request["scope"],
+            "authority": request["authority"],
+            "request_metadata": request.get("metadata", {}),
+            "required_stages": list(required_delivery_stages(request)),
+            "required_identities": list(required_completion_identities(request)),
+            "state": str(row["state"]),
+            "stage": str(row["stage"]),
+            "stage_attempt": int(row["stage_attempt"]),
+            "state_revision": int(row["state_revision"]),
+            "next_action": json.loads(str(row["next_action_json"])),
+            "lease": {
+                "owner_id": row["owner_id"],
+                "coordinator_epoch": int(row["coordinator_epoch"]),
+                "lease_epoch": int(row["lease_epoch"]),
+                "expires_at": row["lease_expires_at"],
+            },
+            "due_at": str(row["due_at"]),
+            "next_wakeup_at": row["next_wakeup_at"],
+            "last_material_progress_at": str(row["last_material_progress_at"]),
+            "last_progress": json.loads(str(row["last_progress_json"])),
+            "wait_reason": (
+                json.loads(str(row["wait_reason_json"]))
+                if row["wait_reason_json"] is not None
+                else None
+            ),
+            "budget": json.loads(str(row["budget_json"])),
+            "evidence_fingerprints": json.loads(str(row["evidence_fingerprints_json"])),
+            "identities": json.loads(str(row["identities_json"])),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+        if include_receipts:
+            receipts = connection.execute(
+                """
+                SELECT * FROM delivery_stage_receipts
+                WHERE objective_id = ?
+                ORDER BY created_at, receipt_id
+                """,
+                (row["objective_id"],),
+            ).fetchall()
+            result["stage_receipts"] = [
+                WorkbenchStore._delivery_stage_receipt_row(receipt) for receipt in receipts
+            ]
+            dispatches = connection.execute(
+                """
+                SELECT * FROM delivery_stage_dispatches
+                WHERE objective_id = ?
+                ORDER BY created_at, dispatch_id
+                """,
+                (row["objective_id"],),
+            ).fetchall()
+            result["stage_dispatches"] = [
+                WorkbenchStore._delivery_stage_dispatch_row(dispatch) for dispatch in dispatches
+            ]
+        if include_authorizations:
+            authorizations = connection.execute(
+                """
+                SELECT * FROM delivery_authorization_receipts
+                WHERE task_id = ?
+                ORDER BY created_at, authorization_id
+                """,
+                (row["task_id"],),
+            ).fetchall()
+            result["delivery_authorizations"] = [
+                WorkbenchStore._delivery_authorization_row(authorization)
+                for authorization in authorizations
+            ]
+        return result
+
+    @staticmethod
+    def _node_admission_wait_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "reason_kind": str(row["reason_kind"]),
+            "reason": json.loads(str(row["reason_json"])),
+            "next_action": json.loads(str(row["next_action_json"])),
+            "blocking": json.loads(str(row["blocking_json"])),
+            "due_at": str(row["due_at"]),
+            "next_wakeup_at": str(row["next_wakeup_at"]),
+            "event_cursor": int(row["event_cursor"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _next_delivery_lease_epoch(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'delivery_objective_lease_epoch'"
+        ).fetchone()
+        epoch = (int(row["value"]) if row else 0) + 1
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES('delivery_objective_lease_epoch', ?)",
+            (str(epoch),),
+        )
+        return epoch
+
+    @staticmethod
+    def _timestamp_after(timestamp: str, seconds: int) -> str:
+        return (datetime.fromisoformat(timestamp) + timedelta(seconds=seconds)).isoformat(
+            timespec="seconds"
+        )
+
+    @staticmethod
+    def _timestamp_is_due(value: str | None, timestamp: str) -> bool:
+        return value is None or datetime.fromisoformat(value) <= datetime.fromisoformat(timestamp)
+
+    def _assert_delivery_task_or_reservation(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> None:
+        task = connection.execute(
+            "SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if task is not None:
+            return
+        reservation = connection.execute(
+            "SELECT 1 FROM planning_requests WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if reservation is None:
+            raise KeyError(task_id)
+
+    def create_delivery_objective(
+        self,
+        task_id: str,
+        command_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable, end-to-end objective beside its task ID.
+
+        The task may still be a planning reservation.  This makes the plan
+        stage restart-safe without creating a shadow implementation task.
+        """
+
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("delivery objective task_id is required")
+        if not isinstance(command_id, str) or not command_id.strip():
+            raise ValueError("delivery objective command_id is required")
+        normalized = normalize_objective_request(request)
+        request_hash = canonical_hash({"task_id": task_id, "request": normalized})
+        timestamp = now_iso()
+        due_at = normalized["due_at"] or self._timestamp_after(
+            timestamp, int(normalized["budget"]["time_budget_seconds"])
+        )
+        next_wakeup_at = normalized["next_wakeup_at"] or timestamp
+        objective_id = "delivery-objective-" + canonical_hash(
+            {"task_id": task_id, "request_hash": request_hash}
+        )[:24]
+        progress = {
+            "kind": "delivery-objective-created",
+            "stage": "plan",
+            "next_action": normalized["next_action"],
+        }
+        with self.transaction() as connection:
+            self._assert_delivery_task_or_reservation(connection, task_id)
+            existing_command = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if existing_command is not None:
+                if (
+                    existing_command["task_id"] != task_id
+                    or existing_command["request_hash"] != request_hash
+                ):
+                    raise CommandConflictError(
+                        f"delivery objective command {command_id!r} was already used with a different request"
+                    )
+                return self._delivery_objective_row(connection, existing_command)
+            existing = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise StateConflictError(
+                        f"task {task_id!r} already has an immutable delivery objective"
+                    )
+                return self._delivery_objective_row(connection, existing)
+            connection.execute(
+                """
+                INSERT INTO delivery_objectives(
+                    objective_id, command_id, task_id, request_hash, request_json,
+                    state, stage, stage_attempt, state_revision, next_action_json,
+                    due_at, next_wakeup_at, last_material_progress_at,
+                    last_progress_json, budget_json, evidence_fingerprints_json,
+                    identities_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, 'active', 'plan', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    objective_id,
+                    command_id,
+                    task_id,
+                    request_hash,
+                    canonical_json(normalized),
+                    canonical_json(normalized["next_action"]),
+                    due_at,
+                    next_wakeup_at,
+                    timestamp,
+                    canonical_json(progress),
+                    canonical_json(normalized["budget"]),
+                    canonical_json(normalized["evidence_fingerprints"]),
+                    canonical_json(normalized["identities"]),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            cursor = self._event(
+                connection,
+                "delivery_objective.created",
+                task_id,
+                None,
+                {
+                    "objective_id": objective_id,
+                    "command_id": command_id,
+                    "request_hash": request_hash,
+                    "stage": "plan",
+                    "stage_attempt": 1,
+                    "state_revision": 1,
+                    "next_wakeup_at": next_wakeup_at,
+                },
+                created_at=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE delivery_objectives SET last_progress_json = ?
+                WHERE objective_id = ?
+                """,
+                (canonical_json({**progress, "event_cursor": cursor}), objective_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert row is not None
+            return self._delivery_objective_row(connection, row)
+
+    def get_delivery_objective(self, objective_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            return self._delivery_objective_row(connection, row)
+
+    def get_delivery_objective_for_task(self, task_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return self._delivery_objective_row(connection, row) if row is not None else None
+
+    def list_due_delivery_objectives(
+        self,
+        *,
+        now: str | None = None,
+        limit: int = 100,
+        owner_id: str | None = None,
+        coordinator_epoch: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("delivery objective limit must be positive")
+        if owner_id is not None and (not isinstance(owner_id, str) or not owner_id.strip()):
+            raise ValueError("delivery objective owner_id must be a non-empty string or null")
+        if coordinator_epoch is not None and (
+            isinstance(coordinator_epoch, bool) or not isinstance(coordinator_epoch, int) or coordinator_epoch <= 0
+        ):
+            raise ValueError("delivery objective coordinator_epoch must be positive or null")
+        if (owner_id is None) != (coordinator_epoch is None):
+            raise ValueError("delivery objective owner_id and coordinator_epoch must be supplied together")
+        timestamp = normalize_timestamp(now, "now") if now is not None else now_iso()
+        assert timestamp is not None
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM delivery_objectives
+                WHERE state IN ('active', 'waiting')
+                  AND next_wakeup_at IS NOT NULL AND next_wakeup_at <= ?
+                  AND (
+                      state != 'active' OR owner_id IS NULL OR lease_expires_at IS NULL
+                      OR lease_expires_at <= ?
+                      OR (owner_id = ? AND coordinator_epoch = ?)
+                  )
+                ORDER BY next_wakeup_at, due_at, objective_id
+                LIMIT ?
+                """,
+                (timestamp, timestamp, owner_id, coordinator_epoch, limit),
+            ).fetchall()
+            return [
+                self._delivery_objective_row(connection, row, include_receipts=False)
+                for row in rows
+            ]
+
+    def claim_delivery_objective(
+        self,
+        objective_id: str,
+        owner_id: str,
+        coordinator_epoch: int,
+        *,
+        expected_revision: int,
+        lease_seconds: int = 60,
+    ) -> dict[str, Any] | None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("delivery objective owner_id is required")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("delivery objective expected_revision must be positive")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= 3600:
+            raise ValueError("delivery objective lease_seconds must be between 1 and 3600")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            self._reconcile_delivery_safe_point_waits(connection, timestamp=timestamp)
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            if int(row["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected delivery objective revision {expected_revision}, found {row['state_revision']}"
+                )
+            if row["state"] in {"complete", "cancelled", "needs_decision"}:
+                return None
+            if row["state"] == "waiting" and row["wait_reason_json"] is not None:
+                try:
+                    wait_reason = json.loads(str(row["wait_reason_json"]))
+                except json.JSONDecodeError as error:
+                    raise StateConflictError("delivery objective wait reason is invalid") from error
+                if (
+                    isinstance(wait_reason, dict)
+                    and wait_reason.get("kind") == "active-workers-draining"
+                    and wait_reason.get("safe_point_ready") is not True
+                ):
+                    # The bounded wake is a reconciliation cadence, not
+                    # permission to interrupt a still-running worker.
+                    return None
+            if not self._timestamp_is_due(row["next_wakeup_at"], timestamp):
+                return None
+            if (
+                row["state"] == "active"
+                and row["owner_id"] is not None
+                and row["lease_expires_at"] is not None
+                and not self._timestamp_is_due(row["lease_expires_at"], timestamp)
+            ):
+                if (
+                    row["owner_id"] == owner_id
+                    and int(row["coordinator_epoch"]) == coordinator_epoch
+                ):
+                    return self._delivery_objective_row(connection, row)
+                raise StateConflictError("delivery objective is leased by another owner")
+            lease_epoch = self._next_delivery_lease_epoch(connection)
+            revision = int(row["state_revision"]) + 1
+            expires_at = self._timestamp_after(timestamp, lease_seconds)
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET state = 'active', state_revision = ?, owner_id = ?, coordinator_epoch = ?,
+                    lease_epoch = ?, lease_expires_at = ?, next_wakeup_at = ?,
+                    wait_reason_json = NULL, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ?
+                """,
+                (
+                    revision,
+                    owner_id,
+                    coordinator_epoch,
+                    lease_epoch,
+                    expires_at,
+                    timestamp,
+                    timestamp,
+                    objective_id,
+                    expected_revision,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery objective claim compare-and-set failed")
+            self._event(
+                connection,
+                "delivery_objective.claimed",
+                str(row["task_id"]),
+                None,
+                {
+                    "objective_id": objective_id,
+                    "owner_id": owner_id,
+                    "coordinator_epoch": coordinator_epoch,
+                    "lease_epoch": lease_epoch,
+                    "state_revision": revision,
+                    "stage": row["stage"],
+                    "stage_attempt": int(row["stage_attempt"]),
+                    "lease_expires_at": expires_at,
+                },
+                created_at=timestamp,
+            )
+            claimed = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert claimed is not None
+            return self._delivery_objective_row(connection, claimed)
+
+    @staticmethod
+    def _assert_delivery_objective_lease(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        timestamp: str,
+    ) -> None:
+        WorkbenchStore._assert_active_coordinator(connection, coordinator_epoch)
+        if (
+            row["state"] != "active"
+            or int(row["coordinator_epoch"]) != coordinator_epoch
+            or int(row["lease_epoch"]) != lease_epoch
+            or row["owner_id"] is None
+            or row["lease_expires_at"] is None
+            or WorkbenchStore._timestamp_is_due(str(row["lease_expires_at"]), timestamp)
+        ):
+            raise StateConflictError("delivery objective lease is stale")
+
+    def renew_delivery_objective_lease(
+        self,
+        objective_id: str,
+        *,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        expected_revision: int,
+        lease_seconds: int = 60,
+    ) -> dict[str, Any]:
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("delivery objective expected_revision must be positive")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= 3600:
+            raise ValueError("delivery objective lease_seconds must be between 1 and 3600")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            if int(row["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected delivery objective revision {expected_revision}, found {row['state_revision']}"
+                )
+            self._assert_delivery_objective_lease(
+                connection,
+                row,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            expires_at = self._timestamp_after(timestamp, lease_seconds)
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET state_revision = ?, lease_expires_at = ?, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ? AND lease_epoch = ?
+                """,
+                (revision, expires_at, timestamp, objective_id, expected_revision, lease_epoch),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery objective renewal compare-and-set failed")
+            self._event(
+                connection,
+                "delivery_objective.lease_renewed",
+                str(row["task_id"]),
+                None,
+                {
+                    "objective_id": objective_id,
+                    "coordinator_epoch": coordinator_epoch,
+                    "lease_epoch": lease_epoch,
+                    "state_revision": revision,
+                    "lease_expires_at": expires_at,
+                },
+                created_at=timestamp,
+            )
+            renewed = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert renewed is not None
+            return self._delivery_objective_row(connection, renewed)
+
+    def get_delivery_stage_dispatch(self, objective_id: str, stage: str, attempt: int) -> dict[str, Any] | None:
+        """Read prior intent without creating a newly authorized side effect."""
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_stage_dispatches WHERE objective_id = ? AND stage = ? AND stage_attempt = ?",
+                (objective_id, stage, attempt),
+            ).fetchone()
+            return self._delivery_stage_dispatch_row(row) if row is not None else None
+
+    def begin_delivery_stage_dispatch(
+        self,
+        objective_id: str,
+        *,
+        stage: str,
+        attempt: int,
+        expected_revision: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        adapter_name: str,
+    ) -> dict[str, Any]:
+        """Persist external-stage intent before invoking an adapter.
+
+        The deterministic dispatch ID is the adapter's idempotency key.  If a
+        process dies after intent but before a receipt, callers receive the
+        old dispatch and must reconcile it; they never receive permission to
+        invoke the effect again merely because a lease expired.
+        """
+
+        normalized_stage = normalize_stage(stage)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("delivery stage dispatch attempt must be positive")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("delivery stage dispatch expected_revision must be positive")
+        if not isinstance(adapter_name, str) or not adapter_name.strip():
+            raise ValueError("delivery stage dispatch adapter_name is required")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            self._assert_delivery_objective_lease(
+                connection,
+                row,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            if int(row["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected delivery objective revision {expected_revision}, found {row['state_revision']}"
+                )
+            request = json.loads(str(row["request_json"]))
+            required_stages = required_delivery_stages(request)
+            if normalized_stage not in required_stages:
+                raise StateConflictError("delivery stage was not explicitly requested")
+            if row["stage"] != normalized_stage or int(row["stage_attempt"]) != attempt:
+                raise StateConflictError("delivery stage dispatch is stale for the current stage attempt")
+            if normalized_stage == "deploy":
+                gate = self._deployment_admission_gate(connection)
+                if ((gate is not None and gate["objective_id"] != objective_id)
+                        or self._delivery_deployment_blockers_for_objective(connection, row)):
+                    raise DeliveryAdmissionBusy("authority work is still active")
+            request_hash = canonical_hash(
+                {
+                    "objective_id": objective_id,
+                    "objective_request_hash": row["request_hash"],
+                    "stage": normalized_stage,
+                    "attempt": attempt,
+                }
+            )
+            dispatch_id = "delivery-dispatch-" + request_hash[:24]
+            existing = connection.execute(
+                """
+                SELECT * FROM delivery_stage_dispatches
+                WHERE objective_id = ? AND stage = ? AND stage_attempt = ?
+                """,
+                (objective_id, normalized_stage, attempt),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash or existing["dispatch_id"] != dispatch_id:
+                    raise StateConflictError("delivery stage dispatch identity conflicts with prior intent")
+                return {**self._delivery_stage_dispatch_row(existing), "new": False}
+            connection.execute(
+                """
+                INSERT INTO delivery_stage_dispatches(
+                    dispatch_id, objective_id, task_id, stage, stage_attempt,
+                    request_hash, adapter_name, state, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)
+                """,
+                (
+                    dispatch_id,
+                    objective_id,
+                    row["task_id"],
+                    normalized_stage,
+                    attempt,
+                    request_hash,
+                    adapter_name.strip(),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            cursor = self._event(
+                connection,
+                "delivery_objective.stage_dispatched",
+                str(row["task_id"]),
+                None,
+                {
+                    "objective_id": objective_id,
+                    "dispatch_id": dispatch_id,
+                    "stage": normalized_stage,
+                    "attempt": attempt,
+                    "adapter_name": adapter_name.strip(),
+                },
+                created_at=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET last_material_progress_at = ?, last_progress_json = ?, updated_at = ?
+                WHERE objective_id = ?
+                """,
+                (
+                    timestamp,
+                    canonical_json(
+                        {
+                            "kind": "delivery_objective.stage_dispatched",
+                            "event_cursor": cursor,
+                            "dispatch_id": dispatch_id,
+                            "stage": normalized_stage,
+                            "attempt": attempt,
+                        }
+                    ),
+                    timestamp,
+                    objective_id,
+                ),
+            )
+            stored = connection.execute(
+                "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            assert stored is not None
+            return {**self._delivery_stage_dispatch_row(stored), "new": True}
+
+    def begin_delivery_stage_rollback(
+        self,
+        dispatch_id: str,
+        *,
+        coordinator_epoch: int,
+        lease_epoch: int,
+    ) -> dict[str, Any]:
+        """Fence one preauthorized reversible rollback beneath its deploy intent."""
+
+        if not isinstance(dispatch_id, str) or not dispatch_id.strip():
+            raise ValueError("delivery rollback dispatch_id is required")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT d.*, o.state AS objective_state, o.coordinator_epoch AS objective_epoch,
+                       o.lease_epoch AS objective_lease_epoch, o.owner_id, o.lease_expires_at
+                FROM delivery_stage_dispatches d
+                JOIN delivery_objectives o USING(objective_id)
+                WHERE d.dispatch_id = ?
+                """,
+                (dispatch_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(dispatch_id)
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (row["objective_id"],)
+            ).fetchone()
+            assert objective is not None
+            self._assert_delivery_objective_lease(
+                connection,
+                objective,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            if row["stage"] != "deploy":
+                raise StateConflictError("only a deployment dispatch can roll back")
+            if row["rollback_state"] is None:
+                connection.execute(
+                    """
+                    UPDATE delivery_stage_dispatches
+                    SET rollback_state = 'started', updated_at = ?
+                    WHERE dispatch_id = ? AND rollback_state IS NULL
+                    """,
+                    (timestamp, dispatch_id),
+                )
+                self._event(
+                    connection,
+                    "delivery_objective.rollback_dispatched",
+                    str(row["task_id"]),
+                    None,
+                    {"objective_id": row["objective_id"], "dispatch_id": dispatch_id},
+                    created_at=timestamp,
+                )
+                current = connection.execute(
+                    "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+                ).fetchone()
+                assert current is not None
+                return {**self._delivery_stage_dispatch_row(current), "new": True}
+            return {**self._delivery_stage_dispatch_row(row), "new": False}
+
+    def settle_delivery_stage_rollback(
+        self,
+        dispatch_id: str,
+        *,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist only an actually verified rollback receipt."""
+
+        if not isinstance(receipt, dict) or receipt.get("verified") is not True:
+            raise ValueError("delivery rollback receipt must explicitly verify rollback")
+        try:
+            json.dumps(receipt, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError("delivery rollback receipt must be JSON-safe") from error
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            dispatch = connection.execute(
+                "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            if dispatch is None:
+                raise KeyError(dispatch_id)
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (dispatch["objective_id"],)
+            ).fetchone()
+            assert objective is not None
+            self._assert_delivery_objective_lease(
+                connection,
+                objective,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            if dispatch["rollback_state"] == "settled":
+                existing = json.loads(str(dispatch["rollback_receipt_json"]))
+                if existing != receipt:
+                    raise StateConflictError("delivery rollback receipt conflicts with prior verified rollback")
+                return self._delivery_stage_dispatch_row(dispatch)
+            if dispatch["rollback_state"] != "started":
+                raise StateConflictError("delivery rollback was not durably dispatched")
+            changed = connection.execute(
+                """
+                UPDATE delivery_stage_dispatches
+                SET rollback_state = 'settled', rollback_receipt_json = ?, updated_at = ?
+                WHERE dispatch_id = ? AND rollback_state = 'started'
+                """,
+                (canonical_json(receipt), timestamp, dispatch_id),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery rollback receipt compare-and-set failed")
+            self._event(
+                connection,
+                "delivery_objective.rollback_verified",
+                str(dispatch["task_id"]),
+                None,
+                {
+                    "objective_id": dispatch["objective_id"],
+                    "dispatch_id": dispatch_id,
+                    "receipt": receipt,
+                },
+                created_at=timestamp,
+            )
+            stored = connection.execute(
+                "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            assert stored is not None
+            return self._delivery_stage_dispatch_row(stored)
+
+    def record_delivery_stage_receipt(
+        self,
+        objective_id: str,
+        receipt_id: str,
+        *,
+        stage: str,
+        attempt: int,
+        expected_revision: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        state: str | None = None,
+        status: str | None = None,
+        receipt: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        evidence_fingerprint: str | None = None,
+        identities: dict[str, Any] | None = None,
+        failure: dict[str, Any] | str | None = None,
+        retry_eligible: bool = False,
+        cost_delta: float = 0.0,
+        next_wakeup_at: str | None = None,
+        dispatch_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fence one stage receipt and advance only the current stage attempt.
+
+        A late webhook cannot pass the stage/attempt/revision/lease fence.  An
+        exact duplicate returns its original receipt without moving a wakeup or
+        appending another event.
+        """
+
+        if not isinstance(receipt_id, str) or not receipt_id.strip():
+            raise ValueError("delivery stage receipt_id is required")
+        if dispatch_id is not None and (not isinstance(dispatch_id, str) or not dispatch_id.strip()):
+            raise ValueError("delivery stage dispatch_id must be a non-empty string or null")
+        normalized_stage = normalize_stage(stage)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("delivery stage attempt must be positive")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("delivery stage expected_revision must be positive")
+        if isinstance(retry_eligible, bool) is False:
+            raise ValueError("delivery stage retry_eligible must be a boolean")
+        if (
+            isinstance(cost_delta, bool)
+            or not isinstance(cost_delta, (int, float))
+            or not math.isfinite(float(cost_delta))
+            or cost_delta < 0
+        ):
+            raise ValueError("delivery stage cost_delta must be a non-negative number")
+        if state is not None and status is not None and state != status:
+            raise ValueError("delivery stage state and status disagree")
+        receipt_state = str(status if status is not None else state if state is not None else "succeeded")
+        if receipt_state not in DELIVERY_RECEIPT_STATES:
+            raise ValueError(f"unsupported delivery receipt state {receipt_state!r}")
+        if receipt is not None and payload is not None and receipt != payload:
+            raise ValueError("delivery stage receipt and payload disagree")
+        receipt_body = receipt if receipt is not None else payload if payload is not None else {}
+        if not isinstance(receipt_body, dict):
+            raise ValueError("delivery stage receipt must be an object")
+        try:
+            json.dumps(receipt_body, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError("delivery stage receipt must be JSON-safe") from error
+        if evidence_fingerprint is not None and (
+            not isinstance(evidence_fingerprint, str) or not evidence_fingerprint.strip()
+        ):
+            raise ValueError("delivery evidence_fingerprint must be a non-empty string")
+        normalized_identities = normalize_identities(identities)
+        if receipt_state == "succeeded":
+            normalized_failure = None
+        else:
+            if failure is None:
+                raise ValueError("a non-succeeded delivery receipt requires a precise failure reason")
+            normalized_failure = normalize_wait_reason(
+                failure, default_kind="verification-failure"
+            )
+        requested_wakeup = normalize_timestamp(next_wakeup_at, "next_wakeup_at")
+        receipt_hash = canonical_hash(
+            {
+                "objective_id": objective_id,
+                "stage": normalized_stage,
+                "attempt": attempt,
+                "state": receipt_state,
+                "receipt": receipt_body,
+                "evidence_fingerprint": evidence_fingerprint,
+                "identities": normalized_identities,
+                "failure": normalized_failure,
+                "retry_eligible": retry_eligible,
+                "cost_delta": float(cost_delta),
+                "dispatch_id": dispatch_id,
+            }
+        )
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM delivery_stage_receipts WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["receipt_hash"] != receipt_hash:
+                    raise CommandConflictError(
+                        f"delivery stage receipt {receipt_id!r} was already used with different content"
+                    )
+                objective = connection.execute(
+                    "SELECT * FROM delivery_objectives WHERE objective_id = ?",
+                    (existing["objective_id"],),
+                ).fetchone()
+                if objective is None:
+                    raise StateConflictError("delivery stage receipt has no objective")
+                return {
+                    "receipt": self._delivery_stage_receipt_row(existing),
+                    "objective": self._delivery_objective_row(connection, objective),
+                    "idempotent": True,
+                }
+            duplicate = connection.execute(
+                """
+                SELECT * FROM delivery_stage_receipts
+                WHERE objective_id = ? AND stage = ? AND stage_attempt = ? AND receipt_hash = ?
+                """,
+                (objective_id, normalized_stage, attempt, receipt_hash),
+            ).fetchone()
+            if duplicate is not None:
+                objective = connection.execute(
+                    "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+                ).fetchone()
+                if objective is None:
+                    raise StateConflictError("delivery stage receipt has no objective")
+                return {
+                    "receipt": self._delivery_stage_receipt_row(duplicate),
+                    "objective": self._delivery_objective_row(connection, objective),
+                    "idempotent": True,
+                }
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            self._assert_delivery_objective_lease(
+                connection,
+                row,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            if int(row["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected delivery objective revision {expected_revision}, found {row['state_revision']}"
+                )
+            if row["stage"] != normalized_stage or int(row["stage_attempt"]) != attempt:
+                raise StateConflictError(
+                    "delivery stage receipt is stale for the current stage attempt"
+                )
+            if receipt_state == "succeeded" and evidence_fingerprint is None:
+                raise StateConflictError("a successful delivery stage requires an Evidence fingerprint")
+            request = json.loads(str(row["request_json"]))
+            required_stages = required_delivery_stages(request)
+            if normalized_stage not in required_stages:
+                raise StateConflictError("delivery stage was not explicitly requested")
+            if dispatch_id is not None:
+                dispatch = connection.execute(
+                    "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+                ).fetchone()
+                if (
+                    dispatch is None
+                    or dispatch["objective_id"] != objective_id
+                    or dispatch["stage"] != normalized_stage
+                    or int(dispatch["stage_attempt"]) != attempt
+                    or dispatch["state"] != "started"
+                ):
+                    raise StateConflictError("delivery stage receipt does not match an active dispatch intent")
+            if receipt_state == "succeeded" and normalized_stage == "live-verify":
+                try:
+                    validate_live_verification_receipt(request, receipt_body)
+                except ValueError as error:
+                    raise StateConflictError(str(error)) from error
+            try:
+                merged_identities = merge_identities(
+                    json.loads(str(row["identities_json"])), normalized_identities
+                )
+            except ValueError as error:
+                raise StateConflictError(str(error)) from error
+            budget = normalize_budget(json.loads(str(row["budget_json"])))
+            elapsed = max(
+                0.0,
+                (datetime.fromisoformat(timestamp) - datetime.fromisoformat(str(row["created_at"]))).total_seconds(),
+            )
+            budget["elapsed_seconds"] = max(float(budget["elapsed_seconds"]), elapsed)
+            budget["cost_used"] = float(budget["cost_used"]) + float(cost_delta)
+            time_exhausted = budget["elapsed_seconds"] > float(budget["time_budget_seconds"])
+            cost_exhausted = budget["cost_used"] > float(budget["cost_budget"])
+            evidence = json.loads(str(row["evidence_fingerprints_json"]))
+            if evidence_fingerprint is not None:
+                evidence[normalized_stage] = {
+                    "attempt": attempt,
+                    "fingerprint": evidence_fingerprint,
+                }
+            receipt_document: dict[str, Any] = dict(receipt_body)
+            if normalized_failure is not None:
+                receipt_document["failure"] = normalized_failure
+            next_state: str
+            next_stage = normalized_stage
+            next_attempt = attempt
+            wait_reason: dict[str, Any] | None = None
+            if receipt_state == "succeeded":
+                if normalized_stage == required_stages[-1]:
+                    succeeded_stages = {
+                        str(item["stage"])
+                        for item in connection.execute(
+                            """
+                            SELECT DISTINCT stage FROM delivery_stage_receipts
+                            WHERE objective_id = ? AND state = 'succeeded'
+                            """,
+                            (objective_id,),
+                        ).fetchall()
+                    }
+                    succeeded_stages.add(normalized_stage)
+                    if set(required_stages) - succeeded_stages:
+                        raise StateConflictError(
+                            "delivery cannot complete before every requested stage has a success receipt"
+                        )
+                    missing_identities = [
+                        name for name in required_completion_identities(request) if name not in merged_identities
+                    ]
+                    if missing_identities:
+                        raise StateConflictError(
+                            "delivery completion requires exact "
+                            + ", ".join(missing_identities)
+                            + " identities"
+                        )
+                    next_state = "complete"
+                    next_action = {"action": "complete", "stage": normalized_stage}
+                    wakeup = None
+                else:
+                    stage_index = required_stages.index(normalized_stage)
+                    next_stage = required_stages[stage_index + 1]
+                    next_attempt = 1
+                    next_state = "active"
+                    next_action = {"action": "execute_stage", "stage": next_stage}
+                    wakeup = timestamp
+            else:
+                assert normalized_failure is not None
+                recovery_action = recovery_action_for_failure(normalized_failure)
+                budget["attempts_used"] = int(budget["attempts_used"]) + 1
+                retry_allowed = (
+                    retry_eligible
+                    and recovery_action["automatic"]
+                    and budget["attempts_used"] < int(budget["attempt_limit"])
+                    and not time_exhausted
+                    and not cost_exhausted
+                )
+                if retry_allowed:
+                    next_state = "waiting"
+                    next_attempt = attempt + 1
+                    exponent = min(30, max(0, int(budget["attempts_used"]) - 1))
+                    backoff = min(
+                        int(budget["max_backoff_seconds"]),
+                        int(budget["base_backoff_seconds"]) * (2**exponent),
+                    )
+                    wakeup = requested_wakeup or self._timestamp_after(timestamp, backoff)
+                    wait_reason = {
+                        **normalized_failure,
+                        "retry_eligible": True,
+                        "next_attempt": next_attempt,
+                        "backoff_seconds": backoff,
+                        "budget": budget,
+                        "recovery": recovery_action,
+                    }
+                    next_action = {
+                        "action": recovery_action["action"],
+                        "stage": normalized_stage,
+                        "attempt": next_attempt,
+                        "retry_after": wakeup,
+                    }
+                else:
+                    next_state = "needs_decision"
+                    wakeup = None
+                    resolution = (
+                        "reconcile_authoritatively"
+                        if normalized_failure["kind"] == "unknown-effects"
+                        else "grant_scope_limited_authorization"
+                        if normalized_failure["kind"] == "permission-denied"
+                        else "provide_essential_user_choice"
+                        if normalized_failure["kind"] == "missing-essential-user-choice"
+                        else "choose_recovery_or_stop"
+                    )
+                    wait_reason = {
+                        **normalized_failure,
+                        "retry_eligible": False,
+                        "resolution": resolution,
+                        "budget": budget,
+                        "recovery": recovery_action,
+                    }
+                    next_action = {
+                        "action": "request_human_decision",
+                        "stage": normalized_stage,
+                        "resolution": resolution,
+                        "recommended_recovery": recovery_action["action"],
+                    }
+            revision = expected_revision + 1
+            event_type = (
+                "delivery_objective.stage_succeeded"
+                if receipt_state == "succeeded"
+                else "delivery_objective.retry_scheduled"
+                if next_state == "waiting"
+                else "delivery_objective.decision_required"
+            )
+            connection.execute(
+                """
+                INSERT INTO delivery_stage_receipts(
+                    receipt_id, objective_id, task_id, stage, stage_attempt, receipt_hash,
+                    state, receipt_json, evidence_fingerprint, identities_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt_id,
+                    objective_id,
+                    row["task_id"],
+                    normalized_stage,
+                    attempt,
+                    receipt_hash,
+                    receipt_state,
+                    canonical_json(receipt_document),
+                    evidence_fingerprint,
+                    canonical_json(normalized_identities),
+                    timestamp,
+                ),
+            )
+            event_payload = {
+                "objective_id": objective_id,
+                "receipt_id": receipt_id,
+                "stage": normalized_stage,
+                "attempt": attempt,
+                "receipt_state": receipt_state,
+                "next_state": next_state,
+                "next_stage": next_stage,
+                "next_attempt": next_attempt,
+                "state_revision": revision,
+                "next_wakeup_at": wakeup,
+                "evidence_fingerprint": evidence_fingerprint,
+            }
+            cursor = self._event(
+                connection,
+                event_type,
+                str(row["task_id"]),
+                None,
+                event_payload,
+                created_at=timestamp,
+            )
+            progress = {
+                "kind": event_type,
+                "event_cursor": cursor,
+                "receipt_id": receipt_id,
+                "stage": normalized_stage,
+                "attempt": attempt,
+                "receipt_state": receipt_state,
+            }
+            retains_lease = next_state == "active"
+            next_owner = row["owner_id"] if retains_lease else None
+            next_coordinator_epoch = int(row["coordinator_epoch"]) if retains_lease else 0
+            next_lease_epoch = lease_epoch if retains_lease else 0
+            next_lease_expires_at = row["lease_expires_at"] if retains_lease else None
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET state = ?, stage = ?, stage_attempt = ?, state_revision = ?,
+                    next_action_json = ?, owner_id = ?, coordinator_epoch = ?, lease_epoch = ?,
+                    lease_expires_at = ?, next_wakeup_at = ?, last_material_progress_at = ?,
+                    last_progress_json = ?, wait_reason_json = ?, budget_json = ?,
+                    evidence_fingerprints_json = ?, identities_json = ?, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ? AND lease_epoch = ?
+                """,
+                (
+                    next_state,
+                    next_stage,
+                    next_attempt,
+                    revision,
+                    canonical_json(next_action),
+                    next_owner,
+                    next_coordinator_epoch,
+                    next_lease_epoch,
+                    next_lease_expires_at,
+                    wakeup,
+                    timestamp,
+                    canonical_json(progress),
+                    canonical_json(wait_reason) if wait_reason is not None else None,
+                    canonical_json(budget),
+                    canonical_json(evidence),
+                    canonical_json(merged_identities),
+                    timestamp,
+                    objective_id,
+                    expected_revision,
+                    lease_epoch,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery stage receipt compare-and-set failed")
+            if dispatch_id is not None:
+                settled_dispatch = connection.execute(
+                    """
+                    UPDATE delivery_stage_dispatches
+                    SET state = 'settled', receipt_id = ?, updated_at = ?
+                    WHERE dispatch_id = ? AND state = 'started'
+                    """,
+                    (receipt_id, timestamp, dispatch_id),
+                ).rowcount
+                if settled_dispatch != 1:
+                    raise StateConflictError("delivery stage dispatch settlement compare-and-set failed")
+            stored_receipt = connection.execute(
+                "SELECT * FROM delivery_stage_receipts WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert stored_receipt is not None and objective is not None
+            return {
+                "receipt": self._delivery_stage_receipt_row(stored_receipt),
+                "objective": self._delivery_objective_row(connection, objective),
+                "idempotent": False,
+            }
+
+    @staticmethod
+    def _deployment_admission_gate(connection: sqlite3.Connection) -> dict[str, Any] | None:
+        row = connection.execute(
+            """
+            SELECT o.objective_id, o.task_id, o.stage, o.state FROM delivery_objectives o
+            WHERE o.state NOT IN ('complete', 'cancelled') AND (
+              (o.stage = 'deploy' AND (
+                json_extract(o.last_progress_json, '$.kind') IN
+                  ('delivery_objective.deployment_safe_point_waiting', 'delivery_objective.deployment_safe_point_ready')
+                OR EXISTS (SELECT 1 FROM delivery_stage_dispatches d WHERE d.objective_id = o.objective_id
+                           AND d.stage = 'deploy' AND d.state = 'started')
+                OR (json_extract(o.wait_reason_json, '$.kind') = 'unknown-effects'
+                    AND EXISTS (SELECT 1 FROM delivery_stage_dispatches d WHERE d.objective_id = o.objective_id AND d.stage = 'deploy'))
+              )) OR (o.stage = 'live-verify' AND EXISTS (
+                SELECT 1 FROM delivery_stage_receipts r WHERE r.objective_id = o.objective_id
+                AND r.stage = 'deploy' AND r.state = 'succeeded'))
+            ) ORDER BY o.created_at, o.objective_id LIMIT 1
+            """
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def delivery_admission_gate(self) -> dict[str, Any] | None:
+        """Expose the authority rollout currently holding new worker admission."""
+        with self.connection() as connection:
+            return self._deployment_admission_gate(connection)
+
+    @staticmethod
+    def _delivery_deployment_blockers_for_objective(
+        connection: sqlite3.Connection,
+        objective: sqlite3.Row,
+    ) -> list[dict[str, Any]]:
+        """Return all authority work that must drain before its service restarts."""
+
+        task = connection.execute(
+            "SELECT contract_json FROM tasks WHERE task_id = ?", (objective["task_id"],)
+        ).fetchone()
+        if task is None:
+            # A planning reservation has no worker worktree to drain yet.
+            return []
+        contract = json.loads(str(task["contract_json"]))
+        repository = contract.get("repository")
+        if not isinstance(repository, str) or not repository:
+            raise StateConflictError("delivery objective task has no repository identity")
+        rows = connection.execute(
+            """
+            SELECT n.task_id, n.node_id, n.attempt, n.worker_id, n.worktree,
+                   n.started_at, t.contract_json
+            FROM nodes n JOIN tasks t USING(task_id)
+            WHERE n.state = 'running'
+            ORDER BY n.started_at, n.task_id, n.node_id
+            """
+        ).fetchall()
+        blockers: list[dict[str, Any]] = []
+        for row in rows:
+            blockers.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "node_id": str(row["node_id"]),
+                    "attempt": int(row["attempt"]),
+                    "worker_id": row["worker_id"],
+                    "worktree": row["worktree"],
+                    "started_at": row["started_at"],
+                }
+            )
+        for planning in connection.execute("SELECT task_id, command_id, attempt, started_at FROM planning_requests WHERE state = 'running'").fetchall():
+            blockers.append({"task_id": planning["task_id"], "node_id": None, "attempt": planning["attempt"],
+                             "worker_id": None, "worktree": None, "started_at": planning["started_at"],
+                             "kind": "planning", "command_id": planning["command_id"]})
+        return blockers
+
+    def delivery_deployment_blockers(self, objective_id: str) -> list[dict[str, Any]]:
+        """Read the concrete worker leases that must drain before deployment."""
+
+        with self.connection() as connection:
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if objective is None:
+                raise KeyError(objective_id)
+            return self._delivery_deployment_blockers_for_objective(connection, objective)
+
+    def defer_delivery_observation(
+        self,
+        objective_id: str,
+        *,
+        expected_revision: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        reason: dict[str, Any],
+        next_wakeup_at: str | None,
+        dispatch_id: str | None,
+    ) -> dict[str, Any]:
+        """Release a stage lease for a pending observation without retrying its effect.
+
+        The dispatch remains unsettled. A later owner must reconcile that same
+        intent, while stage attempts and failure budgets remain unchanged.
+        """
+        wait = normalize_wait_reason(reason)
+        timestamp = now_iso()
+        wakeup = normalize_timestamp(next_wakeup_at, "next_wakeup_at")
+        if wakeup is None or self._timestamp_is_due(wakeup, timestamp):
+            wakeup = self._timestamp_after(timestamp, 5)
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(objective_id)
+            self._assert_delivery_objective_lease(
+                connection, row, coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch, timestamp=timestamp,
+            )
+            if int(row["state_revision"]) != expected_revision:
+                raise StateConflictError("delivery observation revision is stale")
+            dispatch = connection.execute(
+                "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
+            ).fetchone()
+            if dispatch_id is None:
+                if row["stage"] != "deploy" or connection.execute(
+                    "SELECT 1 FROM delivery_stage_dispatches WHERE objective_id = ? AND stage = 'deploy' AND stage_attempt = ?",
+                    (objective_id, row["stage_attempt"]),
+                ).fetchone():
+                    raise StateConflictError("only an undispatched rollout may wait without intent")
+            elif (dispatch is None or dispatch["objective_id"] != objective_id
+                    or dispatch["stage"] != row["stage"]
+                    or dispatch["stage_attempt"] != row["stage_attempt"]
+                    or dispatch["state"] != "started"):
+                raise StateConflictError("delivery observation has no current unsettled dispatch")
+            previous = json.loads(str(row["last_progress_json"]))
+            observation = {
+                "kind": "delivery_objective.observation_waiting",
+                "stage": row["stage"], "dispatch_id": dispatch_id, "reason": wait,
+            }
+            changed_observation = any(previous.get(key) != value for key, value in observation.items())
+            if changed_observation:
+                cursor = self._event(
+                    connection, "delivery_objective.observation_waiting", str(row["task_id"]), None,
+                    {"objective_id": objective_id, **observation, "next_wakeup_at": wakeup},
+                    created_at=timestamp,
+                )
+                observation["event_cursor"] = cursor
+            else:
+                observation = previous
+            next_action = {
+                "action": "reconcile_pending_observation", "stage": row["stage"],
+                "dispatch_id": dispatch_id, "retry_after": wakeup,
+            }
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET state = 'waiting', state_revision = state_revision + 1,
+                    owner_id = NULL, coordinator_epoch = 0, lease_epoch = 0,
+                    lease_expires_at = NULL, next_wakeup_at = ?, next_action_json = ?,
+                    wait_reason_json = ?, last_progress_json = ?,
+                    last_material_progress_at = ?, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ? AND lease_epoch = ?
+                """,
+                (wakeup, canonical_json(next_action), canonical_json(wait), canonical_json(observation),
+                 timestamp if changed_observation else row["last_material_progress_at"], timestamp,
+                 objective_id, expected_revision, lease_epoch),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery observation compare-and-set failed")
+            current = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert current is not None
+            return self._delivery_objective_row(connection, current)
+
+    def defer_delivery_deployment_safe_point(
+        self,
+        objective_id: str,
+        *,
+        expected_revision: int,
+        coordinator_epoch: int,
+        lease_epoch: int,
+        blockers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Durably wait for active workers rather than interrupting a rollout."""
+
+        if not isinstance(blockers, list) or not blockers:
+            raise ValueError("deployment safe-point wait requires active worker blockers")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("delivery safe-point expected_revision must be positive")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if objective is None:
+                raise KeyError(objective_id)
+            self._assert_delivery_objective_lease(
+                connection,
+                objective,
+                coordinator_epoch=coordinator_epoch,
+                lease_epoch=lease_epoch,
+                timestamp=timestamp,
+            )
+            if int(objective["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected delivery objective revision {expected_revision}, found {objective['state_revision']}"
+                )
+            if objective["stage"] != "deploy":
+                raise StateConflictError("only deployment may wait for a rollout safe point")
+            actual_blockers = self._delivery_deployment_blockers_for_objective(connection, objective)
+            if not actual_blockers:
+                raise StateConflictError("deployment workers already drained; claim the stage instead")
+            due_at = str(objective["due_at"])
+            next_wakeup_at = self._timestamp_after(timestamp, 5)
+            next_action = {
+                "action": "wait_for_active_workers_to_drain",
+                "stage": "deploy",
+                "trigger": "worker_settlement_or_bounded_reconciliation",
+                "retry_after": next_wakeup_at,
+            }
+            wait_reason = {
+                "kind": "active-workers-draining",
+                "detail": "deployment waits for all authority work to reach a safe point",
+                "blockers": actual_blockers,
+                "due_at": due_at,
+            }
+            revision = expected_revision + 1
+            cursor = self._event(
+                connection,
+                "delivery_objective.deployment_safe_point_waiting",
+                str(objective["task_id"]),
+                None,
+                {
+                    "objective_id": objective_id,
+                    "stage": "deploy",
+                    "attempt": int(objective["stage_attempt"]),
+                    "state_revision": revision,
+                    "blockers": actual_blockers,
+                    "next_wakeup_at": next_wakeup_at,
+                },
+                created_at=timestamp,
+            )
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET state = 'waiting', state_revision = ?, next_action_json = ?,
+                    owner_id = NULL, coordinator_epoch = 0, lease_epoch = 0,
+                    lease_expires_at = NULL, next_wakeup_at = ?,
+                    last_material_progress_at = ?, last_progress_json = ?,
+                    wait_reason_json = ?, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ? AND lease_epoch = ?
+                """,
+                (
+                    revision,
+                    canonical_json(next_action),
+                    next_wakeup_at,
+                    timestamp,
+                    canonical_json(
+                        {
+                            "kind": "delivery_objective.deployment_safe_point_waiting",
+                            "event_cursor": cursor,
+                            "stage": "deploy",
+                            "attempt": int(objective["stage_attempt"]),
+                            "blocker_count": len(actual_blockers),
+                        }
+                    ),
+                    canonical_json(wait_reason),
+                    timestamp,
+                    objective_id,
+                    expected_revision,
+                    lease_epoch,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("delivery deployment safe-point compare-and-set failed")
+            current = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            assert current is not None
+            return self._delivery_objective_row(connection, current)
+
+    def _reconcile_delivery_safe_point_waits(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        timestamp: str,
+    ) -> int:
+        """Wake each recorded safe point once its exact blocking leases drain."""
+
+        rows = connection.execute(
+            """
+            SELECT * FROM delivery_objectives
+            WHERE state = 'waiting' AND stage = 'deploy' AND wait_reason_json IS NOT NULL
+            """
+        ).fetchall()
+        resumed = 0
+        for objective in rows:
+            try:
+                wait_reason = json.loads(str(objective["wait_reason_json"]))
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError("deployment safe-point wait is invalid") from error
+            if wait_reason.get("kind") != "active-workers-draining":
+                continue
+            recorded = wait_reason.get("blockers")
+            if not isinstance(recorded, list):
+                raise StateConflictError("deployment safe-point blockers are invalid")
+            if wait_reason.get("safe_point_ready") is True:
+                continue
+            still_running = bool(self._delivery_deployment_blockers_for_objective(connection, objective))
+            for blocker in recorded:
+                if not isinstance(blocker, dict):
+                    raise StateConflictError("deployment safe-point blocker is invalid")
+                row = connection.execute(
+                    "SELECT state, attempt FROM nodes WHERE task_id = ? AND node_id = ?",
+                    (blocker.get("task_id"), blocker.get("node_id")),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["state"] == "running"
+                    and int(row["attempt"]) == blocker.get("attempt")
+                ):
+                    still_running = True
+                    break
+            if still_running:
+                continue
+            # A newly running worker is checked again immediately before the
+            # deploy adapter call.  This wake only says the recorded lease
+            # set has drained; it never claims the rollout was successful.
+            revision = int(objective["state_revision"])
+            cursor = self._event(
+                connection,
+                "delivery_objective.deployment_safe_point_ready",
+                str(objective["task_id"]),
+                None,
+                {
+                    "objective_id": objective["objective_id"],
+                    "stage": "deploy",
+                    "attempt": int(objective["stage_attempt"]),
+                    "state_revision": revision,
+                    "next_wakeup_at": timestamp,
+                },
+                created_at=timestamp,
+            )
+            changed = connection.execute(
+                """
+                UPDATE delivery_objectives
+                SET next_wakeup_at = ?, last_material_progress_at = ?,
+                    last_progress_json = ?, wait_reason_json = ?, updated_at = ?
+                WHERE objective_id = ? AND state_revision = ? AND state = 'waiting'
+                """,
+                (
+                    timestamp,
+                    timestamp,
+                    canonical_json(
+                        {
+                            "kind": "delivery_objective.deployment_safe_point_ready",
+                            "event_cursor": cursor,
+                            "stage": "deploy",
+                            "attempt": int(objective["stage_attempt"]),
+                        }
+                    ),
+                    canonical_json({**wait_reason, "safe_point_ready": True}),
+                    timestamp,
+                    objective["objective_id"],
+                    objective["state_revision"],
+                ),
+            ).rowcount
+            if changed == 1:
+                resumed += 1
+        return resumed
+
+    def reconcile_delivery_safe_point_waits(self) -> int:
+        """Event-driven callers and periodic coordinator ticks share this wakeup."""
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            return self._reconcile_delivery_safe_point_waits(connection, timestamp=timestamp)
+
+    @staticmethod
+    def _normalize_delivery_authorization_scope(scope: object) -> dict[str, Any]:
+        """Require one exact GitHub or deployment subset, never a blanket grant."""
+
+        if not isinstance(scope, dict) or not scope:
+            raise ValueError("delivery authorization scope must be a non-empty object")
+        if "deployment" in scope:
+            if set(scope) != {"deployment"}:
+                raise ValueError("deployment authorization may bind only one deployment endpoint")
+            deployment = scope["deployment"]
+            if not isinstance(deployment, dict):
+                raise ValueError("deployment authorization scope.deployment must be an object")
+            unknown = set(deployment) - {"target"}
+            target = deployment.get("target")
+            if unknown or not isinstance(target, str) or not target.strip():
+                raise ValueError("deployment authorization scope must bind exactly one target")
+            return {
+                "deployment": {"target": target.strip()},
+                "declared_scope": dict(scope),
+            }
+        raw_delivery = scope.get("delivery", scope)
+        if not isinstance(raw_delivery, dict):
+            raise ValueError("delivery authorization scope.delivery must be an object")
+        required = {"remote", "base_branch", "merge"}
+        unknown = set(raw_delivery) - {"remote", "base_branch", "merge", "release_tag"}
+        if unknown or not required.issubset(raw_delivery):
+            raise ValueError(
+                "delivery authorization scope must bind remote, base_branch, merge, and optional release_tag"
+            )
+        remote = raw_delivery["remote"]
+        base_branch = raw_delivery["base_branch"]
+        merge = raw_delivery["merge"]
+        release_tag = raw_delivery.get("release_tag")
+        if not isinstance(remote, str) or not remote.strip():
+            raise ValueError("delivery authorization remote is required")
+        if not isinstance(base_branch, str) or not base_branch.strip():
+            raise ValueError("delivery authorization base_branch is required")
+        if not isinstance(merge, bool):
+            raise ValueError("delivery authorization merge must be a boolean")
+        if release_tag is not None and (not isinstance(release_tag, str) or not release_tag.strip()):
+            raise ValueError("delivery authorization release_tag must be a non-empty string or null")
+        return {
+            "delivery": {
+                "remote": remote.strip(),
+                "base_branch": base_branch.strip(),
+                "merge": merge,
+                "release_tag": release_tag.strip() if isinstance(release_tag, str) else None,
+            },
+            "declared_scope": dict(scope),
+        }
+
+    @staticmethod
+    def _normalize_delivery_authority(authority: object) -> dict[str, Any]:
+        if not isinstance(authority, dict) or not authority:
+            raise ValueError("delivery authorization authority must be a non-empty object")
+        try:
+            json.dumps(authority, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        except (TypeError, ValueError) as error:
+            raise ValueError("delivery authorization authority must be JSON-safe") from error
+        return dict(authority)
+
+    @staticmethod
+    def _authorization_matches_request(scope: dict[str, Any], request: dict[str, Any]) -> bool:
+        delivery = scope.get("delivery")
+        if not isinstance(delivery, dict):
+            return False
+        for key in ("remote", "base_branch", "merge", "release_tag"):
+            if delivery.get(key) != request.get(key):
+                return False
+        return True
+
+    def _matching_delivery_authorization(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        request: dict[str, Any],
+        *,
+        timestamp: str,
+    ) -> dict[str, Any] | None:
+        rows = connection.execute(
+            """
+            SELECT * FROM delivery_authorization_receipts
+            WHERE task_id = ? AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY created_at DESC, rowid DESC
+            """,
+            (task_id, timestamp),
+        ).fetchall()
+        for row in rows:
+            candidate = self._delivery_authorization_row(row)
+            if self._authorization_matches_request(candidate["scope"], request):
+                return candidate if candidate["decision"] == "granted" else None
+        return None
+
+    @staticmethod
+    def _deployment_authorization_matches_request(scope: dict[str, Any], target: str) -> bool:
+        deployment = scope.get("deployment")
+        return isinstance(deployment, dict) and deployment.get("target") == target
+
+    def _matching_deployment_authorization(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        target: str,
+        *,
+        timestamp: str,
+    ) -> dict[str, Any] | None:
+        rows = connection.execute(
+            """
+            SELECT * FROM delivery_authorization_receipts
+            WHERE task_id = ? AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
+            ORDER BY created_at DESC, rowid DESC
+            """,
+            (task_id, timestamp),
+        ).fetchall()
+        for row in rows:
+            candidate = self._delivery_authorization_row(row)
+            if self._deployment_authorization_matches_request(candidate["scope"], target):
+                return candidate if candidate["decision"] == "granted" else None
+        return None
+
+    def delivery_stage_authorization(self, objective_id: str, stage: str) -> dict[str, Any]:
+        """Resolve the least authority needed for one external lifecycle stage.
+
+        The task's old immutable external-write bit continues to cover its
+        exact GitHub route for compatibility.  A scope-limited receipt is
+        otherwise required, and deployment always requires its own endpoint
+        receipt.  No worker executor setting is consulted here.
+        """
+
+        normalized_stage = normalize_stage(stage)
+        with self.connection() as connection:
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)
+            ).fetchone()
+            if objective is None:
+                raise KeyError(objective_id)
+            request = json.loads(str(objective["request_json"]))
+            if normalized_stage not in required_delivery_stages(request):
+                return {
+                    "authorized": False,
+                    "reason": "delivery stage was not explicitly requested",
+                    "authorization": None,
+                }
+            if normalized_stage not in {"integrate", "ci", "publish", "deploy", "live-verify"}:
+                return {"authorized": True, "reason": "no external endpoint", "authorization": None}
+            task = connection.execute(
+                "SELECT state, contract_json FROM tasks WHERE task_id = ?", (objective["task_id"],)
+            ).fetchone()
+            if task is None or task["state"] != "accepted":
+                return {
+                    "authorized": False,
+                    "reason": "verifier acceptance is required before coordinator delivery",
+                    "authorization": None,
+                }
+            endpoints = request["requested_endpoints"]
+            timestamp = now_iso()
+            if normalized_stage in {"integrate", "ci", "publish"}:
+                github = endpoints.get("github") if isinstance(endpoints, dict) else None
+                if not isinstance(github, dict):
+                    return {
+                        "authorized": False,
+                        "reason": "GitHub endpoint was not explicitly requested",
+                        "authorization": None,
+                    }
+                delivery_request = {
+                    "task_id": str(objective["task_id"]),
+                    "remote": github.get("remote", "origin"),
+                    "base_branch": github.get("base_branch"),
+                    "merge": github.get("merge", False),
+                    "release_tag": github.get("release_tag"),
+                }
+                if (
+                    not isinstance(delivery_request["remote"], str)
+                    or not isinstance(delivery_request["base_branch"], str)
+                    or not isinstance(delivery_request["merge"], bool)
+                    or (
+                        delivery_request["release_tag"] is not None
+                        and not isinstance(delivery_request["release_tag"], str)
+                    )
+                ):
+                    return {
+                        "authorized": False,
+                        "reason": "requested GitHub endpoint has an invalid exact delivery scope",
+                        "authorization": None,
+                    }
+                contract = json.loads(str(task["contract_json"]))
+                if contract.get("external_write_permission") is True:
+                    return {
+                        "authorized": True,
+                        "reason": "immutable task delivery authority",
+                        "authorization": {"source": "immutable-task-contract"},
+                    }
+                authorization = self._matching_delivery_authorization(
+                    connection,
+                    str(objective["task_id"]),
+                    delivery_request,
+                    timestamp=timestamp,
+                )
+                return {
+                    "authorized": authorization is not None,
+                    "reason": (
+                        "scope-limited GitHub delivery authorization is required"
+                        if authorization is None
+                        else "scope-limited GitHub delivery authorization"
+                    ),
+                    "authorization": authorization,
+                }
+            deployment = endpoints.get("deployment") if isinstance(endpoints, dict) else None
+            if not isinstance(deployment, dict) or not isinstance(deployment.get("target"), str):
+                return {
+                    "authorized": False,
+                    "reason": "deployment endpoint was not explicitly requested",
+                    "authorization": None,
+                }
+            authorization = self._matching_deployment_authorization(
+                connection,
+                str(objective["task_id"]),
+                deployment["target"],
+                timestamp=timestamp,
+            )
+            return {
+                "authorized": authorization is not None,
+                "reason": (
+                    "scope-limited deployment authorization is required"
+                    if authorization is None
+                    else "scope-limited deployment authorization"
+                ),
+                "authorization": authorization,
+            }
+
+    def record_delivery_authorization(
+        self,
+        task_id: str,
+        authorization_id: str,
+        *,
+        scope: dict[str, Any],
+        authority: dict[str, Any],
+        decision: str = "granted",
+        granted_by: str = "coordinator",
+        objective_id: str | None = None,
+        expires_at: str | None = None,
+        expected_task_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Append an explicit delivery overlay without mutating the contract."""
+
+        if not isinstance(authorization_id, str) or not authorization_id.strip():
+            raise ValueError("delivery authorization_id is required")
+        if decision not in {"granted", "denied"}:
+            raise ValueError("delivery authorization decision must be granted or denied")
+        if not isinstance(granted_by, str) or not granted_by.strip():
+            raise ValueError("delivery authorization granted_by is required")
+        normalized_scope = self._normalize_delivery_authorization_scope(scope)
+        normalized_authority = self._normalize_delivery_authority(authority)
+        normalized_expiry = normalize_timestamp(expires_at, "expires_at")
+        request_hash = canonical_hash(
+            {
+                "task_id": task_id,
+                "scope": normalized_scope,
+                "authority": normalized_authority,
+                "decision": decision,
+                "granted_by": granted_by.strip(),
+                "objective_id": objective_id,
+                "expires_at": normalized_expiry,
+            }
+        )
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM delivery_authorization_receipts WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise CommandConflictError(
+                        f"delivery authorization {authorization_id!r} was already used with a different request"
+                    )
+                objective = connection.execute(
+                    "SELECT * FROM delivery_objectives WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                return {
+                    "authorization": self._delivery_authorization_row(existing),
+                    "objective": (
+                        self._delivery_objective_row(connection, objective)
+                        if objective is not None
+                        else None
+                    ),
+                    "idempotent": True,
+                }
+            task = connection.execute(
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if task["state"] != "accepted":
+                raise StateConflictError(
+                    f"task {task_id} is {task['state']}, expected accepted for delivery authorization"
+                )
+            if expected_task_revision is not None and int(task["state_revision"]) != expected_task_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_task_revision}, found {task['state_revision']}"
+                )
+            objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if objective_id is not None:
+                if objective is None or objective["objective_id"] != objective_id:
+                    raise StateConflictError("delivery authorization objective does not belong to the task")
+            linked_objective_id = str(objective["objective_id"]) if objective is not None else None
+            connection.execute(
+                """
+                INSERT INTO delivery_authorization_receipts(
+                    authorization_id, task_id, objective_id, request_hash, scope_json,
+                    authority_json, decision, granted_by, expires_at, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    authorization_id,
+                    task_id,
+                    linked_objective_id,
+                    request_hash,
+                    canonical_json(normalized_scope),
+                    canonical_json(normalized_authority),
+                    decision,
+                    granted_by.strip(),
+                    normalized_expiry,
+                    timestamp,
+                ),
+            )
+            cursor = self._event(
+                connection,
+                f"delivery.authorization_{decision}",
+                task_id,
+                None,
+                {
+                    "authorization_id": authorization_id,
+                    "objective_id": linked_objective_id,
+                    "request_hash": request_hash,
+                    "scope": normalized_scope.get("delivery", normalized_scope.get("deployment")),
+                    "expires_at": normalized_expiry,
+                },
+                created_at=timestamp,
+            )
+            if decision == "denied" and objective is not None and objective["state"] in {"waiting", "needs_decision"}:
+                revision = int(objective["state_revision"]) + 1
+                wait_reason = {
+                    "kind": "permission-denied",
+                    "detail": "explicit coordinator delivery authorization was denied",
+                    "resolution": "grant_scope_limited_authorization",
+                    "authorization_id": authorization_id,
+                }
+                next_action = {
+                    "action": "request_human_decision",
+                    "stage": str(objective["stage"]),
+                    "resolution": "grant_scope_limited_authorization",
+                }
+                connection.execute(
+                    """
+                    UPDATE delivery_objectives
+                    SET state = 'needs_decision', state_revision = ?, next_action_json = ?,
+                        owner_id = NULL, coordinator_epoch = 0, lease_epoch = 0,
+                        lease_expires_at = NULL, next_wakeup_at = NULL,
+                        last_material_progress_at = ?, last_progress_json = ?,
+                        wait_reason_json = ?, updated_at = ?
+                    WHERE objective_id = ? AND state_revision = ?
+                    """,
+                    (
+                        revision,
+                        canonical_json(next_action),
+                        timestamp,
+                        canonical_json(
+                            {
+                                "kind": "delivery-authorization-denied",
+                                "event_cursor": cursor,
+                                "authorization_id": authorization_id,
+                                "stage": objective["stage"],
+                                "attempt": int(objective["stage_attempt"]),
+                            }
+                        ),
+                        canonical_json(wait_reason),
+                        timestamp,
+                        objective["objective_id"],
+                        objective["state_revision"],
+                    ),
+                )
+                self._event(
+                    connection,
+                    "delivery_objective.authorization_denied",
+                    task_id,
+                    None,
+                    {
+                        "objective_id": objective["objective_id"],
+                        "authorization_id": authorization_id,
+                        "stage": objective["stage"],
+                        "attempt": int(objective["stage_attempt"]),
+                        "state_revision": revision,
+                    },
+                    created_at=timestamp,
+                )
+            elif decision == "granted" and objective is not None:
+                wait_reason = (
+                    json.loads(str(objective["wait_reason_json"]))
+                    if objective["wait_reason_json"] is not None
+                    else None
+                )
+                if (
+                    objective["state"] in {"waiting", "needs_decision"}
+                    and isinstance(wait_reason, dict)
+                    and wait_reason.get("kind") == "permission-denied"
+                ):
+                    revision = int(objective["state_revision"]) + 1
+                    progress = {
+                        "kind": "delivery-authorization-granted",
+                        "event_cursor": cursor,
+                        "authorization_id": authorization_id,
+                        "stage": objective["stage"],
+                        "attempt": int(objective["stage_attempt"]),
+                    }
+                    next_action = {
+                        "action": "execute_stage",
+                        "stage": str(objective["stage"]),
+                    }
+                    connection.execute(
+                        """
+                        UPDATE delivery_objectives
+                        SET state = 'active', state_revision = ?, next_action_json = ?,
+                            next_wakeup_at = ?, last_material_progress_at = ?,
+                            last_progress_json = ?, wait_reason_json = NULL, updated_at = ?
+                        WHERE objective_id = ? AND state_revision = ?
+                        """,
+                        (
+                            revision,
+                            canonical_json(next_action),
+                            timestamp,
+                            timestamp,
+                            canonical_json(progress),
+                            timestamp,
+                            objective["objective_id"],
+                            objective["state_revision"],
+                        ),
+                    )
+                    self._event(
+                        connection,
+                        "delivery_objective.authorization_resumed",
+                        task_id,
+                        None,
+                        {
+                            "objective_id": objective["objective_id"],
+                            "authorization_id": authorization_id,
+                            "stage": objective["stage"],
+                            "attempt": int(objective["stage_attempt"]),
+                            "state_revision": revision,
+                            "next_wakeup_at": timestamp,
+                        },
+                        created_at=timestamp,
+                    )
+            authorization = connection.execute(
+                "SELECT * FROM delivery_authorization_receipts WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+            current_objective = connection.execute(
+                "SELECT * FROM delivery_objectives WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            assert authorization is not None
+            return {
+                "authorization": self._delivery_authorization_row(authorization),
+                "objective": (
+                    self._delivery_objective_row(connection, current_objective)
+                    if current_objective is not None
+                    else None
+                ),
+                "idempotent": False,
+            }
+
+    def grant_delivery_authorization(
+        self,
+        task_id: str,
+        authorization_id: str,
+        *,
+        scope: dict[str, Any],
+        authority: dict[str, Any],
+        granted_by: str = "coordinator",
+        objective_id: str | None = None,
+        expires_at: str | None = None,
+        expected_task_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return self.record_delivery_authorization(
+            task_id,
+            authorization_id,
+            scope=scope,
+            authority=authority,
+            decision="granted",
+            granted_by=granted_by,
+            objective_id=objective_id,
+            expires_at=expires_at,
+            expected_task_revision=expected_task_revision,
+        )
+
+    def check_delivery_command(self, command_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        """Return an existing matching delivery receipt without creating one.
+
+        Delivery validates local Git inputs before creating a durable receipt.  A
+        preflight lookup still has to fence a reused command ID first: otherwise
+        a changed request could fail at an unrelated local preflight step rather
+        than being rejected as a command conflict.
+        """
+
+        request_hash = canonical_hash(request)
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["request_hash"] != request_hash:
+                raise CommandConflictError(
+                    f"delivery command {command_id!r} was already used with a different request"
+                )
+            return self._delivery_row(row)
+
+    def acquire_delivery_lease(
+        self,
+        command_id: str,
+        *,
+        lease_seconds: int = _DELIVERY_LEASE_SECONDS,
+    ) -> dict[str, Any]:
+        """Acquire the durable fence for one delivery command.
+
+        The external Git and GitHub calls cannot run in a SQLite transaction.
+        This short transaction therefore gives the caller an opaque fence that
+        every later receipt advance must present.  An expired lease may be
+        recovered after a process loss, while an unexpired lease rejects a
+        concurrent resume instead of permitting a second external write.
+        """
+
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+            raise ValueError("delivery lease_seconds must be a positive integer")
+        observed = datetime.now(UTC)
+        timestamp = observed.isoformat(timespec="seconds")
+        expires_at = (observed + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        fence = uuid4().hex
+        with self.transaction() as connection:
+            receipt = connection.execute(
+                "SELECT * FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if receipt is None:
+                raise KeyError(command_id)
+            existing = connection.execute(
+                "SELECT fence, expires_at FROM delivery_leases WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if existing is not None and str(existing["expires_at"]) > timestamp:
+                raise StateConflictError(
+                    f"delivery command {command_id!r} is already being resumed"
+                )
+            connection.execute(
+                """
+                INSERT INTO delivery_leases(command_id, fence, acquired_at, expires_at, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(command_id) DO UPDATE SET
+                    fence = excluded.fence,
+                    acquired_at = excluded.acquired_at,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (command_id, fence, timestamp, expires_at, timestamp),
+            )
+            self._event(
+                connection,
+                "delivery.lease_acquired",
+                receipt["task_id"],
+                None,
+                {
+                    "command_id": command_id,
+                    "recovered_expired_lease": existing is not None,
+                },
+            )
+            return {"receipt": self._delivery_row(receipt), "fence": fence, "expires_at": expires_at}
+
+    def renew_delivery_lease(
+        self,
+        command_id: str,
+        fence: str,
+        *,
+        lease_seconds: int = _DELIVERY_LEASE_SECONDS,
+    ) -> None:
+        """Extend a current delivery fence before a bounded external command."""
+
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+            raise ValueError("delivery lease_seconds must be a positive integer")
+        observed = datetime.now(UTC)
+        timestamp = observed.isoformat(timespec="seconds")
+        expires_at = (observed + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+        with self.transaction() as connection:
+            self._require_delivery_fence(connection, command_id, fence, timestamp)
+            changed = connection.execute(
+                """
+                UPDATE delivery_leases
+                SET expires_at = ?, updated_at = ?
+                WHERE command_id = ? AND fence = ?
+                """,
+                (expires_at, timestamp, command_id, fence),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError(f"delivery command {command_id!r} lease is stale")
+
+    def release_delivery_lease(self, command_id: str, fence: str) -> bool:
+        """Release a fence if it still belongs to this invocation.
+
+        A stale caller must not be able to release a newer owner's fence.  This
+        method deliberately returns false rather than raising for that normal
+        finally-path race.
+        """
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            receipt = connection.execute(
+                "SELECT task_id FROM delivery_receipts WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if receipt is None:
+                raise KeyError(command_id)
+            changed = connection.execute(
+                "DELETE FROM delivery_leases WHERE command_id = ? AND fence = ?",
+                (command_id, fence),
+            ).rowcount
+            if changed:
+                self._event(
+                    connection,
+                    "delivery.lease_released",
+                    receipt["task_id"],
+                    None,
+                    {"command_id": command_id, "released_at": timestamp},
+                )
+            return bool(changed)
+
     def update_delivery(
         self,
         command_id: str,
         state: str,
         details: dict[str, Any],
+        *,
+        expected_states: tuple[str, ...] | None = None,
+        fence: str | None = None,
     ) -> dict[str, Any]:
+        """Advance one delivery receipt, optionally under its durable fence.
+
+        Existing callers without a fence retain compatibility, but delivery
+        execution itself always supplies both ``expected_states`` and ``fence``.
+        The pair prevents an old or concurrent invocation from overwriting a
+        newer recovery result.
+        """
+
+        if not isinstance(details, dict):
+            raise ValueError("delivery details must be an object")
+        if expected_states is not None:
+            if not expected_states or any(not isinstance(value, str) for value in expected_states):
+                raise ValueError("delivery expected_states must be non-empty strings")
+        if fence is not None and expected_states is None:
+            raise ValueError("fenced delivery updates require expected_states")
         timestamp = now_iso()
         with self.transaction() as connection:
             row = connection.execute(
@@ -672,6 +3121,13 @@ class WorkbenchStore:
             ).fetchone()
             if row is None:
                 raise KeyError(command_id)
+            if expected_states is not None and row["state"] not in expected_states:
+                expected = ", ".join(sorted(expected_states))
+                raise StateConflictError(
+                    f"delivery command {command_id!r} is {row['state']}, expected one of {expected}"
+                )
+            if fence is not None:
+                self._require_delivery_fence(connection, command_id, fence, timestamp)
             merged = {**json.loads(row["details_json"]), **details}
             connection.execute(
                 """
@@ -693,6 +3149,23 @@ class WorkbenchStore:
             assert updated is not None
             return self._delivery_row(updated)
 
+    @staticmethod
+    def _require_delivery_fence(
+        connection: sqlite3.Connection,
+        command_id: str,
+        fence: str,
+        timestamp: str,
+    ) -> None:
+        lease = connection.execute(
+            "SELECT fence, expires_at FROM delivery_leases WHERE command_id = ?", (command_id,)
+        ).fetchone()
+        if (
+            lease is None
+            or lease["fence"] != fence
+            or str(lease["expires_at"]) <= timestamp
+        ):
+            raise StateConflictError(f"delivery command {command_id!r} lease is stale")
+
     def get_delivery(self, command_id: str) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute(
@@ -701,18 +3174,79 @@ class WorkbenchStore:
             if row is None:
                 raise KeyError(command_id)
             return self._delivery_row(row)
+    def deny_delivery_authorization(
+        self,
+        task_id: str,
+        authorization_id: str,
+        *,
+        scope: dict[str, Any],
+        authority: dict[str, Any],
+        granted_by: str = "coordinator",
+        objective_id: str | None = None,
+        expires_at: str | None = None,
+        expected_task_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return self.record_delivery_authorization(
+            task_id,
+            authorization_id,
+            scope=scope,
+            authority=authority,
+            decision="denied",
+            granted_by=granted_by,
+            objective_id=objective_id,
+            expires_at=expires_at,
+            expected_task_revision=expected_task_revision,
+        )
 
-    @staticmethod
-    def _delivery_row(row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "command_id": row["command_id"],
-            "request_hash": row["request_hash"],
-            "task_id": row["task_id"],
-            "state": row["state"],
-            "details": json.loads(row["details_json"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+    def get_planning_request_for_task(self, task_id: str) -> dict[str, Any] | None:
+        """Read the existing reservation without allocating a new task identity."""
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM planning_requests WHERE task_id = ?", (task_id,)).fetchone()
+            return self._planning_request_row(row) if row is not None else None
+
+    def retry_planning_request(self, command_id: str, *, expected_attempt: int, max_attempts: int,
+                               reason: str, coordinator_epoch: int, objective_id: str | None = None,
+                               objective_lease_epoch: int | None = None) -> dict[str, Any]:
+        """Requeue a failed, unmaterialized reservation under its original hash."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("planning retry requires a reason")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("planning retry maximum must be positive")
+        with self.transaction() as connection:
+            self._assert_active_coordinator(connection, coordinator_epoch)
+            row = connection.execute("SELECT * FROM planning_requests WHERE command_id = ?", (command_id,)).fetchone()
+            if row is None:
+                raise KeyError(command_id)
+            if (objective_id is None) != (objective_lease_epoch is None):
+                raise ValueError("planning retry objective and lease must be supplied together")
+            if objective_id is not None:
+                objective = connection.execute("SELECT * FROM delivery_objectives WHERE objective_id = ?", (objective_id,)).fetchone()
+                if objective is None or objective["task_id"] != row["task_id"] or objective["stage"] != "plan":
+                    raise StateConflictError("planning retry objective does not own this reservation")
+                self._assert_delivery_objective_lease(connection, objective, coordinator_epoch=coordinator_epoch,
+                                                      lease_epoch=objective_lease_epoch, timestamp=now_iso())
+                max_attempts = min(max_attempts, json.loads(objective["budget_json"])["attempt_limit"])
+            if int(row["attempt"]) != expected_attempt:
+                raise StateConflictError("planning retry attempt is stale")
+            if connection.execute("SELECT 1 FROM tasks WHERE task_id = ?", (row["task_id"],)).fetchone():
+                raise StateConflictError("planning already materialized a task")
+            if row["state"] == "pending":
+                return self._planning_request_row(row)
+            if row["state"] != "failed":
+                raise StateConflictError("only a failed planning reservation may retry")
+            request = json.loads(row["request_json"])
+            request_limit = request.get("retry_limit", 3)
+            if (isinstance(request_limit, bool) or not isinstance(request_limit, int)
+                    or expected_attempt >= min(max_attempts, request_limit)):
+                raise StateConflictError("planning retry budget exhausted")
+            timestamp = now_iso()
+            connection.execute("UPDATE planning_requests SET state = 'pending', coordinator_epoch = 0, updated_at = ? WHERE command_id = ?",
+                               (timestamp, command_id))
+            self._event(connection, "planning_request.retry_queued", row["task_id"], None,
+                        {"command_id": command_id, "attempt": expected_attempt, "request_hash": row["request_hash"],
+                         "reason": reason, "previous_error": row["error"]}, created_at=timestamp)
+            retried = connection.execute("SELECT * FROM planning_requests WHERE command_id = ?", (command_id,)).fetchone()
+            return self._planning_request_row(retried)
 
     def enqueue_planning_request(
         self,
@@ -824,6 +3358,8 @@ class WorkbenchStore:
         timestamp = now_iso()
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
+            if self._deployment_admission_gate(connection) is not None:
+                return None
             row = connection.execute(
                 """
                 SELECT * FROM planning_requests
@@ -873,7 +3409,7 @@ class WorkbenchStore:
                 (row["command_id"],),
             ).fetchone()
             assert claimed is not None
-            return self._planning_request_row(claimed)
+            return {**self._planning_request_row(claimed), "previous_error": row["error"]}
 
     def complete_planning_request(
         self,
@@ -3521,6 +6057,512 @@ class WorkbenchStore:
                 "indeterminate retry requires explicit recovery because the attempt owns a worktree or recovery receipt"
             )
 
+    def indeterminate_local_recovery_candidate(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        """Read-only shape for one owned-worktree indeterminate node."""
+
+        with self.connection() as connection:
+            return self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+
+    @staticmethod
+    def _indeterminate_local_recovery_candidate(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        """Read-only shape for one owned-worktree indeterminate node.
+
+        Only a worker node left ``indeterminate`` with no pending
+        ``recovery_json`` binding and an owned, physically active worktree
+        allocation is eligible. A node whose target was never assigned (a
+        ``capture_pending`` binding still on the row) already has a safe path
+        through ``queue_task``.
+        """
+
+        task = connection.execute(
+            "SELECT state, state_revision, contract_json FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        node = connection.execute(
+            "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+        ).fetchone()
+        if task is None or node is None:
+            raise KeyError((task_id, node_id))
+        if int(task["state_revision"]) != expected_revision:
+            raise StateConflictError(
+                f"expected task revision {expected_revision}, found {task['state_revision']}"
+            )
+        if int(node["attempt"]) != expected_attempt:
+            raise StateConflictError(
+                f"expected node attempt {expected_attempt}, found {node['attempt']}"
+            )
+        if task["state"] != "needs_approval":
+            raise StateConflictError(
+                f"task {task_id} is {task['state']}, expected needs_approval"
+            )
+        if node["state"] != "indeterminate":
+            raise StateConflictError(f"node {node_id} is {node['state']}, expected indeterminate")
+        if node["recovery_json"] is not None:
+            raise StateConflictError(
+                "indeterminate node still has a pending recovery binding; resolve it through queue_task"
+            )
+        if not isinstance(node["worktree"], str) or not node["worktree"]:
+            raise StateConflictError(
+                "indeterminate node has no owned worktree to recover locally"
+            )
+        try:
+            spec = json.loads(str(node["spec_json"]))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("indeterminate node specification is invalid JSON") from error
+        if not isinstance(spec, dict):
+            raise StateConflictError("indeterminate node specification is invalid")
+        if spec.get("verifier"):
+            raise StateConflictError(
+                "local indeterminate recovery is only supported for worker nodes"
+            )
+        try:
+            contract = json.loads(str(task["contract_json"]))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("indeterminate node task contract is invalid JSON") from error
+        allowed_scope = contract.get("allowed_scope") if isinstance(contract, dict) else None
+        forbidden_scope = contract.get("forbidden_scope") if isinstance(contract, dict) else None
+        write_scopes = spec.get("write_scopes")
+        depends_on = spec.get("depends_on", [])
+        repository = contract.get("repository") if isinstance(contract, dict) else None
+        base_sha = contract.get("base_sha") if isinstance(contract, dict) else None
+        if not (
+            isinstance(repository, str)
+            and repository
+            and isinstance(base_sha, str)
+            and base_sha
+            and isinstance(allowed_scope, list)
+            and all(isinstance(scope, str) for scope in allowed_scope)
+            and isinstance(forbidden_scope, list)
+            and all(isinstance(scope, str) for scope in forbidden_scope)
+            and isinstance(write_scopes, list)
+            and all(isinstance(scope, str) for scope in write_scopes)
+            and isinstance(depends_on, list)
+            and all(isinstance(dependency, str) and dependency for dependency in depends_on)
+        ):
+            raise StateConflictError("local indeterminate recovery task contract or scopes are invalid")
+        # This route is deliberately local-only: a crashed executor with
+        # permission to mutate an external system can leave effects that a
+        # worktree inspection cannot prove absent.  Do not turn the operator
+        # assertion into a blind retry in that case.
+        if (
+            contract.get("external_write_permission") is not False
+            or contract.get("destructive_action_permission") is not False
+        ):
+            raise StateConflictError(
+                "local indeterminate recovery requires a contract with no external or destructive permissions"
+            )
+        allocation = connection.execute(
+            """
+            SELECT * FROM worktree_allocations
+            WHERE task_id = ? AND node_id = ? AND attempt = ?
+            """,
+            (task_id, node_id, expected_attempt),
+        ).fetchone()
+        if allocation is None or allocation["state"] != "active":
+            raise StateConflictError(
+                "indeterminate node has no active physical worktree allocation to recover"
+            )
+        if allocation["current_path"] != node["worktree"]:
+            raise StateConflictError(
+                "indeterminate node worktree does not match its physical allocation"
+            )
+        expected_branch = WorktreeManager.branch_name(task_id, node_id, expected_attempt)
+        if allocation["branch"] != expected_branch:
+            raise StateConflictError(
+                "indeterminate node allocation branch does not match its attempt"
+            )
+        if allocation["repository"] != repository or allocation["base_sha"] != base_sha:
+            raise StateConflictError(
+                "indeterminate node allocation does not match its task contract"
+            )
+        return {
+            "task": {
+                "task_id": task_id,
+                "state": str(task["state"]),
+                "revision": int(task["state_revision"]),
+                "repository": repository,
+                "base_sha": base_sha,
+                "allowed_scope": tuple(allowed_scope),
+                "forbidden_scope": tuple(forbidden_scope),
+            },
+            "node": {
+                "node_id": node_id,
+                "state": str(node["state"]),
+                "attempt": int(node["attempt"]),
+                "worktree": str(node["worktree"]),
+                "branch": expected_branch,
+                "write_scopes": tuple(write_scopes),
+                "depends_on": tuple(depends_on),
+            },
+            "allocation_id": str(allocation["allocation_id"]),
+        }
+
+    def queue_indeterminate_local_recovery(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+        confirm_old_executor_ended: bool,
+        confirm_effects_restricted_to_owned_files: bool,
+        observed_changed_paths: tuple[str, ...],
+        observed_generated_residue_paths: tuple[str, ...] = (),
+        dependency_input_ref: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Authorize one indeterminate node's own worktree for capture-and-retry.
+
+        The caller must already have proven, outside SQLite, that the
+        previous executor process ended and that ``observed_changed_paths``
+        is the exact and complete tracked/untracked change set of the owned
+        worktree before asserting the two confirmation flags; this method
+        performs no filesystem or Git inspection itself. Authorization
+        reuses the identical ``failed-attempt-worktree-recovery`` binding,
+        capture, and pre-dispatch restoration path already used for
+        retryable failed workers: the coordinator captures this worktree's
+        patch, prepares a fresh target worktree, restores the patch there,
+        and only then assigns and dispatches -- the indeterminate source
+        worktree itself is never reused as a dispatch target and is
+        superseded once the new attempt is assigned.
+
+        A node with ``depends_on`` cannot reproduce accepted-ancestor
+        lineage from a fabricated crash receipt, so its own recorded
+        ``dependency-input`` artifact ref (written before dispatch, still
+        durable in ArtifactStore even though the crash never reached
+        settlement) must be supplied explicitly to preserve those already
+        accepted dependencies rather than recomputing them from a
+        potentially changed task snapshot.
+        """
+
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("local indeterminate recovery reason must be non-empty")
+        if confirm_old_executor_ended is not True:
+            raise ValueError(
+                "local indeterminate recovery requires an explicit assertion that the old executor ended"
+            )
+        if confirm_effects_restricted_to_owned_files is not True:
+            raise ValueError(
+                "local indeterminate recovery requires an explicit assertion that effects are "
+                "restricted to owned files"
+            )
+        try:
+            raw_changed_paths = tuple(observed_changed_paths)
+            raw_generated_residue_paths = tuple(observed_generated_residue_paths)
+        except TypeError as error:
+            raise ValueError("observed recovery paths must be explicit path sequences") from error
+        if not all(isinstance(path, str) and path for path in raw_changed_paths):
+            raise ValueError("observed_changed_paths must contain explicit path strings")
+        if not all(isinstance(path, str) and path for path in raw_generated_residue_paths):
+            raise ValueError("observed_generated_residue_paths must contain explicit path strings")
+        changed_paths = tuple(sorted(set(raw_changed_paths)))
+        generated_residue_paths = tuple(sorted(set(raw_generated_residue_paths)))
+        if partition_recovery_paths(generated_residue_paths)[1] != generated_residue_paths:
+            raise ValueError("observed generated residue paths are not recognized recovery residue")
+        if dependency_input_ref is not None and (
+            not isinstance(dependency_input_ref, str) or not dependency_input_ref
+        ):
+            raise ValueError("dependency_input_ref must be a non-empty artifact reference")
+
+        # ``changed_paths`` excludes ignored generated residue by design, but
+        # the shared failed-attempt authorization derives its separate residue
+        # list by partitioning the synthetic result's complete observation.
+        # Include both sets here so that the eventual capture can verify and
+        # discard only the known generated files without losing provenance.
+        observed_result_paths = tuple(sorted(set((*changed_paths, *generated_residue_paths))))
+
+        synthetic_result = NodeResult(
+            status="blocked",
+            summary=f"local indeterminate recovery: {reason}",
+            result_kind="worker",
+            changed_paths=observed_result_paths,
+            verdict=None,
+            artifacts=(
+                {"dependency-input": dependency_input_ref}
+                if dependency_input_ref is not None
+                else {}
+            ),
+        ).to_dict()
+        source_result_json = canonical_json(synthetic_result)
+
+        if dry_run:
+            with self.connection() as connection:
+                candidate = self._indeterminate_local_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                self._require_indeterminate_local_recovery_dependency_input(
+                    candidate, dependency_input_ref
+                )
+                node = connection.execute(
+                    "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+                ).fetchone()
+                assert node is not None
+                authorization = self._failed_attempt_recovery_authorization(
+                    connection,
+                    task_id,
+                    node,
+                    authorization_revision=expected_revision + 1,
+                    source_result_json=source_result_json,
+                )
+            if authorization is None or authorization["source"]["generated_residue_paths"] != list(
+                generated_residue_paths
+            ):
+                raise StateConflictError(
+                    "local indeterminate recovery generated residue paths do not match the observed worktree"
+                )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": True,
+                "task": candidate["task"],
+                "node": candidate["node"],
+                "would_authorize": authorization,
+                "operator_asserted": True,
+                "automatically_verified": False,
+            }
+
+        # Preflight outside the write transaction, mirroring
+        # resume_blocked_worktree: the transaction below repeats only the
+        # same durable, already-recorded checks against a fresh read inside
+        # the lock, so no additional filesystem or subprocess IO ever runs
+        # while SQLite's write lock is held.
+        with self.connection() as connection:
+            candidate = self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            self._require_indeterminate_local_recovery_dependency_input(
+                candidate, dependency_input_ref
+            )
+            preflight_node = connection.execute(
+                "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+            ).fetchone()
+            assert preflight_node is not None
+            preflight_authorization = self._failed_attempt_recovery_authorization(
+                connection,
+                task_id,
+                preflight_node,
+                authorization_revision=expected_revision + 1,
+                source_result_json=source_result_json,
+            )
+        if preflight_authorization is None:
+            raise StateConflictError(
+                "local indeterminate recovery could not build a recovery authorization"
+            )
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            candidate = self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            self._require_indeterminate_local_recovery_dependency_input(
+                candidate, dependency_input_ref
+            )
+            node = connection.execute(
+                "SELECT * FROM nodes WHERE task_id = ? AND node_id = ?", (task_id, node_id)
+            ).fetchone()
+            assert node is not None
+            revision = expected_revision + 1
+            authorization = self._failed_attempt_recovery_authorization(
+                connection,
+                task_id,
+                node,
+                authorization_revision=revision,
+                source_result_json=source_result_json,
+            )
+            if authorization is None:
+                raise StateConflictError(
+                    "local indeterminate recovery could not build a recovery authorization"
+                )
+            if authorization["source"]["generated_residue_paths"] != list(generated_residue_paths):
+                raise StateConflictError(
+                    "local indeterminate recovery generated residue paths do not match the observed worktree"
+                )
+            if canonical_json(authorization) != canonical_json(preflight_authorization):
+                raise StateConflictError(
+                    "local indeterminate recovery authorization changed before commit"
+                )
+            changed = connection.execute(
+                """
+                UPDATE nodes
+                SET state = 'pending', worker_id = NULL, worktree = NULL,
+                    effective_executor = NULL, effective_model = NULL,
+                    started_at = NULL, settled_at = NULL, result_json = NULL,
+                    coordinator_epoch = 0, lease_epoch = 0, recovery_json = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'indeterminate' AND attempt = ?
+                  AND worktree = ? AND recovery_json IS NULL
+                """,
+                (
+                    canonical_json(authorization),
+                    timestamp,
+                    task_id,
+                    node_id,
+                    expected_attempt,
+                    candidate["node"]["worktree"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("local indeterminate recovery node compare-and-set failed")
+
+            approval = connection.execute(
+                """
+                SELECT approval_id, request_json FROM approvals
+                WHERE task_id = ? AND kind = 'indeterminate_resolution'
+                  AND decision IS NULL
+                  AND json_extract(request_json, '$.node_id') = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (task_id, node_id),
+            ).fetchone()
+            if approval is not None:
+                request = json.loads(approval["request_json"])
+                request["decision_revision"] = revision
+                connection.execute(
+                    """
+                    UPDATE approvals SET decision = 'retry', decided_at = ?, request_json = ?
+                    WHERE approval_id = ?
+                    """,
+                    (timestamp, canonical_json(request), approval["approval_id"]),
+                )
+                self._event(
+                    connection,
+                    "approval.decided",
+                    task_id,
+                    node_id,
+                    {
+                        "approval_id": approval["approval_id"],
+                        "decision": "retry",
+                        "task_revision": revision,
+                    },
+                    created_at=timestamp,
+                )
+            remaining_indeterminate = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM nodes WHERE task_id = ? AND state = 'indeterminate'",
+                    (task_id,),
+                ).fetchone()["count"]
+            )
+            if remaining_indeterminate:
+                next_task_state = "needs_approval"
+                blocker = f"{remaining_indeterminate} indeterminate node(s) still require approval"
+            else:
+                next_task_state = "queued"
+                blocker = None
+            changed_task = connection.execute(
+                """
+                UPDATE tasks
+                SET state = ?, state_revision = ?, updated_at = ?, blocker = ?, verdict = NULL
+                WHERE task_id = ? AND state_revision = ?
+                """,
+                (next_task_state, revision, timestamp, blocker, task_id, expected_revision),
+            ).rowcount
+            if changed_task != 1:
+                raise StateConflictError("local indeterminate recovery task compare-and-set failed")
+            authorization_cursor = self._event(
+                connection,
+                "node.indeterminate_local_recovery_queued",
+                task_id,
+                node_id,
+                {
+                    "attempt": expected_attempt,
+                    "next_attempt": expected_attempt + 1,
+                    "worktree": candidate["node"]["worktree"],
+                    "allocation_id": candidate["allocation_id"],
+                    "reason": reason,
+                    "expected_changed_paths": list(changed_paths),
+                    "operator_assertion": {
+                        "confirm_old_executor_ended": True,
+                        "confirm_effects_restricted_to_owned_files": True,
+                        "assertion": "operator_asserted",
+                        "automatically_verified": False,
+                    },
+                    "task_revision": revision,
+                },
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "node.indeterminate_resolved",
+                task_id,
+                node_id,
+                {"resolution": "retry", "task_revision": revision},
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "task.state_changed",
+                task_id,
+                None,
+                {
+                    "from": "needs_approval",
+                    "to": next_task_state,
+                    "revision": revision,
+                    "blocker": blocker,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "dry_run": False,
+                "revision": revision,
+                "task": {"task_id": task_id, "state": next_task_state, "revision": revision},
+                "node": {
+                    "node_id": node_id,
+                    "state": "pending",
+                    "attempt": expected_attempt,
+                    "next_attempt": expected_attempt + 1,
+                },
+                "operator_asserted": True,
+                "automatically_verified": False,
+                "authorization_event_cursor": authorization_cursor,
+            }
+
+    @staticmethod
+    def _require_indeterminate_local_recovery_dependency_input(
+        candidate: Mapping[str, Any], dependency_input_ref: str | None
+    ) -> None:
+        """Fail before queuing when accepted-ancestor lineage is unavailable."""
+
+        node = candidate.get("node")
+        depends_on = node.get("depends_on") if isinstance(node, Mapping) else None
+        if depends_on and dependency_input_ref is None:
+            raise StateConflictError(
+                "local indeterminate recovery requires the recorded dependency-input artifact"
+            )
+
     @staticmethod
     def _approval_row(row: sqlite3.Row) -> dict[str, Any]:
         request = json.loads(row["request_json"])
@@ -3615,6 +6657,17 @@ class WorkbenchStore:
             """,
             (row["task_id"],),
         ).fetchall()
+        admission_wait_rows = connection.execute(
+            "SELECT * FROM node_admission_waits WHERE task_id = ?",
+            (row["task_id"],),
+        ).fetchall()
+        admission_waits = {
+            str(wait["node_id"]): WorkbenchStore._node_admission_wait_row(wait)
+            for wait in admission_wait_rows
+        }
+        delivery_objective = connection.execute(
+            "SELECT * FROM delivery_objectives WHERE task_id = ?", (row["task_id"],)
+        ).fetchone()
         return {
             "task_id": row["task_id"],
             "state": row["state"],
@@ -3627,6 +6680,15 @@ class WorkbenchStore:
             "blocker": row["blocker"],
             "verdict": row["verdict"],
             "steering": [dict(item) for item in steering_rows],
+            "delivery_objective": (
+                WorkbenchStore._delivery_objective_row(
+                    connection,
+                    delivery_objective,
+                    include_receipts=False,
+                )
+                if delivery_objective is not None
+                else None
+            ),
             "nodes": [
                 {
                     **json.loads(node["spec_json"]),
@@ -3642,6 +6704,7 @@ class WorkbenchStore:
                     "settled_at": node["settled_at"],
                     "updated_at": node["updated_at"],
                     "result": json.loads(node["result_json"]) if node["result_json"] else None,
+                    "admission_wait": admission_waits.get(str(node["node_id"])),
                 }
                 for node in node_rows
             ],
@@ -3926,6 +6989,7 @@ class WorkbenchStore:
             "approval.requested",
             "node.blocked",
             "node.indeterminate",
+            "node.admission_waiting",
             "node.routed",
             "coordinator.started",
             "coordinator.stopped",
@@ -3934,6 +6998,8 @@ class WorkbenchStore:
             "quota.refresh_unavailable",
             "worktree.recovery_failed",
             "worktree.purge_failed",
+            "delivery_objective.decision_required",
+            "delivery_objective.authorization_denied",
         }
         with self.connection() as connection:
             rows = connection.execute(
@@ -4868,6 +7934,7 @@ class WorkbenchStore:
         attempt: int,
         coordinator_epoch: int,
         lease_epoch: int,
+        quota_snapshot_id: int | None = None,
     ) -> int:
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
@@ -4893,7 +7960,9 @@ class WorkbenchStore:
             event_payload = dict(payload)
             # Route callers may describe why a handoff happened, but quota
             # provenance must come from the durable snapshot ledger. Strip
-            # caller-supplied copies before attaching the latest persisted row.
+            # caller-supplied copies before attaching the selected durable
+            # row.  Legacy callers retain newest-row attachment when they do
+            # not have an effective-observation reference.
             for key in (
                 "quota_snapshot",
                 "quota_provenance",
@@ -4901,12 +7970,25 @@ class WorkbenchStore:
                 "quota_source",
             ):
                 event_payload.pop(key, None)
-            quota_row = connection.execute(
-                """
-                SELECT id, snapshot_json FROM quota_snapshots
-                WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
-                """
-            ).fetchone()
+            if quota_snapshot_id is not None:
+                if type(quota_snapshot_id) is not int or quota_snapshot_id < 1:
+                    raise ValueError("route quota_snapshot_id must be a positive integer")
+                quota_row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' AND id = ?
+                    """,
+                    (quota_snapshot_id,),
+                ).fetchone()
+                if quota_row is None:
+                    raise StateConflictError("route quota snapshot reference does not exist")
+            else:
+                quota_row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
             if quota_row is not None:
                 try:
                     event_payload["quota_snapshot_id"] = int(quota_row["id"])
@@ -5346,6 +8428,333 @@ class WorkbenchStore:
                 return "codex", model
         return None
 
+    @staticmethod
+    def _scope_access_pairs(
+        candidate_reads: tuple[str, ...],
+        candidate_writes: tuple[str, ...],
+        running_reads: tuple[str, ...],
+        running_writes: tuple[str, ...],
+    ) -> list[dict[str, str]]:
+        """Return the exact non-read/read paths behind an access conflict."""
+
+        if not scope_access_conflicts(
+            candidate_reads, candidate_writes, running_reads, running_writes
+        ):
+            return []
+        pairs: list[dict[str, str]] = []
+        for candidate_kind, candidate_scopes, running_kind, running_scopes in (
+            ("write", candidate_writes, "write", running_writes),
+            ("write", candidate_writes, "read", running_reads),
+            ("read", candidate_reads, "write", running_writes),
+        ):
+            for candidate_scope in candidate_scopes:
+                for running_scope in running_scopes:
+                    if not scopes_overlap(candidate_scope, running_scope):
+                        continue
+                    left = normalize_scope(candidate_scope)
+                    right = normalize_scope(running_scope)
+                    pairs.append(
+                        {
+                            "candidate_access": candidate_kind,
+                            "candidate_scope": left,
+                            "running_access": running_kind,
+                            "running_scope": right,
+                            # The intersection of two nested repository
+                            # scopes is the narrower path.  Persist that
+                            # exact path so an admission wait explains what
+                            # must be released rather than merely the
+                            # candidate's broader read envelope.
+                            "overlap": (
+                                left
+                                if right == "." or (left != "." and len(left) >= len(right))
+                                else right
+                            ),
+                        }
+                    )
+        return pairs
+
+    def _private_worktree_isolation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        candidate: sqlite3.Row,
+        candidate_contract: dict[str, Any],
+        candidate_executor: str,
+        candidate_attempt: int,
+        running: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Report missing evidence for a proposed reader/writer exception.
+
+        This is intentionally stricter than "different task": both worktrees
+        must have deterministic private paths/branches at the exact same base,
+        neither side may be a fixture/shared-resource route, and the running
+        allocation must still be active.  Any missing proof remains a gate.
+        """
+
+        if candidate_executor == "fixture" or running["executor"] == "fixture":
+            return {"status": "unproven", "reason": "fixture_or_shared_execution"}
+        if candidate["recovery_json"] is not None:
+            return {"status": "unproven", "reason": "candidate_recovery_input_is_not_fixed_base"}
+        if candidate_contract.get("base_sha") != running["contract"].get("base_sha"):
+            return {"status": "unproven", "reason": "base_sha_mismatch"}
+        if candidate_contract.get("repository") != running["contract"].get("repository"):
+            return {"status": "unproven", "reason": "repository_contract_mismatch"}
+        candidate_spec = json.loads(str(candidate["spec_json"]))
+        if candidate_spec.get("shared_resources") or running["spec"].get("shared_resources"):
+            return {"status": "unproven", "reason": "shared_resource_declared"}
+        manager = WorktreeManager(self.path.parent / "worktrees")
+        try:
+            candidate_path = str(
+                manager.worktree_path(
+                    str(candidate["task_id"]),
+                    str(candidate["node_id"]),
+                    candidate_attempt,
+                )
+            )
+            candidate_branch = manager.branch_name(
+                str(candidate["task_id"]), str(candidate["node_id"]), candidate_attempt
+            )
+            running_path = str(
+                manager.worktree_path(
+                    str(running["task_id"]), str(running["node_id"]), int(running["attempt"])
+                )
+            )
+            running_branch = manager.branch_name(
+                str(running["task_id"]), str(running["node_id"]), int(running["attempt"])
+            )
+        except (OSError, ValueError):
+            return {"status": "unproven", "reason": "worktree_identity_unavailable"}
+        candidate_allocation = connection.execute(
+            """
+            SELECT 1 FROM worktree_allocations
+            WHERE task_id = ? AND node_id = ? AND attempt = ? AND state = 'active'
+            """,
+            (candidate["task_id"], candidate["node_id"], candidate_attempt),
+        ).fetchone()
+        if candidate_allocation is not None:
+            return {"status": "unproven", "reason": "candidate_attempt_already_has_active_allocation"}
+        if (
+            running["allocation_state"] != "active"
+            or running["worktree"] != running["allocation_path"]
+            or running["allocation_path"] != running_path
+            or running["allocation_branch"] != running_branch
+            or running["allocation_base_sha"] != candidate_contract.get("base_sha")
+            or candidate_path == running_path
+            or candidate_branch == running_branch
+        ):
+            return {"status": "unproven", "reason": "active_private_worktree_receipt_missing"}
+        return {
+            "status": "unproven",
+            "reason": "read_scope_enforcement_unavailable",
+            "candidate_worktree": candidate_path,
+            "candidate_branch": candidate_branch,
+            "running_worktree": running_path,
+            "running_branch": running_branch,
+            "base_sha": candidate_contract["base_sha"],
+        }
+
+    def _record_scope_access_wait(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        candidate: sqlite3.Row,
+        next_attempt: int,
+        blockers: list[dict[str, Any]],
+        timestamp: str,
+    ) -> int:
+        task_id = str(candidate["task_id"])
+        node_id = str(candidate["node_id"])
+        blocking = {
+            "nodes": sorted(
+                blockers,
+                key=lambda item: (
+                    item["task_id"], item["node_id"], item["attempt"], str(item["worker_id"] or "")
+                ),
+            )
+        }
+        reason = {
+            "kind": "scope_access_conflict",
+            "detail": "node waits for a conflicting repository scope to be released",
+            "next_attempt": next_attempt,
+            "conflicts": blocking["nodes"],
+        }
+        wait_fingerprint = canonical_hash(
+            {
+                "task_id": task_id,
+                "node_id": node_id,
+                "next_attempt": next_attempt,
+                "reason": reason,
+                "blocking": blocking,
+            }
+        )
+        previous = connection.execute(
+            "SELECT * FROM node_admission_waits WHERE task_id = ? AND node_id = ?",
+            (task_id, node_id),
+        ).fetchone()
+        if previous is not None and previous["wait_fingerprint"] == wait_fingerprint:
+            return int(previous["event_cursor"])
+        due_at = self._timestamp_after(timestamp, 300)
+        next_wakeup_at = self._timestamp_after(timestamp, 5)
+        next_action = {
+            "action": "claim_when_scope_released",
+            "stage": "admission",
+            "target_attempt": next_attempt,
+            "trigger": "running_node_settlement_or_bounded_reconciliation",
+        }
+        cursor = self._event(
+            connection,
+            "node.admission_waiting",
+            task_id,
+            node_id,
+            {
+                "wait_fingerprint": wait_fingerprint,
+                "reason_kind": "scope_access_conflict",
+                "next_attempt": next_attempt,
+                "blocking": blocking,
+                "next_action": next_action,
+                "due_at": due_at,
+                "next_wakeup_at": next_wakeup_at,
+            },
+            created_at=timestamp,
+        )
+        connection.execute(
+            """
+            INSERT INTO node_admission_waits(
+                task_id, node_id, wait_fingerprint, reason_kind, reason_json,
+                next_action_json, blocking_json, due_at, next_wakeup_at,
+                event_cursor, created_at, updated_at
+            ) VALUES(?, ?, ?, 'scope_access_conflict', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, node_id) DO UPDATE SET
+                wait_fingerprint = excluded.wait_fingerprint,
+                reason_kind = excluded.reason_kind,
+                reason_json = excluded.reason_json,
+                next_action_json = excluded.next_action_json,
+                blocking_json = excluded.blocking_json,
+                due_at = excluded.due_at,
+                next_wakeup_at = excluded.next_wakeup_at,
+                event_cursor = excluded.event_cursor,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                node_id,
+                wait_fingerprint,
+                canonical_json(reason),
+                canonical_json(next_action),
+                canonical_json(blocking),
+                due_at,
+                next_wakeup_at,
+                cursor,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return cursor
+
+    def _resolve_scope_access_wait(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        timestamp: str,
+        reason: str,
+    ) -> int | None:
+        wait = connection.execute(
+            "SELECT * FROM node_admission_waits WHERE task_id = ? AND node_id = ?",
+            (task_id, node_id),
+        ).fetchone()
+        if wait is None:
+            return None
+        connection.execute(
+            "DELETE FROM node_admission_waits WHERE task_id = ? AND node_id = ?",
+            (task_id, node_id),
+        )
+        return self._event(
+            connection,
+            "node.admission_resumed",
+            task_id,
+            node_id,
+            {
+                "reason": reason,
+                "admission_wait_event_cursor": int(wait["event_cursor"]),
+                "wait_fingerprint": wait["wait_fingerprint"],
+            },
+            created_at=timestamp,
+        )
+
+    def _reconcile_scope_access_waits(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        timestamp: str,
+    ) -> None:
+        """Resolve waits only after every recorded blocking lease has released."""
+
+        waits = connection.execute("SELECT * FROM node_admission_waits").fetchall()
+        for wait in waits:
+            node = connection.execute(
+                "SELECT state FROM nodes WHERE task_id = ? AND node_id = ?",
+                (wait["task_id"], wait["node_id"]),
+            ).fetchone()
+            if node is None or node["state"] != "pending":
+                connection.execute(
+                    "DELETE FROM node_admission_waits WHERE task_id = ? AND node_id = ?",
+                    (wait["task_id"], wait["node_id"]),
+                )
+                continue
+            try:
+                blocking = json.loads(str(wait["blocking_json"]))
+                blockers = blocking["nodes"]
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError("scope admission wait is invalid") from error
+            still_running = False
+            for blocker in blockers:
+                if not isinstance(blocker, dict):
+                    raise StateConflictError("scope admission wait blocker is invalid")
+                row = connection.execute(
+                    """
+                    SELECT state, attempt FROM nodes WHERE task_id = ? AND node_id = ?
+                    """,
+                    (blocker.get("task_id"), blocker.get("node_id")),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["state"] == "running"
+                    and int(row["attempt"]) == blocker.get("attempt")
+                ):
+                    still_running = True
+                    break
+            if not still_running:
+                self._resolve_scope_access_wait(
+                    connection,
+                    task_id=str(wait["task_id"]),
+                    node_id=str(wait["node_id"]),
+                    timestamp=timestamp,
+                    reason="recorded_scope_released",
+                )
+
+    def pending_node_admission_waits(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("admission wait limit must be positive")
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM node_admission_waits
+                ORDER BY next_wakeup_at, task_id, node_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [
+                {
+                    "task_id": str(row["task_id"]),
+                    "node_id": str(row["node_id"]),
+                    **self._node_admission_wait_row(row),
+                }
+                for row in rows
+            ]
+
     def claim_ready_node(
         self,
         worker_id: str,
@@ -5359,10 +8768,14 @@ class WorkbenchStore:
             raise ValueError("coordinator_epoch must be positive")
         allowed_lanes = _normalize_execution_lanes(execution_lanes)
         capacities = _normalize_lane_capacities(lane_capacities)
+        if self.delivery_admission_gate() is not None:
+            return None
         repository_identities = self._claim_repository_identities()
         timestamp = now_iso()
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
+            if self._deployment_admission_gate(connection) is not None:
+                return None
             candidates = connection.execute(
                 """
                 SELECT n.*, t.contract_json, t.state AS task_state, t.priority AS task_priority
@@ -5372,14 +8785,19 @@ class WorkbenchStore:
                          json_extract(n.spec_json, '$.ordinal'), n.node_id
                 """
             ).fetchall()
-            running_accesses: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+            running_accesses: list[dict[str, Any]] = []
             running_task_parallelism: dict[str, bool] = {}
             running_lane_active = {lane: 0 for lane in EXECUTION_LANES}
             for running in connection.execute(
                 """
-                SELECT n.task_id, n.spec_json, n.effective_executor, n.effective_model,
-                       t.contract_json
+                SELECT n.task_id, n.node_id, n.attempt, n.worker_id, n.worktree, n.spec_json,
+                       n.effective_executor, n.effective_model, t.contract_json,
+                       a.state AS allocation_state, a.current_path AS allocation_path,
+                       a.base_sha AS allocation_base_sha, a.branch AS allocation_branch
                 FROM nodes n JOIN tasks t USING(task_id)
+                LEFT JOIN worktree_allocations a
+                  ON a.task_id = n.task_id AND a.node_id = n.node_id
+                 AND a.attempt = n.attempt
                 WHERE n.state = 'running'
                 """
             ).fetchall():
@@ -5403,13 +8821,27 @@ class WorkbenchStore:
                     running_spec.get("parallelizable") is False
                 )
                 running_accesses.append(
-                    (
-                        running_repository,
-                        tuple(running_spec.get("read_scopes", [])),
-                        tuple(running_spec.get("write_scopes", [])),
-                    )
+                    {
+                        "repository": running_repository,
+                        "task_id": task_id,
+                        "node_id": str(running["node_id"]),
+                        "attempt": int(running["attempt"]),
+                        "worker_id": running["worker_id"],
+                        "read_scopes": tuple(running_spec.get("read_scopes", [])),
+                        "write_scopes": tuple(running_spec.get("write_scopes", [])),
+                        "executor": str(running_spec["executor"]),
+                        "spec": running_spec,
+                        "contract": running_contract,
+                        "worktree": running["worktree"],
+                        "allocation_state": running["allocation_state"],
+                        "allocation_path": running["allocation_path"],
+                        "allocation_base_sha": running["allocation_base_sha"],
+                        "allocation_branch": running["allocation_branch"],
+                    }
                 )
                 running_lane_active[execution_lane_for_spec(running_spec)] += 1
+
+            self._reconcile_scope_access_waits(connection, timestamp=timestamp)
 
             selected: sqlite3.Row | None = None
             selected_spec: dict[str, Any] | None = None
@@ -5504,11 +8936,61 @@ class WorkbenchStore:
                 )
                 if repository is None:
                     continue
-                if any(
-                    repository == running_repository
-                    and scope_access_conflicts(read_scopes, write_scopes, running_reads, running_writes)
-                    for running_repository, running_reads, running_writes in running_accesses
-                ):
+                blocking_conflicts: list[dict[str, Any]] = []
+                for running in running_accesses:
+                    if repository != running["repository"]:
+                        continue
+                    pairs = self._scope_access_pairs(
+                        read_scopes,
+                        write_scopes,
+                        running["read_scopes"],
+                        running["write_scopes"],
+                    )
+                    candidate_root = WorktreeManager(self.path.parent / "worktrees").worktree_path(
+                        str(candidate["task_id"]), str(candidate["node_id"]), candidate_attempt
+                    )
+                    aliases = scope_entity_alias_conflicts(
+                        candidate_worktree=candidate_root,
+                        candidate_reads=read_scopes,
+                        candidate_writes=write_scopes,
+                        running_worktree=running["worktree"] or candidate_contract["repository"],
+                        running_reads=running["read_scopes"],
+                        running_writes=running["write_scopes"],
+                    )
+                    if aliases["status"] == "conflict":
+                        pairs.extend({**pair, "overlap": pair["entity"]} for pair in aliases["conflicts"])
+                    if not pairs:
+                        continue
+                    isolation = self._private_worktree_isolation(
+                        connection,
+                        candidate=candidate,
+                        candidate_contract=candidate_contract,
+                        candidate_executor=effective_executor,
+                        candidate_attempt=candidate_attempt,
+                        running=running,
+                    )
+                    # Allocations describe paths, not an execution-time write
+                    # barrier. Both logical and observed alias conflicts wait.
+                    unsafe_pairs = pairs
+                    if unsafe_pairs:
+                        blocking_conflicts.append(
+                            {
+                                "task_id": running["task_id"],
+                                "node_id": running["node_id"],
+                                "attempt": running["attempt"],
+                                "worker_id": running["worker_id"],
+                                "conflict_paths": unsafe_pairs,
+                                "isolation": isolation,
+                            }
+                        )
+                if blocking_conflicts:
+                    self._record_scope_access_wait(
+                        connection,
+                        candidate=candidate,
+                        next_attempt=candidate_attempt,
+                        blockers=blocking_conflicts,
+                        timestamp=timestamp,
+                    )
                     continue
                 if admissible is not None and not admissible(effective_spec):
                     continue
@@ -5534,6 +9016,13 @@ class WorkbenchStore:
                 return None
 
             attempt = int(selected["attempt"]) + 1
+            scope_wait_resume_cursor = self._resolve_scope_access_wait(
+                connection,
+                task_id=str(selected["task_id"]),
+                node_id=str(selected["node_id"]),
+                timestamp=timestamp,
+                reason="node_claimed_after_scope_gate",
+            )
             lease_epoch = self._next_lease_epoch(connection)
             effective_executor = selected_effective_executor
             effective_model = selected_effective_model
@@ -5610,6 +9099,9 @@ class WorkbenchStore:
                     **({
                         "admission_deferred_event_cursor": admission_wait_cursor,
                     } if admission_wait_cursor is not None else {}),
+                    **({
+                        "scope_admission_wait_resumed_event_cursor": scope_wait_resume_cursor,
+                    } if scope_wait_resume_cursor is not None else {}),
                     **({
                         "blocked_retry_authorization_event_cursor": selected_blocked_retry_authorization_cursor,
                     } if selected_blocked_retry_authorization_cursor is not None else {}),
@@ -7614,31 +11106,369 @@ class WorkbenchStore:
 
     def write_quota(self, snapshot: QuotaSnapshot) -> None:
         snapshot.validate()
+        raw_snapshot = snapshot.raw_payload()
         with self.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO quota_snapshots(provider, snapshot_json, observed_at)
                 VALUES('claude', ?, ?)
                 """,
-                (canonical_json(asdict(snapshot)), snapshot.observed_at),
+                (canonical_json(raw_snapshot), snapshot.observed_at),
             )
             self._event(
                 connection,
                 "quota.updated",
                 None,
                 None,
-                {"provider": "claude", "snapshot": asdict(snapshot)},
+                {"provider": "claude", "snapshot": raw_snapshot},
             )
 
-    def latest_quota(self) -> QuotaSnapshot | None:
+    @staticmethod
+    def _quota_snapshot_from_row(row: sqlite3.Row) -> QuotaSnapshot:
+        """Hydrate immutable collector evidence and bind its ledger row ID."""
+
+        payload = json.loads(str(row["snapshot_json"]))
+        if not isinstance(payload, dict):
+            raise StateConflictError("quota snapshot ledger row is not an object")
+        # These are read-time projection fields; a raw row may never smuggle
+        # them back into the ledger selection result.
+        payload.pop("ledger_id", None)
+        payload.pop("effective_observation", None)
+        payload.pop("effective_admission_blocked", None)
+        return replace(QuotaSnapshot(**payload), ledger_id=int(row["id"]))
+
+    @staticmethod
+    def _quota_receipt(
+        raw: QuotaSnapshot,
+        effective: QuotaSnapshot,
+        *,
+        selection: str,
+        recovery_reason: str,
+    ) -> dict[str, Any]:
+        """Describe a ledger projection without adding a quota authority."""
+
+        def provenance(snapshot: QuotaSnapshot) -> dict[str, Any]:
+            return {
+                "provider": "claude",
+                "source": snapshot.source,
+                "producer": snapshot.producer,
+                "producer_schema_version": snapshot.producer_schema_version,
+                "claude_version": snapshot.claude_version,
+                "five_hour_window_id": snapshot.five_hour_window_id,
+                "weekly_window_id": snapshot.weekly_window_id,
+            }
+
+        return {
+            "selection": selection,
+            "raw_snapshot_id": raw.ledger_id,
+            "effective_snapshot_id": effective.ledger_id,
+            "raw_observed_at": raw.observed_at,
+            "effective_observed_at": effective.observed_at,
+            "authentication": (
+                "native-subscription-authenticated"
+                if raw.auth_ok and raw.auth_method == "native-subscription"
+                else "unavailable"
+            ),
+            "quota_collection": raw.quota_collection_status(),
+            "raw_observation_status": raw.observation_status(),
+            "recovery_reason": recovery_reason,
+            "admission_blocked": effective.effective_admission_blocked,
+            "raw_provenance": provenance(raw),
+            "effective_provenance": provenance(effective),
+        }
+
+    @staticmethod
+    def _empty_reset_binding_reason(
+        empty: QuotaSnapshot,
+        complete: QuotaSnapshot,
+        *,
+        current_time: datetime | None,
+    ) -> str | None:
+        """Return why an empty row cannot borrow a complete ledger row.
+
+        A producer-confirmed collection failure has no parsed pool/reset
+        payload.  It may borrow only before the selected complete row's known
+        reset deadlines.  An otherwise empty row with unknown bindings remains
+        uncertain and therefore fails closed.
+        """
+
+        empty_windows = (empty.five_hour_window_id, empty.weekly_window_id)
+        complete_windows = (complete.five_hour_window_id, complete.weekly_window_id)
+        if all(isinstance(value, str) and value for value in empty_windows):
+            if empty_windows != complete_windows:
+                return "reset-window-mismatch"
+            if not empty.has_current_confident_reset_windows(current_time=current_time):
+                return "empty-reset-binding-unknown-or-expired"
+            return None
+        if (
+            empty.five_hour_window_id is None
+            and empty.weekly_window_id is None
+            and empty.collection_state == "failed"
+        ):
+            observed = empty.observed_datetime()
+            deadlines = complete.reset_window_deadlines()
+            if (
+                observed is None
+                or deadlines is None
+                or any(observed >= deadline for deadline in deadlines)
+            ):
+                return "empty-reset-binding-unknown-or-expired"
+            return None
+        return "empty-reset-binding-unknown-or-expired"
+
+    @staticmethod
+    def _same_raw_observation(snapshots: list[QuotaSnapshot]) -> bool:
+        """Whether a same-timestamp group is genuinely one raw observation."""
+
+        return len({canonical_json(snapshot.raw_payload()) for snapshot in snapshots}) <= 1
+
+    @staticmethod
+    def _safety_preference(snapshot: QuotaSnapshot) -> tuple[int, float, int]:
+        """Choose the least permissive actual row for an ambiguous tie."""
+
+        status = snapshot.observation_status()
+        identifier = snapshot.ledger_id or 0
+        if status == "authentication-unavailable":
+            return 0, 0.0, -identifier
+        if not snapshot.has_compatible_subscription_provenance():
+            return 1, 0.0, -identifier
+        if status == "authenticated-partial":
+            values = [
+                value
+                for value in (
+                    snapshot.five_hour_remaining,
+                    snapshot.weekly_all_remaining,
+                    snapshot.weekly_sonnet_remaining,
+                    snapshot.weekly_fable_remaining,
+                )
+                if value is not None
+            ]
+            return 2, min(values) if values else 0.0, -identifier
+        if status == "authenticated-empty":
+            return 3, 0.0, -identifier
+        values = [
+            value
+            for value in (
+                snapshot.five_hour_remaining,
+                snapshot.weekly_all_remaining,
+                snapshot.weekly_sonnet_remaining,
+                snapshot.weekly_fable_remaining,
+            )
+            if value is not None
+        ]
+        return 4, min(values) if values else 0.0, -identifier
+
+    @staticmethod
+    def _ordered_quota_observations(
+        snapshots: list[QuotaSnapshot],
+    ) -> tuple[QuotaSnapshot, list[QuotaSnapshot], frozenset[datetime], tuple[int, ...], str | None]:
+        """Pick current raw evidence by observed time, not append race order.
+
+        A later append carrying an older observation cannot replace newer auth
+        loss or low-pool evidence.  Invalid timestamps written after the newest
+        orderable row are also an admission barrier because their placement is
+        unknowable.
+        """
+
+        valid: list[tuple[datetime, QuotaSnapshot]] = []
+        invalid: list[QuotaSnapshot] = []
+        for snapshot in snapshots:
+            observed = snapshot.observed_datetime()
+            if observed is None:
+                invalid.append(snapshot)
+            else:
+                valid.append((observed, snapshot))
+        if not valid:
+            raw = max(snapshots, key=lambda snapshot: snapshot.ledger_id or 0)
+            return (
+                replace(raw, effective_admission_blocked=True),
+                [],
+                frozenset(),
+                tuple(snapshot.ledger_id or 0 for snapshot in invalid),
+                "invalid-observation-time",
+            )
+
+        newest_time = max(observed for observed, _snapshot in valid)
+        newest_group = [
+            snapshot for observed, snapshot in valid if observed == newest_time
+        ]
+        newest_insert_id = max(snapshot.ledger_id or 0 for snapshot in newest_group)
+        invalid_ids = tuple(snapshot.ledger_id or 0 for snapshot in invalid)
+        if invalid and max(invalid_ids) > newest_insert_id:
+            raw = max(invalid, key=lambda snapshot: snapshot.ledger_id or 0)
+            return (
+                replace(raw, effective_admission_blocked=True),
+                [],
+                frozenset(),
+                invalid_ids,
+                "invalid-observation-time",
+            )
+
+        grouped: dict[datetime, list[QuotaSnapshot]] = {}
+        for observed, snapshot in valid:
+            grouped.setdefault(observed, []).append(snapshot)
+        ambiguous_times = frozenset(
+            observed
+            for observed, group in grouped.items()
+            if not WorkbenchStore._same_raw_observation(group)
+        )
+        raw = min(newest_group, key=WorkbenchStore._safety_preference)
+        ordered = [
+            snapshot
+            for _observed, snapshot in sorted(
+                valid,
+                key=lambda item: (item[0], item[1].ledger_id or 0),
+                reverse=True,
+            )
+        ]
+        if newest_time in ambiguous_times:
+            return (
+                replace(raw, effective_admission_blocked=True),
+                ordered,
+                ambiguous_times,
+                invalid_ids,
+                "ambiguous-observation-order",
+            )
+        return raw, ordered, ambiguous_times, invalid_ids, None
+
+    @staticmethod
+    def _recovered_quota(
+        snapshots: list[QuotaSnapshot],
+        *,
+        max_age_seconds: int | None,
+        current_time: datetime | None,
+        ambiguous_times: frozenset[datetime],
+        invalid_observation_ids: tuple[int, ...],
+    ) -> tuple[QuotaSnapshot, str, str]:
+        """Select a bounded effective row from ordered raw ledger evidence.
+
+        Only a current authenticated-empty row may borrow an older complete
+        row.  Its original timestamp, reset windows, and durable ID stay
+        intact.  The append order must agree with observed chronology along
+        the recovery run, so a concurrent delayed write cannot mask a newer
+        empty/auth-loss/low-pool observation.
+        """
+
+        newest = snapshots[0]
+        status = newest.observation_status()
+        if status == "complete":
+            return newest, "latest", "latest-complete-observation"
+        if status == "authentication-unavailable":
+            return newest, "latest", "authentication-unavailable"
+        if status == "authenticated-partial":
+            return newest, "latest", "partial-observation-authoritative"
+        assert status == "authenticated-empty"
+        if max_age_seconds is None:
+            return newest, "latest", "caller-freshness-limit-unavailable"
+        if not newest.has_compatible_subscription_provenance():
+            return newest, "latest", "incompatible-provenance"
+        if not newest.is_fresh(
+            max_age_seconds=max_age_seconds,
+            current_time=current_time,
+        ):
+            return newest, "latest", "empty-observation-stale"
+        if newest.observed_datetime() is None:
+            return newest, "latest", "empty-observation-time-invalid"
+
+        empty_run = [newest]
+        previous_empty = newest
+        for candidate in snapshots[1:]:
+            candidate_observed = candidate.observed_datetime()
+            previous_observed = previous_empty.observed_datetime()
+            candidate_id = candidate.ledger_id or 0
+            previous_id = previous_empty.ledger_id or 0
+            if candidate_observed in ambiguous_times:
+                return newest, "latest", "ambiguous-observation-order"
+            if (
+                candidate_observed is None
+                or previous_observed is None
+                or candidate_observed >= previous_observed
+                or candidate_id >= previous_id
+            ):
+                return newest, "latest", "out-of-order-observation"
+            if any(candidate_id < invalid_id < previous_id for invalid_id in invalid_observation_ids):
+                return newest, "latest", "invalid-observation-time"
+
+            candidate_status = candidate.observation_status()
+            if candidate_status == "authentication-unavailable":
+                return newest, "latest", "intervening-authentication-unavailable"
+            if candidate_status == "authenticated-partial":
+                return newest, "latest", "intervening-partial-observation-authoritative"
+            if candidate_status == "authenticated-empty":
+                if not candidate.has_compatible_subscription_provenance():
+                    return newest, "latest", "incompatible-provenance"
+                if candidate.recovery_identity() != newest.recovery_identity():
+                    return newest, "latest", "source-identity-mismatch"
+                if not candidate.is_fresh(
+                    max_age_seconds=max_age_seconds,
+                    current_time=current_time,
+                ):
+                    return newest, "latest", "empty-observation-stale"
+                empty_run.append(candidate)
+                previous_empty = candidate
+                continue
+
+            assert candidate_status == "complete"
+            if not candidate.has_compatible_subscription_provenance():
+                return newest, "latest", "incompatible-provenance"
+            if candidate.recovery_identity() != newest.recovery_identity():
+                return newest, "latest", "source-identity-mismatch"
+            if not candidate.is_fresh(
+                max_age_seconds=max_age_seconds,
+                current_time=current_time,
+            ):
+                return newest, "latest", "complete-observation-stale"
+            if not candidate.has_current_confident_reset_windows(current_time=current_time):
+                return newest, "latest", "complete-reset-binding-unknown-or-expired"
+            for empty in empty_run:
+                binding_reason = WorkbenchStore._empty_reset_binding_reason(
+                    empty,
+                    candidate,
+                    current_time=current_time,
+                )
+                if binding_reason is not None:
+                    return newest, "latest", binding_reason
+            return candidate, "last-known-good", "authenticated-empty-recovered"
+        return newest, "latest", "no-compatible-complete-observation"
+
+    def latest_quota(
+        self,
+        *,
+        max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
+        current_time: datetime | None = None,
+    ) -> QuotaSnapshot | None:
         with self.connection() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
-                SELECT snapshot_json FROM quota_snapshots
-                WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
+                SELECT id, snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC
                 """
-            ).fetchone()
-            return QuotaSnapshot(**json.loads(row["snapshot_json"])) if row else None
+            ).fetchall()
+        if not rows:
+            return None
+        snapshots = [self._quota_snapshot_from_row(row) for row in rows]
+        raw, ordered, ambiguous_times, invalid_ids, raw_reason = (
+            self._ordered_quota_observations(snapshots)
+        )
+        if raw_reason is not None:
+            effective, selection, recovery_reason = raw, "latest", raw_reason
+        else:
+            effective, selection, recovery_reason = self._recovered_quota(
+                ordered,
+                max_age_seconds=max_age_seconds,
+                current_time=current_time,
+                ambiguous_times=ambiguous_times,
+                invalid_observation_ids=invalid_ids,
+            )
+        return replace(
+            effective,
+            effective_observation=self._quota_receipt(
+                raw,
+                effective,
+                selection=selection,
+                recovery_reason=recovery_reason,
+            ),
+        )
 
     def quota_snapshot_reference(self, snapshot: QuotaSnapshot) -> int | None:
         """Return the existing immutable snapshot row for attribution.
@@ -7649,16 +11479,47 @@ class WorkbenchStore:
         """
 
         snapshot.validate()
+        raw_payload = snapshot.raw_payload()
         with self.connection() as connection:
+            if snapshot.ledger_id is not None:
+                row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' AND id = ?
+                    """,
+                    (snapshot.ledger_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                # Normalize legacy omitted defaults before comparing, while
+                # still requiring the exact immutable ledger row.
+                persisted = self._quota_snapshot_from_row(row)
+                if persisted != snapshot:
+                    return None
+                return int(row["id"])
             row = connection.execute(
                 """
                 SELECT id FROM quota_snapshots
                 WHERE provider = 'claude' AND snapshot_json = ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (canonical_json(asdict(snapshot)),),
+                (canonical_json(raw_payload),),
             ).fetchone()
-            return int(row["id"]) if row is not None else None
+            if row is not None:
+                return int(row["id"])
+            # A bounded compatibility scan resolves a pre-feature row that
+            # omitted optional defaults, without ever attaching a different
+            # newer row to the selected effective observation.
+            rows = connection.execute(
+                """
+                SELECT id, snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC
+                """
+            ).fetchall()
+            for candidate in rows:
+                if self._quota_snapshot_from_row(candidate) == snapshot:
+                    return int(candidate["id"])
+            return None
 
     def list_quota_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -7747,6 +11608,7 @@ class WorkbenchStore:
             "home_presence": self.active_home_presence(),
             "authority": authority,
             "coordinator_failure": coordinator_failure,
+            "deployment_admission_gate": self.delivery_admission_gate(),
         }
 
     def stale_tasks(self, max_age_seconds: int = 300) -> list[dict[str, str]]:

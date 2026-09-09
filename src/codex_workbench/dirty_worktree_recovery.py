@@ -23,9 +23,10 @@ from .dependency_inputs import (
     DependencyInputError,
     apply_recorded_dependency_input,
     changed_paths_since_input_tree,
+    load_recorded_dependency_input,
 )
 from .executors import codex_subscription_environment
-from .worktrees import WorktreeError, WorktreeManager
+from .worktrees import WorktreeError, WorktreeManager, scope_allows
 
 
 class DirtyWorktreeRecoveryError(WorktreeError):
@@ -63,6 +64,75 @@ def partition_recovery_paths(paths: tuple[str, ...]) -> tuple[tuple[str, ...], t
     generated_set = set(generated)
     recoverable = tuple(sorted(path for path in paths if path not in generated_set))
     return recoverable, generated
+
+
+def observed_indeterminate_recovery_paths(
+    candidate: Mapping[str, Any],
+    *,
+    dependency_input_ref: str | None,
+    artifacts: ArtifactStore,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Inspect one owned indeterminate worktree and prove every change is in scope.
+
+    ``candidate`` is the shape returned by
+    ``WorkbenchStore.indeterminate_local_recovery_candidate``. Returns the
+    recoverable changed paths and the generated-residue paths. Any foreign,
+    out-of-scope, unsafe-ignored, or symlinked untracked path raises before
+    the caller can assert the explicit confirmation flags.
+    """
+
+    task = candidate["task"]
+    node = candidate["node"]
+    worktree = Path(str(node["worktree"])).expanduser().resolve(strict=True)
+    base_sha = str(task["base_sha"])
+    depends_on = node.get("depends_on")
+    if not isinstance(depends_on, tuple) or not all(
+        isinstance(dependency, str) and dependency for dependency in depends_on
+    ):
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate node recovery has invalid dependency metadata"
+        )
+    if depends_on and dependency_input_ref is None:
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate node recovery requires the recorded dependency-input artifact"
+        )
+    if dependency_input_ref is not None:
+        dependency_input = load_recorded_dependency_input(
+            artifacts,
+            dependency_input_ref,
+            task_id=str(task["task_id"]),
+            node_id=str(node["node_id"]),
+            base_sha=base_sha,
+        )
+        comparison_tree = dependency_input.input_tree_sha
+    else:
+        comparison_tree = base_sha
+
+    ignored = DirtyWorktreeRecovery.ignored_paths(worktree)
+    recoverable_ignored, generated_residue_paths = partition_recovery_paths(ignored)
+    if recoverable_ignored:
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate node worktree contains ignored paths that cannot be recovered safely: "
+            + ", ".join(recoverable_ignored)
+        )
+    changed_paths = tuple(sorted(changed_paths_since_input_tree(worktree, comparison_tree)))
+    allowed_scope = list(task["allowed_scope"])
+    forbidden_scope = list(task["forbidden_scope"])
+    write_scopes = list(node["write_scopes"])
+    for relative_path in changed_paths:
+        if not scope_allows(relative_path, allowed_scope, forbidden_scope):
+            raise DirtyWorktreeRecoveryError(
+                f"indeterminate node recovery path is outside task scope: {relative_path}"
+            )
+        if not scope_allows(relative_path, write_scopes, []):
+            raise DirtyWorktreeRecoveryError(
+                f"indeterminate node recovery path is outside node write scope: {relative_path}"
+            )
+        if (worktree / relative_path).is_symlink():
+            raise DirtyWorktreeRecoveryError(
+                f"indeterminate node recovery path must not be a symlink: {relative_path}"
+            )
+    return changed_paths, generated_residue_paths
 
 
 @dataclass(frozen=True)

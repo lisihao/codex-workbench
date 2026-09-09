@@ -25,6 +25,7 @@ from .dependency_inputs import (
     load_recorded_dependency_input,
     validate_dependency_input_lineage,
 )
+from .delivery_lifecycle import DeliveryLifecycleReconciler
 from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
@@ -102,6 +103,9 @@ class _ClaimRoute:
     quota: QuotaSnapshot | None
     active_claude_models: tuple[str, ...]
     decision: ClaudeDispatchDecision | None
+    # Claude admission must point to the exact immutable ledger row selected
+    # by the effective-observation projection.
+    quota_snapshot_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,7 @@ class Coordinator:
         quota_refresh_seconds: float = 60,
         quota_snapshot_file: Path | None = None,
         pnpm_materializer: PnpmOfflineMaterializer | None = None,
+        delivery_lifecycle: DeliveryLifecycleReconciler | None = None,
         fatal_exit: Callable[[int], None] | None = None,
         config: WorkbenchConfig | None = None,
     ):
@@ -198,7 +203,23 @@ class Coordinator:
         # Failed retries use the same sealed capture/lineage mechanism, but
         # continue into their original executor after restoration.
         self.failed_attempt_recovery = self.blocked_worktree_recovery
+        # Lifecycle adapters are authority-owned and opt-in.  The coordinator
+        # never creates a real GitHub/deployment adapter from a worker task.
+        # It still owns a no-adapter reconciler by default so an explicitly
+        # requested endpoint becomes a durable, visible decision boundary
+        # rather than an unattended pending objective.
+        self.delivery_lifecycle = delivery_lifecycle or DeliveryLifecycleReconciler(
+            store,
+            owner_id=f"coordinator-{coordinator_epoch}",
+            coordinator_epoch=coordinator_epoch,
+            adapter=None,
+        )
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workbench-worker")
+        self._delivery_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="workbench-delivery",
+        )
+        self._delivery_future: Future[list[dict[str, Any]]] | None = None
         self._futures: dict[Future[None], tuple[str, str | None]] = {}
         self._routed_to_codex: set[str] = set()
         self._routing_lock = threading.Lock()
@@ -274,6 +295,37 @@ class Coordinator:
                 )
         return recovered + recovered_planning
 
+    def _reconcile_delivery_lifecycle(self) -> None:
+        """Schedule at most one fenced delivery turn without blocking workers."""
+
+        future = self._delivery_future
+        if future is not None:
+            if not future.done():
+                return
+            self._delivery_future = None
+            try:
+                future.result()
+            except Exception as error:
+                self.store.record_system_event(
+                    "delivery_lifecycle.reconcile_failed",
+                    {"error": f"{type(error).__name__}: {error}"},
+                )
+
+        try:
+            self.store.reconcile_delivery_safe_point_waits()
+            # GitHub CI observation can take substantially longer than a
+            # normal scheduler turn.  One fenced lifecycle call may run at a
+            # time, but it must never hold worker dispatch or a deployment
+            # safe-point wakeup hostage.
+            self._delivery_future = self._delivery_pool.submit(
+                self.delivery_lifecycle.reconcile_once,
+            )
+        except Exception as error:
+            self.store.record_system_event(
+                "delivery_lifecycle.reconcile_failed",
+                {"error": f"{type(error).__name__}: {error}"},
+            )
+
     def run_forever(self) -> None:
         worker_counter = 0
         self._recovery_thread.start()
@@ -298,11 +350,12 @@ class Coordinator:
                     )
                 self._next_quota_refresh = time.monotonic() + self._quota_refresher.interval_seconds
             self._collect()
+            self._reconcile_delivery_lifecycle()
             self._dispatch_one_planning_request()
             while len(self._futures) < self.max_workers:
                 worker_counter += 1
                 worker_id = f"{socket.gethostname()}-{os.getpid()}-{worker_counter}"
-                quota = self.store.latest_quota()
+                quota = self._latest_quota()
                 quota_snapshot_id = self._quota_snapshot_reference(quota)
                 active_claude_models = self._active_claude_models()
                 admission_waits: dict[tuple[str, str], _AdmissionWait] = {}
@@ -316,9 +369,10 @@ class Coordinator:
                     if pending is None:
                         return True
                     if quota_snapshot_id is None:
-                        raise RuntimeError(
-                            "pending Claude admission has no durable quota snapshot reference"
-                        )
+                        # Claim-time turns this into a Codex fallback.  An
+                        # admission wait may not rely on an unresolved
+                        # effective projection.
+                        return True
                     reason_kind, resume_condition, decision = pending
                     wait = _AdmissionWait(
                         task_id=str(spec["task_id"]),
@@ -348,7 +402,19 @@ class Coordinator:
                         claimed["spec"], claimed["contract"], quota, active_claude_models
                     )
                 )
-                claim_route = _ClaimRoute(quota, active_claude_models, decision)
+                if (
+                    claimed["spec"].get("executor") == "claude"
+                    and decision is not None
+                    and decision.action == "claude"
+                    and quota_snapshot_id is None
+                ):
+                    decision = self._missing_quota_reference_decision(decision)
+                claim_route = _ClaimRoute(
+                    quota,
+                    active_claude_models,
+                    decision,
+                    quota_snapshot_id,
+                )
                 active_claude_model = (
                     claimed["spec"]["model"]
                     if decision is not None and decision.action == "claude"
@@ -361,6 +427,7 @@ class Coordinator:
                 )
             self._stop.wait(self.poll_seconds)
         self._pool.shutdown(wait=True, cancel_futures=False)
+        self._delivery_pool.shutdown(wait=True, cancel_futures=False)
         # A coordinator cannot be considered stopped while its recovery
         # companion still owns work.  The authority caller waits for this
         # method's thread before releasing its lease, so preserve correctness
@@ -540,6 +607,8 @@ class Coordinator:
             # a second plaintext history copy.  Compile receives only the
             # exact, content-addressed receipt selected by the claimed row.
             submit_request["context_excerpt"] = context_excerpt
+            if isinstance(claimed.get("previous_error"), str):
+                submit_request["planning_feedback"] = claimed["previous_error"]
             compiled = compile_natural_language_request(
                 self.config,
                 self.store,
@@ -977,9 +1046,11 @@ class Coordinator:
 
         if claim_route.decision is None or claim_route.decision.action != "claude":
             return None
-        latest = self.store.latest_quota()
-        if latest == claim_route.quota:
-            return None
+        # Re-evaluate immediately before the provider boundary.  Equality of
+        # projected pool values is insufficient: a newer raw row can change
+        # recovery ordering or auth/collection diagnostics without changing
+        # the selected complete snapshot's fields.
+        latest = self._latest_quota()
         decision = self._claude_decision(
             spec,
             contract,
@@ -987,8 +1058,11 @@ class Coordinator:
             claim_route.active_claude_models,
             quota_ttl_seconds=self.quota_ttl_seconds,
         )
-        if decision is not None and decision.action == "codex":
-            return decision
+        if decision is not None:
+            if decision.action == "codex":
+                return decision
+            if decision.action == "claude" and self._quota_snapshot_reference(latest) is None:
+                return self._missing_quota_reference_decision(decision)
         return None
 
     @staticmethod
@@ -1130,9 +1204,31 @@ class Coordinator:
             return None
         try:
             candidate = resolver(snapshot)
-        except (OSError, ValueError):
+        except (OSError, ValueError, StateConflictError):
             return None
         return candidate if isinstance(candidate, int) and candidate > 0 else None
+
+    @staticmethod
+    def _missing_quota_reference_decision(
+        admitted: ClaudeDispatchDecision,
+    ) -> ClaudeDispatchDecision:
+        """Fail closed when quota admission is not tied to a ledger row."""
+
+        return ClaudeDispatchDecision(
+            "codex",
+            "unknown",
+            "Claude quota evidence has no durable snapshot reference",
+            0,
+            capacity_units=admitted.capacity_units,
+            active_units=admitted.active_units,
+            requested_units=admitted.requested_units,
+            available_units=admitted.available_units,
+        )
+
+    def _latest_quota(self) -> QuotaSnapshot | None:
+        """Read effective quota under this coordinator's existing TTL policy."""
+
+        return self.store.latest_quota(max_age_seconds=self.quota_ttl_seconds)
 
     def _candidate_decision(
         self,
@@ -1759,15 +1855,35 @@ class Coordinator:
                     )
                     return
             if claim_route is None:
-                quota = self.store.latest_quota()
+                quota = self._latest_quota()
+                quota_snapshot_id = self._quota_snapshot_reference(quota)
+                decision = self._claim_time_decision(spec, contract, quota, ())
+                if (
+                    spec.get("executor") == "claude"
+                    and decision is not None
+                    and decision.action == "claude"
+                    and quota_snapshot_id is None
+                ):
+                    decision = self._missing_quota_reference_decision(decision)
                 claim_route = _ClaimRoute(
                     quota,
                     (),
-                    self._claim_time_decision(spec, contract, quota, ()),
+                    decision,
+                    quota_snapshot_id,
                 )
             if spec.get("executor") == "claude":
+                # Resolve again beside the provider boundary.  The raw row is
+                # immutable, but a projection with a missing/mismatched ID
+                # must never authorize a Claude call.
                 context.quota_snapshot_id = self._quota_snapshot_reference(claim_route.quota)
             decision = claim_route.decision
+            if (
+                spec.get("executor") == "claude"
+                and decision is not None
+                and decision.action == "claude"
+                and context.quota_snapshot_id is None
+            ):
+                decision = self._missing_quota_reference_decision(decision)
             execute_started_monotonic = time.monotonic()
             context.execute_started_at = now_iso()
             if decision is not None and decision.action != "claude":
@@ -2645,6 +2761,11 @@ class Coordinator:
             attempt=claimed["attempt"],
             coordinator_epoch=claimed["coordinator_epoch"],
             lease_epoch=claimed["lease_epoch"],
+            quota_snapshot_id=(
+                attribution_context.quota_snapshot_id
+                if attribution_context is not None
+                else None
+            ),
         )
         routed_request = ExecutionRequest(
             task_id=request.task_id,
@@ -2693,7 +2814,7 @@ class Coordinator:
             )
             if attribution_context.quota_snapshot_id is None:
                 attribution_context.quota_snapshot_id = self._quota_snapshot_reference(
-                    self.store.latest_quota()
+                    self._latest_quota()
                 )
         return routed_request, self._executor("codex").execute(routed_request)
 
@@ -2825,7 +2946,7 @@ class Coordinator:
         if kind == "claude":
             return ClaudeExecutor(
                 self.artifacts,
-                self.store.latest_quota(),
+                self._latest_quota(),
                 os.environ.get("CODEX_WORKBENCH_CLAUDE") or "claude",
                 self.quota_ttl_seconds,
             )

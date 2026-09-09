@@ -68,6 +68,21 @@ MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不
 - 旧 attempt 晚到的 settlement：coordinator epoch、attempt 和 lease epoch fencing 拒绝写入。
 - 暂停或取消与 settlement 竞态：节点的已租约结果可保存，但任务的 paused/cancelled 控制状态优先，不会被晚到结果推进到 verifying 或 accepted。
 
+## Indeterminate 节点的显式本地恢复
+
+`indeterminate` 节点若在 target attempt 已被 assign 后崩溃，会同时拥有一个物理 worktree 但没有待处理的 `recovery_json` 绑定（结算时已清空）。裸的 `resolve_indeterminate`/`decide_approval(retry)` 对这种节点始终 fail closed（`_assert_indeterminate_retry_is_safe`），因为自动重试无法证明旧执行器已经退出、也无法证明该 worktree 上的改动仍局限于节点自己的写入范围。
+
+MCP `resolve_indeterminate_locally` 动作（CLI `task resolve-indeterminate-locally`）为这一具体场景提供显式、操作员确认的本地恢复路径，复用现有的 `failed-attempt-worktree-recovery` 绑定、捕获与预派发恢复机制，而不是重新实现一套并行系统：
+
+1. `WorkbenchStore.indeterminate_local_recovery_candidate` 只读校验：任务必须仍处于 `needs_approval`，节点必须是 `indeterminate`、没有待处理的 `recovery_json`、拥有一个仍然 `active` 的物理 worktree allocation，且该 allocation 与任务合同的 repository/base_sha 一致。该合同还必须明确禁止 external write 与 destructive action；本恢复路径只适用于可由本地 worktree 证据覆盖的执行。
+2. `observed_indeterminate_recovery_paths`（`dirty_worktree_recovery.py`）在 SQLite 事务之外检查该 worktree：拒绝任何越权 ignored 路径、越出任务 `allowed_scope`/`forbidden_scope` 或节点 `write_scopes` 的路径、以及符号链接；只返回可信的 tracked/untracked changed_paths 与 generated-residue 路径。
+3. 调用方必须显式声明 `confirm_old_executor_ended=true`（旧执行器进程已退出的证据，例如 `ps`/`pgrep` 核实）与 `confirm_effects_restricted_to_owned_files=true`（第 2 步已核实的范围结论）；这是记录在案的操作员断言，不是自动验证。
+4. `WorkbenchStore.queue_indeterminate_local_recovery` 用观测到的 changed_paths 构造与失败 attempt 完全相同形状的 `capture_pending` 恢复绑定（`_failed_attempt_recovery_authorization`），把节点原子地转回 `pending` 并清空其 `worktree`，同时决定任何待处理的 `indeterminate_resolution` approval。
+5. 该节点重新排队后，协调器沿用既有的失败 attempt 续修流程：在新的干净 attempt 上捕获补丁、复原已记录的 dependency-input、核对范围与哈希，只有装配成功后才派发执行器；indeterminate 源 worktree 本身永不被复用为派发目标，assign 成功后其 allocation 转为 superseded。
+6. 若节点 `depends_on` 其他节点，调用方必须显式提供该节点原 attempt 记录的 `dependency-input` artifact ref（结算前已写入 ArtifactStore，即使进程随后崩溃也仍然存在），否则拒绝恢复，防止用未核实的祖先输入静默替换已验收的依赖。
+
+与 `resume-blocked-worktree`/`retry-blocked` 一样，`confirm_*` 字段是留痕断言而非自动核验；未知副作用、越权路径、哈希漂移或过期 revision/attempt 一律 fail closed。
+
 ## SQLite 事务边界
 
 Git repository identity、工作树检查、dependency-input 复原、patch 捕获、Artifact 读取与 SHA-256 校验均在 SQLite 写事务之外运行。写事务只重新核对持久字段、revision、attempt、coordinator/lease epoch、预验证签名和 allocation 状态，再提交短时状态变更。并发期间出现预取快照中没有的新仓库时，本轮 claim 放弃并由下一轮重新读取，不会在写锁内执行 Git。

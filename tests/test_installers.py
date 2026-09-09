@@ -60,6 +60,20 @@ class InstallerTests(unittest.TestCase):
         runtime.chmod(0o755)
         return runtime
 
+    @staticmethod
+    def _fake_pnpm_node(directory: Path, name: str = "pnpm-node") -> Path:
+        node = directory / name
+        node.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then\n"
+            "  printf 'v22.13.0\\n'\n"
+            "else\n"
+            "  printf '11.25.0\\n'\n"
+            "fi\n"
+        )
+        node.chmod(0o755)
+        return node
+
     def _run_selector(self, runtime: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CODEX_WORKBENCH_PYTHON"] = str(runtime)
@@ -107,6 +121,9 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('"--claude-binary"', source)
         self.assertIn('"--quota-claude-binary"', source)
         self.assertNotIn("CODEX_WORKBENCH_CLAUDE=/opt/homebrew/bin/claude", source)
+        self.assertIn('"--pnpm-node"', source)
+        self.assertIn("write_pnpm_launcher(", source)
+        self.assertIn("CODEX_WORKBENCH_PNPM={shlex.quote(str(pnpm_launcher))}", source)
         self.assertIn('source / "skills" / "research"', source)
         self.assertNotIn('default="~/.agents/skills/research"', source)
 
@@ -350,7 +367,7 @@ class InstallerTests(unittest.TestCase):
                 process_home=Path("/tmp/state/process-home"),
                 quota_snapshot_file=Path("/tmp/state/claude-quota.json"),
                 claude_binary=Path("/tmp/claude-2.1.239"),
-                pnpm_binary=Path("/tmp/app/vendor/pnpm-runtime/package/bin/pnpm.mjs"),
+                pnpm_binary=Path("/tmp/app/bin/pnpm"),
                 pnpm_store=Path("/tmp/pnpm-store"),
             )
 
@@ -361,7 +378,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(environment["CODEX_WORKBENCH_CODEX"], "/tmp/runtime/codex")
         self.assertEqual(
             environment["CODEX_WORKBENCH_PNPM"],
-            "/tmp/app/vendor/pnpm-runtime/package/bin/pnpm.mjs",
+            "/tmp/app/bin/pnpm",
         )
         self.assertEqual(environment["CODEX_WORKBENCH_PNPM_STORE"], "/tmp/pnpm-store")
 
@@ -429,15 +446,13 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertTrue(entrypoint.is_file())
             self.assertEqual(manifest["version"], "11.25.0")
-            runtime = subprocess.run(
-                [str(entrypoint), "--version"],
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=10,
+            self.assertEqual(
+                module.sha256(
+                    (source / module.PNPM_RECOVERY_RUNTIME_DIRECTORY / metadata["archive"])
+                    .read_bytes()
+                ).hexdigest(),
+                metadata["sha256"],
             )
-            self.assertEqual(runtime.returncode, 0, runtime.stderr)
-            self.assertEqual(runtime.stdout.strip(), "11.25.0")
 
     def test_harness_installer_is_idempotent_and_preserves_existing_policy(self) -> None:
         module = self._harness_installer_module()
@@ -580,6 +595,8 @@ class InstallerTests(unittest.TestCase):
             missing_codex = root / "missing-codex"
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
                 module, "macos_machine_id", return_value="fixture-machine"
+            ), mock.patch.object(
+                module, "verified_source_commit", return_value="a" * 40
             ), mock.patch.object(module, "install_code_as_harness") as install, mock.patch.object(
                 module.sys,
                 "argv",
@@ -742,10 +759,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_device_installers_delegate_to_the_canonical_harness_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        for name in ("install-macos.py", "install-macbook-client.py"):
+        for name, argument in (
+            ("install-macos.py", "app_root"),
+            ("install-macbook-client.py", "source"),
+        ):
             source = (root / "scripts" / name).read_text()
             self.assertIn('"install-code-as-harness.py"', source)
-            self.assertIn("install_code_as_harness(source)", source)
+            self.assertIn(f"install_code_as_harness({argument})", source)
 
     def test_authority_launch_agent_persists_quota_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1944,10 +1964,17 @@ class InstallerTests(unittest.TestCase):
             host = root / "codex-code-mode-host"
             host.write_text("#!/bin/sh\n")
             host.chmod(0o755)
+            pnpm_node = self._fake_pnpm_node(root)
             calls: list[tuple[str, ...]] = []
 
             def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                 calls.append(command)
+                if command[0] == "git":
+                    if len(command) > 3 and command[3] == "rev-parse":
+                        return subprocess.CompletedProcess(command, 0, stdout="0" * 40 + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 return subprocess.CompletedProcess(command, 0, stdout="fixture\n", stderr="")
 
             output = io.StringIO()
@@ -1968,6 +1995,8 @@ class InstallerTests(unittest.TestCase):
                     str(root / "state"),
                     "--codex-binary",
                     str(codex),
+                    "--pnpm-node",
+                    str(pnpm_node),
                     "--dry-run",
                 ],
             ), redirect_stdout(output):
@@ -1986,6 +2015,8 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("plan: ai-frontier=", output.getvalue())
             self.assertIn("ai-frontier refresh", output.getvalue())
             self.assertIn("no authorization file is created", output.getvalue())
+            self.assertIn(f"plan: pnpm launcher={root / 'state' / 'app' / 'bin' / 'pnpm'}", output.getvalue())
+            self.assertIn(f"plan: pnpm Node={pnpm_node.resolve()}", output.getvalue())
 
     def test_macbook_dry_run_skips_ssh_launchctl_and_mcp_mutations(self) -> None:
         module = self._macbook_installer_module()
@@ -2081,6 +2112,12 @@ class InstallerTests(unittest.TestCase):
     def test_authority_main_rolls_back_global_and_runtime_files_on_failure(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2098,11 +2135,14 @@ class InstallerTests(unittest.TestCase):
             host = root / "codex-code-mode-host"
             host.write_text("#!/bin/sh\n")
             host.chmod(0o755)
+            pnpm_node = self._fake_pnpm_node(root)
 
             def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                 if command and command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command and command[0] == "launchctl":
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
@@ -2140,6 +2180,8 @@ class InstallerTests(unittest.TestCase):
                     str(state_root),
                     "--codex-binary",
                     str(codex),
+                    "--pnpm-node",
+                    str(pnpm_node),
                     "--research-skill-source",
                     str(research),
                 ],
@@ -2154,6 +2196,13 @@ class InstallerTests(unittest.TestCase):
     def test_authority_installer_writes_capability_sidecar_manifest_and_health_checks_it(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2170,6 +2219,7 @@ class InstallerTests(unittest.TestCase):
             for fixture in (codex, codex_host):
                 fixture.write_text("#!/bin/sh\nexit 0\n")
                 fixture.chmod(0o755)
+            pnpm_node = self._fake_pnpm_node(root)
             quota_claude = root / "claude-2.1.239"
             quota_claude.write_text("#!/bin/sh\nexit 0\n")
             quota_claude.chmod(0o755)
@@ -2188,6 +2238,26 @@ class InstallerTests(unittest.TestCase):
                     }
                 )
             )
+            authority_lock = state_root / "coordinator.lock"
+            authority_lock.write_text(
+                json.dumps(
+                    {
+                        "instance_id": "installer-fixture-instance",
+                        "pid": 4242,
+                        "boot_id": "installer-fixture-boot",
+                    }
+                )
+                + "\n"
+            )
+            connection = sqlite3.connect(state_root / "state.sqlite")
+            try:
+                connection.execute(
+                    "CREATE TABLE events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "event_type TEXT NOT NULL, payload_json TEXT NOT NULL)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
             calls: list[tuple[str, ...]] = []
             refreshes: list[dict[str, object]] = []
 
@@ -2195,12 +2265,38 @@ class InstallerTests(unittest.TestCase):
                 calls.append(command)
                 if command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command[:2] == ("id", "-u"):
                     return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
                 if command[0] == "launchctl":
-                    return subprocess.CompletedProcess(command, 0, stdout="fixture-loaded\n", stderr="")
+                    if command[1] == "print":
+                        label = command[-1].rsplit("/", 1)[-1]
+                        stdout = "pid = 4242\n" if label == module.LABEL else "fixture-loaded\n"
+                        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+                    if command[1:3] == ("kill", "SIGTERM"):
+                        if command[-1] == f"gui/501/{module.LABEL}":
+                            connection = sqlite3.connect(state_root / "state.sqlite")
+                            try:
+                                connection.execute(
+                                    "INSERT INTO events(event_type, payload_json) VALUES (?, ?)",
+                                    (
+                                        "coordinator.stopped",
+                                        json.dumps(
+                                            {
+                                                "instance_id": "installer-fixture-instance",
+                                                "boot_id": "installer-fixture-boot",
+                                            }
+                                        ),
+                                    ),
+                                )
+                                connection.commit()
+                            finally:
+                                connection.close()
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                 if command[0].endswith("/runtime/codex"):
                     return subprocess.CompletedProcess(command, 0, stdout="codex-cli 0.149.1\n", stderr="")
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
@@ -2233,6 +2329,8 @@ class InstallerTests(unittest.TestCase):
                     str(state_root),
                     "--codex-binary",
                     str(codex),
+                    "--pnpm-node",
+                    str(pnpm_node),
                     "--research-skill-source",
                     str(research),
                 ],
@@ -2277,6 +2375,8 @@ class InstallerTests(unittest.TestCase):
                     "compression": "zstd",
                     "require_smb": True,
                     "pnpm_store": str(state_root / "pnpm-store"),
+                    "pnpm_node_binary": str(pnpm_node.resolve()),
+                    "pnpm_binary": str(state_root / "app" / "bin" / "pnpm"),
                 },
             )
             self.assertEqual(
@@ -2385,8 +2485,50 @@ class InstallerTests(unittest.TestCase):
                 manifest["worktree_recovery"],
                 config["worktree_recovery"],
             )
+            self.assertEqual(
+                manifest["pnpm_recovery_runtime"],
+                {
+                    "package": "pnpm",
+                    "version": "11.25.0",
+                    "sha256": "33dd0748f27e7916c4f1c8b6943461983e3453b06bbda6312a6280130b4881e5",
+                    "binary": str(state_root / "app" / "bin" / "pnpm"),
+                    "entrypoint": str(
+                        state_root
+                        / "app"
+                        / module.PNPM_RECOVERY_RUNTIME_DIRECTORY
+                        / module.PNPM_RECOVERY_RUNTIME_ENTRYPOINT
+                    ),
+                    "node_binary": str(pnpm_node.resolve()),
+                    "store": str(state_root / "pnpm-store"),
+                },
+            )
             self.assertEqual(manifest["radar"], config["radar"])
             self.assertEqual(manifest["ai_frontier"], config["ai_frontier"])
+            pnpm_launcher = state_root / "app" / "bin" / "pnpm"
+            self.assertTrue(pnpm_launcher.is_file())
+            launcher_source = pnpm_launcher.read_text(encoding="utf-8")
+            self.assertIn(str(pnpm_node.resolve()), launcher_source)
+            self.assertIn(
+                str(
+                    state_root
+                    / "app"
+                    / module.PNPM_RECOVERY_RUNTIME_DIRECTORY
+                    / module.PNPM_RECOVERY_RUNTIME_ENTRYPOINT
+                ),
+                launcher_source,
+            )
+            self.assertIn('"$@"', launcher_source)
+            authority_plist = home / "Library" / "LaunchAgents" / f"{module.LABEL}.plist"
+            authority_payload = plistlib.loads(authority_plist.read_bytes())
+            self.assertEqual(
+                authority_payload["EnvironmentVariables"]["CODEX_WORKBENCH_PNPM"],
+                str(pnpm_launcher),
+            )
+            authority_wrapper = state_root / "app" / "bin" / "codex-workbench"
+            self.assertIn(
+                f"CODEX_WORKBENCH_PNPM={str(pnpm_launcher)}",
+                authority_wrapper.read_text(encoding="utf-8"),
+            )
             self.assertTrue((state_root / "radar").is_dir())
             self.assertFalse((state_root / "radar" / "authorization.json").exists())
             self.assertTrue((state_root / "ai-frontier").is_dir())
@@ -2470,6 +2612,13 @@ class InstallerTests(unittest.TestCase):
     def test_authority_installer_rolls_back_catalog_when_initial_bundled_refresh_fails(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2486,6 +2635,7 @@ class InstallerTests(unittest.TestCase):
             for fixture in (codex, codex_host):
                 fixture.write_text("#!/bin/sh\nexit 0\n")
                 fixture.chmod(0o755)
+            pnpm_node = self._fake_pnpm_node(root)
             state_root = root / "state"
             previous_catalog = state_root / "capabilities" / "generations" / "previous.json"
             previous_catalog.parent.mkdir(parents=True)
@@ -2509,7 +2659,9 @@ class InstallerTests(unittest.TestCase):
                 calls.append(command)
                 if command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command[:2] == ("id", "-u"):
                     return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
@@ -2545,6 +2697,8 @@ class InstallerTests(unittest.TestCase):
                     str(state_root),
                     "--codex-binary",
                     str(codex),
+                    "--pnpm-node",
+                    str(pnpm_node),
                     "--research-skill-source",
                     str(research),
                 ],

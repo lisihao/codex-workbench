@@ -4,6 +4,10 @@ set -euo pipefail
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(dirname -- "$script_directory")"
 
+# Bind module execution to the checkout or installed app containing this
+# launcher, rather than an inherited PYTHONPATH from another Workbench copy.
+export PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # An explicitly configured interpreter is authoritative.  Falling through to
 # another interpreter after it fails would hide a broken deployment and could
 # silently change the runtime used by the coordinator.

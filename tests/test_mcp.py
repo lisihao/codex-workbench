@@ -174,6 +174,8 @@ class MCPTests(unittest.TestCase):
                 "workbench_inspect_task",
                 "workbench_control_task",
                 "workbench_deliver_github",
+                "workbench_create_delivery_objective",
+                "workbench_get_delivery_objective",
                 "workbench_read_events",
                 "workbench_read_artifact",
                 "workbench_acceptance_report",

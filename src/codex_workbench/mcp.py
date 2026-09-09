@@ -11,6 +11,7 @@ from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
+from .dirty_worktree_recovery import observed_indeterminate_recovery_paths
 from .governance import code_as_harness_health
 from .planner import PlannerError
 from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
@@ -42,6 +43,26 @@ _LIST_TASKS_NODE_STATES = (
 
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "workbench_create_delivery_objective",
+        "description": "Attach a durable delivery objective to an existing task or planning reservation. Repeating the same command is idempotent. This does not grant external authority or accept work.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["task_id", "command_id", "request"],
+            "properties": {
+                "task_id": {"type": "string"}, "command_id": {"type": "string"},
+                "request": {"type": "object", "required": ["requested_endpoints", "scope", "authority"]},
+            },
+        },
+    },
+    {
+        "name": "workbench_get_delivery_objective",
+        "description": "Read an existing task's durable delivery stage, next wakeup, waits and receipts.",
+        "inputSchema": {
+            "type": "object", "additionalProperties": False, "required": ["task_id"],
+            "properties": {"task_id": {"type": "string"}},
+        },
+    },
     {
         "name": "workbench_request",
         "description": "Quickly enqueue a bounded natural-language planning request on the Mac mini authority; planning and model calls run asynchronously.",
@@ -204,6 +225,7 @@ TOOLS: list[dict[str, Any]] = [
                         "set_priority",
                         "steer",
                         "resolve_indeterminate",
+                        "resolve_indeterminate_locally",
                     ]
                 },
                 "expected_revision": {"type": "integer"},
@@ -217,6 +239,10 @@ TOOLS: list[dict[str, Any]] = [
                 "expected_checkpoint_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
                 "confirm_no_side_effects": {"type": "boolean"},
                 "resolution": {"enum": ["retry", "fail", "cancel"]},
+                "confirm_old_executor_ended": {"type": "boolean"},
+                "confirm_effects_restricted_to_owned_files": {"type": "boolean"},
+                "dependency_input_ref": {"type": "string"},
+                "dry_run": {"type": "boolean"},
             },
         },
     },
@@ -530,6 +556,61 @@ class WorkbenchMCPServer:
         )
         return {"ok": True, "action": "retry-blocked", **resumed}
 
+    def _resolve_indeterminate_locally(
+        self,
+        task_id: str,
+        arguments: dict[str, Any],
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        node_id = arguments.get("node_id")
+        if type(node_id) is not str or not node_id.strip():
+            raise ValueError("node_id is required to resolve an indeterminate node locally")
+        node_id = node_id.strip()
+        expected_attempt = self._required_blocked_resume_attempt(arguments)
+        reason = self._required_blocked_resume_text(arguments, "reason")
+        confirm_old_executor_ended = self._optional_strict_boolean(
+            arguments, "confirm_old_executor_ended"
+        )
+        confirm_effects_restricted_to_owned_files = self._optional_strict_boolean(
+            arguments, "confirm_effects_restricted_to_owned_files"
+        )
+        dependency_input_ref = arguments.get("dependency_input_ref")
+        if dependency_input_ref is not None and type(dependency_input_ref) is not str:
+            raise ValueError("dependency_input_ref must be a string")
+        dry_run = self._optional_strict_boolean(arguments, "dry_run")
+
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        resumed = self.store.queue_indeterminate_local_recovery(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            reason=reason,
+            confirm_old_executor_ended=confirm_old_executor_ended,
+            confirm_effects_restricted_to_owned_files=confirm_effects_restricted_to_owned_files,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            dry_run=dry_run,
+        )
+        return {
+            "ok": True,
+            "action": "resolve-indeterminate-locally",
+            "operator_confirmed": True,
+            **resumed,
+        }
+
     @staticmethod
     def _bounded_summary_text(value: Any, maximum: int) -> tuple[str, bool]:
         text = str(value)
@@ -797,6 +878,15 @@ class WorkbenchMCPServer:
                     task_id=arguments.get("task_id"),
                 )
             )
+        if name == "workbench_create_delivery_objective":
+            return self._text(self.store.create_delivery_objective(
+                arguments["task_id"], arguments["command_id"], arguments["request"]
+            ))
+        if name == "workbench_get_delivery_objective":
+            objective = self.store.get_delivery_objective_for_task(arguments["task_id"])
+            if objective is None:
+                raise KeyError("delivery objective not found")
+            return self._text(objective)
         if name == "workbench_deliver_github":
             return self._text(
                 GitHubDelivery(self.store, self.artifacts).deliver(
@@ -936,6 +1026,14 @@ class WorkbenchMCPServer:
                     arguments["node_id"],
                     arguments["resolution"],
                     expected_revision=expected_revision,
+                )
+            elif action == "resolve_indeterminate_locally":
+                return self._text(
+                    self._resolve_indeterminate_locally(
+                        task_id,
+                        arguments,
+                        expected_revision=expected_revision,
+                    )
                 )
             else:
                 raise ValueError(f"unsupported control action: {action}")

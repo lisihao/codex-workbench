@@ -83,7 +83,7 @@ class WorkbenchHardeningTests(unittest.TestCase):
         export.write_text(
             json.dumps(
                 {
-                    "observed_at": now.isoformat(),
+                    "observed_at": (now - timedelta(seconds=1)).isoformat(),
                     "auth_ok": True,
                     "auth_method": "native-subscription",
                     "five_hour_remaining": 70,
