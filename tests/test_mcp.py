@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 import shutil
 import tempfile
@@ -28,7 +29,9 @@ from codex_workbench.mcp import (
     LIST_TASKS_MAX_LIMIT,
     LIST_TASKS_MAX_RESPONSE_BYTES,
     WorkbenchMCPServer,
+    serve_stdio,
 )
+from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecoveryError
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.store import WorkbenchStore
 
@@ -50,6 +53,25 @@ class MCPTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_recovery_error_does_not_close_stdio_connection(self) -> None:
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "workbench_resume_blocked_worktree", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+        ]
+        output = io.StringIO()
+        with patch.object(WorkbenchMCPServer, "_tool_result", side_effect=
+                          DirtyWorktreeRecoveryError("recovery worktree no longer matches its contract base")):
+            serve_stdio(self.config, self.store,
+                        io.StringIO("\n".join(json.dumps(item) for item in requests)), output)
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([item["id"] for item in responses], [1, 2, 3])
+        self.assertTrue(responses[0]["result"]["isError"])
+        self.assertIn("contract base", responses[0]["result"]["content"][0]["text"])
+        self.assertEqual(responses[1]["result"], {})
+        self.assertTrue(responses[2]["result"]["tools"])
 
     def call(self, name: str, arguments: dict) -> dict:
         response = self.server.handle(

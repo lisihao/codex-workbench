@@ -2,6 +2,8 @@
 
 Codex Workbench 以 Authority 的 SQLite 数据库作为任务状态、节点 attempt、工作树 allocation、指导和 Evidence 的唯一权威。失败恢复复用已有的 DirtyWorktreeRecovery、ArtifactStore 和 allocation 账本；它不会建立第二份恢复数据库，也不会从生成的运行目录反向覆盖源码仓库。
 
+MCP 将工作树恢复拒绝作为当前请求的 `isError` 返回，连接继续处理后续请求；拒绝不代表节点已恢复或启动。
+
 ## 调用方 revision 与原子控制
 
 外部 CLI、HTTP 和 MCP 的 queue、resume、pause、cancel、steer 必须传入刚读取的 expected_revision。服务端比较该 revision；陈旧、缺失、布尔值或字符串值都不能启动节点。内部创建任务后立即排队的可信路径仍可调用底层 store 接口，但不得用于外部控制。

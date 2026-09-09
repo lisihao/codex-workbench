@@ -14,6 +14,7 @@ from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .governance import code_as_harness_health
 from .planner import PlannerError
 from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
+from .worktrees import WorktreeError
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .submission import enqueue_natural_language_request, planning_request_receipt
 from .sync import RepositorySynchronizer, RepositorySyncError
@@ -369,6 +370,7 @@ class WorkbenchMCPServer:
             RepositorySyncError,
             StateConflictError,
             WorktreeRecoveryError,
+            WorktreeError,
             subprocess.SubprocessError,
             ValueError,
         ) as error:
