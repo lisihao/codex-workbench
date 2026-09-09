@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
@@ -13,6 +13,7 @@ import threading
 from typing import Any, Callable, Iterator
 
 from .model import (
+    DEFAULT_QUOTA_TTL_SECONDS,
     NodeResult,
     NodeSpec,
     QuotaSnapshot,
@@ -4868,6 +4869,7 @@ class WorkbenchStore:
         attempt: int,
         coordinator_epoch: int,
         lease_epoch: int,
+        quota_snapshot_id: int | None = None,
     ) -> int:
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
@@ -4893,7 +4895,9 @@ class WorkbenchStore:
             event_payload = dict(payload)
             # Route callers may describe why a handoff happened, but quota
             # provenance must come from the durable snapshot ledger. Strip
-            # caller-supplied copies before attaching the latest persisted row.
+            # caller-supplied copies before attaching the selected durable
+            # row.  Legacy callers retain newest-row attachment when they do
+            # not have an effective-observation reference.
             for key in (
                 "quota_snapshot",
                 "quota_provenance",
@@ -4901,12 +4905,25 @@ class WorkbenchStore:
                 "quota_source",
             ):
                 event_payload.pop(key, None)
-            quota_row = connection.execute(
-                """
-                SELECT id, snapshot_json FROM quota_snapshots
-                WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
-                """
-            ).fetchone()
+            if quota_snapshot_id is not None:
+                if type(quota_snapshot_id) is not int or quota_snapshot_id < 1:
+                    raise ValueError("route quota_snapshot_id must be a positive integer")
+                quota_row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' AND id = ?
+                    """,
+                    (quota_snapshot_id,),
+                ).fetchone()
+                if quota_row is None:
+                    raise StateConflictError("route quota snapshot reference does not exist")
+            else:
+                quota_row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
             if quota_row is not None:
                 try:
                     event_payload["quota_snapshot_id"] = int(quota_row["id"])
@@ -7614,31 +7631,369 @@ class WorkbenchStore:
 
     def write_quota(self, snapshot: QuotaSnapshot) -> None:
         snapshot.validate()
+        raw_snapshot = snapshot.raw_payload()
         with self.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO quota_snapshots(provider, snapshot_json, observed_at)
                 VALUES('claude', ?, ?)
                 """,
-                (canonical_json(asdict(snapshot)), snapshot.observed_at),
+                (canonical_json(raw_snapshot), snapshot.observed_at),
             )
             self._event(
                 connection,
                 "quota.updated",
                 None,
                 None,
-                {"provider": "claude", "snapshot": asdict(snapshot)},
+                {"provider": "claude", "snapshot": raw_snapshot},
             )
 
-    def latest_quota(self) -> QuotaSnapshot | None:
+    @staticmethod
+    def _quota_snapshot_from_row(row: sqlite3.Row) -> QuotaSnapshot:
+        """Hydrate immutable collector evidence and bind its ledger row ID."""
+
+        payload = json.loads(str(row["snapshot_json"]))
+        if not isinstance(payload, dict):
+            raise StateConflictError("quota snapshot ledger row is not an object")
+        # These are read-time projection fields; a raw row may never smuggle
+        # them back into the ledger selection result.
+        payload.pop("ledger_id", None)
+        payload.pop("effective_observation", None)
+        payload.pop("effective_admission_blocked", None)
+        return replace(QuotaSnapshot(**payload), ledger_id=int(row["id"]))
+
+    @staticmethod
+    def _quota_receipt(
+        raw: QuotaSnapshot,
+        effective: QuotaSnapshot,
+        *,
+        selection: str,
+        recovery_reason: str,
+    ) -> dict[str, Any]:
+        """Describe a ledger projection without adding a quota authority."""
+
+        def provenance(snapshot: QuotaSnapshot) -> dict[str, Any]:
+            return {
+                "provider": "claude",
+                "source": snapshot.source,
+                "producer": snapshot.producer,
+                "producer_schema_version": snapshot.producer_schema_version,
+                "claude_version": snapshot.claude_version,
+                "five_hour_window_id": snapshot.five_hour_window_id,
+                "weekly_window_id": snapshot.weekly_window_id,
+            }
+
+        return {
+            "selection": selection,
+            "raw_snapshot_id": raw.ledger_id,
+            "effective_snapshot_id": effective.ledger_id,
+            "raw_observed_at": raw.observed_at,
+            "effective_observed_at": effective.observed_at,
+            "authentication": (
+                "native-subscription-authenticated"
+                if raw.auth_ok and raw.auth_method == "native-subscription"
+                else "unavailable"
+            ),
+            "quota_collection": raw.quota_collection_status(),
+            "raw_observation_status": raw.observation_status(),
+            "recovery_reason": recovery_reason,
+            "admission_blocked": effective.effective_admission_blocked,
+            "raw_provenance": provenance(raw),
+            "effective_provenance": provenance(effective),
+        }
+
+    @staticmethod
+    def _empty_reset_binding_reason(
+        empty: QuotaSnapshot,
+        complete: QuotaSnapshot,
+        *,
+        current_time: datetime | None,
+    ) -> str | None:
+        """Return why an empty row cannot borrow a complete ledger row.
+
+        A producer-confirmed collection failure has no parsed pool/reset
+        payload.  It may borrow only before the selected complete row's known
+        reset deadlines.  An otherwise empty row with unknown bindings remains
+        uncertain and therefore fails closed.
+        """
+
+        empty_windows = (empty.five_hour_window_id, empty.weekly_window_id)
+        complete_windows = (complete.five_hour_window_id, complete.weekly_window_id)
+        if all(isinstance(value, str) and value for value in empty_windows):
+            if empty_windows != complete_windows:
+                return "reset-window-mismatch"
+            if not empty.has_current_confident_reset_windows(current_time=current_time):
+                return "empty-reset-binding-unknown-or-expired"
+            return None
+        if (
+            empty.five_hour_window_id is None
+            and empty.weekly_window_id is None
+            and empty.collection_state == "failed"
+        ):
+            observed = empty.observed_datetime()
+            deadlines = complete.reset_window_deadlines()
+            if (
+                observed is None
+                or deadlines is None
+                or any(observed >= deadline for deadline in deadlines)
+            ):
+                return "empty-reset-binding-unknown-or-expired"
+            return None
+        return "empty-reset-binding-unknown-or-expired"
+
+    @staticmethod
+    def _same_raw_observation(snapshots: list[QuotaSnapshot]) -> bool:
+        """Whether a same-timestamp group is genuinely one raw observation."""
+
+        return len({canonical_json(snapshot.raw_payload()) for snapshot in snapshots}) <= 1
+
+    @staticmethod
+    def _safety_preference(snapshot: QuotaSnapshot) -> tuple[int, float, int]:
+        """Choose the least permissive actual row for an ambiguous tie."""
+
+        status = snapshot.observation_status()
+        identifier = snapshot.ledger_id or 0
+        if status == "authentication-unavailable":
+            return 0, 0.0, -identifier
+        if not snapshot.has_compatible_subscription_provenance():
+            return 1, 0.0, -identifier
+        if status == "authenticated-partial":
+            values = [
+                value
+                for value in (
+                    snapshot.five_hour_remaining,
+                    snapshot.weekly_all_remaining,
+                    snapshot.weekly_sonnet_remaining,
+                    snapshot.weekly_fable_remaining,
+                )
+                if value is not None
+            ]
+            return 2, min(values) if values else 0.0, -identifier
+        if status == "authenticated-empty":
+            return 3, 0.0, -identifier
+        values = [
+            value
+            for value in (
+                snapshot.five_hour_remaining,
+                snapshot.weekly_all_remaining,
+                snapshot.weekly_sonnet_remaining,
+                snapshot.weekly_fable_remaining,
+            )
+            if value is not None
+        ]
+        return 4, min(values) if values else 0.0, -identifier
+
+    @staticmethod
+    def _ordered_quota_observations(
+        snapshots: list[QuotaSnapshot],
+    ) -> tuple[QuotaSnapshot, list[QuotaSnapshot], frozenset[datetime], tuple[int, ...], str | None]:
+        """Pick current raw evidence by observed time, not append race order.
+
+        A later append carrying an older observation cannot replace newer auth
+        loss or low-pool evidence.  Invalid timestamps written after the newest
+        orderable row are also an admission barrier because their placement is
+        unknowable.
+        """
+
+        valid: list[tuple[datetime, QuotaSnapshot]] = []
+        invalid: list[QuotaSnapshot] = []
+        for snapshot in snapshots:
+            observed = snapshot.observed_datetime()
+            if observed is None:
+                invalid.append(snapshot)
+            else:
+                valid.append((observed, snapshot))
+        if not valid:
+            raw = max(snapshots, key=lambda snapshot: snapshot.ledger_id or 0)
+            return (
+                replace(raw, effective_admission_blocked=True),
+                [],
+                frozenset(),
+                tuple(snapshot.ledger_id or 0 for snapshot in invalid),
+                "invalid-observation-time",
+            )
+
+        newest_time = max(observed for observed, _snapshot in valid)
+        newest_group = [
+            snapshot for observed, snapshot in valid if observed == newest_time
+        ]
+        newest_insert_id = max(snapshot.ledger_id or 0 for snapshot in newest_group)
+        invalid_ids = tuple(snapshot.ledger_id or 0 for snapshot in invalid)
+        if invalid and max(invalid_ids) > newest_insert_id:
+            raw = max(invalid, key=lambda snapshot: snapshot.ledger_id or 0)
+            return (
+                replace(raw, effective_admission_blocked=True),
+                [],
+                frozenset(),
+                invalid_ids,
+                "invalid-observation-time",
+            )
+
+        grouped: dict[datetime, list[QuotaSnapshot]] = {}
+        for observed, snapshot in valid:
+            grouped.setdefault(observed, []).append(snapshot)
+        ambiguous_times = frozenset(
+            observed
+            for observed, group in grouped.items()
+            if not WorkbenchStore._same_raw_observation(group)
+        )
+        raw = min(newest_group, key=WorkbenchStore._safety_preference)
+        ordered = [
+            snapshot
+            for _observed, snapshot in sorted(
+                valid,
+                key=lambda item: (item[0], item[1].ledger_id or 0),
+                reverse=True,
+            )
+        ]
+        if newest_time in ambiguous_times:
+            return (
+                replace(raw, effective_admission_blocked=True),
+                ordered,
+                ambiguous_times,
+                invalid_ids,
+                "ambiguous-observation-order",
+            )
+        return raw, ordered, ambiguous_times, invalid_ids, None
+
+    @staticmethod
+    def _recovered_quota(
+        snapshots: list[QuotaSnapshot],
+        *,
+        max_age_seconds: int | None,
+        current_time: datetime | None,
+        ambiguous_times: frozenset[datetime],
+        invalid_observation_ids: tuple[int, ...],
+    ) -> tuple[QuotaSnapshot, str, str]:
+        """Select a bounded effective row from ordered raw ledger evidence.
+
+        Only a current authenticated-empty row may borrow an older complete
+        row.  Its original timestamp, reset windows, and durable ID stay
+        intact.  The append order must agree with observed chronology along
+        the recovery run, so a concurrent delayed write cannot mask a newer
+        empty/auth-loss/low-pool observation.
+        """
+
+        newest = snapshots[0]
+        status = newest.observation_status()
+        if status == "complete":
+            return newest, "latest", "latest-complete-observation"
+        if status == "authentication-unavailable":
+            return newest, "latest", "authentication-unavailable"
+        if status == "authenticated-partial":
+            return newest, "latest", "partial-observation-authoritative"
+        assert status == "authenticated-empty"
+        if max_age_seconds is None:
+            return newest, "latest", "caller-freshness-limit-unavailable"
+        if not newest.has_compatible_subscription_provenance():
+            return newest, "latest", "incompatible-provenance"
+        if not newest.is_fresh(
+            max_age_seconds=max_age_seconds,
+            current_time=current_time,
+        ):
+            return newest, "latest", "empty-observation-stale"
+        if newest.observed_datetime() is None:
+            return newest, "latest", "empty-observation-time-invalid"
+
+        empty_run = [newest]
+        previous_empty = newest
+        for candidate in snapshots[1:]:
+            candidate_observed = candidate.observed_datetime()
+            previous_observed = previous_empty.observed_datetime()
+            candidate_id = candidate.ledger_id or 0
+            previous_id = previous_empty.ledger_id or 0
+            if candidate_observed in ambiguous_times:
+                return newest, "latest", "ambiguous-observation-order"
+            if (
+                candidate_observed is None
+                or previous_observed is None
+                or candidate_observed >= previous_observed
+                or candidate_id >= previous_id
+            ):
+                return newest, "latest", "out-of-order-observation"
+            if any(candidate_id < invalid_id < previous_id for invalid_id in invalid_observation_ids):
+                return newest, "latest", "invalid-observation-time"
+
+            candidate_status = candidate.observation_status()
+            if candidate_status == "authentication-unavailable":
+                return newest, "latest", "intervening-authentication-unavailable"
+            if candidate_status == "authenticated-partial":
+                return newest, "latest", "intervening-partial-observation-authoritative"
+            if candidate_status == "authenticated-empty":
+                if not candidate.has_compatible_subscription_provenance():
+                    return newest, "latest", "incompatible-provenance"
+                if candidate.recovery_identity() != newest.recovery_identity():
+                    return newest, "latest", "source-identity-mismatch"
+                if not candidate.is_fresh(
+                    max_age_seconds=max_age_seconds,
+                    current_time=current_time,
+                ):
+                    return newest, "latest", "empty-observation-stale"
+                empty_run.append(candidate)
+                previous_empty = candidate
+                continue
+
+            assert candidate_status == "complete"
+            if not candidate.has_compatible_subscription_provenance():
+                return newest, "latest", "incompatible-provenance"
+            if candidate.recovery_identity() != newest.recovery_identity():
+                return newest, "latest", "source-identity-mismatch"
+            if not candidate.is_fresh(
+                max_age_seconds=max_age_seconds,
+                current_time=current_time,
+            ):
+                return newest, "latest", "complete-observation-stale"
+            if not candidate.has_current_confident_reset_windows(current_time=current_time):
+                return newest, "latest", "complete-reset-binding-unknown-or-expired"
+            for empty in empty_run:
+                binding_reason = WorkbenchStore._empty_reset_binding_reason(
+                    empty,
+                    candidate,
+                    current_time=current_time,
+                )
+                if binding_reason is not None:
+                    return newest, "latest", binding_reason
+            return candidate, "last-known-good", "authenticated-empty-recovered"
+        return newest, "latest", "no-compatible-complete-observation"
+
+    def latest_quota(
+        self,
+        *,
+        max_age_seconds: int | None = DEFAULT_QUOTA_TTL_SECONDS,
+        current_time: datetime | None = None,
+    ) -> QuotaSnapshot | None:
         with self.connection() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
-                SELECT snapshot_json FROM quota_snapshots
-                WHERE provider = 'claude' ORDER BY id DESC LIMIT 1
+                SELECT id, snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC
                 """
-            ).fetchone()
-            return QuotaSnapshot(**json.loads(row["snapshot_json"])) if row else None
+            ).fetchall()
+        if not rows:
+            return None
+        snapshots = [self._quota_snapshot_from_row(row) for row in rows]
+        raw, ordered, ambiguous_times, invalid_ids, raw_reason = (
+            self._ordered_quota_observations(snapshots)
+        )
+        if raw_reason is not None:
+            effective, selection, recovery_reason = raw, "latest", raw_reason
+        else:
+            effective, selection, recovery_reason = self._recovered_quota(
+                ordered,
+                max_age_seconds=max_age_seconds,
+                current_time=current_time,
+                ambiguous_times=ambiguous_times,
+                invalid_observation_ids=invalid_ids,
+            )
+        return replace(
+            effective,
+            effective_observation=self._quota_receipt(
+                raw,
+                effective,
+                selection=selection,
+                recovery_reason=recovery_reason,
+            ),
+        )
 
     def quota_snapshot_reference(self, snapshot: QuotaSnapshot) -> int | None:
         """Return the existing immutable snapshot row for attribution.
@@ -7649,16 +8004,47 @@ class WorkbenchStore:
         """
 
         snapshot.validate()
+        raw_payload = snapshot.raw_payload()
         with self.connection() as connection:
+            if snapshot.ledger_id is not None:
+                row = connection.execute(
+                    """
+                    SELECT id, snapshot_json FROM quota_snapshots
+                    WHERE provider = 'claude' AND id = ?
+                    """,
+                    (snapshot.ledger_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                # Normalize legacy omitted defaults before comparing, while
+                # still requiring the exact immutable ledger row.
+                persisted = self._quota_snapshot_from_row(row)
+                if persisted != snapshot:
+                    return None
+                return int(row["id"])
             row = connection.execute(
                 """
                 SELECT id FROM quota_snapshots
                 WHERE provider = 'claude' AND snapshot_json = ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (canonical_json(asdict(snapshot)),),
+                (canonical_json(raw_payload),),
             ).fetchone()
-            return int(row["id"]) if row is not None else None
+            if row is not None:
+                return int(row["id"])
+            # A bounded compatibility scan resolves a pre-feature row that
+            # omitted optional defaults, without ever attaching a different
+            # newer row to the selected effective observation.
+            rows = connection.execute(
+                """
+                SELECT id, snapshot_json FROM quota_snapshots
+                WHERE provider = 'claude' ORDER BY id DESC
+                """
+            ).fetchall()
+            for candidate in rows:
+                if self._quota_snapshot_from_row(candidate) == snapshot:
+                    return int(candidate["id"])
+            return None
 
     def list_quota_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
         with self.connection() as connection:

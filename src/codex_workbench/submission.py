@@ -364,6 +364,7 @@ _PUBLIC_COMPILED_RESULT_FIELDS = (
     "base_sha",
     "claude_dispatch_available",
     "claude_models_available",
+    "quota_observation",
     "routing_strategy",
     "routing_policy",
     "capability_registry",
@@ -845,7 +846,7 @@ def compile_natural_language_request(
     )
     contract.validate()
     artifacts = ArtifactStore(config.state_root / "artifacts")
-    quota = store.latest_quota()
+    quota = store.latest_quota(max_age_seconds=DEFAULT_QUOTA_TTL_SECONDS)
     catalog_claude_families = _catalog_claude_families(capability_catalog)
     quota_admitted_models = tuple(
         model
@@ -891,6 +892,22 @@ def compile_natural_language_request(
         "base_sha": resolved_base_sha,
         "claude_dispatch_available": bool(claude_models_available),
         "claude_models_available": claude_models_available,
+        "quota_observation": (
+            quota.effective_observation
+            if quota is not None and quota.effective_observation is not None
+            else {
+                "selection": "none",
+                "raw_snapshot_id": None,
+                "effective_snapshot_id": None,
+                "authentication": "unavailable",
+                "quota_collection": "not-collected",
+                "raw_observation_status": "unavailable",
+                "recovery_reason": "no-quota-observation",
+                "admission_blocked": True,
+                "raw_provenance": {"provider": "claude"},
+                "effective_provenance": {"provider": "claude"},
+            }
+        ),
         "routing_strategy": contract.strategy.to_dict(),
         "routing_policy": {
             "version": "model-routing-v3" if capability_catalog is not None else contract.strategy.version,

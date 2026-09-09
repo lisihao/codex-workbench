@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shlex
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .governance import (
     CODE_AS_HARNESS_PROFILE,
@@ -1169,10 +1170,22 @@ class QuotaSnapshot:
     producer: str | None = None
     producer_schema_version: int | None = None
     claude_version: str | None = None
+    # Collection state is raw collector evidence.  Authentication can remain
+    # healthy when a passive collection cannot obtain usable quota values.
+    collection_state: str | None = None
+    # These fields are bound only while reading the append-only ledger.  They
+    # are deliberately excluded from raw persistence and identity matching.
+    ledger_id: int | None = field(default=None, compare=False)
+    effective_observation: dict[str, Any] | None = field(default=None, compare=False)
+    effective_admission_blocked: bool = field(default=False, compare=False)
 
     def validate(self) -> None:
         if not self.source.strip():
             raise ValueError("quota source is required")
+        if self.collection_state not in {None, "complete", "failed"}:
+            raise ValueError("quota collection state is invalid")
+        if not isinstance(self.effective_admission_blocked, bool):
+            raise ValueError("quota effective admission state is invalid")
         percentages = {
             "five_hour_remaining": self.five_hour_remaining,
             "weekly_all_remaining": self.weekly_all_remaining,
@@ -1182,6 +1195,107 @@ class QuotaSnapshot:
         for name, value in percentages.items():
             if value is not None and not 0 <= value <= 100:
                 raise ValueError(f"{name} must be between 0 and 100")
+
+    def raw_payload(self) -> dict[str, Any]:
+        """Return collector evidence without a read-time ledger projection."""
+
+        payload = asdict(self)
+        payload.pop("ledger_id", None)
+        payload.pop("effective_observation", None)
+        payload.pop("effective_admission_blocked", None)
+        # Existing ledger rows predate this optional distinction.  Retaining
+        # their canonical shape permits exact durable reference resolution.
+        if payload.get("collection_state") is None:
+            payload.pop("collection_state", None)
+        return payload
+
+    def observed_datetime(self) -> datetime | None:
+        try:
+            observed = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=UTC)
+        return observed.astimezone(UTC)
+
+    def has_complete_shared_pools(self) -> bool:
+        """Whether both shared admission pools are available.
+
+        Model-specific Sonnet and Fable pools are optional: when absent they
+        continue to inherit the all-model weekly pool.
+        """
+
+        return self.five_hour_remaining is not None and self.weekly_all_remaining is not None
+
+    def observation_status(self) -> str:
+        """Classify the raw observation without conflating auth and collection."""
+
+        if not self.auth_ok or self.auth_method != "native-subscription":
+            return "authentication-unavailable"
+        if self.has_complete_shared_pools():
+            return "complete"
+        if all(
+            value is None
+            for value in (
+                self.five_hour_remaining,
+                self.weekly_all_remaining,
+                self.weekly_sonnet_remaining,
+                self.weekly_fable_remaining,
+            )
+        ):
+            return "authenticated-empty"
+        return "authenticated-partial"
+
+    def quota_collection_status(self) -> str:
+        """Expose quota collection health separately from subscription auth."""
+
+        if not self.auth_ok or self.auth_method != "native-subscription":
+            return "not-collected"
+        if self.has_complete_shared_pools():
+            return "complete"
+        if self.collection_state == "failed":
+            return "failed"
+        if self.observation_status() == "authenticated-empty":
+            return "missing"
+        return "partial"
+
+    def recovery_identity(self) -> tuple[object, ...]:
+        """Return the producer/source identity that recovery must not cross."""
+
+        return (
+            self.auth_ok,
+            self.auth_method,
+            self.source,
+            self.producer,
+            self.producer_schema_version,
+            self.claude_version,
+        )
+
+    def reset_window_deadlines(self) -> tuple[datetime, datetime] | None:
+        """Return conservative reset deadlines, or ``None`` when uncertain."""
+
+        five_hour = _quota_reset_deadline(self.five_hour_window_id, "five_hour")
+        weekly = _quota_reset_deadline(self.weekly_window_id, "weekly")
+        if five_hour is None or weekly is None:
+            return None
+        return five_hour, weekly
+
+    def has_current_confident_reset_windows(
+        self,
+        *,
+        current_time: datetime | None = None,
+    ) -> bool:
+        """Ensure a recovery candidate has not crossed either reset boundary."""
+
+        deadlines = self.reset_window_deadlines()
+        observed = self.observed_datetime()
+        if deadlines is None or observed is None:
+            return False
+        current = current_time or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        current = current.astimezone(UTC)
+        return all(observed < deadline and current < deadline for deadline in deadlines)
 
     def remaining_for(self, model: str) -> tuple[float | None, ...]:
         values: list[float | None] = [self.five_hour_remaining, self.weekly_all_remaining]
@@ -1196,14 +1310,13 @@ class QuotaSnapshot:
         return tuple(values)
 
     def age(self, *, current_time: datetime | None = None) -> timedelta | None:
-        try:
-            observed = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
-        except ValueError:
+        observed = self.observed_datetime()
+        if observed is None:
             return None
-        if observed.tzinfo is None:
-            observed = observed.replace(tzinfo=UTC)
         current = current_time or datetime.now(UTC)
-        return current.astimezone(UTC) - observed.astimezone(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return current.astimezone(UTC) - observed
 
     def is_fresh(
         self,
@@ -1218,6 +1331,15 @@ class QuotaSnapshot:
         if not self.auth_ok or self.auth_method != "native-subscription":
             return "auth-unavailable", None
         values = self.remaining_for(model)
+        observed_values = [value for value in values if value is not None]
+        # A partial value cannot authorize a call, but a protected/red value
+        # is sufficient to refuse one.  It must never be hidden by recovery.
+        if observed_values:
+            observed_minimum = min(observed_values)
+            if observed_minimum <= 25:
+                return "protected", observed_minimum
+            if observed_minimum < 30:
+                return "red", observed_minimum
         if any(value is None for value in values):
             return "unknown", None
         minimum = min(value for value in values if value is not None)
@@ -1305,6 +1427,12 @@ class QuotaSnapshot:
                 "codex",
                 "unknown",
                 "Claude quota provenance is not the compatible native subscription producer",
+            )
+        if self.effective_admission_blocked:
+            return decision(
+                "codex",
+                "unknown",
+                "Claude quota observation ordering is uncertain",
             )
         zone, minimum = self.quota_zone(model)
         if zone == "unknown":
@@ -1414,4 +1542,47 @@ class QuotaSnapshot:
                 else None
             ),
             "snapshot_ttl_seconds": max_age_seconds,
+            "quota_snapshot_id": self.ledger_id,
+            "effective_observation": self.effective_observation,
         }
+
+
+def _quota_reset_deadline(window_id: object, kind: str) -> datetime | None:
+    """Parse a collector reset ID conservatively for read-time recovery.
+
+    Weekly IDs intentionally retain only their reset date and timezone.  The
+    local start of that date is the earliest possible reset and is therefore
+    the safe bound for preserving a pre-reset balance.
+    """
+
+    if not isinstance(window_id, str) or not window_id:
+        return None
+    try:
+        if kind == "five_hour":
+            prefix = "five_hour:"
+            if not window_id.startswith(prefix):
+                return None
+            value = window_id.removeprefix(prefix)
+            if not value or value == "idle":
+                return None
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            return parsed.astimezone(UTC)
+        if kind == "weekly":
+            prefix = "weekly:"
+            if not window_id.startswith(prefix):
+                return None
+            date_text, separator, zone_name = window_id.removeprefix(prefix).partition("@")
+            if not separator or not date_text or not zone_name:
+                return None
+            date = datetime.fromisoformat(date_text).date()
+            return datetime(
+                date.year,
+                date.month,
+                date.day,
+                tzinfo=ZoneInfo(zone_name),
+            ).astimezone(UTC)
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    return None
