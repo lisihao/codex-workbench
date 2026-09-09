@@ -420,6 +420,8 @@ class ExecutionPipelineAttributionTests(unittest.TestCase):
             repository=str(repository),
             base_sha=base_sha,
             objective="correlate fallback retry and verifier evidence",
+            capability_snapshot_id="pipeline-v3-fixture",
+            capability_digest="a" * 64,
             allowed_scope=("README.md",),
             required_artifacts=(),
             task_type="tests",
@@ -430,12 +432,16 @@ class ExecutionPipelineAttributionTests(unittest.TestCase):
                 "work", contract.task_id, "fallback fixture", "claude", "sonnet",
                 "exercise keyless fallback", read_scopes=("README.md",), task_type="tests",
                 complexity="high", parallelizable=True, routing_policy_version="model-routing-v3",
+                capability_snapshot_id=contract.capability_snapshot_id,
+                capability_digest=contract.capability_digest,
             ),
             NodeSpec(
                 "verify", contract.task_id, "verifier fixture", "codex", "gpt-5.6-sol",
                 "verify the durable retry result", depends_on=("work",), read_scopes=("README.md",),
                 verifier=True, task_type="tests", complexity="high", parallelizable=True,
                 routing_policy_version="model-routing-v3",
+                capability_snapshot_id=contract.capability_snapshot_id,
+                capability_digest=contract.capability_digest,
             ),
         ]
         store.create_task(contract, nodes, "pipeline-create")
