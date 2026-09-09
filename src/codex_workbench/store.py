@@ -4769,6 +4769,7 @@ class WorkbenchStore:
         allowed_scope = contract.get("allowed_scope") if isinstance(contract, dict) else None
         forbidden_scope = contract.get("forbidden_scope") if isinstance(contract, dict) else None
         write_scopes = spec.get("write_scopes") if isinstance(spec, dict) else None
+        depends_on = spec.get("depends_on") if isinstance(spec, dict) else None
         if not (
             isinstance(allowed_scope, list)
             and all(isinstance(scope, str) for scope in allowed_scope)
@@ -4776,6 +4777,8 @@ class WorkbenchStore:
             and all(isinstance(scope, str) for scope in forbidden_scope)
             and isinstance(write_scopes, list)
             and all(isinstance(scope, str) for scope in write_scopes)
+            and isinstance(depends_on, list)
+            and all(isinstance(dependency, str) and dependency for dependency in depends_on)
         ):
             raise StateConflictError("blocked-worktree recovery scopes are invalid")
         return {
@@ -4791,6 +4794,7 @@ class WorkbenchStore:
                 "state": str(node["state"]),
                 "attempt": int(node["attempt"]),
                 "write_scopes": tuple(write_scopes),
+                "depends_on": tuple(depends_on),
             },
             "source": {
                 "worktree": str(allocation["current_path"]),
@@ -4868,6 +4872,10 @@ class WorkbenchStore:
 
         capture_kwargs: dict[str, object] = {}
         dependency_input_ref = raw_artifacts.get("dependency-input")
+        if candidate["node"]["depends_on"] and dependency_input_ref is None:
+            raise StateConflictError(
+                "dependent blocked-worktree recovery requires a recorded dependency input"
+            )
         if dependency_input_ref is not None:
             if not isinstance(dependency_input_ref, str) or not dependency_input_ref:
                 raise StateConflictError(
@@ -4888,10 +4896,6 @@ class WorkbenchStore:
             }
 
         if preserve_untracked:
-            if dependency_input_ref is None:
-                raise StateConflictError(
-                    "explicit untracked preservation requires a dependent blocked worker"
-                )
             source_path = Path(str(source["worktree"])).expanduser().resolve(strict=True)
             untracked_paths = DirtyWorktreeRecovery.untracked_paths(source_path)
             if not untracked_paths:
@@ -4998,6 +5002,10 @@ class WorkbenchStore:
             common.add("source_checkpoint_sha")
         if schema_version == 1:
             required = common
+        elif schema_version in {7, 8}:
+            required = common | {"untracked_paths"}
+            if schema_version == 8:
+                required |= {"generated_residue_paths", "generated_residue_ref"}
         elif schema_version in {2, 3, 5, 6}:
             required = common | {
                 "source_task_id",
@@ -5016,6 +5024,10 @@ class WorkbenchStore:
         if set(recovery) != required:
             raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
         source = candidate["source"]
+        if schema_version in {1, 4, 7, 8} and candidate["node"]["depends_on"]:
+            raise StateConflictError(
+                "root dirty-worktree recovery receipt cannot reproduce a dependent worker"
+            )
         for relative_path in source["changed_paths"] if "source_checkpoint_sha" in recovery else ():
             if not scope_allows(relative_path, candidate["task"]["allowed_scope"],
                                 candidate["task"]["forbidden_scope"]):
@@ -5034,7 +5046,7 @@ class WorkbenchStore:
         source_residue = source.get("generated_residue_paths", ())
         if source_residue:
             if (
-                schema_version not in {4, 5, 6}
+                schema_version not in {4, 5, 6, 8}
                 or tuple(recovery.get("generated_residue_paths", ())) != source_residue
                 or not isinstance(recovery.get("generated_residue_ref"), str)
                 or not recovery["generated_residue_ref"]
@@ -5042,7 +5054,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     "dirty-worktree recovery receipt does not bind generated residue"
                 )
-        elif schema_version in {4, 5, 6}:
+        elif schema_version in {4, 5, 6, 8}:
             raise StateConflictError(
                 "dirty-worktree recovery receipt has unexpected generated residue"
             )
@@ -5069,7 +5081,7 @@ class WorkbenchStore:
                         f"dirty-worktree recovery receipt field {field!r} is invalid"
                     )
         expected_untracked: tuple[str, ...] = ()
-        if schema_version in {3, 6}:
+        if schema_version in {3, 6, 7, 8}:
             raw_untracked = recovery.get("untracked_paths")
             if (
                 not isinstance(raw_untracked, list)
@@ -5099,7 +5111,7 @@ class WorkbenchStore:
             receipt_source = Path(str(recovery["source_worktree"])).expanduser().resolve(strict=True)
             artifacts = ArtifactStore(self.path.parent / "artifacts")
             patch = artifacts.verify(str(recovery["patch_ref"])).read_bytes()
-            if schema_version in {4, 5, 6}:
+            if schema_version in {4, 5, 6, 8}:
                 artifacts.verify(str(recovery["generated_residue_ref"]))
             source_result = json.loads(candidate["source_result_json"])
             actual_untracked = DirtyWorktreeRecovery.untracked_paths(source_path)
@@ -5137,10 +5149,10 @@ class WorkbenchStore:
         if actual_untracked != expected_untracked:
             raise StateConflictError("dirty-worktree recovery source untracked paths drifted")
         comparison_tree = base_sha
-        if schema_version in {1, 4}:
+        if schema_version in {1, 4, 7, 8}:
             if recorded_dependency_ref is not None:
                 raise StateConflictError(
-                    "legacy dirty-worktree recovery cannot reproduce recorded dependency input"
+                    "root dirty-worktree recovery cannot reproduce recorded dependency input"
                 )
         else:
             if recovery["source_task_id"] != candidate["task"]["task_id"]:
@@ -8173,6 +8185,10 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             receipt_fields = common_fields
+        elif schema_version in {7, 8}:
+            receipt_fields = common_fields | {"untracked_paths"}
+            if schema_version == 8:
+                receipt_fields |= {"generated_residue_paths", "generated_residue_ref"}
         elif schema_version in {2, 3, 5, 6}:
             receipt_fields = common_fields | {
                 "source_task_id",
@@ -8224,7 +8240,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
-        if schema_version in {4, 5, 6}:
+        if schema_version in {4, 5, 6, 8}:
             generated_paths = recovery.get("generated_residue_paths")
             generated_ref = recovery.get("generated_residue_ref")
             if (
@@ -8239,7 +8255,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     "dirty-worktree recovery generated residue evidence is invalid"
                 )
-        if schema_version in {3, 6}:
+        if schema_version in {3, 6, 7, 8}:
             untracked_paths = recovery.get("untracked_paths")
             if (
                 not isinstance(untracked_paths, list)
@@ -9307,7 +9323,7 @@ class WorkbenchStore:
                     "dependency recovery input tree does not match the recovery receipt"
                 )
             comparison_tree = dependency_input.input_tree_sha
-        elif recovery.get("schema_version") not in {1, 4}:
+        elif recovery.get("schema_version") not in {1, 4, 7, 8}:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         expected_branch = WorktreeManager.branch_name(task_id, node_id, attempt)
         if self._recovery_git_bytes(target, "rev-parse", "HEAD").decode().strip() != recovery["base_sha"]:

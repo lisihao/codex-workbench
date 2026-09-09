@@ -822,7 +822,9 @@ class DirtyWorktreeRecovery:
         A dependent worker starts from a materialized ancestor tree rather
         than the contract commit. Its recovery receipt pins that exact input
         artifact and calculates the worker delta from that tree, so accepted
-        ancestor patches never become part of the worker's patch.
+        ancestor patches never become part of the worker's patch. A root
+        worker instead records the contract base tree directly and never
+        fabricates a dependency-input artifact.
         """
 
         path = self._validate_worktree(repository, base_sha, worktree, branch,
@@ -880,10 +882,6 @@ class DirtyWorktreeRecovery:
         untracked_paths = self.untracked_paths(path)
         requested_untracked = tuple(sorted(preserve_untracked_paths))
         if untracked_paths:
-            if dependency_input_ref is None:
-                raise DirtyWorktreeRecoveryError(
-                    "preserving untracked recovery files requires a recorded dependency input"
-                )
             if requested_untracked != untracked_paths:
                 raise DirtyWorktreeRecoveryError(
                     "dirty worktree contains untracked files; pass the exact paths through explicit preservation: "
@@ -891,7 +889,7 @@ class DirtyWorktreeRecovery:
                 )
             recovery_context = {
                 **recovery_context,
-                "schema_version": 3,
+                "schema_version": 3 if dependency_input_ref is not None else 7,
                 "untracked_paths": list(untracked_paths),
             }
         elif requested_untracked:
@@ -901,7 +899,7 @@ class DirtyWorktreeRecovery:
         if generated_residue_ref is not None:
             recovery_context = {
                 **recovery_context,
-                "schema_version": {1: 4, 2: 5, 3: 6}[int(recovery_context["schema_version"])],
+                "schema_version": {1: 4, 2: 5, 3: 6, 7: 8}[int(recovery_context["schema_version"])],
                 "generated_residue_paths": list(expected_generated),
                 "generated_residue_ref": generated_residue_ref,
             }
@@ -1242,8 +1240,8 @@ class DirtyWorktreeRecovery:
         base_sha = recovery.get("base_sha")
         if not isinstance(base_sha, str) or not base_sha:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid base_sha")
-        if schema_version in {1, 4}:
-            legacy = {
+        if schema_version in {1, 4, 7, 8}:
+            root_receipt = {
                 "schema_version",
                 "source_attempt",
                 "source_worktree",
@@ -1253,12 +1251,15 @@ class DirtyWorktreeRecovery:
                 "patch_ref",
                 "patch_sha256",
             }
-            if schema_version == 4:
-                legacy |= {"generated_residue_paths", "generated_residue_ref"}
+            if schema_version in {4, 8}:
+                root_receipt |= {"generated_residue_paths", "generated_residue_ref"}
+            if schema_version in {7, 8}:
+                root_receipt.add("untracked_paths")
             if "source_checkpoint_sha" in recovery:
-                legacy.add("source_checkpoint_sha")
-            if set(recovery) != legacy:
-                raise DirtyWorktreeRecoveryError("blocked legacy recovery receipt has an invalid shape")
+                root_receipt.add("source_checkpoint_sha")
+            if set(recovery) != root_receipt:
+                raise DirtyWorktreeRecoveryError("blocked root recovery receipt has an invalid shape")
+            self._recovery_untracked_paths(recovery)
             return (
                 self._git_text(worktree, "rev-parse", f"{base_sha}^{{tree}}"),
                 None,
@@ -1311,7 +1312,7 @@ class DirtyWorktreeRecovery:
         recovery: Mapping[str, object],
     ) -> None:
         schema_version = recovery.get("schema_version")
-        if schema_version not in {4, 5, 6}:
+        if schema_version not in {4, 5, 6, 8}:
             return
         paths = recovery.get("generated_residue_paths")
         ref = recovery.get("generated_residue_ref")
@@ -1648,8 +1649,11 @@ class DirtyWorktreeRecovery:
 
     @staticmethod
     def _recovery_untracked_paths(recovery: Mapping[str, object]) -> tuple[str, ...]:
-        if recovery.get("schema_version") in {1, 2, 4, 5}:
+        schema_version = recovery.get("schema_version")
+        if schema_version in {1, 2, 4, 5}:
             return ()
+        if schema_version not in {3, 6, 7, 8}:
+            raise DirtyWorktreeRecoveryError("blocked recovery receipt schema is unsupported")
         paths = recovery.get("untracked_paths")
         if (
             not isinstance(paths, list)

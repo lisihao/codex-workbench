@@ -447,6 +447,18 @@ def _capture_blocked_worktree_recovery(
         base_sha=base_sha,
         artifacts=ArtifactStore(artifact_root),
     )
+    nodes = task.get("nodes")
+    if not isinstance(nodes, list):
+        raise ValueError("blocked-worktree recovery task nodes are invalid")
+    node = next((item for item in nodes if isinstance(item, dict) and item.get("node_id") == node_id), None)
+    depends_on = node.get("depends_on") if isinstance(node, dict) else None
+    if (
+        not isinstance(depends_on, list)
+        or not all(isinstance(dependency, str) and dependency for dependency in depends_on)
+    ):
+        raise ValueError("blocked-worktree recovery node dependencies are invalid")
+    if depends_on and dependency_input is None:
+        raise ValueError("dependent blocked-worktree recovery requires a recorded dependency input")
     capture_kwargs: dict[str, object] = {}
     if dependency_input is not None:
         dependency_input_ref, input_tree_sha = dependency_input
@@ -457,17 +469,11 @@ def _capture_blocked_worktree_recovery(
             "dependency_input_ref": dependency_input_ref,
         }
     if preserve_untracked:
-        if dependency_input is None:
-            raise ValueError("explicit untracked preservation requires a dependent blocked worker")
         untracked_paths = DirtyWorktreeRecovery.untracked_paths(
             Path(str(source["worktree"])).expanduser().resolve(strict=True)
         )
         if not untracked_paths:
             raise ValueError("explicit untracked preservation requested but source has no untracked files")
-        nodes = task.get("nodes")
-        if not isinstance(nodes, list):
-            raise ValueError("blocked-worktree recovery task nodes are invalid")
-        node = next((item for item in nodes if isinstance(item, dict) and item.get("node_id") == node_id), None)
         allowed_scope = contract.get("allowed_scope")
         forbidden_scope = contract.get("forbidden_scope")
         write_scopes = node.get("write_scopes") if isinstance(node, dict) else None
@@ -551,6 +557,10 @@ def _validate_blocked_worktree_recovery_receipt(
     schema_version = recovery.get("schema_version")
     if schema_version == 1:
         required = common
+    elif schema_version in {7, 8}:
+        required = common | {"untracked_paths"}
+        if schema_version == 8:
+            required |= {"generated_residue_paths", "generated_residue_ref"}
     elif schema_version in {2, 3, 5, 6}:
         required = common | {
             "source_task_id",
@@ -583,7 +593,7 @@ def _validate_blocked_worktree_recovery_receipt(
         or not all(isinstance(item, str) and item for item in changed_paths)
     ):
         raise ValueError("blocked-worktree recovery changed_paths are invalid")
-    if schema_version in {3, 6}:
+    if schema_version in {3, 6, 7, 8}:
         untracked_paths = recovery.get("untracked_paths")
         if (
             not isinstance(untracked_paths, list)
@@ -596,13 +606,13 @@ def _validate_blocked_worktree_recovery_receipt(
     source_residue = tuple(source.get("generated_residue_paths", ()))
     if source_residue:
         if (
-            schema_version not in {4, 5, 6}
+            schema_version not in {4, 5, 6, 8}
             or tuple(recovery.get("generated_residue_paths", ())) != source_residue
             or not isinstance(recovery.get("generated_residue_ref"), str)
             or not recovery["generated_residue_ref"]
         ):
             raise ValueError("blocked-worktree recovery generated residue is invalid")
-    elif schema_version in {4, 5, 6}:
+    elif schema_version in {4, 5, 6, 8}:
         raise ValueError("blocked-worktree recovery has unexpected generated residue")
     if (
         recovery["source_worktree"] != source["worktree"]

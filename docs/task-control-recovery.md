@@ -48,7 +48,7 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 3. 比较 source 的真实 tracked/untracked 文件集与失败 receipt。
 4. 检查每个路径同时满足任务 allowed/forbidden scope 与节点 write scope。
 5. 内容寻址保存 binary patch，并固定 SHA-256。
-6. 在新的干净 attempt 工作树复原原 dependency-input 和该 Worker 自己的 patch。
+6. 无依赖根 Worker 以合同 `base_sha` 的 tree 复原自己的 patch；有依赖 Worker 则先复原其已记录的 dependency-input，再复原自己的 patch。
 7. 再次核对 source 未漂移、target patch 哈希一致，然后以 lease CAS 写入 allocation。
 8. 只有 assignment 成功后才调用原 Worker 执行器。
 
@@ -58,7 +58,7 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 
 `blocked` 并非一律自动重试。只有由可信执行边界产生且显式带 `retryable=true` 的 Worker 结果，才可在 `retry_limit` 内进入与失败 attempt 相同的内容捕获和新工作树恢复路径。模型自报阻断、凭据、权限、配额、需求歧义、verifier 阻断和 `indeterminate` 结果均保持显式终态，防止无界循环或重复副作用。
 
-MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不是把通用 `resume` 直接交给只接受 `paused`/`needs_fix` 的 queue 路径。调用方必须同时提交最新 `expected_revision`、精确 `node_id`、`expected_attempt` 和持久化 `reason`。若 receipt 含业务修改，调用方还必须声明 `confirm_recovery=true`；Workbench 在 SQLite 写事务之外捕获内容寻址补丁，再用 revision/attempt CAS 授权一次新 attempt。若 receipt 明确没有修改，只能以 `confirm_no_side_effects=true` 授权原路重试。合法 untracked 文件仍需显式 `preserve_untracked=true`，未知副作用或不确定捕获继续 fail closed。`instruction` 仍是模型指导而不是恢复理由；需要新指导时先 `steer`，再以更新后的 revision 执行 `resume`。
+MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不是把通用 `resume` 直接交给只接受 `paused`/`needs_fix` 的 queue 路径。调用方必须同时提交最新 `expected_revision`、精确 `node_id`、`expected_attempt` 和持久化 `reason`。若 receipt 含业务修改，调用方还必须声明 `confirm_recovery=true`；Workbench 在 SQLite 写事务之外捕获内容寻址补丁，再用 revision/attempt CAS 授权一次新 attempt。若 receipt 明确没有修改，只能以 `confirm_no_side_effects=true` 授权原路重试。无依赖根 Worker 与有依赖 Worker 的合法 untracked 文件都需显式 `preserve_untracked=true`；根 Worker 收据只绑定合同 base tree，绝不伪造 dependency-input。有 `depends_on` 的节点若缺少已记录 dependency-input 一律拒绝恢复。未知副作用或不确定捕获继续 fail closed。`instruction` 仍是模型指导而不是恢复理由；需要新指导时先 `steer`，再以更新后的 revision 执行 `resume`。
 
 ## 崩溃与重复请求
 
