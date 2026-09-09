@@ -23,12 +23,16 @@ from .ai_frontier import WorkbenchAIFrontier
 from .api import WorkbenchHTTPServer
 from .artifacts import ArtifactStore, presentation_format
 from .authority import CoordinatorAuthorityError, CoordinatorAuthorityLease, authority_machine_id
+from .authority_delivery import build_authority_delivery_lifecycle
 from .capabilities import CapabilityCatalogError, CapabilityRegistry
 from .claude_quota import COMPATIBLE_SOURCE, ClaudeQuotaCollector, watch_claude_quota
 from .config import WorkbenchConfig
 from .delivery import GitHubDelivery, GitHubDeliveryRequest
 from .dependency_inputs import load_recorded_dependency_input
-from .dirty_worktree_recovery import DirtyWorktreeRecovery
+from .dirty_worktree_recovery import (
+    DirtyWorktreeRecovery,
+    observed_indeterminate_recovery_paths,
+)
 from .executors import ClaudeExecutor, CodexExecutor
 from .governance import VERIFICATION_TIERS, code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS, NodeSpec, QuotaSnapshot, TaskContract
@@ -147,6 +151,11 @@ def command_serve(args: argparse.Namespace) -> int:
             spark_workers=config.effective_spark_workers,
             quota_snapshot_file=config.effective_quota_snapshot_file,
             quota_refresh_seconds=config.quota_refresh_seconds,
+            delivery_lifecycle=build_authority_delivery_lifecycle(
+                store,
+                config,
+                coordinator_epoch=coordinator_epoch,
+            ),
             config=config,
         )
         recovered = coordinator.recover()
@@ -675,6 +684,37 @@ def command_task(args: argparse.Namespace) -> int:
             dry_run=bool(args.dry_run),
         )
         result = {"ok": True, "action": "retry-blocked", **result}
+    elif args.action == "resolve-indeterminate-locally":
+        candidate = store.indeterminate_local_recovery_candidate(
+            args.task_id,
+            args.node_id,
+            expected_revision=args.expected_revision,
+            expected_attempt=args.expected_attempt,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=args.dependency_input_ref,
+            artifacts=ArtifactStore(config.state_root / "artifacts"),
+        )
+        result = store.queue_indeterminate_local_recovery(
+            args.task_id,
+            args.node_id,
+            expected_revision=args.expected_revision,
+            expected_attempt=args.expected_attempt,
+            reason=args.reason,
+            confirm_old_executor_ended=bool(args.confirm_old_executor_ended),
+            confirm_effects_restricted_to_owned_files=bool(args.confirm_effects_restricted_to_owned_files),
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=args.dependency_input_ref,
+            dry_run=bool(args.dry_run),
+        )
+        result = {
+            "ok": True,
+            "action": "resolve-indeterminate-locally",
+            "operator_confirmed": True,
+            **result,
+        }
     elif args.action == "resolve":
         revision = store.resolve_indeterminate(
             args.task_id,
@@ -1826,6 +1866,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="record the operator assertion; it is not automatic verification",
     )
     retry_blocked.add_argument("--dry-run", action="store_true")
+    resolve_indeterminate_locally = task_sub.add_parser(
+        "resolve-indeterminate-locally",
+        help=(
+            "explicitly resume a timed-out indeterminate node's own worktree by "
+            "capturing it in place and restoring it onto a fresh attempt before dispatch"
+        ),
+    )
+    resolve_indeterminate_locally.add_argument("task_id")
+    resolve_indeterminate_locally.add_argument("node_id")
+    resolve_indeterminate_locally.add_argument("--expected-revision", type=int, required=True)
+    resolve_indeterminate_locally.add_argument("--expected-attempt", type=int, required=True)
+    resolve_indeterminate_locally.add_argument("--reason", required=True)
+    resolve_indeterminate_locally.add_argument(
+        "--confirm-old-executor-ended",
+        action="store_true",
+        required=True,
+        help="assert that the prior executor process for this attempt has ended",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--confirm-effects-restricted-to-owned-files",
+        action="store_true",
+        required=True,
+        help="assert that every observed change is confined to this node's own worktree",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--dependency-input-ref",
+        help="recorded dependency-input artifact ref, required when the node depends on other nodes",
+    )
+    resolve_indeterminate_locally.add_argument("--dry-run", action="store_true")
     reconcile_archify = task_sub.add_parser("reconcile-archify")
     reconcile_archify.add_argument("task_id")
     reconcile_archify.add_argument("--expected-revision", type=int, required=True)

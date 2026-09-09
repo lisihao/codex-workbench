@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 from hashlib import sha256
 import json
 import os
@@ -16,6 +17,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+from typing import TextIO
 import uuid
 from urllib.parse import quote
 
@@ -86,6 +89,9 @@ PNPM_PREFLIGHT_TIMEOUT_SECONDS = 8
 # do not discover one through PATH because that would recreate the shebang
 # selection problem this launcher prevents.
 DEFAULT_PNPM_NODE_BINARY = Path("/opt/homebrew/bin/node")
+AUTHORITY_DRAIN_TIMEOUT_SECONDS = 5 * 60
+AUTHORITY_DRAIN_POLL_SECONDS = 0.2
+GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -109,6 +115,82 @@ relaunch_with_supported_runtime()
 
 def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=check)
+
+
+def verified_source_commit(source: Path) -> str:
+    """Require a committed, clean Git source before packaging its bytes."""
+
+    revision = run(
+        "git", "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}", check=False
+    )
+    commit = revision.stdout.strip()
+    if revision.returncode != 0 or GIT_COMMIT_PATTERN.fullmatch(commit) is None:
+        detail = revision.stderr.strip() or revision.stdout.strip() or f"exit {revision.returncode}"
+        raise SystemExit(
+            "Workbench source must resolve HEAD to a full Git commit before installation: "
+            + detail
+        )
+
+    status = run(
+        "git", "-C", str(source), "status", "--porcelain=v1",
+        "--untracked-files=all", check=False,
+    )
+    if status.returncode != 0:
+        detail = status.stderr.strip() or status.stdout.strip() or f"exit {status.returncode}"
+        raise SystemExit(
+            "Workbench source working tree cannot be verified before installation: "
+            + detail
+        )
+    if status.stdout.strip():
+        raise SystemExit(
+            "Workbench source has uncommitted changes; refusing to label dirty bytes as HEAD"
+        )
+    return commit
+
+def extract_verified_source_archive(source: Path, commit: str, destination: Path) -> None:
+    """Materialize exactly one committed Git tree without ignored working-tree files."""
+
+    if GIT_COMMIT_PATTERN.fullmatch(commit) is None:
+        raise SystemExit("verified source archive requires a full Git commit")
+    destination = absolute_path(destination)
+    assert_no_symlink_ancestors(destination, label="application root")
+    if destination.exists() or destination.is_symlink():
+        raise SystemExit(f"verified source archive destination is occupied: {destination}")
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="codex-workbench-source-", suffix=".tar"
+        ) as archive_file:
+            result = subprocess.run(
+                ("git", "-C", str(source), "archive", "--format=tar", commit),
+                stdout=archive_file,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"exit {result.returncode}"
+                raise SystemExit(f"verified source archive failed: {detail}")
+            archive_file.flush()
+            with tarfile.open(archive_file.name, mode="r") as archive:
+                members = archive.getmembers()
+                for member in members:
+                    member_path = Path(member.name)
+                    if (
+                        not member.name
+                        or member_path.is_absolute()
+                        or ".." in member_path.parts
+                        or not (member.isfile() or member.isdir())
+                    ):
+                        raise SystemExit(
+                            f"verified source archive contains an unsafe entry: {member.name}"
+                        )
+                destination.mkdir(mode=0o700)
+                if sys.version_info >= (3, 12):
+                    archive.extractall(destination, members=members, filter="data")
+                else:
+                    archive.extractall(destination, members=members)
+    except (OSError, tarfile.TarError) as error:
+        raise SystemExit(f"verified source archive could not be extracted: {error}") from error
 
 
 def macos_machine_id() -> str:
@@ -1564,6 +1646,288 @@ def initial_capability_refresh(
     raise SystemExit(f"initial capability catalog refresh failed: {detail}")
 
 
+def authority_lock_identity(lock_path: Path) -> tuple[str, int, str]:
+    """Read the immutable coordinator identity published while its lease is held."""
+
+    lock_path = absolute_path(lock_path)
+    assert_no_symlink_ancestors(lock_path, label="authority coordinator lock")
+    if not lock_path.is_file():
+        raise SystemExit(f"authority coordinator lock is missing: {lock_path}")
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"authority coordinator lock is unreadable: {error}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit("authority coordinator lock must contain a JSON object")
+    instance_id = payload.get("instance_id")
+    pid = payload.get("pid")
+    boot_id = payload.get("boot_id")
+    if (
+        not isinstance(instance_id, str)
+        or not instance_id.strip()
+        or not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(boot_id, str)
+        or not boot_id.strip()
+    ):
+        raise SystemExit("authority coordinator lock has an invalid identity")
+    return instance_id, pid, boot_id
+
+
+def launchctl_service_pid(
+    status: subprocess.CompletedProcess[str],
+    *,
+    label: str,
+) -> int:
+    """Extract exactly one running PID from a successful launchctl print result."""
+
+    matches = re.findall(r"(?m)^\s*pid = (\d+)\s*$", status.stdout)
+    if status.returncode != 0 or len(matches) != 1:
+        raise SystemExit(f"LaunchAgent does not expose one running PID: {label}")
+    pid = int(matches[0])
+    if pid <= 0:
+        raise SystemExit(f"LaunchAgent PID is invalid: {label}")
+    return pid
+
+
+def launchctl_reported_pid(status: subprocess.CompletedProcess[str]) -> int | None:
+    """Return a running service PID, or None when launchctl reports no process."""
+
+    if status.returncode != 0:
+        return None
+    matches = re.findall(r"(?m)^\s*pid = (\d+)\s*$", status.stdout)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise SystemExit("LaunchAgent exposes more than one PID")
+    pid = int(matches[0])
+    if pid <= 0:
+        raise SystemExit("LaunchAgent PID is invalid")
+    return pid
+
+
+def stop_sidecar_for_install(
+    domain: str,
+    label: str,
+    plist_path: Path,
+    status: subprocess.CompletedProcess[str],
+) -> None:
+    """Stop one sidecar writer without asking launchd to enforce ExitTimeOut."""
+
+    if status.returncode != 0:
+        return
+    service_target = f"{domain}/{label}"
+    expected_pid = launchctl_reported_pid(status)
+    if expected_pid is not None:
+        signaled = run("launchctl", "kill", "SIGTERM", service_target, check=False)
+        if signaled.returncode != 0:
+            detail = signaled.stderr.strip() or signaled.stdout.strip() or (
+                f"exit {signaled.returncode}"
+            )
+            raise SystemExit(f"{label} could not be signaled for shutdown: {detail}")
+        deadline = time.monotonic() + AUTHORITY_DRAIN_TIMEOUT_SECONDS
+        while True:
+            current = run("launchctl", "print", service_target, check=False)
+            current_pid = launchctl_reported_pid(current)
+            if current_pid is None:
+                break
+            if current_pid != expected_pid:
+                raise SystemExit(f"{label} restarted while the installer waited for shutdown")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit(f"{label} did not exit after SIGTERM")
+            time.sleep(min(AUTHORITY_DRAIN_POLL_SECONDS, remaining))
+    removed = run("launchctl", "bootout", domain, str(plist_path), check=False)
+    if removed.returncode != 0:
+        detail = removed.stderr.strip() or removed.stdout.strip() or (
+            f"exit {removed.returncode}"
+        )
+        raise SystemExit(f"{label} could not be removed after shutdown: {detail}")
+
+
+def verify_coordinator_stopped_receipt(
+    database: Path,
+    *,
+    instance_id: str,
+    boot_id: str,
+) -> None:
+    """Require the durable receipt emitted after the coordinator joins every worker."""
+
+    database = absolute_path(database)
+    assert_no_symlink_ancestors(database, label="Authority state database")
+    if not database.is_file():
+        raise SystemExit(f"Authority state database is missing: {database}")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{quote(str(database), safe='/')}?mode=ro",
+            uri=True,
+            timeout=30,
+        )
+        rows = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'coordinator.stopped' ORDER BY cursor DESC"
+        ).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        raise SystemExit(
+            f"Authority state database cannot verify coordinator drain: {error}"
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
+    for row in rows:
+        try:
+            payload = json.loads(str(row[0]))
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("instance_id") == instance_id
+            and payload.get("boot_id") == boot_id
+        ):
+            return
+    raise SystemExit(
+        "authority did not record a matching coordinator.stopped receipt before release"
+    )
+
+
+def acquire_authority_safe_point(
+    lock_path: Path,
+    *,
+    timeout_seconds: float = AUTHORITY_DRAIN_TIMEOUT_SECONDS,
+    poll_seconds: float = AUTHORITY_DRAIN_POLL_SECONDS,
+    expected_instance_id: str | None = None,
+) -> TextIO:
+    """Wait for and hold the coordinator lock before snapshotting authority state."""
+
+    if timeout_seconds < 0 or poll_seconds <= 0:
+        raise ValueError("authority drain timing must be non-negative with a positive poll interval")
+    lock_path = absolute_path(lock_path)
+    assert_no_symlink_ancestors(lock_path, label="authority coordinator lock")
+    if lock_path.exists() and not lock_path.is_file():
+        raise SystemExit(f"authority coordinator lock is not a regular file: {lock_path}")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        assert_no_symlink_ancestors(lock_path, label="authority coordinator lock")
+        handle = lock_path.open("a+", encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"authority coordinator lock is unavailable: {error}") from error
+
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                if expected_instance_id is not None:
+                    observed_instance_id, _, _ = authority_lock_identity(lock_path)
+                    if observed_instance_id != expected_instance_id:
+                        raise SystemExit(
+                            "authority restarted while the installer waited for graceful drain"
+                        )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SystemExit(
+                        "authority did not release coordinator.lock after graceful shutdown"
+                    )
+                time.sleep(min(poll_seconds, remaining))
+            except OSError as error:
+                raise SystemExit(f"authority coordinator lock cannot be acquired: {error}") from error
+    except BaseException:
+        handle.close()
+        raise
+
+
+def release_authority_safe_point(handle: TextIO) -> None:
+    """Release the installer-held coordinator lease before a new authority starts."""
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def stop_authority_for_install(
+    domain: str,
+    plist_path: Path,
+    lock_path: Path,
+    database: Path,
+    *,
+    authority_status: subprocess.CompletedProcess[str],
+) -> TextIO | None:
+    """Drain the exact authority instance before any state snapshot or replacement.
+
+    launchctl bootout can impose ExitTimeOut and escalate a slow coordinator to
+    SIGKILL.  Send SIGTERM only to the named service, hold its released lease,
+    verify the instance's durable stopped receipt, then remove the exited
+    service definition.  Worker processes are never signaled by the installer.
+    """
+
+    authority_was_loaded = authority_status.returncode == 0
+    if not authority_was_loaded:
+        if not (lock_path.exists() or lock_path.is_symlink()):
+            return None
+        try:
+            return acquire_authority_safe_point(lock_path, timeout_seconds=0)
+        except SystemExit as error:
+            raise SystemExit(
+                "authority coordinator lock is held although its LaunchAgent is not loaded"
+            ) from error
+
+    instance_id, lock_pid, boot_id = authority_lock_identity(lock_path)
+    service_pid = launchctl_service_pid(authority_status, label=LABEL)
+    if service_pid != lock_pid:
+        raise SystemExit(
+            "LaunchAgent PID does not match the coordinator.lock authority identity"
+        )
+
+    signaled = run("launchctl", "kill", "SIGTERM", f"{domain}/{LABEL}", check=False)
+    timeout_seconds = (
+        AUTHORITY_DRAIN_TIMEOUT_SECONDS if signaled.returncode == 0 else 0.0
+    )
+    try:
+        safe_point = acquire_authority_safe_point(
+            lock_path,
+            timeout_seconds=timeout_seconds,
+            expected_instance_id=instance_id,
+        )
+    except SystemExit as error:
+        if signaled.returncode != 0:
+            detail = signaled.stderr.strip() or signaled.stdout.strip() or (
+                f"exit {signaled.returncode}"
+            )
+            raise SystemExit(
+                "authority LaunchAgent could not be signaled for cooperative drain: "
+                + detail
+            ) from error
+        raise SystemExit(
+            "authority did not finish cooperative drain before installation"
+        ) from error
+
+    try:
+        verify_coordinator_stopped_receipt(
+            database,
+            instance_id=instance_id,
+            boot_id=boot_id,
+        )
+        removed = run("launchctl", "bootout", domain, str(plist_path), check=False)
+        if removed.returncode != 0:
+            detail = removed.stderr.strip() or removed.stdout.strip() or (
+                f"exit {removed.returncode}"
+            )
+            raise SystemExit(
+                "authority LaunchAgent could not be removed after cooperative drain: "
+                + detail
+            )
+    except BaseException:
+        release_authority_safe_point(safe_point)
+        raise
+    return safe_point
+
+
 def restart_launch_agent(domain: str, label: str, plist_path: Path) -> None:
     """Replace, start, and confirm one declared LaunchAgent is loaded."""
 
@@ -1636,6 +2000,7 @@ def main() -> int:
     if not source.is_dir():
         raise SystemExit(f"Workbench source is not a directory: {source}")
     state_root = absolute_path(Path(args.state_root))
+    commit = verified_source_commit(source)
     app_root = state_root / "app"
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / f"{LABEL}.plist"
@@ -1815,17 +2180,8 @@ def main() -> int:
     runtime_selector = source / "scripts" / "python-runtime"
     if not runtime_selector.is_file() or not os.access(runtime_selector, os.X_OK):
         raise SystemExit(f"Workbench Python runtime selector is missing or not executable: {runtime_selector}")
-    commit = run("git", "-C", str(source), "rev-parse", "HEAD").stdout.strip()
-    if not commit:
-        raise SystemExit(f"Workbench source has no commit identity: {source}")
-    tag_result = run("git", "-C", str(source), "describe", "--tags", "--exact-match", check=False)
+    tag_result = run("git", "-C", str(source), "describe", "--tags", "--exact-match", commit, check=False)
     tag = tag_result.stdout.strip() if tag_result.returncode == 0 else None
-    version_line = next(
-        line
-        for line in (source / "src" / "codex_workbench" / "__init__.py").read_text().splitlines()
-        if line.startswith("__version__")
-    )
-    version = version_line.split("=", 1)[1].strip().strip('"')
     runtime_binary = runtime_root / "codex"
     assert_file_target(runtime_binary, "runtime Codex executable")
     assert_file_target(runtime_root / "codex-code-mode-host", "runtime Codex workspace tool host")
@@ -1910,12 +2266,14 @@ def main() -> int:
         RADAR_LABEL,
         AI_FRONTIER_LABEL,
     )
-    service_was_loaded = {
-        label: run("launchctl", "print", f"{domain}/{label}", check=False).returncode == 0
+    service_status = {
+        label: run("launchctl", "print", f"{domain}/{label}", check=False)
         for label in service_labels
     }
+    service_was_loaded = {
+        label: status.returncode == 0 for label, status in service_status.items()
+    }
     transaction = InstallTransaction(state_root)
-    transaction.snapshot_sqlite(state_root / "state.sqlite", "Authority state database")
     for directory in (
         state_root,
         logs,
@@ -1929,7 +2287,7 @@ def main() -> int:
     ):
         if not directory.exists():
             transaction.track_created_directory(directory)
-    for path, label in (
+    snapshot_targets = (
         (config_file, "config file"),
         (runtime_root, "runtime root"),
         (process_home / ".agents" / "skills" / "research", "Research skill"),
@@ -1950,12 +2308,53 @@ def main() -> int:
         (Path.home() / ".claude" / "skills" / "code-as-harness", "Claude Code-as-Harness skill"),
         (Path.home() / ".claude" / "CLAUDE.md", "Claude policy"),
         (Path.home() / ".claude" / "skills" / "archify", "Claude Archify skill"),
-    ):
-        transaction.snapshot(path, label, allow_symlink=path == auth_link)
-    services_touched = False
+    )
+    sidecar_services = (
+        (QUOTA_LABEL, quota_plist_path),
+        (CAPABILITY_LABEL, capability_plist_path),
+        (RADAR_LABEL, radar_plist_path),
+        (AI_FRONTIER_LABEL, ai_frontier_plist_path),
+    )
+    authority_safe_point: TextIO | None = None
+    stopped_sidecars: list[tuple[str, Path]] = []
     try:
-        install_code_as_harness(source)
-        install_archify(source)
+        authority_safe_point = stop_authority_for_install(
+            domain,
+            plist_path,
+            state_root / "coordinator.lock",
+            state_root / "state.sqlite",
+            authority_status=service_status[LABEL],
+        )
+        for label, path in sidecar_services:
+            stop_sidecar_for_install(domain, label, path, service_status[label])
+            if service_status[label].returncode == 0:
+                stopped_sidecars.append((label, path))
+        transaction.snapshot_sqlite(state_root / "state.sqlite", "Authority state database")
+        for path, label in snapshot_targets:
+            transaction.snapshot(path, label, allow_symlink=path == auth_link)
+    except BaseException as error:
+        restore_error: BaseException | None = None
+        if authority_safe_point is not None:
+            try:
+                release_authority_safe_point(authority_safe_point)
+                authority_safe_point = None
+                if service_was_loaded[LABEL] and plist_path.is_file():
+                    run("launchctl", "bootstrap", domain, str(plist_path))
+                    run("launchctl", "enable", f"{domain}/{LABEL}")
+                for label, path in stopped_sidecars:
+                    if service_was_loaded[label] and path.is_file():
+                        run("launchctl", "bootstrap", domain, str(path))
+                        run("launchctl", "enable", f"{domain}/{label}")
+            except BaseException as cleanup_error:
+                restore_error = cleanup_error
+        transaction.cleanup()
+        if restore_error is not None:
+            raise SystemExit(
+                "authority installation failed before replacing files; "
+                f"authority restore failed: {restore_error}"
+            ) from error
+        raise
+    try:
 
         state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         logs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1965,7 +2364,35 @@ def main() -> int:
         process_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         radar_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         ai_frontier_state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        research_skill = install_research_skill(research_source, process_home)
+        transaction.preserve_existing_app(app_root, state_root)
+        extract_verified_source_archive(source, commit, app_root)
+        install_code_as_harness(app_root)
+        install_archify(app_root)
+        installed_research_source = validate_research_skill_source(
+            Path(args.research_skill_source)
+            if args.research_skill_source
+            else app_root / "skills" / "research"
+        )
+        version_line = next(
+            line
+            for line in (app_root / "src" / "codex_workbench" / "__init__.py").read_text().splitlines()
+            if line.startswith("__version__")
+        )
+        version = version_line.split("=", 1)[1].strip().strip('"')
+        research_skill = install_research_skill(installed_research_source, process_home)
+        pnpm_runtime = pnpm_recovery_runtime_metadata(app_root)
+        archify_lock = json.loads(
+            (app_root / "vendor" / "archify" / "SOURCE-LOCK.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        radar_config = radar_installation_config(
+            config_raw,
+            app_root=app_root,
+            state_root=state_root,
+            refresh_seconds=radar_refresh_seconds,
+            upstream=radar_upstream_metadata(app_root),
+        )
         config_raw.update(
             {
                 "deployment_role": "authority",
@@ -2002,8 +2429,6 @@ def main() -> int:
             if auth_link.exists():
                 raise SystemExit(f"refusing to replace non-symlink auth file: {auth_link}")
             auth_link.symlink_to(auth_source)
-        transaction.preserve_existing_app(app_root, state_root)
-        shutil.copytree(source, app_root, ignore=shutil.ignore_patterns(".git", "__pycache__", ".workbench"))
         pnpm_entrypoint = install_pnpm_recovery_runtime(app_root, pnpm_runtime)
         bin_dir = app_root / "bin"
         bin_dir.mkdir(exist_ok=True)
@@ -2050,7 +2475,7 @@ def main() -> int:
                     "research_skill": {
                         "name": "Research",
                         "policy": "research-skill/v2",
-                        "source": str(research_source),
+                        "source": str(installed_research_source),
                         "managed_path": str(research_skill),
                     },
                     "code_as_harness": {
@@ -2108,7 +2533,7 @@ def main() -> int:
         )
         wrapper.chmod(0o755)
 
-        template = (source / "launchd" / f"{LABEL}.plist.in").read_text()
+        template = (app_root / "launchd" / f"{LABEL}.plist.in").read_text()
         rendered = render_authority_service_plist(
             template,
             app_root=app_root,
@@ -2126,7 +2551,7 @@ def main() -> int:
         plist_path.chmod(0o600)
         quota_rendered: str | None = None
         if quota_claude_binary is not None:
-            quota_template = (source / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
+            quota_template = (app_root / "launchd" / f"{QUOTA_LABEL}.plist.in").read_text()
             quota_rendered = render_quota_plist(
                 quota_template,
                 app_root=app_root,
@@ -2138,7 +2563,7 @@ def main() -> int:
             quota_plist_path.write_text(quota_rendered)
             quota_plist_path.chmod(0o600)
 
-        capability_template = (source / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
+        capability_template = (app_root / "launchd" / f"{CAPABILITY_LABEL}.plist.in").read_text()
         capability_rendered = render_capability_plist(
             capability_template,
             app_root=app_root,
@@ -2154,7 +2579,7 @@ def main() -> int:
         capability_plist_path.write_text(capability_rendered)
         capability_plist_path.chmod(0o600)
 
-        radar_template = (source / "launchd" / f"{RADAR_LABEL}.plist.in").read_text()
+        radar_template = (app_root / "launchd" / f"{RADAR_LABEL}.plist.in").read_text()
         radar_rendered = render_radar_plist(
             radar_template,
             app_root=app_root,
@@ -2165,7 +2590,7 @@ def main() -> int:
         radar_plist_path.chmod(0o600)
 
         ai_frontier_template = (
-            source / "launchd" / f"{AI_FRONTIER_LABEL}.plist.in"
+            app_root / "launchd" / f"{AI_FRONTIER_LABEL}.plist.in"
         ).read_text()
         ai_frontier_rendered = render_ai_frontier_plist(
             ai_frontier_template,
@@ -2186,7 +2611,9 @@ def main() -> int:
             claude_binary=claude_binary,
         )
 
-        services_touched = True
+        if authority_safe_point is not None:
+            release_authority_safe_point(authority_safe_point)
+            authority_safe_point = None
         restart_launch_agent(domain, LABEL, plist_path)
         if quota_claude_binary is not None and quota_rendered is not None:
             restart_launch_agent(domain, QUOTA_LABEL, quota_plist_path)
@@ -2206,40 +2633,82 @@ def main() -> int:
             )
     except BaseException as error:
         rollback_errors: list[str] = []
-        services_need_stop = services_touched or any(service_was_loaded.values())
-        if services_need_stop:
-            for label, path in (
-                (LABEL, plist_path),
-                (QUOTA_LABEL, quota_plist_path),
-                (CAPABILITY_LABEL, capability_plist_path),
-                (RADAR_LABEL, radar_plist_path),
-                (AI_FRONTIER_LABEL, ai_frontier_plist_path),
-            ):
+        if authority_safe_point is None:
+            try:
+                current_authority_status = run(
+                    "launchctl", "print", f"{domain}/{LABEL}", check=False
+                )
+                authority_safe_point = stop_authority_for_install(
+                    domain,
+                    plist_path,
+                    state_root / "coordinator.lock",
+                    state_root / "state.sqlite",
+                    authority_status=current_authority_status,
+                )
+            except BaseException as rollback_error:
+                rollback_errors.append(f"authority drain: {rollback_error}")
+        for label, path in sidecar_services:
+            try:
+                current_status = run(
+                    "launchctl", "print", f"{domain}/{label}", check=False
+                )
+                stop_sidecar_for_install(domain, label, path, current_status)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"{label} shutdown: {rollback_error}")
+        if rollback_errors:
+            if authority_safe_point is not None:
                 try:
-                    run("launchctl", "bootout", domain, str(path), check=False)
-                except BaseException as rollback_error:
-                    rollback_errors.append(f"{label} service: {rollback_error}")
+                    release_authority_safe_point(authority_safe_point)
+                    authority_safe_point = None
+                except BaseException as release_error:
+                    rollback_errors.append(f"authority safe point: {release_error}")
+            raise SystemExit(
+                "authority installation failed: "
+                f"{error}; rollback skipped because safe quiescence was not proven: "
+                + "; ".join(rollback_errors)
+                + f"; transaction backup remains at {transaction.root}"
+            ) from error
         try:
             transaction.rollback()
         except BaseException as rollback_error:
-            rollback_errors.append(str(rollback_error))
-        if services_need_stop:
-            for label, path in (
-                (LABEL, plist_path),
-                (QUOTA_LABEL, quota_plist_path),
-                (CAPABILITY_LABEL, capability_plist_path),
-                (RADAR_LABEL, radar_plist_path),
-                (AI_FRONTIER_LABEL, ai_frontier_plist_path),
-            ):
-                if not service_was_loaded[label] or not path.is_file():
-                    continue
+            release_error: BaseException | None = None
+            if authority_safe_point is not None:
                 try:
-                    run("launchctl", "bootstrap", domain, str(path))
-                    run("launchctl", "enable", f"{domain}/{label}")
-                except BaseException as rollback_error:
-                    rollback_errors.append(f"{label} service restore: {rollback_error}")
+                    release_authority_safe_point(authority_safe_point)
+                    authority_safe_point = None
+                except BaseException as error_releasing:
+                    release_error = error_releasing
+            detail = (
+                ""
+                if release_error is None
+                else f"; authority safe point release failed: {release_error}"
+            )
+            raise SystemExit(
+                f"authority installation failed: {error}; rollback failed: "
+                f"{rollback_error}{detail}"
+            ) from error
+        if authority_safe_point is not None:
+            try:
+                release_authority_safe_point(authority_safe_point)
+                authority_safe_point = None
+            except BaseException as rollback_error:
+                raise SystemExit(
+                    "authority installation rolled back files but could not release "
+                    f"the safe point: {rollback_error}"
+                ) from error
+        for label, path in ((LABEL, plist_path), *sidecar_services):
+            if not service_was_loaded[label] or not path.is_file():
+                continue
+            try:
+                run("launchctl", "bootstrap", domain, str(path))
+                run("launchctl", "enable", f"{domain}/{label}")
+            except BaseException as rollback_error:
+                rollback_errors.append(f"{label} service restore: {rollback_error}")
         if rollback_errors:
-            raise SystemExit(f"authority installation failed: {error}; rollback failed: {'; '.join(rollback_errors)}") from error
+            raise SystemExit(
+                "authority installation restored files but service restoration failed: "
+                + "; ".join(rollback_errors)
+            ) from error
         raise
     else:
         transaction.commit()

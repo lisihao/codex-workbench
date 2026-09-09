@@ -25,6 +25,7 @@ from .dependency_inputs import (
     load_recorded_dependency_input,
     validate_dependency_input_lineage,
 )
+from .delivery_lifecycle import DeliveryLifecycleReconciler
 from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
@@ -167,6 +168,7 @@ class Coordinator:
         quota_refresh_seconds: float = 60,
         quota_snapshot_file: Path | None = None,
         pnpm_materializer: PnpmOfflineMaterializer | None = None,
+        delivery_lifecycle: DeliveryLifecycleReconciler | None = None,
         fatal_exit: Callable[[int], None] | None = None,
         config: WorkbenchConfig | None = None,
     ):
@@ -201,7 +203,23 @@ class Coordinator:
         # Failed retries use the same sealed capture/lineage mechanism, but
         # continue into their original executor after restoration.
         self.failed_attempt_recovery = self.blocked_worktree_recovery
+        # Lifecycle adapters are authority-owned and opt-in.  The coordinator
+        # never creates a real GitHub/deployment adapter from a worker task.
+        # It still owns a no-adapter reconciler by default so an explicitly
+        # requested endpoint becomes a durable, visible decision boundary
+        # rather than an unattended pending objective.
+        self.delivery_lifecycle = delivery_lifecycle or DeliveryLifecycleReconciler(
+            store,
+            owner_id=f"coordinator-{coordinator_epoch}",
+            coordinator_epoch=coordinator_epoch,
+            adapter=None,
+        )
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workbench-worker")
+        self._delivery_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="workbench-delivery",
+        )
+        self._delivery_future: Future[list[dict[str, Any]]] | None = None
         self._futures: dict[Future[None], tuple[str, str | None]] = {}
         self._routed_to_codex: set[str] = set()
         self._routing_lock = threading.Lock()
@@ -277,6 +295,37 @@ class Coordinator:
                 )
         return recovered + recovered_planning
 
+    def _reconcile_delivery_lifecycle(self) -> None:
+        """Schedule at most one fenced delivery turn without blocking workers."""
+
+        future = self._delivery_future
+        if future is not None:
+            if not future.done():
+                return
+            self._delivery_future = None
+            try:
+                future.result()
+            except Exception as error:
+                self.store.record_system_event(
+                    "delivery_lifecycle.reconcile_failed",
+                    {"error": f"{type(error).__name__}: {error}"},
+                )
+
+        try:
+            self.store.reconcile_delivery_safe_point_waits()
+            # GitHub CI observation can take substantially longer than a
+            # normal scheduler turn.  One fenced lifecycle call may run at a
+            # time, but it must never hold worker dispatch or a deployment
+            # safe-point wakeup hostage.
+            self._delivery_future = self._delivery_pool.submit(
+                self.delivery_lifecycle.reconcile_once,
+            )
+        except Exception as error:
+            self.store.record_system_event(
+                "delivery_lifecycle.reconcile_failed",
+                {"error": f"{type(error).__name__}: {error}"},
+            )
+
     def run_forever(self) -> None:
         worker_counter = 0
         self._recovery_thread.start()
@@ -301,6 +350,7 @@ class Coordinator:
                     )
                 self._next_quota_refresh = time.monotonic() + self._quota_refresher.interval_seconds
             self._collect()
+            self._reconcile_delivery_lifecycle()
             self._dispatch_one_planning_request()
             while len(self._futures) < self.max_workers:
                 worker_counter += 1
@@ -377,6 +427,7 @@ class Coordinator:
                 )
             self._stop.wait(self.poll_seconds)
         self._pool.shutdown(wait=True, cancel_futures=False)
+        self._delivery_pool.shutdown(wait=True, cancel_futures=False)
         # A coordinator cannot be considered stopped while its recovery
         # companion still owns work.  The authority caller waits for this
         # method's thread before releasing its lease, so preserve correctness
@@ -556,6 +607,8 @@ class Coordinator:
             # a second plaintext history copy.  Compile receives only the
             # exact, content-addressed receipt selected by the claimed row.
             submit_request["context_excerpt"] = context_excerpt
+            if isinstance(claimed.get("previous_error"), str):
+                submit_request["planning_feedback"] = claimed["previous_error"]
             compiled = compile_natural_language_request(
                 self.config,
                 self.store,

@@ -140,8 +140,10 @@ class DeliveryTests(unittest.TestCase):
         branch = "codex-workbench/integration/delivery-task"
         commit = "b" * 40
         worktree = str(self.worktree.resolve())
+        pushed_ref = False
 
         def runner(command, **kwargs):
+            nonlocal pushed_ref
             calls.append((command, kwargs))
             if command == ["git", "-C", worktree, "remote", "get-url", "--", "origin"]:
                 return subprocess.CompletedProcess(command, 0, "https://example.invalid/fixture.git\n", "")
@@ -153,14 +155,24 @@ class DeliveryTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"{commit}\n", "")
             if command[:4] == ["git", "-C", worktree, "diff"]:
                 return subprocess.CompletedProcess(command, 1, "", "")
+            if command[:4] == ["git", "-C", worktree, "ls-remote"]:
+                if pushed_ref:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        f"{commit}\trefs/heads/{branch}\n",
+                        "",
+                    )
+                return subprocess.CompletedProcess(command, 2, "", "remote ref is absent")
             if command[:4] == ["git", "-C", worktree, "push"]:
+                pushed_ref = True
                 return subprocess.CompletedProcess(command, 0, "", "")
             if command[:3] == ["gh", "pr", "view"]:
                 return subprocess.CompletedProcess(command, 1, "", "not found")
             if command[:3] == ["gh", "pr", "create"]:
                 return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/1\n", "")
             if command[:3] == ["gh", "pr", "checks"]:
-                return subprocess.CompletedProcess(command, 0, "checks passed\n", "")
+                return subprocess.CompletedProcess(command, 0, "[{\"bucket\":\"pass\",\"name\":\"fixture\",\"state\":\"SUCCESS\"}]\n", "")
             raise AssertionError(command)
 
         delivery = GitHubDelivery(
@@ -206,7 +218,7 @@ class DeliveryTests(unittest.TestCase):
             if command[:3] == ["gh", "pr", "create"]:
                 return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/1\n", "")
             if command[:3] == ["gh", "pr", "checks"]:
-                return subprocess.CompletedProcess(command, 0, "checks passed\n", "")
+                return subprocess.CompletedProcess(command, 0, "[{\"bucket\":\"pass\",\"name\":\"fixture\",\"state\":\"SUCCESS\"}]\n", "")
             if command[:3] == ["gh", "pr", "merge"]:
                 return subprocess.CompletedProcess(command, 0, "merged\n", "")
             if command[:3] == ["gh", "pr", "view"]:

@@ -26,7 +26,7 @@ from .performance import PERFORMANCE_SEMANTIC_VERSION, PerformanceRegistry
 from .quota_productivity import build_quota_productivity
 from .radar import WorkbenchRadar
 from .scheduler_metrics import build_scheduler_metrics
-from .store import StateConflictError, WorkbenchStore
+from .store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
 CONTENT_SECURITY_POLICY = (
@@ -228,6 +228,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/tasks":
             return self._json({"tasks": self.server.store.list_tasks()})
+        if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/delivery-objective"):
+            task_id = unquote(
+                parsed.path.removeprefix("/api/tasks/").removesuffix("/delivery-objective")
+            )
+            try:
+                objective = self.server.store.get_delivery_objective_for_task(task_id)
+                if objective is None:
+                    return self._json({"error": "delivery objective not found"}, HTTPStatus.NOT_FOUND)
+                return self._json(objective)
+            except KeyError:
+                return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path.startswith("/api/artifacts/"):
             if not self._authenticated():
                 return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
@@ -314,6 +325,48 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "revision": revision})
             except KeyError:
                 return self._json({"error": "approval not found"}, HTTPStatus.NOT_FOUND)
+            except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+        if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/delivery-objective"):
+            task_id = unquote(
+                parsed.path.removeprefix("/api/tasks/").removesuffix("/delivery-objective")
+            )
+            try:
+                body = json.loads(self._read_body() or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("delivery objective body must be an object")
+                if "command_id" not in body or "request" not in body:
+                    raise ValueError("delivery objective requires command_id and request")
+                objective = self.server.store.create_delivery_objective(
+                    task_id, body["command_id"], body["request"]
+                )
+                return self._json({"ok": True, "objective": objective})
+            except KeyError:
+                return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
+            except (CommandConflictError, StateConflictError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/delivery-authorization"):
+            task_id = unquote(
+                parsed.path.removeprefix("/api/tasks/").removesuffix("/delivery-authorization")
+            )
+            try:
+                body = json.loads(self._read_body() or b"{}")
+                receipt = self.server.store.record_delivery_authorization(
+                    task_id,
+                    str(body["authorization_id"]),
+                    scope=body["scope"],
+                    authority=body["authority"],
+                    decision=str(body.get("decision", "granted")),
+                    granted_by=str(body.get("granted_by", "api-user")),
+                    objective_id=body.get("objective_id"),
+                    expires_at=body.get("expires_at"),
+                    expected_task_revision=self._expected_revision(body),
+                )
+                return self._json({"ok": True, **receipt})
+            except KeyError:
+                return self._json({"error": "task not found"}, HTTPStatus.NOT_FOUND)
             except (StateConflictError, TypeError, ValueError, json.JSONDecodeError) as error:
                 return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
         if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/steer"):

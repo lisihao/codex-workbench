@@ -595,6 +595,8 @@ class InstallerTests(unittest.TestCase):
             missing_codex = root / "missing-codex"
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
                 module, "macos_machine_id", return_value="fixture-machine"
+            ), mock.patch.object(
+                module, "verified_source_commit", return_value="a" * 40
             ), mock.patch.object(module, "install_code_as_harness") as install, mock.patch.object(
                 module.sys,
                 "argv",
@@ -757,10 +759,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_device_installers_delegate_to_the_canonical_harness_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        for name in ("install-macos.py", "install-macbook-client.py"):
+        for name, argument in (
+            ("install-macos.py", "app_root"),
+            ("install-macbook-client.py", "source"),
+        ):
             source = (root / "scripts" / name).read_text()
             self.assertIn('"install-code-as-harness.py"', source)
-            self.assertIn("install_code_as_harness(source)", source)
+            self.assertIn(f"install_code_as_harness({argument})", source)
 
     def test_authority_launch_agent_persists_quota_source(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1964,6 +1969,12 @@ class InstallerTests(unittest.TestCase):
 
             def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                 calls.append(command)
+                if command[0] == "git":
+                    if len(command) > 3 and command[3] == "rev-parse":
+                        return subprocess.CompletedProcess(command, 0, stdout="0" * 40 + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 return subprocess.CompletedProcess(command, 0, stdout="fixture\n", stderr="")
 
             output = io.StringIO()
@@ -2101,6 +2112,12 @@ class InstallerTests(unittest.TestCase):
     def test_authority_main_rolls_back_global_and_runtime_files_on_failure(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2123,7 +2140,9 @@ class InstallerTests(unittest.TestCase):
             def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                 if command and command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command and command[0] == "launchctl":
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
@@ -2177,6 +2196,13 @@ class InstallerTests(unittest.TestCase):
     def test_authority_installer_writes_capability_sidecar_manifest_and_health_checks_it(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2212,6 +2238,26 @@ class InstallerTests(unittest.TestCase):
                     }
                 )
             )
+            authority_lock = state_root / "coordinator.lock"
+            authority_lock.write_text(
+                json.dumps(
+                    {
+                        "instance_id": "installer-fixture-instance",
+                        "pid": 4242,
+                        "boot_id": "installer-fixture-boot",
+                    }
+                )
+                + "\n"
+            )
+            connection = sqlite3.connect(state_root / "state.sqlite")
+            try:
+                connection.execute(
+                    "CREATE TABLE events (cursor INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "event_type TEXT NOT NULL, payload_json TEXT NOT NULL)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
             calls: list[tuple[str, ...]] = []
             refreshes: list[dict[str, object]] = []
 
@@ -2219,12 +2265,38 @@ class InstallerTests(unittest.TestCase):
                 calls.append(command)
                 if command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command[:2] == ("id", "-u"):
                     return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
                 if command[0] == "launchctl":
-                    return subprocess.CompletedProcess(command, 0, stdout="fixture-loaded\n", stderr="")
+                    if command[1] == "print":
+                        label = command[-1].rsplit("/", 1)[-1]
+                        stdout = "pid = 4242\n" if label == module.LABEL else "fixture-loaded\n"
+                        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+                    if command[1:3] == ("kill", "SIGTERM"):
+                        if command[-1] == f"gui/501/{module.LABEL}":
+                            connection = sqlite3.connect(state_root / "state.sqlite")
+                            try:
+                                connection.execute(
+                                    "INSERT INTO events(event_type, payload_json) VALUES (?, ?)",
+                                    (
+                                        "coordinator.stopped",
+                                        json.dumps(
+                                            {
+                                                "instance_id": "installer-fixture-instance",
+                                                "boot_id": "installer-fixture-boot",
+                                            }
+                                        ),
+                                    ),
+                                )
+                                connection.commit()
+                            finally:
+                                connection.close()
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                 if command[0].endswith("/runtime/codex"):
                     return subprocess.CompletedProcess(command, 0, stdout="codex-cli 0.149.1\n", stderr="")
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
@@ -2540,6 +2612,13 @@ class InstallerTests(unittest.TestCase):
     def test_authority_installer_rolls_back_catalog_when_initial_bundled_refresh_fails(self) -> None:
         module = self._macos_installer_module()
         source = Path(__file__).resolve().parents[1]
+        source_commit = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             root = Path(directory)
             home = root / "home"
@@ -2580,7 +2659,9 @@ class InstallerTests(unittest.TestCase):
                 calls.append(command)
                 if command[0] == "git":
                     if len(command) > 3 and command[3] == "rev-parse":
-                        return subprocess.CompletedProcess(command, 0, stdout="fixture-sha\n", stderr="")
+                        return subprocess.CompletedProcess(command, 0, stdout=source_commit + "\n", stderr="")
+                    if len(command) > 3 and command[3] == "status":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="no-tag")
                 if command[:2] == ("id", "-u"):
                     return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")

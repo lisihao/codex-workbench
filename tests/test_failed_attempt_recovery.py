@@ -13,6 +13,10 @@ from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
+from codex_workbench.dirty_worktree_recovery import (
+    DirtyWorktreeRecoveryError,
+    observed_indeterminate_recovery_paths,
+)
 from codex_workbench.executors import ExecutionRequest
 from codex_workbench.mcp import WorkbenchMCPServer
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
@@ -21,7 +25,7 @@ from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeError, WorktreeManager
 
 
-class FailedAttemptRecoveryTests(unittest.TestCase):
+class _FailedAttemptRecoveryFixture:
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -90,6 +94,8 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
         retryable: bool = False,
         python_residue: bool = False,
         result_status: str = "failed",
+        external_write_permission: bool = False,
+        destructive_action_permission: bool = False,
     ) -> tuple[TaskContract, Path]:
         contract = TaskContract(
             task_id=task_id,
@@ -99,6 +105,8 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
             allowed_scope=("src",),
             executor_model="fixture",
             verifier_model="fixture",
+            external_write_permission=external_write_permission,
+            destructive_action_permission=destructive_action_permission,
         )
         ancestor = NodeSpec(
             "ancestor",
@@ -228,6 +236,7 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
         )
         return contract, source
 
+class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCase):
     def test_retry_restores_tracked_and_untracked_changes_without_rerunning_accepted_ancestors(self) -> None:
         contract, source = self._dirty_failed_task()
         failed = self.store.get_task(contract.task_id)
@@ -1384,6 +1393,669 @@ class FailedAttemptRecoveryTests(unittest.TestCase):
                     if event["event_type"] == "task.control_state_preserved"
                 ]
                 self.assertEqual(len(preserved), 1)
+
+
+class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCase):
+    """Explicit operator-confirmed local recovery for owned-worktree indeterminate nodes."""
+
+    def _indeterminate_owned_worktree_task(
+        self,
+        *,
+        task_id: str = "indeterminate-recovery",
+        external_write_permission: bool = False,
+        destructive_action_permission: bool = False,
+    ) -> tuple[TaskContract, Path, str]:
+        """Leave the worker ``indeterminate`` while it still owns an attempt-2 worktree.
+
+        ``_dirty_failed_task(retryable=True)`` already settles the worker as a
+        retryable failed attempt, which builds the normal ``capture_pending``
+        recovery binding and auto-queues the task; this then claims that
+        binding and crashes the fixture executor after the coordinator has
+        already restored the patch onto a fresh attempt-2 target and assigned
+        it -- exactly the scenario already covered by
+        ``test_indeterminate_recovered_worktree_cannot_be_retried_or_duplicated``.
+
+        Also returns the worker's recorded ``dependency-input`` artifact ref
+        (durable in ArtifactStore from the original attempt-1 settlement)
+        so callers can preserve the accepted ``ancestor`` dependency rather
+        than recomputing lineage from the raw task base.
+        """
+
+        contract, _ = self._dirty_failed_task(
+            task_id=task_id,
+            retryable=True,
+            external_write_permission=external_write_permission,
+            destructive_action_permission=destructive_action_permission,
+        )
+        failed_event = next(
+            event
+            for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.failed" and event["node_id"] == "worker"
+        )
+        dependency_input_ref = failed_event["payload"]["result"]["artifacts"]["dependency-input"]
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node(f"{task_id}-crashing-retry")
+            assert claimed is not None
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = RuntimeError("fixture crash after assignment")
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        indeterminate = self.store.get_task(contract.task_id)
+        node = next(item for item in indeterminate["nodes"] if item["node_id"] == "worker")
+        self.assertEqual(
+            (indeterminate["state"], node["state"], node["attempt"]),
+            ("needs_approval", "indeterminate", 2),
+        )
+        target = Path(str(node["worktree"]))
+        self.assertEqual(
+            (target / "src" / "continuation.txt").read_text(encoding="utf-8"),
+            "untracked prior attempt\n",
+        )
+        return contract, target, dependency_input_ref
+
+    def test_candidate_requires_owned_worktree_with_no_pending_recovery_binding(self) -> None:
+        contract, target, _ = self._indeterminate_owned_worktree_task()
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        self.assertEqual(candidate["node"]["worktree"], str(target))
+        self.assertEqual(candidate["node"]["attempt"], 2)
+        self.assertEqual(candidate["task"]["repository"], str(self.repository))
+
+    def test_local_recovery_preserves_tracked_and_untracked_changes_and_dispatches_new_attempt(
+        self,
+    ) -> None:
+        contract, target, dependency_input_ref = self._indeterminate_owned_worktree_task()
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(changed_paths, ("src/continuation.txt", "src/value.txt"))
+        self.assertEqual(generated_residue_paths, ())
+
+        result = self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="operator confirmed the crashed executor exited and effects stayed in-scope",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+        )
+        self.assertEqual(result["task"]["state"], "queued")
+        self.assertEqual(result["node"]["state"], "pending")
+        self.assertEqual(result["node"]["next_attempt"], 3)
+
+        queued = self.store.get_task(contract.task_id)
+        node = next(item for item in queued["nodes"] if item["node_id"] == "worker")
+        self.assertEqual((node["state"], node["attempt"], node["worktree"]), ("pending", 2, None))
+
+        # The prior attempt-2 worktree is left untouched on disk: recovery
+        # restores its patch onto a brand-new attempt-3 target rather than
+        # mutating or reusing the indeterminate source in place.
+        self.assertEqual(
+            (target / "src" / "continuation.txt").read_text(encoding="utf-8"),
+            "untracked prior attempt\n",
+        )
+        self.assertEqual(
+            (target / "src" / "value.txt").read_text(encoding="utf-8"),
+            "dirty prior attempt\n",
+        )
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        observed: dict[str, object] = {}
+
+        def execute(request: object) -> NodeResult:
+            worktree = request.worktree  # type: ignore[attr-defined]
+            assert worktree is not None
+            observed["attempt"] = request.attempt  # type: ignore[attr-defined]
+            observed["ancestor"] = (worktree / "src" / "ancestor.txt").read_text(encoding="utf-8")
+            observed["tracked"] = (worktree / "src" / "value.txt").read_text(encoding="utf-8")
+            observed["untracked"] = (worktree / "src" / "continuation.txt").read_text(encoding="utf-8")
+            return NodeResult("succeeded", "fake executor continued recovered worker", checks=("fake",))
+
+        try:
+            claimed = coordinator._claim_next_ready_node("resume-after-local-recovery")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 3))
+            self.assertIn("failed_attempt_recovery", claimed)
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = execute
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        self.assertEqual(
+            observed,
+            {
+                "attempt": 3,
+                "ancestor": "accepted ancestor\n",
+                "tracked": "dirty prior attempt\n",
+                "untracked": "untracked prior attempt\n",
+            },
+        )
+        accepted = self.store.get_task(contract.task_id)
+        node = next(item for item in accepted["nodes"] if item["node_id"] == "worker")
+        self.assertEqual((node["state"], node["attempt"]), ("accepted", 3))
+
+    def test_local_recovery_via_mcp_control_action(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-mcp"
+        )
+        task = self.store.get_task(contract.task_id)
+        response = self.mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_control_task",
+                    "arguments": {
+                        "task_id": contract.task_id,
+                        "action": "resolve_indeterminate_locally",
+                        "expected_revision": int(task["state_revision"]),
+                        "node_id": "worker",
+                        "expected_attempt": 2,
+                        "reason": "operator confirmed process exit via ps/pgrep before recovery",
+                        "confirm_old_executor_ended": True,
+                        "confirm_effects_restricted_to_owned_files": True,
+                        "dependency_input_ref": dependency_input_ref,
+                    },
+                },
+            }
+        )
+        assert response is not None
+        self.assertNotIn("isError", response["result"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["task"]["state"], "queued")
+
+    def test_bare_resolve_indeterminate_still_rejects_owned_worktree_retry(self) -> None:
+        """The original fail-closed guard remains intact for the un-recovered path."""
+
+        contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-bare-reject")
+        indeterminate = self.store.get_task(contract.task_id)
+        approval = self.store.list_approvals()[0]
+        with self.assertRaisesRegex(StateConflictError, "explicit recovery"):
+            self.store.decide_approval(
+                approval["approval_id"],
+                "retry",
+                expected_revision=int(indeterminate["state_revision"]),
+            )
+
+    def test_stale_expected_attempt_is_rejected(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-stale-attempt")
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(StateConflictError, "expected node attempt"):
+            self.store.indeterminate_local_recovery_candidate(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=1,
+            )
+
+    def test_stale_expected_revision_is_rejected(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-stale-revision")
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(StateConflictError, "expected task revision"):
+            self.store.indeterminate_local_recovery_candidate(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]) + 1,
+                expected_attempt=2,
+            )
+
+    def test_missing_confirmation_flags_are_rejected(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-missing-confirm")
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(ValueError, "old executor ended"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="missing confirmation",
+                confirm_old_executor_ended=False,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=("src/value.txt",),
+            )
+        with self.assertRaisesRegex(ValueError, "restricted to owned files"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="missing confirmation",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=False,
+                observed_changed_paths=("src/value.txt",),
+            )
+        unchanged = self.store.get_task(contract.task_id)
+        self.assertEqual(unchanged, task)
+
+    def test_dependent_node_requires_its_recorded_input_before_local_recovery(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-missing-dependency-input"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError, "recorded dependency-input artifact"
+        ):
+            observed_indeterminate_recovery_paths(
+                candidate,
+                dependency_input_ref=None,
+                artifacts=self.artifacts,
+            )
+        with self.assertRaisesRegex(
+            StateConflictError, "recorded dependency-input artifact"
+        ):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="operator confirmed process exit and local effects",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=("src/value.txt",),
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+
+    def test_local_recovery_rejects_contracts_with_possible_external_effects(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-external-effects",
+            external_write_permission=True,
+        )
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(StateConflictError, "no external or destructive permissions"):
+            self.store.indeterminate_local_recovery_candidate(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+            )
+
+    def test_out_of_node_scope_path_is_rejected_before_confirmation(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-node-scope"
+        )
+        task = self.store.get_task(contract.task_id)
+        with self.store.transaction() as connection:
+            raw = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            ).fetchone()
+            assert raw is not None
+            spec = json.loads(raw["spec_json"])
+            spec["write_scopes"] = ["src/narrow"]
+            connection.execute(
+                "UPDATE nodes SET spec_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                (json.dumps(spec, sort_keys=True), contract.task_id),
+            )
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "outside node write scope"):
+            observed_indeterminate_recovery_paths(
+                candidate,
+                dependency_input_ref=dependency_input_ref,
+                artifacts=self.artifacts,
+            )
+
+    def test_known_generated_residue_is_bound_without_becoming_worker_input(self) -> None:
+        contract, target, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-generated-residue"
+        )
+        residue = target / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+        residue.parent.mkdir(parents=True)
+        residue.write_bytes(b"indeterminate residue\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        self.assertEqual(generated_residue_paths, ("tests/__pycache__/fixture.cpython-313.pyc",))
+        preview = self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="operator confirmed process exit and local effects",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            dry_run=True,
+        )
+        source = preview["would_authorize"]["source"]
+        self.assertEqual(source["changed_paths"], list(changed_paths))
+        self.assertEqual(source["generated_residue_paths"], list(generated_residue_paths))
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+
+    def test_local_observation_runs_before_the_queue_write_transaction(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-observation-transaction"
+        )
+        task = self.store.get_task(contract.task_id)
+        original_transaction = self.store.transaction
+        from codex_workbench import mcp as mcp_module
+
+        original_observation = mcp_module.observed_indeterminate_recovery_paths
+        in_write_transaction = False
+
+        @contextmanager
+        def tracked_transaction():
+            nonlocal in_write_transaction
+            with original_transaction() as connection:
+                in_write_transaction = True
+                try:
+                    yield connection
+                finally:
+                    in_write_transaction = False
+
+        def observed_outside_write_transaction(*args: object, **kwargs: object):
+            self.assertFalse(in_write_transaction)
+            return original_observation(*args, **kwargs)
+
+        with (
+            patch.object(self.store, "transaction", tracked_transaction),
+            patch.object(
+                mcp_module,
+                "observed_indeterminate_recovery_paths",
+                side_effect=observed_outside_write_transaction,
+            ),
+        ):
+            response = self.mcp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "workbench_control_task",
+                        "arguments": {
+                            "task_id": contract.task_id,
+                            "action": "resolve_indeterminate_locally",
+                            "expected_revision": int(task["state_revision"]),
+                            "node_id": "worker",
+                            "expected_attempt": 2,
+                            "reason": "operator confirmed process exit and local effects",
+                            "confirm_old_executor_ended": True,
+                            "confirm_effects_restricted_to_owned_files": True,
+                            "dependency_input_ref": dependency_input_ref,
+                        },
+                    },
+                }
+            )
+        assert response is not None
+        self.assertNotIn("isError", response["result"])
+
+    def test_foreign_out_of_scope_path_is_rejected_before_confirmation(self) -> None:
+        contract, target, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-foreign-path"
+        )
+        (target / "outside.txt").write_text("not in scope\n", encoding="utf-8")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "outside task scope"):
+            observed_indeterminate_recovery_paths(
+                candidate,
+                dependency_input_ref=dependency_input_ref,
+                artifacts=self.artifacts,
+            )
+        # The rejection happens before any store mutation is attempted.
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+
+    def test_stale_changed_paths_receipt_is_rejected_at_dispatch(self) -> None:
+        """An inaccurate changed_paths receipt is caught before executor dispatch.
+
+        ``queue_indeterminate_local_recovery`` authorizes the reused
+        ``failed-attempt-worktree-recovery`` binding from the caller-supplied
+        receipt; the coordinator's existing drift check re-derives the actual
+        changed paths from the live worktree at dispatch time and rejects a
+        receipt that claims a path never touched by the worker.
+        """
+
+        contract, target, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-drift"
+        )
+        task = self.store.get_task(contract.task_id)
+        (target / "src" / "does-not-exist.txt").write_text("added after capture\n", encoding="utf-8")
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="operator confirmed the crashed executor exited and effects stayed in-scope",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+        )
+        (target / "src" / "does-not-exist.txt").unlink()
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("drift-detection")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("drifted recovery must not dispatch an executor"),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        drifted = self.store.get_task(contract.task_id)
+        node = next(item for item in drifted["nodes"] if item["node_id"] == "worker")
+        self.assertEqual((drifted["state"], node["state"], node["attempt"]), ("needs_fix", "failed", 2))
+
+    def test_old_attempt_fencing_rejects_wrong_attempt_number(self) -> None:
+        contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-attempt-fence")
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(StateConflictError, "expected node attempt"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=1,
+                reason="wrong attempt",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=("src/value.txt",),
+            )
+
+    def test_stale_revision_cas_rejects_commit(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-stale-cas"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        with self.assertRaisesRegex(StateConflictError, "expected task revision"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]) + 1,
+                expected_attempt=2,
+                reason="stale revision",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=changed_paths,
+                observed_generated_residue_paths=generated_residue_paths,
+                dependency_input_ref=dependency_input_ref,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+
+    def test_observed_revision_that_changes_before_commit_is_rejected(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-racing-cas"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        original_authorization = self.store._failed_attempt_recovery_authorization
+        authorization_calls = 0
+
+        def stale_after_preflight(*args: object, **kwargs: object) -> dict[str, object] | None:
+            nonlocal authorization_calls
+            authorization_calls += 1
+            authorization = original_authorization(*args, **kwargs)
+            if authorization_calls == 1:
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET state_revision = state_revision + 1 WHERE task_id = ?",
+                        (contract.task_id,),
+                    )
+            return authorization
+
+        with (
+            patch.object(
+                self.store,
+                "_failed_attempt_recovery_authorization",
+                side_effect=stale_after_preflight,
+            ),
+            self.assertRaisesRegex(StateConflictError, "expected task revision"),
+        ):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="operator confirmed process exit and local effects",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=changed_paths,
+                observed_generated_residue_paths=generated_residue_paths,
+                dependency_input_ref=dependency_input_ref,
+            )
+        self.assertEqual(authorization_calls, 1)
+
+    def test_local_recovery_hash_mismatch_is_rejected_before_executor_dispatch(self) -> None:
+        contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-hash-mismatch"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="operator confirmed process exit and local effects",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        original_capture = coordinator.failed_attempt_recovery.capture
+
+        def tampered_capture(**kwargs: object) -> dict[str, object]:
+            recovery = original_capture(**kwargs)
+            return {**recovery, "patch_sha256": "0" * 64}
+
+        try:
+            claimed = coordinator._claim_next_ready_node("local-recovery-hash-mismatch")
+            assert claimed is not None
+            with (
+                patch.object(
+                    coordinator.failed_attempt_recovery,
+                    "capture",
+                    side_effect=tampered_capture,
+                ),
+                patch.object(coordinator, "_executor") as executor,
+            ):
+                coordinator._execute_claimed(claimed)
+                executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        rejected = self.store.get_task(contract.task_id)
+        worker = next(node for node in rejected["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((rejected["state"], worker["state"], worker["attempt"]), ("needs_fix", "failed", 2))
 
 
 if __name__ == "__main__":
