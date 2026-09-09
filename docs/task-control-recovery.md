@@ -4,6 +4,8 @@ Codex Workbench 以 Authority 的 SQLite 数据库作为任务状态、节点 at
 
 MCP 将工作树恢复拒绝作为当前请求的 `isError` 返回，连接继续处理后续请求；拒绝不代表节点已恢复或启动。
 
+原 attempt 已提交 checkpoint 时，MCP `resume` 可显式提供 `expected_checkpoint_sha`，CLI `task resume-blocked-worktree` 对应 `--expected-checkpoint-sha`。必须使用核实过的完整 SHA；未提供时仍要求 HEAD 等于合同 base。恢复核对同一 Git 仓库、分配分支、base 祖先关系、原 attempt 已报告的文件列表和写入范围，将 checkpoint SHA 与补丁哈希封存在现有恢复回执中。新 attempt 从原 base／依赖输入恢复完整差异，不重写旧提交。HEAD 或补丁在封存后变化均拒绝恢复；其他分支的新功能不会自动合入旧任务。
+
 ## 调用方 revision 与原子控制
 
 外部 CLI、HTTP 和 MCP 的 queue、resume、pause、cancel、steer 必须传入刚读取的 expected_revision。服务端比较该 revision；陈旧、缺失、布尔值或字符串值都不能启动节点。内部创建任务后立即排队的可信路径仍可调用底层 store 接口，但不得用于外部控制。

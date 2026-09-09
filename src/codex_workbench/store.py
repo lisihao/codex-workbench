@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -2249,6 +2250,7 @@ class WorkbenchStore:
                 "changed_paths": recoverable_paths,
                 "generated_residue_paths": generated_residue_paths,
                 "allocation_id": str(allocation["allocation_id"]),
+                "repository": str(contract["repository"]),
             },
             "source_result_json": str(node["result_json"]),
         }
@@ -2279,6 +2281,7 @@ class WorkbenchStore:
         expected_attempt: int,
         reason: str,
         preserve_untracked: bool = False,
+        expected_checkpoint_sha: str | None = None,
     ) -> dict[str, Any]:
         """Capture a blocked attempt outside SQLite, then authorize its retry."""
 
@@ -2381,6 +2384,7 @@ class WorkbenchStore:
             branch=str(source["branch"]),
             attempt=expected_attempt,
             expected_changed_paths=tuple(source["changed_paths"]),
+            expected_checkpoint_sha=expected_checkpoint_sha,
             expected_generated_residue_paths=tuple(
                 source.get("generated_residue_paths", ())
             ),
@@ -2438,6 +2442,11 @@ class WorkbenchStore:
             "patch_sha256",
         }
         schema_version = recovery.get("schema_version")
+        if "source_checkpoint_sha" in recovery:
+            checkpoint = recovery["source_checkpoint_sha"]
+            if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint):
+                raise StateConflictError("checkpoint requires an exact full commit SHA")
+            common.add("source_checkpoint_sha")
         if schema_version == 1:
             required = common
         elif schema_version in {2, 3, 5, 6}:
@@ -2458,6 +2467,12 @@ class WorkbenchStore:
         if set(recovery) != required:
             raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
         source = candidate["source"]
+        for relative_path in source["changed_paths"] if "source_checkpoint_sha" in recovery else ():
+            if not scope_allows(relative_path, candidate["task"]["allowed_scope"],
+                                candidate["task"]["forbidden_scope"]):
+                raise StateConflictError("recovery path is outside the task contract scope: " + relative_path)
+            if not scope_allows(relative_path, candidate["node"]["write_scopes"], []):
+                raise StateConflictError("recovery path is outside the blocked node write scope: " + relative_path)
         if (
             recovery["source_attempt"] != expected_attempt
             or recovery["source_branch"] != source["branch"]
@@ -2559,7 +2574,14 @@ class WorkbenchStore:
                 "dirty-worktree recovery patch artifact does not match the captured receipt"
             )
         base_sha = str(source["base_sha"])
-        if self._recovery_git_bytes(source_path, "rev-parse", "HEAD").decode().strip() != base_sha:
+        checkpoint = recovery.get("source_checkpoint_sha")
+        if checkpoint is not None:
+            DirtyWorktreeRecovery(self.artifacts, WorktreeManager(self.path.parent / "worktrees")).validate_retry_source(
+                repository=str(source["repository"]), base_sha=base_sha,
+                worktree=str(source_path), branch=str(source["branch"]),
+                expected_checkpoint_sha=checkpoint,
+            )
+        if self._recovery_git_bytes(source_path, "rev-parse", "HEAD").decode().strip() != (checkpoint or base_sha):
             raise StateConflictError("dirty-worktree recovery source no longer matches contract base")
         if self._recovery_git_bytes(source_path, "branch", "--show-current").decode().strip() != source["branch"]:
             raise StateConflictError("dirty-worktree recovery source no longer matches allocated branch")
@@ -5033,6 +5055,11 @@ class WorkbenchStore:
         }
         if not isinstance(recovery, dict):
             raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
+        if "source_checkpoint_sha" in recovery:
+            checkpoint = recovery["source_checkpoint_sha"]
+            if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint):
+                raise StateConflictError("checkpoint requires an exact full commit SHA")
+            common_fields.add("source_checkpoint_sha")
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             receipt_fields = common_fields

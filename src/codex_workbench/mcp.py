@@ -214,6 +214,7 @@ TOOLS: list[dict[str, Any]] = [
                 "node_id": {"type": "string"},
                 "confirm_recovery": {"type": "boolean"},
                 "preserve_untracked": {"type": "boolean"},
+                "expected_checkpoint_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
                 "confirm_no_side_effects": {"type": "boolean"},
                 "resolution": {"enum": ["retry", "fail", "cancel"]},
             },
@@ -506,6 +507,7 @@ class WorkbenchMCPServer:
                 expected_attempt=expected_attempt,
                 reason=reason,
                 preserve_untracked=preserve_untracked,
+                expected_checkpoint_sha=arguments.get("expected_checkpoint_sha"),
             )
             return {
                 "ok": True,
@@ -514,7 +516,7 @@ class WorkbenchMCPServer:
                 **resumed,
             }
 
-        if confirm_recovery or preserve_untracked:
+        if confirm_recovery or preserve_untracked or "expected_checkpoint_sha" in arguments:
             raise ValueError(
                 "clean blocked resume does not accept recovery or untracked-preservation assertions"
             )

@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 from datetime import UTC, datetime
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -404,6 +405,7 @@ def _capture_blocked_worktree_recovery(
     reason: str,
     dry_run: bool,
     preserve_untracked: bool,
+    expected_checkpoint_sha: str | None = None,
 ) -> dict[str, object]:
     if not dry_run:
         return store.capture_and_resume_blocked_worktree(
@@ -413,6 +415,7 @@ def _capture_blocked_worktree_recovery(
             expected_attempt=expected_attempt,
             reason=reason,
             preserve_untracked=preserve_untracked,
+            expected_checkpoint_sha=expected_checkpoint_sha,
         )
 
     candidate = store.blocked_worktree_recovery_candidate(
@@ -490,6 +493,7 @@ def _capture_blocked_worktree_recovery(
                 branch=str(source["branch"]),
                 attempt=expected_attempt,
                 expected_changed_paths=tuple(source["changed_paths"]),
+                expected_checkpoint_sha=expected_checkpoint_sha,
                 expected_generated_residue_paths=tuple(
                     source.get("generated_residue_paths", ())
                 ),
@@ -530,6 +534,11 @@ def _validate_blocked_worktree_recovery_receipt(
         "patch_ref",
         "patch_sha256",
     }
+    if "source_checkpoint_sha" in recovery:
+        checkpoint = recovery["source_checkpoint_sha"]
+        if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint):
+            raise ValueError("checkpoint requires an exact full commit SHA")
+        common.add("source_checkpoint_sha")
     schema_version = recovery.get("schema_version")
     if schema_version == 1:
         required = common
@@ -616,6 +625,8 @@ def command_task(args: argparse.Namespace) -> int:
         result = {"ok": True, "action": "reconcile-archify", **result}
     elif args.action == "resume-blocked-worktree":
         if getattr(args, "recovery_file", None):
+            if getattr(args, "expected_checkpoint_sha", None) is not None:
+                raise ValueError("--expected-checkpoint-sha cannot be combined with --recovery-file")
             if args.preserve_untracked:
                 raise ValueError("--preserve-untracked cannot be combined with --recovery-file")
             recovery = _load_blocked_worktree_recovery(args.recovery_file)
@@ -644,6 +655,7 @@ def command_task(args: argparse.Namespace) -> int:
                 reason=args.reason,
                 dry_run=bool(args.dry_run),
                 preserve_untracked=bool(args.preserve_untracked),
+                expected_checkpoint_sha=args.expected_checkpoint_sha,
             )
         result = {
             "ok": True,
@@ -1801,6 +1813,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly preserve exact in-scope untracked files on the clean recovery target",
     )
+    resume_blocked_worktree.add_argument("--expected-checkpoint-sha", help="explicit full SHA of the owned source checkpoint")
     resume_blocked_worktree.add_argument("--dry-run", action="store_true")
     retry_blocked = task_sub.add_parser("retry-blocked")
     retry_blocked.add_argument("task_id")

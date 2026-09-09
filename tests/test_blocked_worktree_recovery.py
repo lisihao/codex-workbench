@@ -30,7 +30,7 @@ from codex_workbench.dirty_worktree_recovery import (
 from codex_workbench.mcp import WorkbenchMCPServer
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
-from codex_workbench.store import WorkbenchStore
+from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
 
 
@@ -196,6 +196,69 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         )
         assert response is not None
         return response["result"]
+
+    def test_explicit_checkpoint_is_restored_without_rewriting_source(self) -> None:
+        contract, blocked, source, original_patch = self._blocked_task(acceptance_command="git diff --check")
+        self._git(source, "add", "src/value.txt")
+        self._git(source, "commit", "-m", "checkpoint")
+        checkpoint = self._git(source, "rev-parse", "HEAD")
+        arguments = dict(task_id=contract.task_id, action="resume", node_id="worker",
+                         expected_revision=blocked["state_revision"], expected_attempt=1,
+                         reason="preserve the reviewed checkpoint", confirm_recovery=True)
+        self.assertTrue(self._call_control(arguments)["isError"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        arguments["expected_checkpoint_sha"] = checkpoint
+        response = self._call_control(arguments)
+        self.assertNotIn("isError", response, response)
+        receipt = json.loads(response["content"][0]["text"])["recovery"]
+        self.assertEqual(receipt["source_checkpoint_sha"], checkpoint)
+        self.assertEqual(self.store.artifacts.verify(receipt["patch_ref"]).read_bytes(), original_patch)
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("checkpoint-test")
+            self.assertIsNotNone(claimed)
+            with patch.object(coordinator, "_executor", side_effect=AssertionError("no model dispatch")):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((worker["state"], worker["attempt"]), ("accepted", 2))
+        self.assertEqual((Path(worker["worktree"]) / "src/value.txt").read_text(), "patched\n")
+        self.assertEqual(self._git(source, "rev-parse", "HEAD"), checkpoint)
+        self.assertEqual(self._git(source, "status", "--porcelain"), "")
+
+    def test_checkpoint_drift_and_invalid_identity_do_not_authorize_retry(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(acceptance_command="git diff --check")
+        self._git(source, "add", "src/value.txt")
+        self._git(source, "commit", "-m", "checkpoint")
+        checkpoint = self._git(source, "rev-parse", "HEAD")
+        for bad in ("HEAD", checkpoint[:8], "-bad", 1, self.base_sha):
+            with self.subTest(checkpoint=bad), self.assertRaises(DirtyWorktreeRecoveryError):
+                self.store.capture_and_resume_blocked_worktree(
+                    contract.task_id, "worker", expected_revision=blocked["state_revision"],
+                    expected_attempt=1, reason="recover", expected_checkpoint_sha=bad)
+            self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        receipt = self.recovery.capture(
+            repository=contract.repository, base_sha=self.base_sha, worktree=str(source),
+            branch=self._git(source, "branch", "--show-current"), attempt=1,
+            expected_changed_paths=("src/value.txt",), expected_checkpoint_sha=checkpoint)
+        self._git(source, "commit", "--allow-empty", "-m", "head drift")
+        with self.assertRaises(DirtyWorktreeRecoveryError):
+            self.recovery._validate_snapshot(contract.repository, str(source), receipt)
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
+    def test_checkpoint_outside_node_scope_cannot_be_authorized(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command="git diff --check", patch_path="other.txt",
+            allowed_scope=(".",), write_scopes=("src",))
+        self._git(source, "add", "other.txt")
+        self._git(source, "commit", "-m", "out-of-scope checkpoint")
+        with self.assertRaisesRegex(StateConflictError, "write scope"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id, "worker", expected_revision=blocked["state_revision"],
+                expected_attempt=1, reason="recover", expected_checkpoint_sha=self._git(source, "rev-parse", "HEAD"))
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
 
     def test_mcp_resume_recovers_dirty_blocked_attempt_without_losing_changes(self) -> None:
         command = (
@@ -480,6 +543,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         dependency_input_ref: str,
         *,
         preserve_untracked: bool = False,
+        expected_checkpoint_sha: str | None = None,
     ) -> dict:
         worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
         dependency_input = json.loads(
@@ -498,6 +562,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             node_id="worker",
             input_tree_sha=dependency_input["input_tree_sha"],
             dependency_input_ref=dependency_input_ref,
+            expected_checkpoint_sha=expected_checkpoint_sha,
             preserve_untracked_paths=(
                 DirtyWorktreeRecovery.untracked_paths(source) if preserve_untracked else ()
             ),
@@ -996,13 +1061,25 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(task["state"], "blocked")
 
     def test_dependent_recovery_replays_recorded_input_and_only_worker_delta(self) -> None:
+        self._exercise_dependent_recovery(checkpoint=False)
+
+    def test_dependent_checkpoint_preserves_accepted_ancestor_and_worker_delta(self) -> None:
+        self._exercise_dependent_recovery(checkpoint=True)
+
+    def _exercise_dependent_recovery(self, *, checkpoint: bool) -> None:
         contract, blocked, source, dependency_input_ref, source_worker_patch = self._blocked_dependent_task()
+        checkpoint_sha = None
+        if checkpoint:
+            self._git(source, "add", "src")
+            self._git(source, "commit", "-m", "checkpoint with dependency input")
+            checkpoint_sha = self._git(source, "rev-parse", "HEAD")
         source_patch_before = subprocess.run(
             ["git", "-C", str(source), "diff", "--binary", self.base_sha],
             check=True,
             capture_output=True,
         ).stdout
-        self._authorize_dependent(contract, blocked, source, dependency_input_ref)
+        self._authorize_dependent(contract, blocked, source, dependency_input_ref,
+                                  expected_checkpoint_sha=checkpoint_sha)
         coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
         try:
             claimed = coordinator._claim_next_ready_node("dependent-recovery-worker")

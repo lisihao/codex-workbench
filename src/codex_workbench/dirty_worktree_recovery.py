@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import shlex
 import shutil
 import stat
@@ -744,6 +745,7 @@ class DirtyWorktreeRecovery:
         dependency_input_ref: str | None = None,
         preserve_untracked_paths: tuple[str, ...] = (),
         expected_generated_residue_paths: tuple[str, ...] = (),
+        expected_checkpoint_sha: str | None = None,
     ) -> dict[str, object]:
         """Capture only the blocked worker's own patch.
 
@@ -753,7 +755,8 @@ class DirtyWorktreeRecovery:
         ancestor patches never become part of the worker's patch.
         """
 
-        path = self._validate_worktree(repository, base_sha, worktree, branch)
+        path = self._validate_worktree(repository, base_sha, worktree, branch,
+                                       checkpoint_sha=expected_checkpoint_sha)
         if dependency_input_ref is None:
             if any(value is not None for value in (task_id, node_id, input_tree_sha)):
                 raise DirtyWorktreeRecoveryError(
@@ -839,6 +842,11 @@ class DirtyWorktreeRecovery:
         if not patch:
             raise DirtyWorktreeRecoveryError("dirty worktree has no patch to preserve")
         patch_ref = self.artifacts.put_bytes(patch, "blocked-worktree.patch")
+        # Recheck the explicit HEAD binding after filesystem capture, before sealing.
+        self._validate_worktree(repository, base_sha, worktree, branch,
+                                checkpoint_sha=expected_checkpoint_sha)
+        if expected_checkpoint_sha is not None:
+            recovery_context["source_checkpoint_sha"] = expected_checkpoint_sha
         return {
             **recovery_context,
             "source_attempt": attempt,
@@ -857,10 +865,12 @@ class DirtyWorktreeRecovery:
         base_sha: str,
         worktree: str,
         branch: str,
+        expected_checkpoint_sha: str | None = None,
     ) -> Path:
         """Check a failed source binding before deciding whether it is clean."""
 
-        return self._validate_worktree(repository, base_sha, worktree, branch)
+        return self._validate_worktree(repository, base_sha, worktree, branch,
+                                       checkpoint_sha=expected_checkpoint_sha)
 
     def prepare(
         self,
@@ -1113,7 +1123,8 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid source_attempt")
         if not isinstance(changed_paths, list) or not all(isinstance(path, str) for path in changed_paths):
             raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid changed_paths")
-        path = self._validate_worktree(repository, base_sha, worktree, branch)
+        path = self._validate_worktree(repository, base_sha, worktree, branch,
+                                       checkpoint_sha=recovery.get("source_checkpoint_sha"))
         try:
             expected_source = Path(source_worktree).expanduser().resolve(strict=True)
         except OSError as error:
@@ -1153,6 +1164,10 @@ class DirtyWorktreeRecovery:
     ) -> tuple[str, str | None, str | None, str | None]:
         """Return the worker-input tree and optional recorded-input binding."""
 
+        if "source_checkpoint_sha" in recovery:
+            checkpoint = recovery["source_checkpoint_sha"]
+            if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint):
+                raise DirtyWorktreeRecoveryError("checkpoint requires an exact full commit SHA")
         schema_version = recovery.get("schema_version")
         base_sha = recovery.get("base_sha")
         if not isinstance(base_sha, str) or not base_sha:
@@ -1170,6 +1185,8 @@ class DirtyWorktreeRecovery:
             }
             if schema_version == 4:
                 legacy |= {"generated_residue_paths", "generated_residue_ref"}
+            if "source_checkpoint_sha" in recovery:
+                legacy.add("source_checkpoint_sha")
             if set(recovery) != legacy:
                 raise DirtyWorktreeRecoveryError("blocked legacy recovery receipt has an invalid shape")
             return (
@@ -1198,6 +1215,8 @@ class DirtyWorktreeRecovery:
             required.add("untracked_paths")
         if schema_version in {5, 6}:
             required |= {"generated_residue_paths", "generated_residue_ref"}
+        if "source_checkpoint_sha" in recovery:
+            required.add("source_checkpoint_sha")
         if set(recovery) != required:
             raise DirtyWorktreeRecoveryError("blocked dependency recovery receipt has an invalid shape")
         task_id = recovery["source_task_id"]
@@ -1674,7 +1693,8 @@ class DirtyWorktreeRecovery:
         return patch
 
 
-    def _validate_worktree(self, repository: str, base_sha: str, worktree: str, branch: str) -> Path:
+    def _validate_worktree(self, repository: str, base_sha: str, worktree: str, branch: str,
+                           *, checkpoint_sha: object = None) -> Path:
         repo = Path(repository).expanduser().resolve(strict=True)
         path = Path(worktree).expanduser().resolve(strict=True)
         root = self.worktrees.root.expanduser().resolve(strict=False)
@@ -1682,7 +1702,18 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError("recovery worktree is outside the Workbench worktree root")
         if self._git_text(path, "rev-parse", "--show-toplevel") != str(path):
             raise DirtyWorktreeRecoveryError("recovery path is not a standalone Git worktree")
-        if self._git_text(path, "rev-parse", "HEAD") != self._git_text(repo, "rev-parse", f"{base_sha}^{{commit}}"):
+        base = self._git_text(repo, "rev-parse", f"{base_sha}^{{commit}}")
+        expected_head = base
+        if checkpoint_sha is not None:
+            if not isinstance(checkpoint_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint_sha):
+                raise DirtyWorktreeRecoveryError("checkpoint requires an exact full commit SHA")
+            common = self._git_text(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            if common != self._git_text(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+                raise DirtyWorktreeRecoveryError("checkpoint source belongs to another repository")
+            if self._git_text(path, "merge-base", base, checkpoint_sha) != base:
+                raise DirtyWorktreeRecoveryError("checkpoint does not descend from the contract base")
+            expected_head = checkpoint_sha
+        if self._git_text(path, "rev-parse", "HEAD") != expected_head:
             raise DirtyWorktreeRecoveryError("recovery worktree no longer matches its contract base")
         if self._git_text(path, "branch", "--show-current") != branch:
             raise DirtyWorktreeRecoveryError("recovery worktree no longer matches its allocated branch")
