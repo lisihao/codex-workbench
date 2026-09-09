@@ -155,6 +155,31 @@ smbutil statshares -m "$WB_NAS_ARCHIVE_ROOT"
 
 如需让受控脏工作树恢复完全离线，先在 Authority 准备包含目标锁文件依赖的本地 pnpm store，并在 dry-run 与正式安装中都附加 `--pnpm-store "$WB_PNPM_STORE"`。不提供该参数时，安装器会建立独立空 store；缓存缺包会明确阻断恢复，不会访问 registry 或静默重试。
 
+Workbench 不会直接执行 vendor 中带有 `#!/usr/bin/env node` 的 pnpm 文件。安装器会生成
+`$WB_STATE_ROOT/app/bin/pnpm`，将固定的、绝对路径的 Node 可执行文件直接传给已校验的
+pnpm 11.25.0 entrypoint；Authority、LaunchAgent 与恢复元数据均使用该 launcher，不会从
+`PATH` 选择 Node。当前 Mac mini 的默认值是 `/opt/homebrew/bin/node`。其他安装或需要明确
+覆盖时，先选择 Node 22.13.0 或更新版本的绝对路径，再在 dry-run 和正式安装中使用同一参数：
+
+```bash
+export WB_PNPM_NODE="/ABSOLUTE/PATH/TO/node"
+
+"$WB_ROOT/scripts/python-runtime" \
+  "$WB_ROOT/scripts/install-macos.py" \
+  --source "$WB_ROOT" \
+  --state-root "$WB_STATE_ROOT" \
+  --codex-binary "$WB_CODEX_BINARY" \
+  --nas-archive-root "$WB_NAS_ARCHIVE_ROOT" \
+  --tailscale-socket "$WB_TAILSCALE_SOCKET" \
+  --pnpm-node "$WB_PNPM_NODE" \
+  --dry-run
+```
+
+预检会在中性临时目录中以有界超时检查该 Node 可执行、其版本，以及它直接运行校验和固定的
+pnpm runtime 是否返回预期版本。首次成功安装后会保存 `worktree_recovery.pnpm_node_binary`；
+后续安装未传 `--pnpm-node` 时复用该现有配置，显式参数才会覆盖它。dry-run 不写入安装目标或
+启动服务。
+
 ### 2.2 可选：接入 Claude Code，但保留配额
 
 Claude Code 完全可选。没有它时，Workbench 保持可安装并将 Claude 工作路由为 Codex；不要因缺少 Claude 而阻塞基础部署。

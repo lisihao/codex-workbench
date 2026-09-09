@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
+import shlex
 import sqlite3
 import shutil
 import subprocess
@@ -72,6 +74,18 @@ PNPM_RECOVERY_RUNTIME_DIRECTORY = Path("vendor") / "pnpm-runtime"
 PNPM_RECOVERY_RUNTIME_LOCK = "SOURCE-LOCK.json"
 PNPM_RECOVERY_RUNTIME_PACKAGE_DIRECTORY = "package"
 PNPM_RECOVERY_RUNTIME_ENTRYPOINT = Path("package") / "bin" / "pnpm.mjs"
+PNPM_LAUNCHER_FILENAME = "pnpm"
+PNPM_NODE_CONFIG_KEY = "pnpm_node_binary"
+PNPM_BINARY_CONFIG_KEY = "pnpm_binary"
+# pnpm 11.25.0 itself rejects older Node versions before loading its bundled
+# implementation.  Keep the installer contract at that same floor.
+MINIMUM_PNPM_NODE_VERSION = (22, 13, 0)
+PNPM_PREFLIGHT_TIMEOUT_SECONDS = 8
+# This is the known-good Node installation on the Authority Mac mini.  Other
+# installations must select their own absolute executable with --pnpm-node;
+# do not discover one through PATH because that would recreate the shebang
+# selection problem this launcher prevents.
+DEFAULT_PNPM_NODE_BINARY = Path("/opt/homebrew/bin/node")
 
 
 def relaunch_with_supported_runtime() -> None:
@@ -577,18 +591,54 @@ def pnpm_recovery_runtime_metadata(source: Path) -> dict[str, object]:
     return {**metadata, "archive_path": archive, "vendor_root": vendor_root}
 
 
-def install_pnpm_recovery_runtime(app_root: Path, metadata: dict[str, object]) -> Path:
-    """Extract the pinned archive into the disposable application payload."""
+def configured_pnpm_node_binary(
+    requested: str | None,
+    recovery_config: dict[str, object],
+) -> Path:
+    """Select one explicit Node executable without consulting PATH."""
 
+    selected = (
+        requested
+        if requested is not None
+        else recovery_config.get(PNPM_NODE_CONFIG_KEY, str(DEFAULT_PNPM_NODE_BINARY))
+    )
+    if not isinstance(selected, str) or not selected.strip():
+        raise SystemExit("pnpm Node executable must be a non-empty absolute path")
+    candidate = Path(selected).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit("pnpm Node executable must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"pnpm Node executable is unavailable: {candidate}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SystemExit(f"pnpm Node executable is not executable: {resolved}")
+    return resolved
+
+
+def _pnpm_runtime_fields(metadata: dict[str, object]) -> tuple[str, str, str]:
     archive_name = metadata.get("archive")
     expected_digest = metadata.get("sha256")
     version = metadata.get("version")
-    if not all(isinstance(value, str) and value for value in (archive_name, expected_digest, version)):
+    if not all(
+        isinstance(value, str) and value
+        for value in (archive_name, expected_digest, version)
+    ):
         raise SystemExit("pnpm recovery runtime metadata is incomplete")
-    runtime_root = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY
-    archive = runtime_root / archive_name
+    return archive_name, expected_digest, version
+
+
+def extract_pnpm_recovery_runtime(
+    runtime_root: Path,
+    *,
+    archive: Path,
+    expected_digest: str,
+    version: str,
+) -> Path:
+    """Extract and validate a checked pnpm archive at an explicit destination."""
+
     if not archive.is_file() or sha256(archive.read_bytes()).hexdigest() != expected_digest:
-        raise SystemExit("installed pnpm recovery runtime archive does not match source lock")
+        raise SystemExit("pnpm recovery runtime archive does not match source lock")
     package_root = runtime_root / PNPM_RECOVERY_RUNTIME_PACKAGE_DIRECTORY
     if package_root.exists() or package_root.is_symlink():
         raise SystemExit(f"pnpm recovery runtime extraction target is unexpectedly occupied: {package_root}")
@@ -620,6 +670,134 @@ def install_pnpm_recovery_runtime(app_root: Path, metadata: dict[str, object]) -
         raise SystemExit(f"pnpm recovery runtime entrypoint is missing: {entrypoint}")
     entrypoint.chmod(entrypoint.stat().st_mode | 0o755)
     return entrypoint
+
+
+def install_pnpm_recovery_runtime(app_root: Path, metadata: dict[str, object]) -> Path:
+    """Extract the pinned archive into the disposable application payload."""
+
+    archive_name, expected_digest, version = _pnpm_runtime_fields(metadata)
+    runtime_root = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY
+    return extract_pnpm_recovery_runtime(
+        runtime_root,
+        archive=runtime_root / archive_name,
+        expected_digest=expected_digest,
+        version=version,
+    )
+
+
+def _parse_node_version(output: str) -> tuple[int, int, int]:
+    value = output.strip()
+    match = re.fullmatch(
+        r"v?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+        value,
+    )
+    if match is None:
+        raise SystemExit(f"pnpm Node executable returned an invalid version: {value or '<empty>'}")
+    return tuple(int(part) for part in match.groups())
+
+
+def _run_pnpm_preflight(*command: str, label: str) -> subprocess.CompletedProcess[str]:
+    """Run one no-input pnpm runtime probe with a hard, local timeout."""
+
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(Path(tempfile.gettempdir()).resolve()),
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=PNPM_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(
+            f"{label} timed out after {PNPM_PREFLIGHT_TIMEOUT_SECONDS} seconds"
+        ) from error
+    except OSError as error:
+        raise SystemExit(f"{label} could not start: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise SystemExit(f"{label} failed: {detail}")
+    return result
+
+
+def validate_pnpm_node_runtime(
+    node_binary: Path,
+    pnpm_entrypoint: Path,
+    expected_pnpm_version: str,
+) -> None:
+    """Qualify the explicit Node and the pinned pnpm entrypoint together."""
+
+    if not node_binary.is_absolute() or not node_binary.is_file() or not os.access(node_binary, os.X_OK):
+        raise SystemExit(f"pnpm Node executable is not executable: {node_binary}")
+    if not pnpm_entrypoint.is_file():
+        raise SystemExit(f"pnpm recovery runtime entrypoint is missing: {pnpm_entrypoint}")
+    node_result = _run_pnpm_preflight(str(node_binary), "--version", label="pnpm Node version probe")
+    node_version = _parse_node_version(node_result.stdout)
+    if node_version < MINIMUM_PNPM_NODE_VERSION:
+        minimum = ".".join(str(part) for part in MINIMUM_PNPM_NODE_VERSION)
+        raise SystemExit(
+            "pnpm Node executable is unsupported: "
+            f"{node_binary} reports {node_result.stdout.strip()}; requires Node >= {minimum}"
+        )
+    pnpm_result = _run_pnpm_preflight(
+        str(node_binary),
+        str(pnpm_entrypoint),
+        "--version",
+        label="pinned pnpm version probe",
+    )
+    actual_pnpm_version = pnpm_result.stdout.strip()
+    if actual_pnpm_version != expected_pnpm_version:
+        raise SystemExit(
+            "pinned pnpm version does not match SOURCE-LOCK.json: "
+            f"expected {expected_pnpm_version}, got {actual_pnpm_version or '<empty>'}"
+        )
+
+
+def preflight_pnpm_runtime(node_binary: Path, metadata: dict[str, object]) -> None:
+    """Run the checksummed vendor runtime with the selected Node before writes."""
+
+    _, expected_digest, version = _pnpm_runtime_fields(metadata)
+    archive = metadata.get("archive_path")
+    if not isinstance(archive, Path):
+        raise SystemExit("pnpm recovery runtime archive metadata is incomplete")
+    # The vendor archive is the immutable source boundary.  Expand it only in
+    # a disposable directory so --dry-run leaves the installation untouched.
+    with tempfile.TemporaryDirectory(prefix="codex-workbench-pnpm-preflight-") as directory:
+        runtime_root = Path(directory) / "pnpm-runtime"
+        runtime_root.mkdir()
+        entrypoint = extract_pnpm_recovery_runtime(
+            runtime_root,
+            archive=archive,
+            expected_digest=expected_digest,
+            version=version,
+        )
+        validate_pnpm_node_runtime(node_binary, entrypoint, version)
+
+
+def pnpm_launcher_script(node_binary: Path, pnpm_entrypoint: Path) -> str:
+    """Render a launcher that never evaluates the vendor entrypoint shebang."""
+
+    if not node_binary.is_absolute() or not pnpm_entrypoint.is_absolute():
+        raise SystemExit("pnpm launcher requires absolute Node and entrypoint paths")
+    return (
+        "#!/bin/sh\n"
+        "# Generated by Codex Workbench; do not replace with a PATH-selected Node.\n"
+        f"exec {shlex.quote(str(node_binary))} {shlex.quote(str(pnpm_entrypoint))} \"$@\"\n"
+    )
+
+
+def write_pnpm_launcher(
+    launcher: Path,
+    *,
+    node_binary: Path,
+    pnpm_entrypoint: Path,
+) -> Path:
+    """Write the Workbench-owned, explicitly bound pnpm launcher."""
+
+    launcher.write_text(pnpm_launcher_script(node_binary, pnpm_entrypoint), encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
 
 
 def preflight_managed_agent_skills(source: Path) -> None:
@@ -1422,6 +1600,15 @@ def main() -> int:
         help="existing local pnpm content store pre-seeded for offline worktree recovery",
     )
     parser.add_argument(
+        "--pnpm-node",
+        "--pnpm-node-binary",
+        dest="pnpm_node",
+        help=(
+            "absolute Node executable for the Workbench-owned pinned pnpm launcher; "
+            "defaults to /opt/homebrew/bin/node"
+        ),
+    )
+    parser.add_argument(
         "--nas-archive-root",
         help="mounted NAS directory for verified worktree recovery archives",
     )
@@ -1607,6 +1794,13 @@ def main() -> int:
         requested=args.quota_claude_binary,
         fallback=claude_binary,
     )
+    pnpm_node_binary = configured_pnpm_node_binary(args.pnpm_node, recovery_config)
+    pnpm_runtime = pnpm_recovery_runtime_metadata(source)
+    preflight_pnpm_runtime(pnpm_node_binary, pnpm_runtime)
+    pnpm_entrypoint = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY / PNPM_RECOVERY_RUNTIME_ENTRYPOINT
+    pnpm_launcher = app_root / "bin" / PNPM_LAUNCHER_FILENAME
+    recovery_config[PNPM_NODE_CONFIG_KEY] = str(pnpm_node_binary)
+    recovery_config[PNPM_BINARY_CONFIG_KEY] = str(pnpm_launcher)
 
     tailscale_socket = None
     tailscale = None
@@ -1632,8 +1826,6 @@ def main() -> int:
         if line.startswith("__version__")
     )
     version = version_line.split("=", 1)[1].strip().strip('"')
-    pnpm_runtime = pnpm_recovery_runtime_metadata(source)
-    pnpm_binary = app_root / PNPM_RECOVERY_RUNTIME_DIRECTORY / PNPM_RECOVERY_RUNTIME_ENTRYPOINT
     runtime_binary = runtime_root / "codex"
     assert_file_target(runtime_binary, "runtime Codex executable")
     assert_file_target(runtime_root / "codex-code-mode-host", "runtime Codex workspace tool host")
@@ -1647,7 +1839,7 @@ def main() -> int:
         quota_snapshot_file,
         claude_binary,
         quota_claude_binary,
-        pnpm_binary,
+        pnpm_launcher,
         pnpm_store,
         capability_refresh_seconds,
         radar_refresh_seconds,
@@ -1664,7 +1856,9 @@ def main() -> int:
         print(f"plan: state_root={state_root}")
         print(f"plan: application={app_root}")
         print(f"plan: Codex runtime={runtime_root}")
-        print(f"plan: pnpm recovery runtime={pnpm_binary} ({pnpm_runtime['version']})")
+        print(f"plan: pnpm recovery runtime={pnpm_entrypoint} ({pnpm_runtime['version']})")
+        print(f"plan: pnpm launcher={pnpm_launcher}")
+        print(f"plan: pnpm Node={pnpm_node_binary}")
         print(f"plan: pnpm recovery store={pnpm_store}")
         print(f"plan: workers={max_workers} (Spark lane={spark_workers})")
         print(f"plan: performance state={performance_state_root}")
@@ -1810,7 +2004,14 @@ def main() -> int:
             auth_link.symlink_to(auth_source)
         transaction.preserve_existing_app(app_root, state_root)
         shutil.copytree(source, app_root, ignore=shutil.ignore_patterns(".git", "__pycache__", ".workbench"))
-        pnpm_binary = install_pnpm_recovery_runtime(app_root, pnpm_runtime)
+        pnpm_entrypoint = install_pnpm_recovery_runtime(app_root, pnpm_runtime)
+        bin_dir = app_root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        write_pnpm_launcher(
+            pnpm_launcher,
+            node_binary=pnpm_node_binary,
+            pnpm_entrypoint=pnpm_entrypoint,
+        )
         manifest = app_root / "install-manifest.json"
         manifest.write_text(
             json.dumps(
@@ -1841,7 +2042,9 @@ def main() -> int:
                         "package": pnpm_runtime["package"],
                         "version": pnpm_runtime["version"],
                         "sha256": pnpm_runtime["sha256"],
-                        "binary": str(pnpm_binary),
+                        "binary": str(pnpm_launcher),
+                        "entrypoint": str(pnpm_entrypoint),
+                        "node_binary": str(pnpm_node_binary),
                         "store": str(pnpm_store),
                     },
                     "research_skill": {
@@ -1880,8 +2083,6 @@ def main() -> int:
             + "\n"
         )
         manifest.chmod(0o600)
-        bin_dir = app_root / "bin"
-        bin_dir.mkdir(exist_ok=True)
         wrapper = bin_dir / "codex-workbench"
         runtime_selector = app_root / "scripts" / "python-runtime"
         if not runtime_selector.is_file():
@@ -1889,17 +2090,21 @@ def main() -> int:
         wrapper.write_text(
             (
             "#!/bin/zsh\n"
-            f"export HOME={str(Path.home())!r}\n"
-            f"export PYTHONPATH={str(app_root / 'src')!r}\n"
-            f"export CODEX_HOME={str(codex_home)!r}\n"
-            f"export CODEX_WORKBENCH_PROCESS_HOME={str(process_home)!r}\n"
-            f"export CODEX_WORKBENCH_CODEX={str(codex_binary)!r}\n"
-            f"export CODEX_WORKBENCH_PNPM={str(pnpm_binary)!r}\n"
-            f"export CODEX_WORKBENCH_PNPM_STORE={str(pnpm_store)!r}\n"
-            f"export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE={str(quota_snapshot_file)!r}\n"
+            f"export HOME={shlex.quote(str(Path.home()))}\n"
+            f"export PYTHONPATH={shlex.quote(str(app_root / 'src'))}\n"
+            f"export CODEX_HOME={shlex.quote(str(codex_home))}\n"
+            f"export CODEX_WORKBENCH_PROCESS_HOME={shlex.quote(str(process_home))}\n"
+            f"export CODEX_WORKBENCH_CODEX={shlex.quote(str(codex_binary))}\n"
+            f"export CODEX_WORKBENCH_PNPM={shlex.quote(str(pnpm_launcher))}\n"
+            f"export CODEX_WORKBENCH_PNPM_STORE={shlex.quote(str(pnpm_store))}\n"
+            f"export CODEX_WORKBENCH_QUOTA_SNAPSHOT_FILE={shlex.quote(str(quota_snapshot_file))}\n"
             )
-            + (f"export CODEX_WORKBENCH_CLAUDE={str(claude_binary)!r}\n" if claude_binary else "")
-            + f"exec {str(runtime_selector)!r} -m codex_workbench \"$@\"\n"
+            + (
+                f"export CODEX_WORKBENCH_CLAUDE={shlex.quote(str(claude_binary))}\n"
+                if claude_binary
+                else ""
+            )
+            + f"exec {shlex.quote(str(runtime_selector))} -m codex_workbench \"$@\"\n"
         )
         wrapper.chmod(0o755)
 
@@ -1913,7 +2118,7 @@ def main() -> int:
             process_home=process_home,
             quota_snapshot_file=quota_snapshot_file,
             claude_binary=claude_binary,
-            pnpm_binary=pnpm_binary,
+            pnpm_binary=pnpm_launcher,
             pnpm_store=pnpm_store,
         )
         launch_agents.mkdir(parents=True, exist_ok=True)
