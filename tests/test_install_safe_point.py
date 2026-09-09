@@ -486,7 +486,7 @@ class InstallerSafePointTests(unittest.TestCase):
             self.assertNotIn("transaction-rollback", events)
             self.assertEqual(self._database_marker(state_root / "state.sqlite"), "new-authority-write")
 
-    def test_sidecar_writer_exits_before_launchd_bootout(self) -> None:
+    def test_sidecar_is_unloaded_before_exit_observation_to_prevent_keepalive_restart(self) -> None:
         module = self._installer_module()
         status = subprocess.CompletedProcess(
             ("launchctl", "print", f"gui/501/{module.RADAR_LABEL}"),
@@ -500,26 +500,34 @@ class InstallerSafePointTests(unittest.TestCase):
         def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
             nonlocal running
             action = command[1]
-            if action == "kill":
-                self.assertEqual(command[2:], ("SIGTERM", f"gui/501/{module.RADAR_LABEL}"))
-                events.append("sigterm")
-                running = False
-                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-            if action == "print":
-                self.assertEqual(command[-1], f"gui/501/{module.RADAR_LABEL}")
-                events.append("exit-observed")
-                return subprocess.CompletedProcess(command, 0, stdout="" if not running else "pid = 8080\n", stderr="")
             self.assertEqual(action, "bootout")
-            self.assertFalse(running)
+            running = False
             events.append("bootout")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-        with mock.patch.object(module, "run", side_effect=fake_run):
+        def observe_exit(pid: int, signal: int) -> None:
+            self.assertEqual((pid, signal), (8080, 0))
+            self.assertFalse(running)
+            events.append("exit-observed")
+            raise ProcessLookupError()
+
+        with mock.patch.object(module, "run", side_effect=fake_run), mock.patch.object(
+            module.os, "kill", side_effect=observe_exit
+        ):
             module.stop_sidecar_for_install(
                 "gui/501", module.RADAR_LABEL, Path("/tmp/radar.plist"), status
             )
 
-        self.assertEqual(events, ["sigterm", "exit-observed", "bootout"])
+        self.assertEqual(events, ["bootout", "exit-observed"])
+
+    def test_sidecar_still_alive_after_unload_blocks_snapshot(self) -> None:
+        module = self._installer_module()
+        status = subprocess.CompletedProcess([], 0, stdout="pid = 8080\n", stderr="")
+        with mock.patch.object(module, "run", return_value=subprocess.CompletedProcess([], 0)), mock.patch.object(
+            module.os, "kill", return_value=None
+        ), mock.patch.object(module, "AUTHORITY_DRAIN_TIMEOUT_SECONDS", 0):
+            with self.assertRaisesRegex(SystemExit, "process remains alive"):
+                module.stop_sidecar_for_install("gui/501", module.RADAR_LABEL, Path("/tmp/radar.plist"), status)
 
     def test_source_commit_requires_clean_committed_checkout(self) -> None:
         module = self._installer_module()

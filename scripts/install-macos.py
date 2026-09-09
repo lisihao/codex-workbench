@@ -1713,37 +1713,32 @@ def stop_sidecar_for_install(
     plist_path: Path,
     status: subprocess.CompletedProcess[str],
 ) -> None:
-    """Stop one sidecar writer without asking launchd to enforce ExitTimeOut."""
+    """Unload a passive writer and observe its exit before taking snapshots.
+
+    Unlike the authority, sidecars own no task workers. Unloading first
+    prevents KeepAlive from spawning another writer after SIGTERM.
+    """
 
     if status.returncode != 0:
         return
-    service_target = f"{domain}/{label}"
     expected_pid = launchctl_reported_pid(status)
-    if expected_pid is not None:
-        signaled = run("launchctl", "kill", "SIGTERM", service_target, check=False)
-        if signaled.returncode != 0:
-            detail = signaled.stderr.strip() or signaled.stdout.strip() or (
-                f"exit {signaled.returncode}"
-            )
-            raise SystemExit(f"{label} could not be signaled for shutdown: {detail}")
-        deadline = time.monotonic() + AUTHORITY_DRAIN_TIMEOUT_SECONDS
-        while True:
-            current = run("launchctl", "print", service_target, check=False)
-            current_pid = launchctl_reported_pid(current)
-            if current_pid is None:
-                break
-            if current_pid != expected_pid:
-                raise SystemExit(f"{label} restarted while the installer waited for shutdown")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SystemExit(f"{label} did not exit after SIGTERM")
-            time.sleep(min(AUTHORITY_DRAIN_POLL_SECONDS, remaining))
     removed = run("launchctl", "bootout", domain, str(plist_path), check=False)
     if removed.returncode != 0:
         detail = removed.stderr.strip() or removed.stdout.strip() or (
             f"exit {removed.returncode}"
         )
         raise SystemExit(f"{label} could not be removed after shutdown: {detail}")
+    if expected_pid is not None:
+        deadline = time.monotonic() + AUTHORITY_DRAIN_TIMEOUT_SECONDS
+        while True:
+            try:
+                os.kill(expected_pid, 0)
+            except ProcessLookupError:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit(f"{label} process remains alive after unloading")
+            time.sleep(min(AUTHORITY_DRAIN_POLL_SECONDS, remaining))
 
 
 def verify_coordinator_stopped_receipt(
