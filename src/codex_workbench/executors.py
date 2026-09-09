@@ -2066,12 +2066,14 @@ class ClaudeExecutor(ProcessExecutor):
     def _worker_schema(*, archify_required: bool = False) -> dict:
         return CodexExecutor._worker_schema(archify_required=archify_required)
 
-    @staticmethod
-    def _decode_response(output: str) -> tuple[dict | None, str | None]:
+    @classmethod
+    def _decode_response(cls, output: str) -> tuple[dict | None, str | None]:
         try:
             response = json.loads(output)
         except json.JSONDecodeError as error:
             return None, f"CLI output is not JSON: {error.msg}"
+        if isinstance(response, list):
+            return cls._decode_event_array(response)
         if not isinstance(response, dict):
             return None, "CLI JSON response must be an object"
         if response.get("type") not in {None, "result"}:
@@ -2081,6 +2083,72 @@ class ClaudeExecutor(ProcessExecutor):
         if response.get("subtype") not in {None, "success"}:
             return None, "CLI reported a non-success result"
         return response, None
+
+    @classmethod
+    def _decode_event_array(cls, events: list[object]) -> tuple[dict | None, str | None]:
+        """Extract the one final result from Claude's verbose JSON event form.
+
+        The array is an interaction transcript, not an unordered collection of
+        possible responses.  Fail closed instead of picking a convenient
+        dictionary: all events must be objects, there must be one result event,
+        and that result must be the final event and meet the stricter terminal
+        fields supplied by this envelope.
+        """
+
+        if not events:
+            return None, "CLI event-array envelope must not be empty"
+        if not all(isinstance(event, dict) for event in events):
+            return None, "CLI event-array envelope contains a non-object event"
+
+        terminal_indexes = [
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, dict) and event.get("type") == "result"
+        ]
+        if not terminal_indexes:
+            return None, "CLI event-array envelope has no terminal result"
+        if len(terminal_indexes) != 1:
+            return None, "CLI event-array envelope has multiple terminal results"
+        if terminal_indexes[0] != len(events) - 1:
+            return None, "CLI event-array terminal result must be final"
+
+        terminal = events[-1]
+        assert isinstance(terminal, dict)
+        if terminal.get("subtype") != "success":
+            return None, "CLI event-array terminal reported a non-success result"
+        if terminal.get("is_error") is not False:
+            return None, "CLI event-array terminal reported an error"
+        if not isinstance(terminal.get("structured_output"), dict):
+            return None, "CLI event-array terminal structured_output is missing or is not an object"
+        model_error = cls._event_array_model_error(terminal)
+        if model_error:
+            return None, model_error
+        return terminal, None
+
+    @classmethod
+    def _event_array_model_error(cls, response: dict) -> str | None:
+        """Require one non-conflicting model attestation for an event array."""
+
+        actual_model = cls._actual_model(response)
+        if actual_model is None:
+            return "CLI event-array terminal did not attest exactly one actual model"
+
+        model_usage = response.get("modelUsage")
+        declared_model = response.get("model")
+        if isinstance(model_usage, dict) and isinstance(declared_model, str):
+            usage_models = [
+                name.strip()
+                for name in model_usage
+                if isinstance(name, str) and name.strip()
+            ]
+            declared_model = declared_model.strip()
+            if (
+                len(usage_models) == 1
+                and declared_model
+                and usage_models[0] != declared_model
+            ):
+                return "CLI event-array terminal has conflicting actual-model attestations"
+        return None
 
     @staticmethod
     def _actual_model(response: dict | None) -> str | None:
