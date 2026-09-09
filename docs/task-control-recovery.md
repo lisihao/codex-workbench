@@ -83,6 +83,10 @@ MCP `resolve_indeterminate_locally` 动作（CLI `task resolve-indeterminate-loc
 
 与 `resume-blocked-worktree`/`retry-blocked` 一样，`confirm_*` 字段是留痕断言而非自动核验；未知副作用、越权路径、哈希漂移或过期 revision/attempt 一律 fail closed。
 
+### 提供方响应故障后的重新准入
+
+Claude 执行器明确记录的 CLI 响应解析故障（`claude-executor-failed`，原因以 `Claude structured result rejected: CLI ` 开头）只决定失败源 attempt 的 Codex fallback，不再永久覆盖后续 attempt 的冻结 Claude 候选。已授权的新 attempt 会重新经过原有能力、合同、认证、配额和容量检查；`node.started.provider_readmission` 记录源 attempt 与重新准入意图，不代表 Claude 已实际执行。运行中的 attempt 不变，恢复绑定及源工作树内容不变。配额/认证拒绝、业务失败及未知原因仍沿用原 fallback 行为；这不是自动解禁 `claude_allowed=false` 或自动重试未知副作用。
+
 ## SQLite 事务边界
 
 Git repository identity、工作树检查、dependency-input 复原、patch 捕获、Artifact 读取与 SHA-256 校验均在 SQLite 写事务之外运行。写事务只重新核对持久字段、revision、attempt、coordinator/lease epoch、预验证签名和 allocation 状态，再提交短时状态变更。并发期间出现预取快照中没有的新仓库时，本轮 claim 放弃并由下一轮重新读取，不会在写锁内执行 Git。

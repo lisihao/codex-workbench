@@ -8419,15 +8419,16 @@ class WorkbenchStore:
         task_id: str,
         node_id: str,
         source_attempt: int,
+        original_claude_model: str | None = None,
     ) -> tuple[str, str] | None:
         """Reuse a durable fallback route without treating it as identity evidence.
 
         Retry recovery intentionally clears transient ``effective_*`` columns
         before a new lease.  A Claude-to-Codex fallback is nevertheless a
-        durable route decision for the failed source attempt, recorded in the
-        event ledger.  Replaying that exact decision avoids another Claude
-        dispatch while preserving the new attempt's model observation as a
-        separate typed-attribution question.
+        durable route decision for the failed source attempt. Provider CLI
+        response failures allow a new attempt to reconsider its frozen Claude
+        candidate; current contract, authentication and quota gates still run.
+        Other fallback reasons keep their existing durable Codex route.
         """
 
         rows = connection.execute(
@@ -8453,6 +8454,14 @@ class WorkbenchStore:
                 and isinstance(model, str)
                 and model
             ):
+                reason = payload.get("reason")
+                if (
+                    original_claude_model
+                    and payload.get("fallback_kind") == "claude-executor-failed"
+                    and isinstance(reason, str)
+                    and reason.startswith("Claude structured result rejected: CLI ")
+                ):
+                    return "claude", original_claude_model
                 return "codex", model
         return None
 
@@ -8880,7 +8889,9 @@ class WorkbenchStore:
             selected_blocked_retry_authorization_cursor: int | None = None
             selected_dirty_worktree_recovery: dict[str, Any] | None = None
             selected_failed_attempt_recovery: dict[str, Any] | None = None
+            selected_provider_readmission: dict[str, Any] | None = None
             for candidate in candidates:
+                provider_readmission = None
                 spec = json.loads(candidate["spec_json"])
                 candidate_attempt = int(candidate["attempt"]) + 1
                 authorization = self._blocked_retry_authorization(
@@ -8909,16 +8920,32 @@ class WorkbenchStore:
                     effective_executor = str(authorization["executor"])
                     effective_model = str(authorization["model"])
                 else:
+                    source_attempt = (
+                        int(failed_attempt_recovery["source"]["attempt"])
+                        if failed_attempt_recovery is not None
+                        else int(candidate["attempt"])
+                    )
                     retry_fallback = (
                         self._recorded_retry_fallback_route(
                             connection,
                             task_id=str(candidate["task_id"]),
                             node_id=str(candidate["node_id"]),
-                            source_attempt=int(failed_attempt_recovery["source"]["attempt"]),
+                            source_attempt=source_attempt,
+                            original_claude_model=(
+                                str(spec["model"]) if spec["executor"] == "claude" else None
+                            ),
                         )
-                        if failed_attempt_recovery is not None
+                        if source_attempt > 0
                         else None
                     )
+                    if retry_fallback is not None and retry_fallback[0] == "claude":
+                        provider_readmission = {
+                            "source_attempt": source_attempt,
+                            "reason": "prior-provider-cli-response-failure",
+                            "candidate_executor": "claude",
+                            "candidate_model": retry_fallback[1],
+                            "requires_current_admission": True,
+                        }
                     effective_executor, selected_model = retry_fallback or (
                         str(candidate["effective_executor"] or spec["executor"]),
                         str(candidate["effective_model"] or spec["model"]),
@@ -9031,6 +9058,7 @@ class WorkbenchStore:
                 selected_blocked_retry_authorization_cursor = authorization["event_cursor"] if authorization is not None else None
                 selected_dirty_worktree_recovery = dirty_worktree_recovery
                 selected_failed_attempt_recovery = failed_attempt_recovery
+                selected_provider_readmission = provider_readmission
                 break
 
             if (
@@ -9124,6 +9152,8 @@ class WorkbenchStore:
                     "lane_capacity": capacities.get(selected_lane),
                     "lane_active_units": running_lane_active[selected_lane] + 1,
                     "claimed_at": timestamp,
+                    **({"provider_readmission": selected_provider_readmission}
+                       if selected_provider_readmission is not None else {}),
                     **({
                         "admission_deferred_event_cursor": admission_wait_cursor,
                     } if admission_wait_cursor is not None else {}),
