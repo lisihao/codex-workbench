@@ -21,6 +21,7 @@ from codex_workbench.delivery import GitHubDelivery
 from codex_workbench.delivery_lifecycle import DeliveryStageContext
 from codex_workbench.model import NodeSpec, TaskContract, now_iso
 from codex_workbench.service import Coordinator
+from codex_workbench.store import StateConflictError
 
 from tests import test_delivery as delivery_fixtures
 
@@ -332,6 +333,32 @@ class AuthorityDeliveryTests(unittest.TestCase):
 
         self.assertEqual(sum(command[:2] == ["git", "-C"] and command[3] == "push" for command in calls), 1)
         self.assertTrue(any(command[:3] == ["gh", "pr", "checks"] for command in calls))
+
+    def test_pending_delivery_blocks_stale_reclamation_candidate(self) -> None:
+        self.create_accepted_task(external_write=False)
+        candidate = self.store.reclaimable_worktree_allocations()[0]
+        self._create_objective(authorize=True)
+        self.assertEqual(self.store.reclaimable_worktree_allocations(), [])
+        with self.assertRaisesRegex(StateConflictError, "unfinished delivery"):
+            self.store.begin_worktree_quarantine(candidate["allocation_id"], str(self.root / "quarantine"))
+        self.assertEqual(self.store.get_worktree_allocation(candidate["allocation_id"])["state"], "active")
+        self.assertTrue(self.worktree.is_dir())
+
+    def test_reclamation_winner_requires_restore_before_new_objective(self) -> None:
+        self.create_accepted_task(external_write=False)
+        candidate = self.store.reclaimable_worktree_allocations()[0]
+        self.store.begin_worktree_quarantine(candidate["allocation_id"], str(self.root / "quarantine"))
+        with self.assertRaisesRegex(StateConflictError, "restore the verifier worktree"):
+            self._create_objective(authorize=False)
+
+    def test_completed_delivery_releases_reclamation_protection(self) -> None:
+        self.create_accepted_task(external_write=False)
+        objective = self._create_objective(authorize=True)
+        lifecycle = self._lifecycle(self._config(), self._github_delivery([]), epoch=self.epoch)
+        for _ in range(6):
+            lifecycle.reconcile_once()
+        self.assertEqual(self.store.get_delivery_objective(objective["objective_id"])["state"], "complete")
+        self.assertEqual(len(self.store.reclaimable_worktree_allocations()), 1)
 
     def test_ci_not_reported_then_pending_resumes_without_repush_or_retry_exhaustion(self) -> None:
         self.create_accepted_task(external_write=False)

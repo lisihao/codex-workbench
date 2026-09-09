@@ -1088,6 +1088,19 @@ class WorkbenchStore:
                         f"task {task_id!r} already has an immutable delivery objective"
                     )
                 return self._delivery_objective_row(connection, existing)
+            unavailable = connection.execute(
+                """
+                SELECT a.allocation_id FROM worktree_allocations a
+                JOIN nodes n ON n.task_id = a.task_id AND n.node_id = a.node_id
+                    AND n.attempt = a.attempt
+                WHERE a.task_id = ? AND json_extract(n.spec_json, '$.verifier') = 1
+                    AND a.state != 'active'
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if unavailable is not None:
+                raise StateConflictError("restore the verifier worktree before creating a delivery objective")
             connection.execute(
                 """
                 INSERT INTO delivery_objectives(
@@ -7377,6 +7390,12 @@ class WorkbenchStore:
             states=("active", "quarantine_pending", "quarantined", "archive_failed", "archived_verified", "purge_failed")
         )
         with self.connection() as connection:
+            pending_delivery = {
+                str(row["task_id"])
+                for row in connection.execute(
+                    "SELECT task_id FROM delivery_objectives WHERE state NOT IN ('complete', 'cancelled')"
+                ).fetchall()
+            }
             delivered = {
                 str(row["task_id"])
                 for row in connection.execute(
@@ -7385,6 +7404,8 @@ class WorkbenchStore:
             }
         result: list[dict[str, Any]] = []
         for allocation in candidates:
+            if allocation["task_id"] in pending_delivery:
+                continue
             if allocation["task_state"] not in {"accepted", "cancelled"}:
                 continue
             verifier = bool(allocation["spec"].get("verifier"))
@@ -7408,6 +7429,13 @@ class WorkbenchStore:
             ).fetchone()
             if row is None:
                 raise KeyError(allocation_id)
+            pending_delivery = connection.execute(
+                "SELECT 1 FROM delivery_objectives WHERE task_id = ? "
+                "AND state NOT IN ('complete', 'cancelled')",
+                (row["task_id"],),
+            ).fetchone()
+            if pending_delivery is not None:
+                raise StateConflictError("worktree is retained by an unfinished delivery objective")
             if row["state"] not in {"active", "quarantine_pending"}:
                 return dict(row)
             connection.execute(

@@ -12,6 +12,8 @@ External actions remain subject to the task's frozen authorization or the existi
 
 Normal pending observations retain one unsettled dispatch and a durable next wakeup. They release the objective lease without consuming failure retries or incrementing the stage attempt. A restarted owner reconciles the same dispatch rather than replaying its external action; unchanged wait observations do not become new progress evidence.
 
+An unfinished objective retains its task worktrees even after verifier acceptance. Objective creation and the final quarantine claim are mutually exclusive ledger transactions: a stale reclamation candidate cannot move an active delivery's files, and a verifier already claimed for quarantine must be restored before a new objective is created. Completion or cancellation releases this protection; ordinary reclaim policy still applies.
+
 A planning validation failure with no materialized task can retry the same reservation under both its original retry limit and the objective budget. The original request hash and user objective remain unchanged; the recorded validation error is supplied as bounded diagnostic context to the next planning attempt. Concurrent retries use the attempt comparison, and a materialized task cannot be recreated. Other failures retain their explicit recovery or decision requirement rather than triggering blind model retries.
 
 GitHub-only objectives require source and build evidence. A project that also requires Node or pnpm attestation declares `github.required_runtime_identities` as a list containing `node` and/or `pnpm`; pure Python publication does not need unrelated toolchains. Deployment objectives retain the full explicitly checked source, build, deployment, runtime, Node and pnpm identity chain.
