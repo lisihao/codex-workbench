@@ -612,6 +612,9 @@ class MCPTests(unittest.TestCase):
             ({"confirm_preserve_unknown_ignored": True}, "only supported"),
             ({"source_only": "true"}, "must be a boolean"),
             ({"confirm_preserve_unknown_ignored": 1}, "must be a boolean"),
+            ({"confirm_source_only_extraction": True}, "only supported"),
+            ({"confirm_source_only_extraction": False}, "only supported"),
+            ({"expected_source_delta_sha256": "a" * 64}, "only supported"),
         ):
             response = self.call(
                 "workbench_control_task",

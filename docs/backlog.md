@@ -1,5 +1,11 @@
 # Codex Workbench Backlog
 
+## Codex timeout evidence gap
+
+`ProcessExecutor._run` persists stdout/stderr only after `subprocess.run` returns normally. `CodexExecutor.execute` returns indeterminate on `TimeoutExpired` without retaining the exception's partial output. Missing logs are not proof of absent side effects. The source-only authorization fix does not fabricate historical logs or include a logging-system redesign.
+
+A separate fix should retain bounded, explicitly partial stdout/stderr and timeout attribution, distinguish missing from empty output, and preserve credential handling and content-addressed storage. Validate with timeout fixtures, not live model calls. Partial logs still do not prove complete historical side-effect compliance.
+
 ## 页面关闭后的手机 Web Push（deferred）
 
 1.10.0 已恢复手机接入：Codex 原生 Remote 管理入口、响应式手机 cockpit、认证控制和 A2 `client.observed` 回执都在当前实现与验收范围内。真实手机配对、查看和发任务仍是 external-pending Evidence，不属于 backlog。
