@@ -88,6 +88,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         allowed_scope: tuple[str, ...] = ("src",),
         write_scopes: tuple[str, ...] = ("src",),
         python_residue: bool = False,
+        untracked_path: str | None = None,
     ) -> tuple[TaskContract, dict, Path, bytes]:
         contract = TaskContract(
             task_id="blocked-worktree",
@@ -137,16 +138,23 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         target_file.parent.mkdir(parents=True, exist_ok=True)
         target_file.write_text("patched\n", encoding="utf-8")
         changed_paths = [patch_path]
+        untracked_paths: tuple[str, ...] = ()
+        if untracked_path is not None:
+            untracked = source / untracked_path
+            untracked.parent.mkdir(parents=True, exist_ok=True)
+            untracked.write_text("untracked recovery fixture\n", encoding="utf-8")
+            untracked_paths = (untracked_path,)
+            changed_paths.append(untracked_path)
         if python_residue:
             residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
             residue.parent.mkdir(parents=True)
             residue.write_bytes(b"fixture bytecode\0")
             changed_paths.append("tests/__pycache__/fixture.cpython-313.pyc")
-        patch_before = subprocess.run(
-            ["git", "-C", str(source), "diff", "--binary", self.base_sha],
-            check=True,
-            capture_output=True,
-        ).stdout
+        patch_before = DirtyWorktreeRecovery.captured_patch(
+            source,
+            self.base_sha,
+            untracked_paths,
+        )
         self.store.settle_claimed(
             claimed,
             NodeResult(
@@ -347,6 +355,317 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             "patched\n",
         )
 
+    def test_mcp_dirty_dry_run_does_not_authorize_or_persist_artifacts(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            untracked_path="src/root-preview.ts",
+        )
+        with self.store.connection() as connection:
+            before = list(connection.iterdump())
+        artifacts = {str(p): p.read_bytes() for p in self.store.artifacts.root.rglob("*") if p.is_file()}
+        untracked = (source / "src/root-preview.ts").read_bytes()
+        tracked_diff = self._git(source, "diff", "--binary")
+        for _ in range(2):
+            response = self._call_control({
+                "task_id": contract.task_id, "action": "resume", "node_id": "worker",
+                "expected_revision": blocked["state_revision"], "expected_attempt": 1,
+                "reason": "preview only", "confirm_recovery": True,
+                "preserve_untracked": True, "dry_run": True,
+            })
+            self.assertFalse(response.get("isError", False), response)
+            preview = json.loads(response["content"][0]["text"])
+            self.assertTrue(preview["dry_run"])
+            self.assertEqual(preview["task"]["state"], "blocked")
+        with self.store.connection() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+        self.assertEqual({str(p): p.read_bytes() for p in self.store.artifacts.root.rglob("*") if p.is_file()}, artifacts)
+        self.assertEqual((source / "src/root-preview.ts").read_bytes(), untracked)
+        self.assertEqual(self._git(source, "diff", "--binary"), tracked_diff)
+
+    def test_root_untracked_recovery_requires_confirmation_and_explicit_preservation(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            untracked_path="src/root-continuation.ts",
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        arguments = {
+            "task_id": contract.task_id,
+            "action": "resume",
+            "expected_revision": blocked["state_revision"],
+            "node_id": "worker",
+            "expected_attempt": worker["attempt"],
+            "reason": "preserve the explicit root fixture file on clean a2",
+            "preserve_untracked": True,
+        }
+
+        unconfirmed = self._call_control(arguments)
+        self.assertTrue(unconfirmed["isError"])
+        self.assertIn("confirm_recovery", unconfirmed["content"][0]["text"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
+        arguments["confirm_recovery"] = True
+        arguments.pop("preserve_untracked")
+        not_preserved = self._call_control(arguments)
+        self.assertTrue(not_preserved["isError"])
+        self.assertIn("explicit preservation", not_preserved["content"][0]["text"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
+
+    def test_cli_root_untracked_recovery_restores_clean_a2_without_dependency_input(self) -> None:
+        untracked_path = "src/root-continuation.ts"
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'; "
+            "assert Path('src/root-continuation.ts').read_text() == 'untracked recovery fixture\\n'\""
+        )
+        contract, blocked, source, source_patch = self._blocked_task(
+            acceptance_command=command,
+            untracked_path=untracked_path,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        args = build_parser().parse_args([
+            "--home", str(self.state_root),
+            "task", "resume-blocked-worktree", contract.task_id, "worker",
+            "--expected-revision", str(blocked["state_revision"]),
+            "--expected-attempt", str(worker["attempt"]),
+            "--reason", "preserve the declared root fixture file on clean a2",
+            "--confirm-recovery", "--preserve-untracked",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(command_task(args), 0)
+        receipt = json.loads(output.getvalue())
+        recovery = receipt["recovery"]
+        self.assertEqual(recovery["schema_version"], 7)
+        self.assertEqual(recovery["untracked_paths"], [untracked_path])
+        self.assertNotIn("dependency_input_ref", recovery)
+        self.assertNotIn("input_tree_sha", recovery)
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("root-untracked-recovery-worker")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("recovery must not dispatch a model"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        recovered_worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((recovered_worker["state"], recovered_worker["attempt"]), ("accepted", 2))
+        self.assertEqual(
+            recovered_worker["result"]["changed_paths"],
+            ["src/root-continuation.ts", "src/value.txt"],
+        )
+        self.assertNotIn("dependency-input", recovered_worker["result"]["artifacts"])
+        target = Path(recovered_worker["worktree"])
+        self.assertEqual((target / untracked_path).read_text(encoding="utf-8"), "untracked recovery fixture\n")
+        self.assertEqual(self.worktrees.diff_patch(target, self.base_sha), source_patch)
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
+
+    def test_cli_dry_run_captures_root_untracked_without_dependency_input(self) -> None:
+        untracked_path = "src/root-continuation.ts"
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            untracked_path=untracked_path,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+        args = build_parser().parse_args([
+            "--home", str(self.state_root),
+            "task", "resume-blocked-worktree", contract.task_id, "worker",
+            "--expected-revision", str(blocked["state_revision"]),
+            "--expected-attempt", str(worker["attempt"]),
+            "--reason", "inspect the root fixture capture without authorization",
+            "--confirm-recovery", "--preserve-untracked", "--dry-run",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(command_task(args), 0)
+        payload = json.loads(output.getvalue())
+        recovery = payload["recovery"]
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(recovery["schema_version"], 7)
+        self.assertEqual(recovery["untracked_paths"], [untracked_path])
+        self.assertNotIn("dependency_input_ref", recovery)
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(
+            self._git(source, "status", "--porcelain=v1", "--untracked-files=all"),
+            source_status,
+        )
+
+    def test_root_untracked_recovery_rejects_paths_outside_the_node_scope(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            allowed_scope=(".",),
+            write_scopes=("src",),
+            untracked_path="other-root-continuation.ts",
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+
+        with self.assertRaisesRegex(StateConflictError, "outside the blocked node write scope"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="reject an untracked root file outside the node scope",
+                preserve_untracked=True,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertTrue((source / "other-root-continuation.ts").is_file())
+
+    def test_root_untracked_recovery_rejects_symlinks(self) -> None:
+        untracked_path = "src/root-continuation.ts"
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            untracked_path=untracked_path,
+        )
+        untracked = source / untracked_path
+        untracked.unlink()
+        untracked.symlink_to(source / "src" / "value.txt")
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "must not be a symlink"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="reject a symlink instead of preserving untrusted content",
+                preserve_untracked=True,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertTrue(untracked.is_symlink())
+
+    def test_root_untracked_recovery_with_generated_residue_uses_v8(self) -> None:
+        untracked_path = "src/root-continuation.ts"
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'; "
+            "assert Path('src/root-continuation.ts').read_text() == 'untracked recovery fixture\\n'\""
+        )
+        contract, blocked, source, source_patch = self._blocked_task(
+            acceptance_command=command,
+            python_residue=True,
+            untracked_path=untracked_path,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        residue = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+        authorization = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=blocked["state_revision"],
+            expected_attempt=worker["attempt"],
+            reason="archive only the declared bytecode residue and preserve the root patch",
+            preserve_untracked=True,
+        )
+        recovery = authorization["recovery"]
+        self.assertEqual(recovery["schema_version"], 8)
+        self.assertEqual(recovery["untracked_paths"], [untracked_path])
+        self.assertEqual(
+            recovery["generated_residue_paths"],
+            ["tests/__pycache__/fixture.cpython-313.pyc"],
+        )
+        self.assertNotIn("dependency_input_ref", recovery)
+        self.assertFalse(residue.exists())
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("root-v8-recovery-worker")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("recovery must not dispatch a model"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        recovered = self.store.get_task(contract.task_id)
+        recovered_worker = next(node for node in recovered["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((recovered_worker["state"], recovered_worker["attempt"]), ("accepted", 2))
+        target = Path(recovered_worker["worktree"])
+        self.assertEqual((target / untracked_path).read_text(encoding="utf-8"), "untracked recovery fixture\n")
+        self.assertFalse((target / "tests" / "__pycache__").exists())
+        self.assertEqual(self.worktrees.diff_patch(target, self.base_sha), source_patch)
+        self.assertEqual(
+            DirtyWorktreeRecovery.captured_patch(source, self.base_sha, (untracked_path,)),
+            source_patch,
+        )
+
+    def test_dependent_recovery_missing_input_cannot_use_a_root_receipt(self) -> None:
+        contract, blocked, source, _, _ = self._blocked_dependent_task(
+            untracked_path="src/dependent-continuation.ts",
+            record_dependency_input=False,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(worker["depends_on"], ["schema"])
+        self.assertEqual(worker["result"]["artifacts"], {})
+
+        with self.assertRaisesRegex(
+            StateConflictError,
+            "requires a recorded dependency input",
+        ):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="refuse to replace missing dependency provenance with a root receipt",
+                preserve_untracked=True,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertTrue((source / "src" / "dependent-continuation.ts").is_file())
+
+    def test_dependent_recovery_rejects_a_submitted_root_receipt(self) -> None:
+        untracked_path = "src/dependent-continuation.ts"
+        contract, blocked, source, _, _ = self._blocked_dependent_task(
+            untracked_path=untracked_path,
+            record_dependency_input=False,
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        submitted_root_receipt = {
+            "schema_version": 7,
+            "source_attempt": worker["attempt"],
+            "source_worktree": str(source),
+            "source_branch": self.worktrees.branch_name(contract.task_id, "worker", worker["attempt"]),
+            "base_sha": contract.base_sha,
+            "changed_paths": worker["result"]["changed_paths"],
+            "untracked_paths": [untracked_path],
+            "patch_ref": "sha256:" + "0" * 64,
+            "patch_sha256": "0" * 64,
+        }
+
+        with self.assertRaisesRegex(
+            StateConflictError,
+            "root dirty-worktree recovery receipt cannot reproduce a dependent worker",
+        ):
+            self.store.resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=blocked["state_revision"],
+                expected_attempt=worker["attempt"],
+                reason="reject a submitted root receipt for a dependent worker",
+                recovery=submitted_root_receipt,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+
     def test_recovery_acceptance_environment_rejects_path_override(self) -> None:
         with self.assertRaisesRegex(
             DirtyWorktreeRecoveryError,
@@ -389,6 +708,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self,
         *,
         untracked_path: str | None = None,
+        record_dependency_input: bool = True,
     ) -> tuple[TaskContract, dict, Path, str, bytes]:
         command = (
             f"{sys.executable} -c \"from pathlib import Path; "
@@ -518,7 +838,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             NodeResult(
                 "blocked",
                 "fixture worker stopped after its own tracked patch",
-                artifacts={"dependency-input": dependency_input_ref},
+                artifacts=(
+                    {"dependency-input": dependency_input_ref}
+                    if record_dependency_input
+                    else {}
+                ),
                 actual_model="fixture",
                 result_kind="worker",
                 changed_paths=("src/value.txt", *untracked_paths),

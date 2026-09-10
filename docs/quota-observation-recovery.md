@@ -33,3 +33,12 @@ the provider boundary; an unresolved reference falls back to Codex.
 Existing policy is unchanged: absent model-specific Sonnet/Fable pools use the
 shared weekly pool, the 20% reserve and 25% stop line remain fail-closed, and
 shared weighted capacity is unchanged.
+
+The pinned CLI display may contain only the current-session and all-model
+weekly pools, or those two followed by one Sonnet/Fable pool. Both base pools
+are required, ordered, and independently validated. A missing model-specific
+row remains absent; no model balance is fabricated. A displayed but malformed
+model row is rejected rather than treated as absent. Idle sessions still use
+the explicit idle window, percentage rounding still uses the conservative
+remaining lower bound, and all freshness and protected-reserve checks remain
+unchanged.

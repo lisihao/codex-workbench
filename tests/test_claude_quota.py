@@ -134,6 +134,51 @@ class ClaudeQuotaCollectorTests(unittest.TestCase):
         self.assertFalse(persisted.auth_ok)
         self.assertIsNone(persisted.five_hour_remaining)
 
+    def _collect_display(self, text: str) -> dict:
+        return self._collector({
+            ("auth", "status", "--json"): _completed([], self._logged_in()),
+            ("--version",): _completed([], "2.1.239 (Claude Code)\n"),
+            ("-p", "/usage", "--output-format", "json", "--no-session-persistence"):
+                _completed([], self._usage(text)),
+        }).collect()
+
+    def test_two_base_pools_do_not_invent_a_model_specific_balance(self) -> None:
+        snapshot = self._collect_display("\n".join(self._text_result().splitlines()[:2]))
+        self.assertEqual(set(snapshot["pools"]), {"five_hour", "seven_day"})
+        adapted = JsonFileQuotaAdapter(self.output).read()
+        self.assertEqual((adapted.five_hour_remaining, adapted.weekly_all_remaining), (89, 79))
+        self.assertIsNone(adapted.weekly_sonnet_remaining)
+        self.assertIsNone(adapted.weekly_fable_remaining)
+        self.assertEqual(adapted.dispatch_decision("sonnet").action, "claude")
+
+    def test_two_pool_idle_subscription_display_is_complete(self) -> None:
+        snapshot = self._collect_display(
+            "You are currently using your subscription to power your Claude Code usage\n\n"
+            "Current session: 0% used\n"
+            "Current week (all models): 0% used · resets Dec 31, 2027 (America/Toronto)"
+        )
+        self.assertEqual(snapshot["pools"]["five_hour"]["window_id"], "five_hour:idle")
+        self.assertEqual(snapshot["pools"]["five_hour"]["remaining_lower_bound"], 99)
+        self.assertTrue(snapshot["quota_ok"])
+
+    def test_two_base_pools_still_enforce_protected_reserve(self) -> None:
+        self._collect_display("\n".join(self._text_result().splitlines()[:2]).replace("10% used", "75% used"))
+        adapted = JsonFileQuotaAdapter(self.output).read()
+        self.assertEqual(adapted.dispatch_decision("sonnet").action, "codex")
+        self.assertEqual(adapted.quota_zone("sonnet")[0], "protected")
+
+    def test_malformed_optional_pool_is_not_treated_as_absent(self) -> None:
+        base = "\n".join(self._text_result().splitlines()[:2])
+        for line in ("Current week (Sonnet only): unavailable", "Current week (Fable): unknown% used"):
+            with self.subTest(line=line), self.assertRaises(ClaudeQuotaError):
+                self._collect_display(base + "\n" + line)
+        self._assert_fail_closed_snapshot(auth_ok=True)
+
+    def test_two_pool_support_does_not_allow_missing_or_duplicate_base_pool(self) -> None:
+        first, second = self._text_result().splitlines()[:2]
+        for text in (first, second, second + "\n" + first, first + "\n" + first):
+            with self.subTest(text=text), self.assertRaises(ClaudeQuotaError):
+                self._collect_display(text)
     def test_successful_three_pool_snapshot_is_trusted_and_atomic_0600(self) -> None:
         responses = {
             ("auth", "status", "--json"): _completed([], self._logged_in()),

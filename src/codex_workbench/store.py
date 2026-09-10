@@ -4310,6 +4310,7 @@ class WorkbenchStore:
         *,
         authorization_revision: int,
         source_result_json: str | None = None,
+        source_only_ignored: bool = False,
     ) -> dict[str, Any] | None:
         """Build a filesystem-free retry binding for one failed allocation.
 
@@ -4411,6 +4412,16 @@ class WorkbenchStore:
         base_sha = contract.get("base_sha")
         if not isinstance(base_sha, str) or not base_sha or allocation["base_sha"] != base_sha:
             raise StateConflictError("failed node recovery allocation base does not match its contract")
+        source = {
+            "attempt": int(node["attempt"]),
+            "worktree": str(allocation["current_path"]),
+            "branch": str(allocation["branch"]),
+            "base_sha": base_sha,
+            "changed_paths": list(recoverable_paths),
+            "generated_residue_paths": list(generated_residue_paths),
+        }
+        if source_only_ignored:
+            source["source_only_ignored"] = True
         return {
             "schema_version": 1,
             "kind": _FAILED_ATTEMPT_RECOVERY_KIND,
@@ -4418,14 +4429,7 @@ class WorkbenchStore:
             "authorization_revision": authorization_revision,
             "source_allocation_id": str(allocation["allocation_id"]),
             "source_result_json": source_result_json,
-            "source": {
-                "attempt": int(node["attempt"]),
-                "worktree": str(allocation["current_path"]),
-                "branch": str(allocation["branch"]),
-                "base_sha": base_sha,
-                "changed_paths": list(recoverable_paths),
-                "generated_residue_paths": list(generated_residue_paths),
-            },
+            "source": source,
         }
 
     @staticmethod
@@ -4769,6 +4773,7 @@ class WorkbenchStore:
         allowed_scope = contract.get("allowed_scope") if isinstance(contract, dict) else None
         forbidden_scope = contract.get("forbidden_scope") if isinstance(contract, dict) else None
         write_scopes = spec.get("write_scopes") if isinstance(spec, dict) else None
+        depends_on = spec.get("depends_on") if isinstance(spec, dict) else None
         if not (
             isinstance(allowed_scope, list)
             and all(isinstance(scope, str) for scope in allowed_scope)
@@ -4776,6 +4781,8 @@ class WorkbenchStore:
             and all(isinstance(scope, str) for scope in forbidden_scope)
             and isinstance(write_scopes, list)
             and all(isinstance(scope, str) for scope in write_scopes)
+            and isinstance(depends_on, list)
+            and all(isinstance(dependency, str) and dependency for dependency in depends_on)
         ):
             raise StateConflictError("blocked-worktree recovery scopes are invalid")
         return {
@@ -4791,6 +4798,7 @@ class WorkbenchStore:
                 "state": str(node["state"]),
                 "attempt": int(node["attempt"]),
                 "write_scopes": tuple(write_scopes),
+                "depends_on": tuple(depends_on),
             },
             "source": {
                 "worktree": str(allocation["current_path"]),
@@ -4868,6 +4876,10 @@ class WorkbenchStore:
 
         capture_kwargs: dict[str, object] = {}
         dependency_input_ref = raw_artifacts.get("dependency-input")
+        if candidate["node"]["depends_on"] and dependency_input_ref is None:
+            raise StateConflictError(
+                "dependent blocked-worktree recovery requires a recorded dependency input"
+            )
         if dependency_input_ref is not None:
             if not isinstance(dependency_input_ref, str) or not dependency_input_ref:
                 raise StateConflictError(
@@ -4888,10 +4900,6 @@ class WorkbenchStore:
             }
 
         if preserve_untracked:
-            if dependency_input_ref is None:
-                raise StateConflictError(
-                    "explicit untracked preservation requires a dependent blocked worker"
-                )
             source_path = Path(str(source["worktree"])).expanduser().resolve(strict=True)
             untracked_paths = DirtyWorktreeRecovery.untracked_paths(source_path)
             if not untracked_paths:
@@ -4998,6 +5006,10 @@ class WorkbenchStore:
             common.add("source_checkpoint_sha")
         if schema_version == 1:
             required = common
+        elif schema_version in {7, 8}:
+            required = common | {"untracked_paths"}
+            if schema_version == 8:
+                required |= {"generated_residue_paths", "generated_residue_ref"}
         elif schema_version in {2, 3, 5, 6}:
             required = common | {
                 "source_task_id",
@@ -5016,6 +5028,10 @@ class WorkbenchStore:
         if set(recovery) != required:
             raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
         source = candidate["source"]
+        if schema_version in {1, 4, 7, 8} and candidate["node"]["depends_on"]:
+            raise StateConflictError(
+                "root dirty-worktree recovery receipt cannot reproduce a dependent worker"
+            )
         for relative_path in source["changed_paths"] if "source_checkpoint_sha" in recovery else ():
             if not scope_allows(relative_path, candidate["task"]["allowed_scope"],
                                 candidate["task"]["forbidden_scope"]):
@@ -5034,7 +5050,7 @@ class WorkbenchStore:
         source_residue = source.get("generated_residue_paths", ())
         if source_residue:
             if (
-                schema_version not in {4, 5, 6}
+                schema_version not in {4, 5, 6, 8}
                 or tuple(recovery.get("generated_residue_paths", ())) != source_residue
                 or not isinstance(recovery.get("generated_residue_ref"), str)
                 or not recovery["generated_residue_ref"]
@@ -5042,7 +5058,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     "dirty-worktree recovery receipt does not bind generated residue"
                 )
-        elif schema_version in {4, 5, 6}:
+        elif schema_version in {4, 5, 6, 8}:
             raise StateConflictError(
                 "dirty-worktree recovery receipt has unexpected generated residue"
             )
@@ -5069,7 +5085,7 @@ class WorkbenchStore:
                         f"dirty-worktree recovery receipt field {field!r} is invalid"
                     )
         expected_untracked: tuple[str, ...] = ()
-        if schema_version in {3, 6}:
+        if schema_version in {3, 6, 7, 8}:
             raw_untracked = recovery.get("untracked_paths")
             if (
                 not isinstance(raw_untracked, list)
@@ -5099,7 +5115,7 @@ class WorkbenchStore:
             receipt_source = Path(str(recovery["source_worktree"])).expanduser().resolve(strict=True)
             artifacts = ArtifactStore(self.path.parent / "artifacts")
             patch = artifacts.verify(str(recovery["patch_ref"])).read_bytes()
-            if schema_version in {4, 5, 6}:
+            if schema_version in {4, 5, 6, 8}:
                 artifacts.verify(str(recovery["generated_residue_ref"]))
             source_result = json.loads(candidate["source_result_json"])
             actual_untracked = DirtyWorktreeRecovery.untracked_paths(source_path)
@@ -5137,10 +5153,10 @@ class WorkbenchStore:
         if actual_untracked != expected_untracked:
             raise StateConflictError("dirty-worktree recovery source untracked paths drifted")
         comparison_tree = base_sha
-        if schema_version in {1, 4}:
+        if schema_version in {1, 4, 7, 8}:
             if recorded_dependency_ref is not None:
                 raise StateConflictError(
-                    "legacy dirty-worktree recovery cannot reproduce recorded dependency input"
+                    "root dirty-worktree recovery cannot reproduce recorded dependency input"
                 )
         else:
             if recovery["source_task_id"] != candidate["task"]["task_id"]:
@@ -6242,6 +6258,8 @@ class WorkbenchStore:
         observed_changed_paths: tuple[str, ...],
         observed_generated_residue_paths: tuple[str, ...] = (),
         dependency_input_ref: str | None = None,
+        source_only: bool = False,
+        confirm_preserve_unknown_ignored: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Authorize one indeterminate node's own worktree for capture-and-retry.
@@ -6280,6 +6298,18 @@ class WorkbenchStore:
                 "local indeterminate recovery requires an explicit assertion that effects are "
                 "restricted to owned files"
             )
+        if type(source_only) is not bool:
+            raise ValueError("source_only must be a boolean")
+        if type(confirm_preserve_unknown_ignored) is not bool:
+            raise ValueError("confirm_preserve_unknown_ignored must be a boolean")
+        if source_only and confirm_preserve_unknown_ignored is not True:
+            raise ValueError(
+                "source-only recovery requires explicit confirmation that unknown ignored files stay in the source worktree"
+            )
+        if not source_only and confirm_preserve_unknown_ignored:
+            raise ValueError(
+                "unknown ignored-file preservation is only available in source-only recovery"
+            )
         try:
             raw_changed_paths = tuple(observed_changed_paths)
             raw_generated_residue_paths = tuple(observed_generated_residue_paths)
@@ -6293,6 +6323,8 @@ class WorkbenchStore:
         generated_residue_paths = tuple(sorted(set(raw_generated_residue_paths)))
         if partition_recovery_paths(generated_residue_paths)[1] != generated_residue_paths:
             raise ValueError("observed generated residue paths are not recognized recovery residue")
+        if source_only and generated_residue_paths:
+            raise ValueError("source-only recovery must not discard generated residue")
         if dependency_input_ref is not None and (
             not isinstance(dependency_input_ref, str) or not dependency_input_ref
         ):
@@ -6341,6 +6373,7 @@ class WorkbenchStore:
                     node,
                     authorization_revision=expected_revision + 1,
                     source_result_json=source_result_json,
+                    source_only_ignored=source_only,
                 )
             if authorization is None or authorization["source"]["generated_residue_paths"] != list(
                 generated_residue_paths
@@ -6357,6 +6390,7 @@ class WorkbenchStore:
                 "would_authorize": authorization,
                 "operator_asserted": True,
                 "automatically_verified": False,
+                "source_only": source_only,
             }
 
         # Preflight outside the write transaction, mirroring
@@ -6385,6 +6419,7 @@ class WorkbenchStore:
                 preflight_node,
                 authorization_revision=expected_revision + 1,
                 source_result_json=source_result_json,
+                source_only_ignored=source_only,
             )
         if preflight_authorization is None:
             raise StateConflictError(
@@ -6414,6 +6449,7 @@ class WorkbenchStore:
                 node,
                 authorization_revision=revision,
                 source_result_json=source_result_json,
+                source_only_ignored=source_only,
             )
             if authorization is None:
                 raise StateConflictError(
@@ -6515,6 +6551,7 @@ class WorkbenchStore:
                     "allocation_id": candidate["allocation_id"],
                     "reason": reason,
                     "expected_changed_paths": list(changed_paths),
+                    "source_only_ignored": source_only,
                     "operator_assertion": {
                         "confirm_old_executor_ended": True,
                         "confirm_effects_restricted_to_owned_files": True,
@@ -6560,6 +6597,8 @@ class WorkbenchStore:
                 },
                 "operator_asserted": True,
                 "automatically_verified": False,
+                "source_only": source_only,
+                "ignored_source_retained": source_only,
                 "authorization_event_cursor": authorization_cursor,
             }
 
@@ -7390,6 +7429,7 @@ class WorkbenchStore:
             states=("active", "quarantine_pending", "quarantined", "archive_failed", "archived_verified", "purge_failed")
         )
         with self.connection() as connection:
+            source_only_holds = self._source_only_recovery_hold_ids(connection)
             pending_delivery = {
                 str(row["task_id"])
                 for row in connection.execute(
@@ -7404,6 +7444,8 @@ class WorkbenchStore:
             }
         result: list[dict[str, Any]] = []
         for allocation in candidates:
+            if allocation["allocation_id"] in source_only_holds:
+                continue
             if allocation["task_id"] in pending_delivery:
                 continue
             if allocation["task_state"] not in {"accepted", "cancelled"}:
@@ -7420,6 +7462,31 @@ class WorkbenchStore:
                 result.append(allocation)
         return result
 
+    @staticmethod
+    def _source_only_recovery_hold_ids(connection: sqlite3.Connection) -> set[str]:
+        """Return source allocations permanently retained by source-only recovery."""
+
+        holds: set[str] = set()
+        rows = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'node.indeterminate_local_recovery_queued'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError(
+                    "source-only recovery retention event is invalid"
+                ) from error
+            if not isinstance(payload, dict):
+                raise StateConflictError("source-only recovery retention event is invalid")
+            allocation_id = payload.get("allocation_id")
+            if payload.get("source_only_ignored") is True:
+                if not isinstance(allocation_id, str) or not allocation_id:
+                    raise StateConflictError("source-only recovery retention event is invalid")
+                holds.add(allocation_id)
+        return holds
+
     def begin_worktree_quarantine(self, allocation_id: str, destination: str) -> dict[str, Any]:
         timestamp = now_iso()
         with self.transaction() as connection:
@@ -7429,6 +7496,10 @@ class WorkbenchStore:
             ).fetchone()
             if row is None:
                 raise KeyError(allocation_id)
+            if allocation_id in self._source_only_recovery_hold_ids(connection):
+                raise StateConflictError(
+                    "source-only recovery retains this source worktree; it cannot be quarantined"
+                )
             pending_delivery = connection.execute(
                 "SELECT 1 FROM delivery_objectives WHERE task_id = ? "
                 "AND state NOT IN ('complete', 'cancelled')",
@@ -8173,6 +8244,10 @@ class WorkbenchStore:
         schema_version = recovery.get("schema_version")
         if schema_version == 1:
             receipt_fields = common_fields
+        elif schema_version in {7, 8}:
+            receipt_fields = common_fields | {"untracked_paths"}
+            if schema_version == 8:
+                receipt_fields |= {"generated_residue_paths", "generated_residue_ref"}
         elif schema_version in {2, 3, 5, 6}:
             receipt_fields = common_fields | {
                 "source_task_id",
@@ -8224,7 +8299,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"dirty-worktree recovery receipt field {field!r} is invalid"
                 )
-        if schema_version in {4, 5, 6}:
+        if schema_version in {4, 5, 6, 8}:
             generated_paths = recovery.get("generated_residue_paths")
             generated_ref = recovery.get("generated_residue_ref")
             if (
@@ -8239,7 +8314,7 @@ class WorkbenchStore:
                 raise StateConflictError(
                     "dirty-worktree recovery generated residue evidence is invalid"
                 )
-        if schema_version in {3, 6}:
+        if schema_version in {3, 6, 7, 8}:
             untracked_paths = recovery.get("untracked_paths")
             if (
                 not isinstance(untracked_paths, list)
@@ -8336,10 +8411,15 @@ class WorkbenchStore:
             "base_sha",
             "changed_paths",
         }
-        if not isinstance(source, dict) or frozenset(source) not in {
-            frozenset(source_fields),
-            frozenset(source_fields | {"generated_residue_paths"}),
-        }:
+        allowed_source_fields = source_fields | {
+            "generated_residue_paths",
+            "source_only_ignored",
+        }
+        if (
+            not isinstance(source, dict)
+            or not source_fields.issubset(source)
+            or not set(source).issubset(allowed_source_fields)
+        ):
             raise StateConflictError("failed-attempt recovery source is invalid")
         source_attempt = source["attempt"]
         changed_paths = source["changed_paths"]
@@ -8367,6 +8447,10 @@ class WorkbenchStore:
             != tuple(generated_residue_paths)
         ):
             raise StateConflictError("failed-attempt recovery generated residue paths are invalid")
+        if source.get("source_only_ignored", False) is not False and source.get(
+            "source_only_ignored"
+        ) is not True:
+            raise StateConflictError("failed-attempt recovery source-only flag is invalid")
         binding: dict[str, Any] = {
             "state": state,
             "authorization_revision": int(authorization["authorization_revision"]),
@@ -9307,7 +9391,7 @@ class WorkbenchStore:
                     "dependency recovery input tree does not match the recovery receipt"
                 )
             comparison_tree = dependency_input.input_tree_sha
-        elif recovery.get("schema_version") not in {1, 4}:
+        elif recovery.get("schema_version") not in {1, 4, 7, 8}:
             raise StateConflictError("dirty-worktree recovery receipt schema is unsupported")
         expected_branch = WorktreeManager.branch_name(task_id, node_id, attempt)
         if self._recovery_git_bytes(target, "rev-parse", "HEAD").decode().strip() != recovery["base_sha"]:

@@ -31,6 +31,7 @@ from .dirty_worktree_recovery import (
     DirtyWorktreeRecoveryError,
     PnpmOfflineMaterializer,
     partition_recovery_paths,
+    summarize_recovery_paths,
 )
 from .execution_attribution import (
     AttributionReference,
@@ -79,6 +80,7 @@ from .model import (
 from .planner import PlannerError
 from .quota import JsonFileQuotaAdapter, QuotaRefresher
 from .recovery import RecoveryPolicy, WorktreeRecoveryManager
+from .recovery_processes import RecoveryProcessError, assert_recovery_source_idle
 from .routing import (
     ROUTING_V3_POLICY_VERSION,
     codex_fallback_model,
@@ -549,7 +551,7 @@ class Coordinator:
 
     @staticmethod
     def _planning_error_text(error: Exception) -> str:
-        return f"{type(error).__name__}: {error}"[:1024]
+        return f"{type(error).__name__}: {error}"
 
     def _record_planning_system_event(self, event_type: str, payload: dict[str, object]) -> None:
         """Best-effort diagnostics must not turn a planning failure into exit."""
@@ -1144,6 +1146,7 @@ class Coordinator:
         context: _ExecutionAttributionContext,
         *,
         timeout_seconds: int,
+        require_cached_template: bool = False,
     ) -> str:
         """Materialize local dependencies before readiness or executor work.
 
@@ -1162,6 +1165,7 @@ class Coordinator:
                     timeout_seconds,
                     PnpmOfflineMaterializer.MAX_TEMPLATE_SEED_SECONDS,
                 ),
+                require_cached_template=require_cached_template,
             )
         except DirtyWorktreeRecoveryError as error:
             materialization = {
@@ -1694,7 +1698,7 @@ class Coordinator:
                     dependency_input,
                     input_receipt_ref,
                     recovery_artifacts,
-                ) = self._prepare_failed_attempt_recovery(claimed)
+                ) = self._prepare_failed_attempt_recovery(claimed, context)
                 failed_attempt_assigned = True
             elif spec["executor"] != "fixture":
                 worktree = self.worktrees.prepare(
@@ -2099,6 +2103,7 @@ class Coordinator:
     def _prepare_failed_attempt_recovery(
         self,
         claimed: dict,
+        context: _ExecutionAttributionContext,
     ) -> tuple[Path, DependencyInput, str, dict[str, str]]:
         """Capture and restore one failed worktree before its executor starts.
 
@@ -2125,6 +2130,7 @@ class Coordinator:
         source_base = source.get("base_sha")
         expected_paths = source.get("changed_paths")
         expected_generated_residue_paths = source.get("generated_residue_paths", [])
+        source_only = source.get("source_only_ignored", False)
         if not (
             isinstance(source_worktree, str)
             and isinstance(source_branch, str)
@@ -2136,6 +2142,7 @@ class Coordinator:
                 isinstance(path, str) and path
                 for path in expected_generated_residue_paths
             )
+            and isinstance(source_only, bool)
         ):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery source is invalid")
         if source_base != contract["base_sha"]:
@@ -2148,14 +2155,21 @@ class Coordinator:
             worktree=source_worktree,
             branch=source_branch,
         )
+        if source_only:
+            try:
+                assert_recovery_source_idle(source_path)
+            except RecoveryProcessError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"source-only recovery cannot prove the source worktree is idle: {error}"
+                ) from error
         ignored_paths = self.failed_attempt_recovery.ignored_paths(source_path)
         unsafe_ignored, observed_generated_residue = partition_recovery_paths(
             ignored_paths
         )
-        if unsafe_ignored:
+        if unsafe_ignored and not source_only:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt source contains ignored paths that cannot be recovered safely: "
-                + ", ".join(unsafe_ignored)
+                + summarize_recovery_paths(unsafe_ignored)
             )
         unreported_generated = tuple(
             sorted(
@@ -2163,10 +2177,14 @@ class Coordinator:
                 - set(expected_generated_residue_paths)
             )
         )
-        if unreported_generated:
+        if unreported_generated and not source_only:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt source contains unreported generated residue: "
-                + ", ".join(unreported_generated)
+                + summarize_recovery_paths(unreported_generated)
+            )
+        if source_only and expected_generated_residue_paths:
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery must not discard generated residue"
             )
         try:
             source_result = json.loads(str(binding["source_result_json"]))
@@ -2236,9 +2254,13 @@ class Coordinator:
         )
         if not actual_paths:
             try:
-                generated_residue_ref = self.failed_attempt_recovery.discard_generated_residue(
-                    source_path,
-                    tuple(expected_generated_residue_paths),
+                generated_residue_ref = (
+                    None
+                    if source_only
+                    else self.failed_attempt_recovery.discard_generated_residue(
+                        source_path,
+                        tuple(expected_generated_residue_paths),
+                    )
                 )
                 # Even a clean failed attempt reproduces its immutable input rather
                 # than recomputing accepted ancestors from a potentially changed
@@ -2261,6 +2283,13 @@ class Coordinator:
                 ) != expected:
                     raise DirtyWorktreeRecoveryError(
                         "failed-attempt source changed while its clean retry was being prepared"
+                    )
+                if source_only:
+                    self._materialize_worktree_dependencies(
+                        target,
+                        context,
+                        timeout_seconds=int(contract["timeout_seconds"]),
+                        require_cached_template=True,
                     )
                 self.store.assign_failed_attempt_recovery_worktree(
                     claimed["task_id"],
@@ -2310,6 +2339,7 @@ class Coordinator:
                 expected_generated_residue_paths=tuple(
                     expected_generated_residue_paths
                 ),
+                source_only=source_only,
             )
             recovered_paths = tuple(recovery.get("changed_paths", ()))
             if recovered_paths != actual_paths:
@@ -2327,6 +2357,7 @@ class Coordinator:
                 target_branch=target_branch,
                 target_attempt=target_attempt,
                 recovery=recovery,
+                source_only=source_only,
             )
             if outcome.status != "succeeded":
                 raise DirtyWorktreeRecoveryError(outcome.summary)
@@ -2343,6 +2374,13 @@ class Coordinator:
             ):
                 raise DirtyWorktreeRecoveryError(
                     "failed-attempt recovery prepared target does not match the captured patch"
+                )
+            if source_only:
+                self._materialize_worktree_dependencies(
+                    target,
+                    context,
+                    timeout_seconds=int(contract["timeout_seconds"]),
+                    require_cached_template=True,
                 )
             self.store.assign_failed_attempt_recovery_worktree(
                 claimed["task_id"],

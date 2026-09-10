@@ -389,6 +389,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 body = json.loads(self._read_body() or b"{}")
                 action = body.get("action")
                 expected_revision = self._expected_revision(body)
+                if "dry_run" in body and type(body["dry_run"]) is not bool:
+                    raise ValueError("dry_run must be a boolean")
+                if body.get("dry_run") is True:
+                    raise ValueError("dry_run is not supported by the HTTP control endpoint")
+                for option in ("source_only", "confirm_preserve_unknown_ignored"):
+                    if option in body and type(body[option]) is not bool:
+                        raise ValueError(f"{option} must be a boolean")
+                    if body.get(option) is True:
+                        raise ValueError("source-only recovery is not supported by the HTTP control endpoint")
                 if action in {"queue", "resume"}:
                     if "instruction" not in body:
                         receipt = {

@@ -198,9 +198,6 @@ def validate_producer_snapshot(raw: object) -> dict[str, Any]:
             raise ValueError("unavailable Claude quota snapshot must contain an error")
         return dict(raw)
     pools = _validated_pools(raw.get("pools"))
-    model_pool = next(name for name in MODEL_POOL_LABELS.values() if name in pools)
-    if pools["seven_day"]["window_id"] != pools[model_pool]["window_id"]:
-        raise ClaudeQuotaError("weekly quota pools must share one reset window")
     return {**raw, "pools": pools}
 
 
@@ -335,14 +332,16 @@ def _zero_number(container: object, field: str) -> None:
 def _parse_usage_text(text: str, observed: datetime) -> dict[str, dict[str, Any]]:
     matches = list(_TEXT_LINE.finditer(text))
     labels = [match.group("label") for match in matches]
+    quota_lines = [line for line in text.splitlines() if line.startswith(("Current session:", "Current week"))]
     if (
         labels[:2] != list(_BASE_TEXT_LABELS)
-        or len(labels) != 3
-        or labels[2] not in MODEL_POOL_LABELS
+        or len(labels) not in {2, 3}
+        or (len(labels) == 3 and labels[2] not in MODEL_POOL_LABELS)
+        or len(quota_lines) != len(matches)
     ):
         raise ClaudeQuotaError("Claude /usage display labels are missing, duplicated, or reordered")
     pools: dict[str, dict[str, Any]] = {}
-    names = (*BASE_POOL_NAMES, MODEL_POOL_LABELS[labels[2]])
+    names = (*BASE_POOL_NAMES, *(MODEL_POOL_LABELS[label] for label in labels[2:]))
     for name, match in zip(names, matches):
         used = int(match.group("used"))
         if not 0 <= used <= 100:
@@ -370,10 +369,10 @@ def _parse_usage_text(text: str, observed: datetime) -> dict[str, dict[str, Any]
 
 def _validated_pools(raw: object) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, Mapping):
-        raise ClaudeQuotaError("Claude quota producer must contain all three pools")
+        raise ClaudeQuotaError("Claude quota producer must contain both base pools and at most one model pool")
     model_pools = set(raw).intersection(MODEL_POOL_LABELS.values())
-    if set(raw) != set(BASE_POOL_NAMES).union(model_pools) or len(model_pools) != 1:
-        raise ClaudeQuotaError("Claude quota producer must contain all three pools")
+    if set(raw) != set(BASE_POOL_NAMES).union(model_pools) or len(model_pools) > 1:
+        raise ClaudeQuotaError("Claude quota producer must contain both base pools and at most one model pool")
     names = (*BASE_POOL_NAMES, *sorted(model_pools))
     pools: dict[str, dict[str, Any]] = {}
     for name in names:
@@ -392,11 +391,11 @@ def _validated_pools(raw: object) -> dict[str, dict[str, Any]]:
         pools[name] = {"displayed_used_percent": used, "remaining_lower_bound": remaining, "window_id": window, "reset_precision": precision, "reset_fingerprint": fingerprint}
     if pools["five_hour"]["reset_precision"] not in {"precise", "idle"}:
         raise ClaudeQuotaError("five-hour reset must be precise or explicitly idle")
-    model_pool = next(iter(model_pools))
-    if pools["seven_day"]["window_id"] != pools[model_pool]["window_id"]:
-        raise ClaudeQuotaError("weekly quota pools must share one reset window")
-    if pools["seven_day"]["reset_fingerprint"] != pools[model_pool]["reset_fingerprint"]:
-        raise ClaudeQuotaError("weekly quota pools must share one reset fingerprint")
+    for model_pool in model_pools:
+        if pools["seven_day"]["window_id"] != pools[model_pool]["window_id"]:
+            raise ClaudeQuotaError("weekly quota pools must share one reset window")
+        if pools["seven_day"]["reset_fingerprint"] != pools[model_pool]["reset_fingerprint"]:
+            raise ClaudeQuotaError("weekly quota pools must share one reset fingerprint")
     return pools
 
 
