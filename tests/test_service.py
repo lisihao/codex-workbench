@@ -739,6 +739,7 @@ raise AssertionError("fatal coordinator failure returned")
                 coordinator._pool.shutdown(wait=True)
 
     def test_planning_error_is_durable_and_does_not_fail_the_coordinator(self) -> None:
+        diagnostic = "planner rejected the request: " + ("candidate rejected; " * 120) + "codex-tail-rejection"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = WorkbenchStore(root / "state.sqlite")
@@ -759,7 +760,7 @@ raise AssertionError("fatal coordinator failure returned")
             try:
                 with patch(
                     "codex_workbench.service.compile_natural_language_request",
-                    side_effect=PlannerError("planner rejected the request"),
+                    side_effect=PlannerError(diagnostic),
                 ):
                     self.assertTrue(coordinator._dispatch_one_planning_request())
                     future = next(iter(coordinator._futures))
@@ -768,7 +769,7 @@ raise AssertionError("fatal coordinator failure returned")
 
                 receipt = store.get_planning_request("planning-command")
                 self.assertEqual(receipt["state"], "failed")
-                self.assertIn("PlannerError: planner rejected the request", receipt["error"])
+                self.assertEqual(receipt["error"], "PlannerError: " + diagnostic)
                 self.assertEqual(fatal_exit_codes, [])
                 self.assertFalse(coordinator._stop.is_set())
             finally:

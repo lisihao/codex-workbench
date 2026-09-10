@@ -549,7 +549,7 @@ class Coordinator:
 
     @staticmethod
     def _planning_error_text(error: Exception) -> str:
-        return f"{type(error).__name__}: {error}"[:1024]
+        return f"{type(error).__name__}: {error}"
 
     def _record_planning_system_event(self, event_type: str, payload: dict[str, object]) -> None:
         """Best-effort diagnostics must not turn a planning failure into exit."""
