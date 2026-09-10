@@ -6,6 +6,10 @@ MCP 将工作树恢复拒绝作为当前请求的 `isError` 返回，连接继�
 
 原 attempt 已提交 checkpoint 时，MCP `resume` 可显式提供 `expected_checkpoint_sha`，CLI `task resume-blocked-worktree` 对应 `--expected-checkpoint-sha`。必须使用核实过的完整 SHA；未提供时仍要求 HEAD 等于合同 base。恢复核对同一 Git 仓库、分配分支、base 祖先关系、原 attempt 已报告的文件列表和写入范围，将 checkpoint SHA 与补丁哈希封存在现有恢复回执中。新 attempt 从原 base／依赖输入恢复完整差异，不重写旧提交。HEAD 或补丁在封存后变化均拒绝恢复；其他分支的新功能不会自动合入旧任务。
 
+## 规划错误保留和公开摘要
+
+完整的规划错误保留在私有 `planning_requests.error`；`error_ref` 是内容关联的 SHA 摘要，不是可读取的 ArtifactStore 地址。公共响应只给摘要，重规划时的 `planning_feedback` 仍最多传入前 1000 个字符。旧版本已截断的错误无法追补。
+
 ## 调用方 revision 与原子控制
 
 外部 CLI、HTTP 和 MCP 的 queue、resume、pause、cancel、steer 必须传入刚读取的 expected_revision。服务端比较该 revision；陈旧、缺失、布尔值或字符串值都不能启动节点。内部创建任务后立即排队的可信路径仍可调用底层 store 接口，但不得用于外部控制。
@@ -54,7 +58,7 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 
 恢复验收仍以无 shell 的 argv 方式执行。合同命令可以在可执行文件之前声明 `PYTHONPATH`、`PYTHONPYCACHEPREFIX` 或 `PYTHONDONTWRITEBYTECODE`；恢复器把这些前缀写入该子进程环境，同时在 Evidence 中保留完整原始命令。`PATH`、`HOME`、加载器变量及其他环境覆盖会在执行前被拒绝，不能借环境前缀绕过 argv 治理。
 
-已验收祖先保持原 attempt 和 accepted 状态，不重新执行。tracked 与合法普通 untracked 文件均可恢复。`__pycache__/*.pyc` 是唯一可自动分类的 ignored 残留：它必须已出现在失败回执中，且物理对象必须是工作树内的普通非符号链接文件；恢复器会先把每个文件的字节、SHA-256 和路径写入 ArtifactStore，再删除缓存并只重放业务补丁。缓存已在捕获前被清理时，收据显式记录 missing path，不再把它误判为业务补丁漂移。其他 ignored 文件、符号链接、越权路径、来源漂移、丢失 allocation、错误 branch/base 或哈希不一致仍会 fail closed，原失败 attempt 仍是权威状态。
+已验收祖先保持原 attempt 和 accepted 状态，不重新执行。tracked 与合法普通 untracked 文件均可恢复。`__pycache__/*.pyc` 是唯一可自动分类的 ignored 残留：它必须已出现在失败回执中，且物理对象必须是工作树内的普通非符号链接文件；恢复器会先把每个文件的字节、SHA-256 和路径写入 ArtifactStore，再删除缓存并只重放业务补丁。缓存已在捕获前被清理时，收据显式记录 missing path，不再把它误判为业务补丁漂移。`node_modules`、`.pnpm-store` 和编译 `lib` 目前没有同时绑定 source allocation、attempt、worktree 与生成输入（依赖还需要 lockfile）的持久平台证据，因此仍作为未知 ignored 内容拒绝；不得按目录名放行或删除依赖。其他 ignored 文件、符号链接、越权路径、来源漂移、丢失 allocation、错误 branch/base 或哈希不一致同样 fail closed，原失败 attempt 仍是权威状态。涉及路径的恢复错误只报告总数、最多 8 条转义样本和省略标记，避免把大型依赖树回传到控制面。
 
 `blocked` 并非一律自动重试。只有由可信执行边界产生且显式带 `retryable=true` 的 Worker 结果，才可在 `retry_limit` 内进入与失败 attempt 相同的内容捕获和新工作树恢复路径。模型自报阻断、凭据、权限、配额、需求歧义、verifier 阻断和 `indeterminate` 结果均保持显式终态，防止无界循环或重复副作用。
 

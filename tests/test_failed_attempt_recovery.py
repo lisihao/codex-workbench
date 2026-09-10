@@ -1470,6 +1470,41 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         self.assertEqual(candidate["node"]["attempt"], 2)
         self.assertEqual(candidate["task"]["repository"], str(self.repository))
 
+    def test_unknown_ignored_paths_are_rejected_with_a_bounded_sample(self) -> None:
+        contract, target, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-bounded-ignored"
+        )
+        ignored = target / ".workbench-ignored"
+        ignored.mkdir()
+        for index in range(12):
+            (ignored / f"generated-{index:02d}-{'x' * 160}.cache").write_text(
+                "not platform-attested\n", encoding="utf-8"
+            )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError,
+            r"12 path\(s\).*4 additional path\(s\) omitted",
+        ) as raised:
+            observed_indeterminate_recovery_paths(
+                candidate,
+                dependency_input_ref=dependency_input_ref,
+                artifacts=self.artifacts,
+            )
+
+        self.assertLessEqual(len(str(raised.exception)), 1_024)
+        self.assertEqual(
+            (ignored / f"generated-11-{'x' * 160}.cache").read_text(encoding="utf-8"),
+            "not platform-attested\n",
+        )
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+
     def test_local_recovery_preserves_tracked_and_untracked_changes_and_dispatches_new_attempt(
         self,
     ) -> None:

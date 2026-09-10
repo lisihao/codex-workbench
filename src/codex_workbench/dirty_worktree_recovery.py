@@ -41,6 +41,30 @@ _RECOVERY_ACCEPTANCE_ENVIRONMENT = frozenset(
     }
 )
 
+_RECOVERY_ERROR_PATH_LIMIT = 8
+_RECOVERY_ERROR_PATH_CHARS = 80
+_RECOVERY_ERROR_SUMMARY_CHARS = 768
+
+
+def summarize_recovery_paths(paths: tuple[str, ...]) -> str:
+    """Return a count and bounded escaped sample of recovery paths for an error."""
+
+    total = len(paths)
+    if not total:
+        return "0 paths"
+    rendered = []
+    for path in paths[:_RECOVERY_ERROR_PATH_LIMIT]:
+        item = repr(path)
+        if len(item) > _RECOVERY_ERROR_PATH_CHARS:
+            item = item[: _RECOVERY_ERROR_PATH_CHARS - 3] + "..."
+        rendered.append(item)
+    omitted = total - len(rendered)
+    suffix = f"; {omitted} additional path(s) omitted" if omitted else ""
+    summary = f"{total} path(s): " + ", ".join(rendered) + suffix
+    if len(summary) <= _RECOVERY_ERROR_SUMMARY_CHARS:
+        return summary
+    return summary[: _RECOVERY_ERROR_SUMMARY_CHARS - 3] + "..."
+
 
 def is_python_bytecode_residue_path(value: object) -> bool:
     """Return whether a Git-relative path is a generated Python cache file."""
@@ -113,7 +137,7 @@ def observed_indeterminate_recovery_paths(
     if recoverable_ignored:
         raise DirtyWorktreeRecoveryError(
             "indeterminate node worktree contains ignored paths that cannot be recovered safely: "
-            + ", ".join(recoverable_ignored)
+            + summarize_recovery_paths(recoverable_ignored)
         )
     changed_paths = tuple(sorted(changed_paths_since_input_tree(worktree, comparison_tree)))
     allowed_scope = list(task["allowed_scope"])
@@ -885,7 +909,7 @@ class DirtyWorktreeRecovery:
             if requested_untracked != untracked_paths:
                 raise DirtyWorktreeRecoveryError(
                     "dirty worktree contains untracked files; pass the exact paths through explicit preservation: "
-                    + ", ".join(untracked_paths)
+                    + summarize_recovery_paths(untracked_paths)
                 )
             recovery_context = {
                 **recovery_context,
@@ -1209,7 +1233,7 @@ class DirtyWorktreeRecovery:
         if ignored_paths:
             raise DirtyWorktreeRecoveryError(
                 "dirty worktree acquired ignored paths after recovery was scheduled: "
-                + ", ".join(ignored_paths)
+                + summarize_recovery_paths(ignored_paths)
             )
         self._validate_generated_residue_receipt(recovery)
         untracked_paths = self.untracked_paths(path)
@@ -1430,14 +1454,14 @@ class DirtyWorktreeRecovery:
         if unexpected:
             raise DirtyWorktreeRecoveryError(
                 "dirty worktree contains ignored paths that cannot be recovered safely: "
-                + ", ".join(unexpected)
+                + summarize_recovery_paths(unexpected)
             )
         observed = tuple(path for path in ignored if is_python_bytecode_residue_path(path))
         undeclared = tuple(sorted(set(observed) - set(expected)))
         if undeclared:
             raise DirtyWorktreeRecoveryError(
                 "dirty worktree contains unreported generated residue: "
-                + ", ".join(undeclared)
+                + summarize_recovery_paths(undeclared)
             )
         if not expected and not observed:
             return None
@@ -1536,7 +1560,7 @@ class DirtyWorktreeRecovery:
         if remaining:
             raise DirtyWorktreeRecoveryError(
                 "dirty worktree acquired ignored paths during generated-residue capture: "
-                + ", ".join(remaining)
+                + summarize_recovery_paths(remaining)
             )
         return receipt_ref
 
