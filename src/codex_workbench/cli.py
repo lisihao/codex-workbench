@@ -643,7 +643,28 @@ def command_task(args: argparse.Namespace) -> int:
         )
         result = {"ok": True, "action": "reconcile-archify", **result}
     elif args.action == "resume-blocked-worktree":
-        if getattr(args, "recovery_file", None):
+        if args.source_only:
+            if args.recovery_file:
+                raise ValueError("--source-only cannot be combined with --recovery-file")
+            result = store.capture_and_resume_blocked_worktree(
+                args.task_id, args.node_id,
+                expected_revision=args.expected_revision,
+                expected_attempt=args.expected_attempt,
+                reason=args.reason,
+                preserve_untracked=bool(args.preserve_untracked),
+                expected_checkpoint_sha=args.expected_checkpoint_sha,
+                source_only=True,
+                confirm_source_only_extraction=bool(args.confirm_source_only_extraction),
+                confirm_preserve_unknown_ignored=bool(args.confirm_preserve_unknown_ignored),
+                expected_source_delta_sha256=args.expected_source_delta_sha256,
+                dry_run=bool(args.dry_run),
+            )
+        elif (args.confirm_source_only_extraction or args.confirm_preserve_unknown_ignored
+              or args.expected_source_delta_sha256 is not None):
+            raise ValueError("source-only extraction flags require --source-only")
+        elif not args.confirm_recovery:
+            raise ValueError("strict blocked recovery requires --confirm-recovery")
+        elif getattr(args, "recovery_file", None):
             if getattr(args, "expected_checkpoint_sha", None) is not None:
                 raise ValueError("--expected-checkpoint-sha cannot be combined with --recovery-file")
             if args.preserve_untracked:
@@ -1858,7 +1879,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-no-side-effects",
         dest="confirm_recovery",
         action="store_true",
-        required=True,
         help="explicitly authorize source capture and deterministic clean-target recovery",
     )
     resume_blocked_worktree.add_argument(
@@ -1871,6 +1891,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly preserve exact in-scope untracked files on the clean recovery target",
     )
     resume_blocked_worktree.add_argument("--expected-checkpoint-sha", help="explicit full SHA of the owned source checkpoint")
+    resume_blocked_worktree.add_argument(
+        "--source-only", action="store_true",
+        help="extract the current verified source delta without trusting historical changed_paths",
+    )
+    resume_blocked_worktree.add_argument(
+        "--confirm-source-only-extraction", action="store_true",
+        help="authorize source extraction only; historical effects remain unknown",
+    )
+    resume_blocked_worktree.add_argument(
+        "--confirm-preserve-unknown-ignored", action="store_true",
+        help="retain all ignored files in the original source worktree",
+    )
+    resume_blocked_worktree.add_argument(
+        "--expected-source-delta-sha256",
+        help="source-only apply: use source_delta_sha256 returned by the read-only preview",
+    )
     resume_blocked_worktree.add_argument("--dry-run", action="store_true")
     retry_blocked = task_sub.add_parser("retry-blocked")
     retry_blocked.add_argument("task_id")

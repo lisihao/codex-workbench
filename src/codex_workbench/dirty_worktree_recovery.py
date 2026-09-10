@@ -385,18 +385,23 @@ def inspect_indeterminate_source_delta(
     *,
     dependency_input_ref: str | None,
     artifacts: ArtifactStore,
+    expected_checkpoint_sha: str | None = None,
+    recovery_label: str = "indeterminate",
 ) -> SourceDelta:
-    """Validate an indeterminate allocation and return its live source delta.
+    """Validate one normalized source-only allocation and return its live delta.
 
+    The legacy entry point is shared by indeterminate and blocked recovery.
     This read-only preflight checks process quiescence, the physical
     repository/base/branch/common-Git binding, dependency input, task and node
     scopes, and every source path before the store authorizes extraction.
     """
 
+    if recovery_label not in {"indeterminate", "blocked"}:
+        raise ValueError("source-only recovery label is invalid")
     task = candidate.get("task")
     node = candidate.get("node")
     if not isinstance(task, Mapping) or not isinstance(node, Mapping):
-        raise DirtyWorktreeRecoveryError("indeterminate source recovery candidate is invalid")
+        raise DirtyWorktreeRecoveryError(f"{recovery_label} source recovery candidate is invalid")
     repository = task.get("repository")
     base_sha = task.get("base_sha")
     worktree = node.get("worktree")
@@ -407,13 +412,13 @@ def inspect_indeterminate_source_delta(
         for value in (repository, base_sha, worktree, branch)
     ):
         raise DirtyWorktreeRecoveryError(
-            "indeterminate source recovery candidate has invalid repository binding"
+            f"{recovery_label} source recovery candidate has invalid repository binding"
         )
     if not isinstance(depends_on, tuple) or not all(
         isinstance(dependency, str) and dependency for dependency in depends_on
     ):
         raise DirtyWorktreeRecoveryError(
-            "indeterminate source recovery candidate has invalid dependency metadata"
+            f"{recovery_label} source recovery candidate has invalid dependency metadata"
         )
     recovery = DirtyWorktreeRecovery(
         artifacts,
@@ -424,6 +429,7 @@ def inspect_indeterminate_source_delta(
         base_sha=base_sha,
         worktree=worktree,
         branch=branch,
+        expected_checkpoint_sha=expected_checkpoint_sha,
     )
     _validate_recovery_common_git_directory(repository, source)
     try:
@@ -434,7 +440,7 @@ def inspect_indeterminate_source_delta(
         ) from error
     if depends_on and dependency_input_ref is None:
         raise DirtyWorktreeRecoveryError(
-            "indeterminate node recovery requires the recorded dependency-input artifact"
+            f"{recovery_label} node recovery requires the recorded dependency-input artifact"
         )
     if dependency_input_ref is not None:
         dependency_input = load_recorded_dependency_input(
@@ -458,7 +464,7 @@ def inspect_indeterminate_source_delta(
         and isinstance(write_scopes, tuple)
         and all(isinstance(scope, str) for scope in write_scopes)
     ):
-        raise DirtyWorktreeRecoveryError("indeterminate source recovery scopes are invalid")
+        raise DirtyWorktreeRecoveryError(f"{recovery_label} source recovery scopes are invalid")
 
     def validate_paths(paths: tuple[str, ...]) -> None:
         for relative_path in paths:
@@ -468,12 +474,12 @@ def inspect_indeterminate_source_delta(
                 list(forbidden_scope),
             ):
                 raise DirtyWorktreeRecoveryError(
-                    "indeterminate node recovery path is outside task scope: "
+                    f"{recovery_label} node recovery path is outside task scope: "
                     + relative_path
                 )
             if not scope_allows(relative_path, list(write_scopes), []):
                 raise DirtyWorktreeRecoveryError(
-                    "indeterminate node recovery path is outside node write scope: "
+                    f"{recovery_label} node recovery path is outside node write scope: "
                     + relative_path
                 )
 
@@ -1441,6 +1447,8 @@ class DirtyWorktreeRecovery:
         recovery: Mapping[str, object],
         acceptance_commands: tuple[str, ...],
         timeout_seconds: int,
+        source_only: bool = False,
+        expected_source_delta_sha256: str | None = None,
     ) -> RecoveryOutcome:
         """Prepare a verified recovery target without ever executing in source.
 
@@ -1449,8 +1457,30 @@ class DirtyWorktreeRecovery:
         its source allocation authoritative.
         """
 
+        if expected_source_delta_sha256 is not None and (
+            not source_only
+            or not isinstance(expected_source_delta_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery preparation has an invalid source delta digest"
+            )
+        if source_only and expected_source_delta_sha256 is None:
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery preparation requires a verified source delta digest"
+            )
         try:
-            source = self._validate_snapshot(repository, source_worktree, recovery)
+            source = self._validate_snapshot(
+                repository, source_worktree, recovery, source_only=source_only
+            )
+            if source_only:
+                assert expected_source_delta_sha256 is not None
+                self._validate_source_only_delta(
+                    source,
+                    recovery,
+                    expected_source_delta_sha256,
+                    phase="before clean-target preparation",
+                )
             target = self._validate_target(
                 repository,
                 target_worktree,
@@ -1504,7 +1534,17 @@ class DirtyWorktreeRecovery:
                 )
                 if outcome.exit_code != 0:
                     log_ref = self._store_logs(materialization, outcomes)
-                    self._validate_snapshot(repository, str(source), recovery)
+                    self._validate_snapshot(
+                        repository, str(source), recovery, source_only=source_only
+                    )
+                    if source_only:
+                        assert expected_source_delta_sha256 is not None
+                        self._validate_source_only_delta(
+                            source,
+                            recovery,
+                            expected_source_delta_sha256,
+                            phase="during clean-target preparation",
+                        )
                     return RecoveryOutcome(
                         "failed",
                         "declared recovery acceptance command failed: "
@@ -1522,7 +1562,17 @@ class DirtyWorktreeRecovery:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target changed after offline materialization or acceptance"
                 )
-            self._validate_snapshot(repository, str(source), recovery)
+            self._validate_snapshot(
+                repository, str(source), recovery, source_only=source_only
+            )
+            if source_only:
+                assert expected_source_delta_sha256 is not None
+                self._validate_source_only_delta(
+                    source,
+                    recovery,
+                    expected_source_delta_sha256,
+                    phase="during clean-target preparation",
+                )
             checks.append("PASS: blocked dirty worktree snapshot remained unchanged after verification")
             log_ref = self._store_logs(materialization, outcomes)
             prepared_recovery = {
@@ -1554,6 +1604,43 @@ class DirtyWorktreeRecovery:
                 else {},
                 (f"BLOCKED: {error}",),
                 tuple(str(path) for path in recovery.get("changed_paths", ()) if isinstance(path, str)),
+            )
+
+    def _validate_source_only_delta(
+        self,
+        source: Path,
+        recovery: Mapping[str, object],
+        expected_source_delta_sha256: str,
+        *,
+        phase: str,
+    ) -> None:
+        """Require the current non-ignored source delta to match its preview digest."""
+
+        changed_paths = recovery.get("changed_paths")
+        if (
+            not isinstance(changed_paths, list)
+            or not all(isinstance(path, str) and path for path in changed_paths)
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery receipt has invalid changed_paths"
+            )
+        expected_paths = tuple(sorted(changed_paths))
+        comparison_tree, _, _, _ = self._recovery_input_context(source, recovery)
+
+        def validate_paths(paths: tuple[str, ...]) -> None:
+            if paths != expected_paths:
+                raise DirtyWorktreeRecoveryError(
+                    "source-only recovery source paths drifted " + phase
+                )
+
+        current = inspect_recovery_source_delta(
+            source,
+            comparison_tree,
+            validate_paths=validate_paths,
+        )
+        if current.sha256 != expected_source_delta_sha256:
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery source delta drifted " + phase
             )
 
     def prepare_for_retry(

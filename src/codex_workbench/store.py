@@ -51,6 +51,7 @@ from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
     inspect_indeterminate_source_delta,
+    inspect_recovery_source_delta,
     partition_recovery_paths,
 )
 from .execution_attribution import ExecutionAttribution
@@ -4858,6 +4859,249 @@ class WorkbenchStore:
                 expected_attempt=expected_attempt,
             )
 
+    def _blocked_source_only_recovery_durable_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        """Read the durable inputs that must remain fixed during source inspection."""
+
+        candidate = self._blocked_worktree_recovery_candidate(
+            connection,
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+        )
+        task = connection.execute(
+            "SELECT contract_json FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        node = connection.execute(
+            "SELECT spec_json, result_json FROM nodes WHERE task_id = ? AND node_id = ?",
+            (task_id, node_id),
+        ).fetchone()
+        allocation = connection.execute(
+            """
+            SELECT allocation_id, state, repository, base_sha, branch, current_path, attempt
+            FROM worktree_allocations WHERE allocation_id = ?
+            """,
+            (candidate["source"]["allocation_id"],),
+        ).fetchone()
+        if task is None or node is None or allocation is None:
+            raise StateConflictError("blocked source-only recovery durable state is incomplete")
+        try:
+            contract = json.loads(str(task["contract_json"]))
+            spec = json.loads(str(node["spec_json"]))
+            historical_result = json.loads(str(node["result_json"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StateConflictError(
+                "blocked source-only recovery durable state is invalid JSON"
+            ) from error
+        if not isinstance(contract, dict) or not isinstance(spec, dict):
+            raise StateConflictError("blocked source-only recovery durable state is invalid")
+        if not isinstance(historical_result, dict) or historical_result.get("status") != "blocked":
+            raise StateConflictError(
+                "blocked source-only recovery has no blocked historical result"
+            )
+        artifacts = historical_result.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise StateConflictError("blocked source-only recovery source artifacts are invalid")
+        dependency_input_ref = artifacts.get("dependency-input")
+        if dependency_input_ref is not None and (
+            not isinstance(dependency_input_ref, str) or not dependency_input_ref
+        ):
+            raise StateConflictError(
+                "blocked source-only recovery dependency input ref is invalid"
+            )
+        source = candidate["source"]
+        if (
+            contract.get("external_write_permission") is not False
+            or contract.get("destructive_action_permission") is not False
+        ):
+            raise StateConflictError(
+                "blocked source-only recovery requires a contract with no external or destructive permissions"
+            )
+        expected_branch = WorktreeManager.branch_name(task_id, node_id, expected_attempt)
+        if (
+            allocation["state"] != "active"
+            or allocation["current_path"] != source["worktree"]
+            or allocation["repository"] != source["repository"]
+            or allocation["base_sha"] != source["base_sha"]
+            or allocation["branch"] != source["branch"]
+            or allocation["branch"] != expected_branch
+            or int(allocation["attempt"]) != expected_attempt
+        ):
+            raise StateConflictError(
+                "blocked source-only recovery allocation no longer matches its durable binding"
+            )
+        source_candidate = {
+            "task": {
+                **candidate["task"],
+                "repository": source["repository"],
+                "base_sha": source["base_sha"],
+            },
+            "node": {
+                **candidate["node"],
+                "worktree": source["worktree"],
+                "branch": source["branch"],
+            },
+        }
+        return {
+            "candidate": candidate,
+            "source_candidate": source_candidate,
+            "contract_json": str(task["contract_json"]),
+            "spec_json": str(node["spec_json"]),
+            "historical_result_json": str(node["result_json"]),
+            "dependency_input_ref": dependency_input_ref,
+            "allocation": {
+                "allocation_id": str(allocation["allocation_id"]),
+                "state": str(allocation["state"]),
+                "repository": str(allocation["repository"]),
+                "base_sha": str(allocation["base_sha"]),
+                "branch": str(allocation["branch"]),
+                "current_path": str(allocation["current_path"]),
+                "attempt": int(allocation["attempt"]),
+            },
+        }
+
+    def _prepare_source_only_blocked_recovery(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        preserve_untracked: bool,
+        expected_checkpoint_sha: str | None,
+        expected_source_delta_sha256: str | None,
+    ) -> tuple[dict[str, Any], Any]:
+        """Verify the live blocked source delta without holding the SQLite write lock."""
+
+        with self.connection() as connection:
+            before = self._blocked_source_only_recovery_durable_snapshot(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+        source_candidate = before["source_candidate"]
+        assert isinstance(source_candidate, dict)
+        dependency_input_ref = before["dependency_input_ref"]
+        delta = inspect_indeterminate_source_delta(
+            source_candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+            expected_checkpoint_sha=expected_checkpoint_sha,
+            recovery_label="blocked",
+        )
+        if delta.untracked_paths and not preserve_untracked:
+            raise StateConflictError(
+                "dirty worktree contains untracked files; pass preserve_untracked=true to retain the exact verified paths"
+            )
+        if preserve_untracked and not delta.untracked_paths:
+            raise StateConflictError(
+                "explicit untracked preservation requested but source has no untracked files"
+            )
+        if (
+            expected_source_delta_sha256 is not None
+            and expected_source_delta_sha256 != delta.sha256
+        ):
+            raise StateConflictError(
+                "expected_source_delta_sha256 does not match the verified source-only delta"
+            )
+        with self.connection() as connection:
+            after = self._blocked_source_only_recovery_durable_snapshot(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+        if canonical_json(before) != canonical_json(after):
+            raise StateConflictError(
+                "blocked source-only recovery durable state changed during source inspection"
+            )
+        return after, delta
+
+    @staticmethod
+    def _blocked_source_only_extraction(
+        raw: object,
+    ) -> dict[str, Any] | None:
+        """Validate the fixed audit fields of a blocked source-only authorization."""
+
+        if raw is None:
+            return None
+        required = {
+            "recovery_authorization",
+            "source_delta_sha256",
+            "historical_effects",
+            "retrospective_compliance_claimed",
+            "external_replay_authorized",
+        }
+        if not isinstance(raw, dict) or set(raw) != required:
+            raise StateConflictError(
+                "blocked source-only recovery authorization has an invalid shape"
+            )
+        if (
+            raw.get("recovery_authorization") != "source_only_extraction"
+            or not isinstance(raw.get("source_delta_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", raw["source_delta_sha256"]) is None
+            or raw.get("historical_effects") != "unknown"
+            or raw.get("retrospective_compliance_claimed") is not False
+            or raw.get("external_replay_authorized") is not False
+        ):
+            raise StateConflictError("blocked source-only recovery authorization is invalid")
+        return dict(raw)
+
+    @staticmethod
+    def _blocked_source_only_response_fields(
+        source: Mapping[str, Any],
+        *,
+        changed_paths: tuple[str, ...],
+        untracked_paths: tuple[str, ...],
+        historical_result_json: str,
+    ) -> dict[str, Any]:
+        """Render current extraction evidence without returning the old receipt path list."""
+
+        try:
+            historical_result = json.loads(historical_result_json)
+        except json.JSONDecodeError as error:
+            raise StateConflictError(
+                "blocked source-only recovery historical result is invalid JSON"
+            ) from error
+        historical_paths = (
+            historical_result.get("changed_paths")
+            if isinstance(historical_result, dict)
+            else None
+        )
+        if not isinstance(historical_paths, list) or not all(
+            isinstance(path, str) and path for path in historical_paths
+        ):
+            raise StateConflictError(
+                "blocked source-only recovery historical changed paths are invalid"
+            )
+        current_source = {
+            field: source[field]
+            for field in ("worktree", "branch", "base_sha", "allocation_id", "repository")
+        }
+        current_source.update({
+            "changed_paths": list(changed_paths),
+            "untracked_paths": list(untracked_paths),
+        })
+        return {
+            "source": current_source,
+            "changed_paths": list(changed_paths),
+            "untracked_paths": list(untracked_paths),
+            "historical_changed_path_count": len(historical_paths),
+            "historical_changed_paths_sha256": canonical_hash(historical_paths),
+            "historical_changed_path_sample": historical_paths[:8],
+        }
+
     def capture_and_resume_blocked_worktree(
         self,
         task_id: str,
@@ -4868,12 +5112,158 @@ class WorkbenchStore:
         reason: str,
         preserve_untracked: bool = False,
         expected_checkpoint_sha: str | None = None,
+        source_only: bool = False,
+        confirm_source_only_extraction: bool = False,
+        confirm_preserve_unknown_ignored: bool = False,
+        expected_source_delta_sha256: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Capture a blocked attempt outside SQLite, then authorize its retry."""
+        """Capture a blocked attempt outside SQLite, then authorize its retry.
+
+        Strict recovery preserves the historical blocked receipt and uses its
+        recorded paths. Source-only extraction instead requires a new,
+        explicit authorization, verifies the current non-ignored source delta,
+        and makes no assertion about historical effects.
+        """
 
         reason = reason.strip()
         if not reason:
             raise ValueError("dirty-worktree recovery reason must be non-empty")
+        if type(source_only) is not bool:
+            raise ValueError("source_only must be a boolean")
+        if type(confirm_source_only_extraction) is not bool:
+            raise ValueError("confirm_source_only_extraction must be a boolean")
+        if type(confirm_preserve_unknown_ignored) is not bool:
+            raise ValueError("confirm_preserve_unknown_ignored must be a boolean")
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean")
+        if expected_source_delta_sha256 is not None and (
+            not isinstance(expected_source_delta_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
+            raise ValueError("expected_source_delta_sha256 must be a lowercase SHA-256 digest")
+        if source_only:
+            if confirm_source_only_extraction is not True:
+                raise ValueError(
+                    "source-only recovery requires explicit confirm_source_only_extraction=true"
+                )
+            if confirm_preserve_unknown_ignored is not True:
+                raise ValueError(
+                    "source-only recovery requires confirmation that unknown ignored files remain in the source worktree"
+                )
+            if not dry_run and expected_source_delta_sha256 is None:
+                raise ValueError(
+                    "source-only recovery apply requires expected_source_delta_sha256 from its dry-run"
+                )
+            snapshot, delta = self._prepare_source_only_blocked_recovery(
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+                preserve_untracked=preserve_untracked,
+                expected_checkpoint_sha=expected_checkpoint_sha,
+                expected_source_delta_sha256=expected_source_delta_sha256,
+            )
+            candidate = snapshot["candidate"]
+            assert isinstance(candidate, dict)
+            response_fields = self._blocked_source_only_response_fields(
+                candidate["source"],
+                changed_paths=delta.changed_paths,
+                untracked_paths=delta.untracked_paths,
+                historical_result_json=str(snapshot["historical_result_json"]),
+            )
+            if dry_run:
+                return {
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "dry_run": True,
+                    "task": candidate["task"],
+                    "node": candidate["node"],
+                    "next_attempt": expected_attempt + 1,
+                    **response_fields,
+                    "recovery_authorization": "source_only_extraction",
+                    "source_delta_sha256": delta.sha256,
+                    "historical_effects": "unknown",
+                    "historical_result_unchanged": True,
+                    "retrospective_compliance_claimed": False,
+                    "external_replay_authorized": False,
+                    "ignored_source_retained": True,
+                }
+            source = candidate["source"]
+            dependency_input_ref = snapshot["dependency_input_ref"]
+            capture_kwargs: dict[str, object] = {}
+            if dependency_input_ref is not None:
+                if not isinstance(dependency_input_ref, str) or not dependency_input_ref:
+                    raise StateConflictError(
+                        "blocked source-only recovery dependency input ref is invalid"
+                    )
+                dependency_input = load_recorded_dependency_input(
+                    self.artifacts,
+                    dependency_input_ref,
+                    task_id=task_id,
+                    node_id=node_id,
+                    base_sha=str(source["base_sha"]),
+                )
+                capture_kwargs = {
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "input_tree_sha": dependency_input.input_tree_sha,
+                    "dependency_input_ref": dependency_input_ref,
+                }
+            if preserve_untracked:
+                capture_kwargs["preserve_untracked_paths"] = delta.untracked_paths
+            recovery = DirtyWorktreeRecovery(
+                self.artifacts,
+                WorktreeManager(self.path.parent / "worktrees"),
+            ).capture(
+                repository=str(source["repository"]),
+                base_sha=str(source["base_sha"]),
+                worktree=str(source["worktree"]),
+                branch=str(source["branch"]),
+                attempt=expected_attempt,
+                expected_changed_paths=delta.changed_paths,
+                expected_checkpoint_sha=expected_checkpoint_sha,
+                source_only=True,
+                expected_source_delta_sha256=delta.sha256,
+                **capture_kwargs,
+            )
+            source_only_extraction = {
+                "recovery_authorization": "source_only_extraction",
+                "source_delta_sha256": delta.sha256,
+                "historical_effects": "unknown",
+                "retrospective_compliance_claimed": False,
+                "external_replay_authorized": False,
+            }
+            authorization = self.resume_blocked_worktree(
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+                reason=reason,
+                recovery=recovery,
+                source_only_extraction=source_only_extraction,
+                source_only_durable_snapshot=snapshot,
+            )
+            return {
+                **authorization,
+                **response_fields,
+                "recovery": recovery,
+                "recovery_authorization": "source_only_extraction",
+                "source_delta_sha256": delta.sha256,
+                "historical_effects": "unknown",
+                "historical_result_unchanged": True,
+                "retrospective_compliance_claimed": False,
+                "external_replay_authorized": False,
+                "ignored_source_retained": True,
+            }
+        if (
+            confirm_source_only_extraction
+            or confirm_preserve_unknown_ignored
+            or expected_source_delta_sha256 is not None
+        ):
+            raise ValueError("source-only extraction fields require source_only=true")
+        if dry_run:
+            raise ValueError("dry_run is only available for source-only blocked recovery")
         candidate = self.blocked_worktree_recovery_candidate(
             task_id,
             node_id,
@@ -5015,8 +5405,12 @@ class WorkbenchStore:
         expected_attempt: int,
         recovery: dict[str, Any],
         *,
+        source_only_extraction: object = None,
         verify_filesystem: bool = True,
     ) -> dict[str, Any]:
+        source_only_authorization = self._blocked_source_only_extraction(
+            source_only_extraction
+        )
         common = {
             "schema_version",
             "source_attempt",
@@ -5057,11 +5451,32 @@ class WorkbenchStore:
         if set(recovery) != required:
             raise StateConflictError("dirty-worktree recovery receipt has an invalid shape")
         source = candidate["source"]
+        recovery_paths = recovery.get("changed_paths")
+        if (
+            not isinstance(recovery_paths, list)
+            or not all(isinstance(path, str) and path for path in recovery_paths)
+        ):
+            raise StateConflictError("dirty-worktree recovery receipt changed_paths are invalid")
+        expected_source_paths = (
+            tuple(recovery_paths)
+            if source_only_authorization is not None
+            else source["changed_paths"]
+        )
+        if source_only_authorization is not None and (
+            tuple(recovery_paths) != tuple(sorted(set(recovery_paths)))
+        ):
+            raise StateConflictError(
+                "blocked source-only recovery receipt changed_paths are not canonical"
+            )
         if schema_version in {1, 4, 7, 8} and candidate["node"]["depends_on"]:
             raise StateConflictError(
                 "root dirty-worktree recovery receipt cannot reproduce a dependent worker"
             )
-        for relative_path in source["changed_paths"] if "source_checkpoint_sha" in recovery else ():
+        for relative_path in (
+            expected_source_paths
+            if source_only_authorization is not None or "source_checkpoint_sha" in recovery
+            else ()
+        ):
             if not scope_allows(relative_path, candidate["task"]["allowed_scope"],
                                 candidate["task"]["forbidden_scope"]):
                 raise StateConflictError("recovery path is outside the task contract scope: " + relative_path)
@@ -5071,13 +5486,18 @@ class WorkbenchStore:
             recovery["source_attempt"] != expected_attempt
             or recovery["source_branch"] != source["branch"]
             or recovery["base_sha"] != source["base_sha"]
-            or tuple(sorted(recovery["changed_paths"])) != source["changed_paths"]
+            or tuple(sorted(recovery["changed_paths"])) != expected_source_paths
         ):
             raise StateConflictError(
                 "dirty-worktree recovery receipt does not match the blocked allocation"
             )
         source_residue = source.get("generated_residue_paths", ())
-        if source_residue:
+        if source_only_authorization is not None:
+            if schema_version in {4, 5, 6, 8}:
+                raise StateConflictError(
+                    "blocked source-only recovery must not discard generated residue"
+                )
+        elif source_residue:
             if (
                 schema_version not in {4, 5, 6, 8}
                 or tuple(recovery.get("generated_residue_paths", ())) != source_residue
@@ -5121,7 +5541,7 @@ class WorkbenchStore:
                 or not raw_untracked
                 or not all(isinstance(path, str) and path for path in raw_untracked)
                 or tuple(raw_untracked) != tuple(sorted(set(raw_untracked)))
-                or not set(raw_untracked).issubset(source["changed_paths"])
+                or not set(raw_untracked).issubset(expected_source_paths)
             ):
                 raise StateConflictError("dirty-worktree recovery receipt untracked_paths are invalid")
             expected_untracked = tuple(raw_untracked)
@@ -5235,8 +5655,48 @@ class WorkbenchStore:
             )
         )
         source_paths = tuple(sorted((*tracked_paths, *actual_untracked)))
-        if source_paths != source["changed_paths"]:
+        if source_paths != expected_source_paths:
             raise StateConflictError("dirty-worktree recovery source changed paths drifted")
+        if source_only_authorization is not None:
+            def validate_source_only_paths(paths: tuple[str, ...]) -> None:
+                if paths != expected_source_paths:
+                    raise StateConflictError(
+                        "blocked source-only recovery source paths drifted"
+                    )
+                for relative_path in paths:
+                    if not scope_allows(
+                        relative_path,
+                        candidate["task"]["allowed_scope"],
+                        candidate["task"]["forbidden_scope"],
+                    ):
+                        raise StateConflictError(
+                            "blocked source-only recovery path is outside task scope: "
+                            + relative_path
+                        )
+                    if not scope_allows(
+                        relative_path,
+                        candidate["node"]["write_scopes"],
+                        [],
+                    ):
+                        raise StateConflictError(
+                            "blocked source-only recovery path is outside node write scope: "
+                            + relative_path
+                        )
+
+            try:
+                current_delta = inspect_recovery_source_delta(
+                    source_path,
+                    comparison_tree,
+                    validate_paths=validate_source_only_paths,
+                )
+            except DirtyWorktreeRecoveryError as error:
+                raise StateConflictError(
+                    "blocked source-only recovery source delta is unavailable: " + str(error)
+                ) from error
+            if current_delta.sha256 != source_only_authorization["source_delta_sha256"]:
+                raise StateConflictError(
+                    "blocked source-only recovery source delta drifted"
+                )
         try:
             current_patch = DirtyWorktreeRecovery.captured_patch(
                 source_path,
@@ -5259,26 +5719,57 @@ class WorkbenchStore:
         reason: str,
         recovery: dict[str, Any],
         dry_run: bool = False,
+        source_only_extraction: dict[str, Any] | None = None,
+        source_only_durable_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reason = reason.strip()
         if not reason:
             raise ValueError("dirty-worktree recovery reason must be non-empty")
+        source_only_authorization = self._blocked_source_only_extraction(
+            source_only_extraction
+        )
+        if source_only_authorization is not None:
+            if not isinstance(source_only_durable_snapshot, dict):
+                raise StateConflictError(
+                    "blocked source-only recovery requires its verified durable snapshot"
+                )
+        elif source_only_durable_snapshot is not None:
+            raise ValueError(
+                "source_only_durable_snapshot requires source-only extraction"
+            )
 
         if dry_run:
             with self.connection() as connection:
-                candidate = self._blocked_worktree_recovery_candidate(
-                    connection,
-                    task_id,
-                    node_id,
-                    expected_revision=expected_revision,
-                    expected_attempt=expected_attempt,
-                )
+                if source_only_authorization is not None:
+                    current_snapshot = self._blocked_source_only_recovery_durable_snapshot(
+                        connection,
+                        task_id,
+                        node_id,
+                        expected_revision=expected_revision,
+                        expected_attempt=expected_attempt,
+                    )
+                    if canonical_json(current_snapshot) != canonical_json(
+                        source_only_durable_snapshot
+                    ):
+                        raise StateConflictError(
+                            "blocked source-only recovery durable state changed before dry-run response"
+                        )
+                    candidate = current_snapshot["candidate"]
+                else:
+                    candidate = self._blocked_worktree_recovery_candidate(
+                        connection,
+                        task_id,
+                        node_id,
+                        expected_revision=expected_revision,
+                        expected_attempt=expected_attempt,
+                    )
                 capture = self._validate_blocked_worktree_recovery_capture(
                     candidate,
                     expected_attempt,
                     recovery,
+                    source_only_extraction=source_only_authorization,
                 )
-            return {
+            response = {
                 "task_id": task_id,
                 "node_id": node_id,
                 "dry_run": True,
@@ -5288,36 +5779,84 @@ class WorkbenchStore:
                 "next_attempt": expected_attempt + 1,
                 "recovery": capture,
             }
+            if source_only_authorization is not None:
+                response_fields = self._blocked_source_only_response_fields(
+                    candidate["source"],
+                    changed_paths=tuple(capture["changed_paths"]),
+                    untracked_paths=tuple(capture.get("untracked_paths", ())),
+                    historical_result_json=candidate["source_result_json"],
+                )
+                response.update({
+                    **source_only_authorization,
+                    **response_fields,
+                    "historical_result_unchanged": True,
+                    "ignored_source_retained": True,
+                })
+            return response
 
         # Freeze and inspect the source/artifact before acquiring SQLite's
         # write lock. The following transaction repeats only durable shape and
         # revision checks, then CASes the authorization into place.
         with self.connection() as connection:
-            preflight_candidate = self._blocked_worktree_recovery_candidate(
-                connection,
-                task_id,
-                node_id,
-                expected_revision=expected_revision,
-                expected_attempt=expected_attempt,
-            )
+            if source_only_authorization is not None:
+                current_snapshot = self._blocked_source_only_recovery_durable_snapshot(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                if canonical_json(current_snapshot) != canonical_json(
+                    source_only_durable_snapshot
+                ):
+                    raise StateConflictError(
+                        "blocked source-only recovery durable state changed before authorization"
+                    )
+                preflight_candidate = current_snapshot["candidate"]
+            else:
+                preflight_candidate = self._blocked_worktree_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
             preflight_capture = self._validate_blocked_worktree_recovery_capture(
                 preflight_candidate,
                 expected_attempt,
                 recovery,
+                source_only_extraction=source_only_authorization,
             )
         timestamp = now_iso()
         with self.transaction() as connection:
-            candidate = self._blocked_worktree_recovery_candidate(
-                connection,
-                task_id,
-                node_id,
-                expected_revision=expected_revision,
-                expected_attempt=expected_attempt,
-            )
+            if source_only_authorization is not None:
+                current_snapshot = self._blocked_source_only_recovery_durable_snapshot(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                if canonical_json(current_snapshot) != canonical_json(
+                    source_only_durable_snapshot
+                ):
+                    raise StateConflictError(
+                        "blocked source-only recovery durable state changed before commit"
+                    )
+                candidate = current_snapshot["candidate"]
+            else:
+                candidate = self._blocked_worktree_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
             capture = self._validate_blocked_worktree_recovery_capture(
                 candidate,
                 expected_attempt,
                 recovery,
+                source_only_extraction=source_only_authorization,
                 verify_filesystem=False,
             )
             if canonical_json(capture) != canonical_json(preflight_capture):
@@ -5331,6 +5870,8 @@ class WorkbenchStore:
                 "source_allocation_id": candidate["source"]["allocation_id"],
                 "source_result_json": candidate["source_result_json"],
                 "recovery": capture,
+                **({"source_only_extraction": source_only_authorization}
+                   if source_only_authorization is not None else {}),
             }
             changed = connection.execute(
                 """
@@ -5368,19 +5909,43 @@ class WorkbenchStore:
                 raise StateConflictError(
                     "dirty-worktree recovery task revision compare-and-set failed"
                 )
+            authorization_event: dict[str, Any] = {
+                "source_attempt": expected_attempt,
+                "next_attempt": expected_attempt + 1,
+                "reason": reason,
+                "recovery": capture,
+                "source_allocation_id": candidate["source"]["allocation_id"],
+                "task_revision": revision,
+            }
+            if source_only_authorization is not None:
+                try:
+                    historical_result = json.loads(candidate["source_result_json"])
+                except json.JSONDecodeError as error:
+                    raise StateConflictError(
+                        "blocked source-only recovery historical result is invalid JSON"
+                    ) from error
+                if not isinstance(historical_result, dict):
+                    raise StateConflictError(
+                        "blocked source-only recovery historical result is invalid"
+                    )
+                authorization_event.update({
+                    "source_only_ignored": True,
+                    **source_only_authorization,
+                    "historical_result": historical_result,
+                    "source_result_role": "historical_blocked_receipt",
+                    "operator_assertion": {
+                        "confirm_preserve_unknown_ignored": True,
+                        "confirm_source_only_extraction": True,
+                        "assertion": "operator_asserted",
+                        "automatically_verified": False,
+                    },
+                })
             self._event(
                 connection,
                 "node.blocked_worktree_recovery_authorized",
                 task_id,
                 node_id,
-                {
-                    "source_attempt": expected_attempt,
-                    "next_attempt": expected_attempt + 1,
-                    "reason": reason,
-                    "recovery": capture,
-                    "source_allocation_id": candidate["source"]["allocation_id"],
-                    "task_revision": revision,
-                },
+                authorization_event,
                 created_at=timestamp,
             )
             if next_state != candidate["task"]["state"]:
@@ -5397,7 +5962,7 @@ class WorkbenchStore:
                     },
                     created_at=timestamp,
                 )
-            return {
+            response = {
                 "task_id": task_id,
                 "node_id": node_id,
                 "dry_run": False,
@@ -5411,6 +5976,20 @@ class WorkbenchStore:
                 "source": candidate["source"],
                 "next_attempt": expected_attempt + 1,
             }
+            if source_only_authorization is not None:
+                response_fields = self._blocked_source_only_response_fields(
+                    candidate["source"],
+                    changed_paths=tuple(capture["changed_paths"]),
+                    untracked_paths=tuple(capture.get("untracked_paths", ())),
+                    historical_result_json=candidate["source_result_json"],
+                )
+                response.update({
+                    **source_only_authorization,
+                    **response_fields,
+                    "historical_result_unchanged": True,
+                    "ignored_source_retained": True,
+                })
+            return response
 
     def _archify_reconciliation_candidate(
         connection: sqlite3.Connection,
@@ -8227,8 +8806,12 @@ class WorkbenchStore:
 
         holds: set[str] = set()
         rows = connection.execute(
-            "SELECT payload_json FROM events "
-            "WHERE event_type = 'node.indeterminate_local_recovery_queued'"
+            "SELECT event_type, payload_json FROM events "
+            "WHERE event_type IN (?, ?) ",
+            (
+                "node.indeterminate_local_recovery_queued",
+                "node.blocked_worktree_recovery_authorized",
+            ),
         ).fetchall()
         for row in rows:
             try:
@@ -8239,7 +8822,7 @@ class WorkbenchStore:
                 ) from error
             if not isinstance(payload, dict):
                 raise StateConflictError("source-only recovery retention event is invalid")
-            allocation_id = payload.get("allocation_id")
+            allocation_id = payload.get("allocation_id", payload.get("source_allocation_id"))
             if payload.get("source_only_ignored") is True:
                 if not isinstance(allocation_id, str) or not allocation_id:
                     raise StateConflictError("source-only recovery retention event is invalid")
@@ -8957,7 +9540,12 @@ class WorkbenchStore:
             "source_result_json",
             "recovery",
         }
-        if not isinstance(authorization, dict) or set(authorization) != required:
+        allowed = required | {"source_only_extraction"}
+        if (
+            not isinstance(authorization, dict)
+            or not required.issubset(authorization)
+            or not set(authorization).issubset(allowed)
+        ):
             raise StateConflictError("dirty-worktree recovery authorization has an invalid shape")
         if (
             authorization["schema_version"] != 1
@@ -8982,6 +9570,9 @@ class WorkbenchStore:
             ) from error
         if not isinstance(source_result, dict) or source_result.get("status") != "blocked":
             raise StateConflictError("dirty-worktree recovery source result is not blocked")
+        source_only_extraction = WorkbenchStore._blocked_source_only_extraction(
+            authorization.get("source_only_extraction")
+        )
         recovery = authorization["recovery"]
         common_fields = {
             "schema_version",
@@ -9083,12 +9674,15 @@ class WorkbenchStore:
                 or not set(untracked_paths).issubset(recovery["changed_paths"])
             ):
                 raise StateConflictError("dirty-worktree recovery receipt untracked_paths are invalid")
-        return {
+        binding = {
             "authorization_revision": authorization["authorization_revision"],
             "source_allocation_id": authorization["source_allocation_id"],
             "source_result_json": authorization["source_result_json"],
             "recovery": dict(recovery),
         }
+        if source_only_extraction is not None:
+            binding["source_only_extraction"] = source_only_extraction
+        return binding
 
     @staticmethod
     def _failed_attempt_recovery_binding(
@@ -10669,6 +11263,9 @@ class WorkbenchStore:
             "source_result_json",
             "recovery",
         }
+        if "source_only_extraction" in stored:
+            self._blocked_source_only_extraction(stored["source_only_extraction"])
+            base_fields.add("source_only_extraction")
         if state == "authorized":
             binding = self._current_dirty_worktree_recovery_binding(raw, next_attempt=attempt)
             return {"state": state, **binding}

@@ -506,6 +506,41 @@ class WorkbenchMCPServer:
             arguments,
             "confirm_no_side_effects",
         )
+        source_only = self._optional_strict_boolean(arguments, "source_only")
+        confirm_source_only_extraction = self._optional_strict_boolean(
+            arguments, "confirm_source_only_extraction"
+        )
+        confirm_preserve_unknown_ignored = self._optional_strict_boolean(
+            arguments, "confirm_preserve_unknown_ignored"
+        )
+        expected_source_delta_sha256 = arguments.get("expected_source_delta_sha256")
+        if expected_source_delta_sha256 is not None and (
+            type(expected_source_delta_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
+            raise ValueError("expected_source_delta_sha256 must be a lowercase SHA-256 digest")
+        if source_only:
+            if confirm_no_side_effects or self._optional_strict_boolean(
+                arguments, "confirm_effects_restricted_to_owned_files"
+            ):
+                raise ValueError("source-only extraction cannot assert historical effects")
+            resumed = self.store.capture_and_resume_blocked_worktree(
+                task_id, node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+                reason=reason,
+                preserve_untracked=preserve_untracked,
+                expected_checkpoint_sha=arguments.get("expected_checkpoint_sha"),
+                source_only=True,
+                confirm_source_only_extraction=confirm_source_only_extraction,
+                confirm_preserve_unknown_ignored=confirm_preserve_unknown_ignored,
+                expected_source_delta_sha256=expected_source_delta_sha256,
+                dry_run=dry_run,
+            )
+            return {"ok": True, "action": "resume-blocked-worktree", **resumed}
+        if (confirm_source_only_extraction or confirm_preserve_unknown_ignored
+                or expected_source_delta_sha256 is not None):
+            raise ValueError("source-only extraction fields require source_only=true")
 
         task = self.store.get_task(task_id)
         nodes = task.get("nodes")
@@ -1012,10 +1047,19 @@ class WorkbenchMCPServer:
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]
-            if action != "resolve_indeterminate_locally" and {
+            source_fields = {
+                "source_only", "confirm_preserve_unknown_ignored",
                 "confirm_source_only_extraction", "expected_source_delta_sha256",
-            }.intersection(arguments):
-                raise ValueError("source-only extraction fields are only supported by resolve_indeterminate_locally")
+            }
+            for field in ("source_only", "confirm_preserve_unknown_ignored",
+                          "confirm_source_only_extraction"):
+                self._optional_strict_boolean(arguments, field)
+            if action != "resolve_indeterminate_locally" and source_fields.intersection(arguments):
+                if action != "resume" or self.store.get_task(task_id)["state"] != "blocked":
+                    raise ValueError(
+                        "source-only extraction fields are only supported by "
+                        "resolve_indeterminate_locally or blocked resume"
+                    )
             expected_revision = self._required_expected_revision(arguments)
             dry_run = self._optional_strict_boolean(arguments, "dry_run")
             confirm_scope_normalization = self._optional_strict_boolean(
@@ -1027,16 +1071,6 @@ class WorkbenchMCPServer:
             }
             if action != "normalize_indeterminate_scope" and normalization_fields.intersection(arguments):
                 raise ValueError("scope normalization fields are only supported by normalize_indeterminate_scope")
-            source_only = self._optional_strict_boolean(arguments, "source_only")
-            confirm_preserve_unknown_ignored = self._optional_strict_boolean(
-                arguments, "confirm_preserve_unknown_ignored"
-            )
-            if action != "resolve_indeterminate_locally" and (
-                source_only or confirm_preserve_unknown_ignored
-            ):
-                raise ValueError(
-                    "source-only recovery flags are only supported by resolve_indeterminate_locally"
-                )
             if dry_run and not (
                 action in {"resolve_indeterminate_locally", "normalize_indeterminate_scope"}
                 or (action == "resume" and self.store.get_task(task_id)["state"] == "blocked")

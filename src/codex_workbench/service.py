@@ -74,6 +74,7 @@ from .model import (
     NodeResult,
     QuotaSnapshot,
     TaskContract,
+    canonical_hash,
     canonical_json,
     codex_model_profile,
     codex_model_reasoning_effort,
@@ -2513,6 +2514,8 @@ class Coordinator:
                 )
 
     def _with_observed_failure_paths(self, request: ExecutionRequest, result: NodeResult) -> NodeResult:
+        """Bind recoverable source paths without promoting ignored residue to worker output."""
+
         if request.worktree is None:
             return result
         recoverable_paths = (
@@ -2523,8 +2526,22 @@ class Coordinator:
             )
         )
         ignored_paths = DirtyWorktreeRecovery.ignored_paths(request.worktree)
-        unsafe_ignored, _ = partition_recovery_paths(ignored_paths)
-        paths = tuple(sorted(recoverable_paths | set(ignored_paths)))
+        unsafe_ignored, generated_residue_paths = partition_recovery_paths(ignored_paths)
+        paths = tuple(sorted(recoverable_paths | set(generated_residue_paths)))
+        ignored_artifacts: dict[str, str] = {}
+        if unsafe_ignored:
+            ignored_artifacts["ignored-worktree-residue"] = self.artifacts.put_text(
+                canonical_json(
+                    {
+                        "schema_version": 1,
+                        "kind": "ignored-worktree-residue",
+                        "ignored_path_count": len(unsafe_ignored),
+                        "paths_sha256": canonical_hash(list(unsafe_ignored)),
+                        "sample_paths": list(unsafe_ignored[:8]),
+                    }
+                ),
+                "ignored-worktree-residue.json",
+            )
         coordinator_retryable = (
             result.status == "blocked"
             and bool(recoverable_paths)
@@ -2535,6 +2552,7 @@ class Coordinator:
         return replace(
             result,
             changed_paths=paths,
+            artifacts={**result.artifacts, **ignored_artifacts},
             retryable=result.retryable or coordinator_retryable,
         )
 
@@ -2618,6 +2636,27 @@ class Coordinator:
         recovery = binding.get("recovery")
         if not isinstance(recovery, dict):
             raise WorktreeError("blocked-worktree recovery receipt is missing")
+        source_only_extraction = binding.get("source_only_extraction")
+        if source_only_extraction is not None and not isinstance(
+            source_only_extraction, dict
+        ):
+            raise WorktreeError("blocked source-only recovery authorization is invalid")
+        expected_source_delta_sha256 = (
+            source_only_extraction.get("source_delta_sha256")
+            if isinstance(source_only_extraction, dict)
+            else None
+        )
+        if expected_source_delta_sha256 is not None and not isinstance(
+            expected_source_delta_sha256, str
+        ):
+            raise WorktreeError("blocked source-only recovery digest is invalid")
+        if source_only_extraction is not None and (
+            contract.get("external_write_permission") is not False
+            or contract.get("destructive_action_permission") is not False
+        ):
+            raise WorktreeError(
+                "blocked source-only recovery requires no external or destructive permissions"
+            )
         source_worktree = str(recovery["source_worktree"])
         target_attempt = int(claimed["attempt"])
         target = self.worktrees.prepare_clean(
@@ -2639,6 +2678,8 @@ class Coordinator:
             recovery=recovery,
             acceptance_commands=tuple(contract.get("acceptance_commands", ())),
             timeout_seconds=int(contract["timeout_seconds"]),
+            source_only=source_only_extraction is not None,
+            expected_source_delta_sha256=expected_source_delta_sha256,
         )
         artifacts = {
             **outcome.artifacts,
@@ -2693,6 +2734,11 @@ class Coordinator:
                         "dependency_input_ref": recovery.get("dependency_input_ref"),
                         "patch_ref": recovery["patch_ref"],
                         "patch_sha256": recovery["patch_sha256"],
+                        **(
+                            {"source_only_extraction": source_only_extraction}
+                            if source_only_extraction is not None
+                            else {}
+                        ),
                     },
                     "target": {
                         "attempt": target_attempt,
