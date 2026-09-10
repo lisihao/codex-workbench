@@ -627,6 +627,49 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(self.store.get_task("unsupported-source-only"), before)
             self.assertEqual(self.store.read_events(task_id="unsupported-source-only"), events)
 
+    def test_scope_normalization_fields_cannot_silently_queue(self) -> None:
+        self._create_list_task("unsupported-normalization")
+        before = self.store.get_task("unsupported-normalization")
+        events = self.store.read_events(task_id="unsupported-normalization")
+        for field, value in (
+            ("scope_pattern", "tests/task*.ts"), ("exact_path", "tests/task.spec.ts"),
+            ("expected_file_sha256", "a" * 64), ("confirm_scope_normalization", False),
+        ):
+            with self.subTest(field=field):
+                response = self.call("workbench_control_task", {
+                    "task_id": "unsupported-normalization", "action": "queue",
+                    "expected_revision": before["state_revision"], field: value,
+                })
+                self.assertTrue(response["isError"])
+                self.assertIn("only supported", response["content"][0]["text"])
+                self.assertEqual(self.store.get_task("unsupported-normalization"), before)
+                self.assertEqual(self.store.read_events(task_id="unsupported-normalization"), events)
+
+    def test_scope_normalization_dispatch_preserves_preview_and_cas_arguments(self) -> None:
+        arguments = {
+            "task_id": "legacy", "node_id": "A", "action": "normalize_indeterminate_scope",
+            "expected_revision": 11, "expected_attempt": 2,
+            "scope_pattern": "tests/task*.ts", "exact_path": "tests/task.spec.ts",
+            "reason": "Normalize legacy planner scope", "dry_run": True,
+        }
+        with patch.object(self.store, "normalize_indeterminate_scope", create=True,
+                          return_value={"dry_run": True, "revision_after": 11}) as normalize:
+            response = self.call("workbench_control_task", arguments)
+            self.assertNotIn("isError", response)
+            self.assertTrue(json.loads(response["content"][0]["text"])["dry_run"])
+            normalize.assert_called_once_with(
+                "legacy", "A", expected_revision=11, expected_attempt=2,
+                scope_pattern="tests/task*.ts", exact_path="tests/task.spec.ts",
+                reason="Normalize legacy planner scope", expected_file_sha256=None,
+                confirm_scope_normalization=False, dry_run=True,
+            )
+            normalize.reset_mock()
+            for invalid in ({"dry_run": "true"}, {"confirm_scope_normalization": 1},
+                            {"expected_file_sha256": "not-a-hash"}, {"expected_attempt": True}):
+                response = self.call("workbench_control_task", {**arguments, **invalid})
+                self.assertTrue(response["isError"])
+                normalize.assert_not_called()
+
     def test_harness_health_requires_real_skill_and_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             home = Path(directory)

@@ -253,6 +253,106 @@ class PlannerRoutingTests(unittest.TestCase):
 
         self.assertEqual([node.node_id for node in planned], ["worker", "verify"])
 
+    def test_planner_rejects_embedded_glob_in_read_scope(self) -> None:
+        worker = node("worker", write_scope="src/worker")
+        worker["read_scopes"] = ["src/task-template*.ts"]
+        raw = {
+            "summary": "glob read scope",
+            "nodes": [
+                worker,
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("worker",),
+                    verifier=True,
+                ),
+            ],
+        }
+
+        with self.assertRaisesRegex(PlannerError, r"read_scopes.*glob"):
+            CodexPlanner.normalize_and_validate_plan(
+                make_contract(),
+                raw,
+                claude_models_available=(),
+                default_executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+            )
+
+    def test_planner_rejects_embedded_glob_in_write_scope(self) -> None:
+        worker = node("worker", write_scope="src/worker")
+        worker["write_scopes"] = ["src/task-template*.ts"]
+        raw = {
+            "summary": "glob write scope",
+            "nodes": [
+                worker,
+                node(
+                    "verify",
+                    write_scope="",
+                    executor="codex",
+                    model="gpt-5.6-sol",
+                    depends_on=("worker",),
+                    verifier=True,
+                ),
+            ],
+        }
+
+        with self.assertRaisesRegex(PlannerError, r"write_scopes.*glob"):
+            CodexPlanner.normalize_and_validate_plan(
+                make_contract(),
+                raw,
+                claude_models_available=(),
+                default_executor_model="gpt-5.6-luna",
+                verifier_model="gpt-5.6-sol",
+            )
+
+    def test_planner_preserves_exact_directory_and_root_scope_normalization(self) -> None:
+        cases = (
+            ("exact", make_contract(), "src/task-template.ts", "src/task-template.ts"),
+            ("directory", make_contract(), "src/task-templates", "src/task-templates"),
+            ("root", make_contract(allowed_scope=(".",)), "*", "."),
+        )
+
+        for label, contract, scope, expected in cases:
+            with self.subTest(scope=label):
+                planned = CodexPlanner.normalize_and_validate_plan(
+                    contract,
+                    {
+                        "summary": f"{label} scope",
+                        "nodes": [
+                            node("worker", write_scope=scope),
+                            node(
+                                "verify",
+                                write_scope="",
+                                executor="codex",
+                                model="gpt-5.6-sol",
+                                depends_on=("worker",),
+                                verifier=True,
+                            ),
+                        ],
+                    },
+                    claude_models_available=(),
+                    default_executor_model="gpt-5.6-luna",
+                    verifier_model="gpt-5.6-sol",
+                )
+
+                self.assertEqual(planned[0].read_scopes, (expected,))
+                self.assertEqual(planned[0].write_scopes, (expected,))
+
+    def test_planner_prompt_requires_exact_scope_paths_without_globs(self) -> None:
+        prompt = CodexPlanner._prompt(
+            make_contract(),
+            claude_models_available=(),
+            default_executor_model="gpt-5.6-luna",
+            verifier_model="gpt-5.6-sol",
+        )
+
+        self.assertIn(
+            "Declare read_scopes and write_scopes as exact repository-relative file paths or directory paths; do not generate embedded glob patterns",
+            prompt,
+        )
+
     def test_normalization_preserves_an_explicit_astra_verifier(self) -> None:
         contract = make_contract(
             planner_model=CODEX_ASTRA_MODEL,

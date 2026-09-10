@@ -66,7 +66,7 @@ MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不
 
 ## 崩溃与重复请求
 
-MCP 的 blocked `resume` 支持布尔值 `dry_run=true`：无修改分支只返回重试预览，有修改分支在临时 ArtifactStore 中验证恢复补丁；两者均不写入任务、节点、事件或正式工件，不启动下一 attempt，也不修改源工作树。重复预检保持相同持久状态。字符串或数字形式的 `dry_run` 一律拒绝。除该路径与 `resolve_indeterminate_locally` 外，其他控制动作不支持预检并明确报错；HTTP control 端点同样拒绝 `dry_run=true`，不会将预检静默执行为真实操作。
+MCP 的 blocked `resume` 支持布尔值 `dry_run=true`：无修改分支只返回重试预览，有修改分支在临时 ArtifactStore 中验证恢复补丁；两者均不写入任务、节点、事件或正式工件，不启动下一 attempt，也不修改源工作树。重复预检保持相同持久状态。字符串或数字形式的 `dry_run` 一律拒绝。除该路径、`resolve_indeterminate_locally` 与 `normalize_indeterminate_scope` 外，其他控制动作不支持预检并明确报错；HTTP control 端点同样拒绝 `dry_run=true`，不会将预检静默执行为真实操作。
 
 - assignment 前重启：recover_interrupted() 将 capture_pending 原子回滚到原失败 attempt 和 needs_fix，并在同一事务写入 orphan cleanup receipt。协调器在 SQLite 事务外把可能残留的 target 移入私有 recovery archive；归档失败或进程再次重启时，未 resolved 的 receipt 会继续重放。下一次合法 queue 再重建恢复绑定。
 - assignment 后重启或执行器崩溃：target allocation 已是 attempt 的物理状态，节点进入 indeterminate。自动 retry 被明确拒绝，直到操作人完成显式恢复裁决；不会把同一 target 再派发给新 attempt。
@@ -88,6 +88,16 @@ MCP `resolve_indeterminate_locally` 动作（CLI `task resolve-indeterminate-loc
 6. 若节点 `depends_on` 其他节点，调用方必须显式提供该节点原 attempt 记录的 `dependency-input` artifact ref（结算前已写入 ArtifactStore，即使进程随后崩溃也仍然存在），否则拒绝恢复，防止用未核实的祖先输入静默替换已验收的依赖。
 
 与 `resume-blocked-worktree`/`retry-blocked` 一样，`confirm_*` 字段是留痕断言而非自动核验；未知副作用、越权路径、哈希漂移或过期 revision/attempt 一律 fail closed。
+
+### 历史 glob 范围的显式规范化
+
+新规划的 read/write scopes 只接受精确文件、目录和根范围（独立 `*` 规范化为 `.`），拒绝嵌入式 `*`、`?`、`[`、`]`。运行时和调度器仍采用相同的路径/目录前缀匹配，不增加通用 glob 权限。
+
+历史 `indeterminate` 节点可以通过 MCP `workbench_control_task` 的 `normalize_indeterminate_scope` 动作，将已存储的单星号文件名范围转换为唯一现存的精确文件。必填 `task_id`、`node_id`、`expected_revision`、`expected_attempt`、`scope_pattern`、`exact_path` 和非空 `reason`。星号只能出现在最终文件名中；不接受目录 glob、多个匹配、目录或符号链接目标、任务权限外路径或并发访问冲突。HTTP control 不提供此动作，且明确拒绝其专用字段。
+
+先以布尔值 `dry_run=true` 获取预览和 `file_sha256`，不会修改任务、节点、事件、工件或源码。正式操作需携带同一 revision/attempt、预览返回的 `expected_file_sha256`，并显式指定 `confirm_scope_normalization=true`。服务核对 allocation、repository/base/branch、源路径和文件内容，在短事务内重新核对持久状态后更新范围和任务 revision。并发修改或文件哈希变化时必须重新预检。
+
+回执包含旧/新 read/write scopes、revision_before/revision_after、attempt、allocation_id、base_sha、branch、worktree、文件哈希、理由及 event_cursor。仅规范化已声明的范围，不扩展到整个父目录，不恢复执行，也不改写历史 result、节点状态或 attempt；审计事件不能作为过去副作用合规的追认证据。之后的恢复仍需单独通过 `resolve_indeterminate_locally` 的检查和操作员确认。
 
 ### Source-only ignored 留存模式
 

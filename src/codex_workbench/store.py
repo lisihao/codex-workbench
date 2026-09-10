@@ -62,6 +62,14 @@ from .scheduler_metrics import (
     quota_pool_id_for_spec,
 )
 from .scope_isolation import scope_entity_alias_conflicts
+from .scope_normalization import (
+    ScopeNormalizationError,
+    ScopeNormalizationPlan,
+    inspect_scope_normalization,
+    scope_conflict_pairs,
+    validate_common_git_directory,
+    validate_matching_file_hash,
+)
 from .worktrees import (
     WorktreeManager,
     normalize_scope,
@@ -6169,6 +6177,7 @@ class WorkbenchStore:
             raise StateConflictError("indeterminate node task contract is invalid JSON") from error
         allowed_scope = contract.get("allowed_scope") if isinstance(contract, dict) else None
         forbidden_scope = contract.get("forbidden_scope") if isinstance(contract, dict) else None
+        read_scopes = spec.get("read_scopes", [])
         write_scopes = spec.get("write_scopes")
         depends_on = spec.get("depends_on", [])
         repository = contract.get("repository") if isinstance(contract, dict) else None
@@ -6182,6 +6191,8 @@ class WorkbenchStore:
             and all(isinstance(scope, str) for scope in allowed_scope)
             and isinstance(forbidden_scope, list)
             and all(isinstance(scope, str) for scope in forbidden_scope)
+            and isinstance(read_scopes, list)
+            and all(isinstance(scope, str) for scope in read_scopes)
             and isinstance(write_scopes, list)
             and all(isinstance(scope, str) for scope in write_scopes)
             and isinstance(depends_on, list)
@@ -6239,10 +6250,468 @@ class WorkbenchStore:
                 "attempt": int(node["attempt"]),
                 "worktree": str(node["worktree"]),
                 "branch": expected_branch,
+                "read_scopes": tuple(read_scopes),
                 "write_scopes": tuple(write_scopes),
                 "depends_on": tuple(depends_on),
             },
             "allocation_id": str(allocation["allocation_id"]),
+        }
+
+    def normalize_indeterminate_scope(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        scope_pattern: str,
+        exact_path: str,
+        reason: str,
+        expected_file_sha256: str | None = None,
+        confirm_scope_normalization: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Narrow one legacy final-basename wildcard on an indeterminate node.
+
+        This is not a glob matcher and does not reinterpret historical worker
+        output. It only replaces an explicitly requested persisted scope after
+        proving that the owned, idle source worktree has one matching regular
+        file and that the durable task/node/allocation snapshot remains current.
+        """
+
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
+        if isinstance(expected_attempt, bool) or not isinstance(expected_attempt, int) or expected_attempt < 1:
+            raise ValueError("expected_attempt must be a positive integer")
+        if type(confirm_scope_normalization) is not bool:
+            raise ValueError("confirm_scope_normalization must be a boolean")
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean")
+        if expected_file_sha256 is not None and not isinstance(expected_file_sha256, str):
+            raise ValueError("expected_file_sha256 must be a lowercase SHA-256 digest")
+        if not isinstance(reason, str) or not (reason := reason.strip()):
+            raise ValueError("scope normalization reason must be non-empty")
+        if len(reason) > 500:
+            raise ValueError("scope normalization reason must contain 1 to 500 characters")
+
+        first = self._prepare_indeterminate_scope_normalization(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            scope_pattern=scope_pattern,
+            exact_path=exact_path,
+        )
+        if expected_file_sha256 is not None:
+            validate_matching_file_hash(expected_file_sha256, first["plan"].file_sha256)
+        if dry_run:
+            return self._scope_normalization_response(
+                first,
+                reason=reason,
+                dry_run=True,
+                changed=False,
+                revision_after=expected_revision,
+                event_cursor=None,
+            )
+        if confirm_scope_normalization is not True:
+            raise ValueError(
+                "scope normalization requires explicit confirm_scope_normalization=true"
+            )
+        if expected_file_sha256 is None:
+            raise ValueError(
+                "scope normalization apply requires expected_file_sha256 from its dry-run"
+            )
+
+        # Check the exact source file and directory enumeration again before
+        # acquiring SQLite's write lock. The transaction below repeats only
+        # durable DB comparisons, so no Git/filesystem/process IO occurs while
+        # the authority lock is held.
+        second = self._prepare_indeterminate_scope_normalization(
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            scope_pattern=scope_pattern,
+            exact_path=exact_path,
+        )
+        validate_matching_file_hash(expected_file_sha256, second["plan"].file_sha256)
+        if self._scope_normalization_preflight_fingerprint(first) != self._scope_normalization_preflight_fingerprint(second):
+            raise StateConflictError(
+                "scope normalization source or durable preflight changed; rerun dry-run"
+            )
+
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            candidate = self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            node = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            assert node is not None
+            current_spec_json = str(node["spec_json"])
+            if (
+                self._scope_normalization_candidate_fingerprint(candidate)
+                != self._scope_normalization_candidate_fingerprint(second["candidate"])
+                or current_spec_json != second["spec_json"]
+            ):
+                raise StateConflictError(
+                    "scope normalization node or allocation changed before commit"
+                )
+            current_running = self._scope_normalization_running_bindings(connection)
+            if canonical_json(current_running) != canonical_json(second["running_bindings"]):
+                raise StateConflictError(
+                    "running scope set changed before scope normalization commit"
+                )
+
+            plan = second["plan"]
+            try:
+                old_spec = json.loads(current_spec_json)
+            except json.JSONDecodeError as error:
+                raise StateConflictError("scope normalization node specification is invalid JSON") from error
+            if not isinstance(old_spec, dict):
+                raise StateConflictError("scope normalization node specification is invalid")
+            if (
+                tuple(old_spec.get("read_scopes", ())) != plan.before_read_scopes
+                or tuple(old_spec.get("write_scopes", ())) != plan.before_write_scopes
+            ):
+                raise StateConflictError("scope normalization scope metadata changed before commit")
+            new_spec = dict(old_spec)
+            if plan.before_read_scopes != plan.after_read_scopes:
+                new_spec["read_scopes"] = list(plan.after_read_scopes)
+            new_spec["write_scopes"] = list(plan.after_write_scopes)
+            new_spec_json = canonical_json(new_spec)
+            node_changed = connection.execute(
+                """
+                UPDATE nodes SET spec_json = ?, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'indeterminate'
+                  AND attempt = ? AND spec_json = ?
+                """,
+                (
+                    new_spec_json,
+                    timestamp,
+                    task_id,
+                    node_id,
+                    expected_attempt,
+                    current_spec_json,
+                ),
+            ).rowcount
+            if node_changed != 1:
+                raise StateConflictError("scope normalization node compare-and-set failed")
+            revision_after = expected_revision + 1
+            task_changed = connection.execute(
+                """
+                UPDATE tasks SET state_revision = ?, updated_at = ?
+                WHERE task_id = ? AND state = 'needs_approval' AND state_revision = ?
+                """,
+                (revision_after, timestamp, task_id, expected_revision),
+            ).rowcount
+            if task_changed != 1:
+                raise StateConflictError("scope normalization task compare-and-set failed")
+            event_cursor = self._event(
+                connection,
+                "node.indeterminate_scope_normalized",
+                task_id,
+                node_id,
+                {
+                    "schema_version": 1,
+                    "action": "normalize_indeterminate_scope",
+                    "task_revision_before": expected_revision,
+                    "task_revision_after": revision_after,
+                    "attempt": expected_attempt,
+                    "allocation_id": second["candidate"]["allocation_id"],
+                    "repository": second["candidate"]["task"]["repository"],
+                    "base_sha": second["candidate"]["task"]["base_sha"],
+                    "branch": second["candidate"]["node"]["branch"],
+                    "worktree": second["candidate"]["node"]["worktree"],
+                    "scope_pattern": plan.scope_pattern,
+                    "exact_path": plan.exact_path,
+                    "before": {
+                        "read_scopes": list(plan.before_read_scopes),
+                        "write_scopes": list(plan.before_write_scopes),
+                    },
+                    "after": {
+                        "read_scopes": list(plan.after_read_scopes),
+                        "write_scopes": list(plan.after_write_scopes),
+                    },
+                    "file_sha256": plan.file_sha256,
+                    "reason": reason,
+                    "historical_result_unchanged": True,
+                    "retrospective_compliance_claimed": False,
+                },
+                created_at=timestamp,
+            )
+        return self._scope_normalization_response(
+            second,
+            reason=reason,
+            dry_run=False,
+            changed=True,
+            revision_after=revision_after,
+            event_cursor=event_cursor,
+        )
+
+    def _prepare_indeterminate_scope_normalization(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        scope_pattern: str,
+        exact_path: str,
+    ) -> dict[str, Any]:
+        """Read durable state, inspect source, then re-read the immutable inputs."""
+
+        with self.connection() as connection:
+            candidate = self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            row = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            assert row is not None
+            spec_json = str(row["spec_json"])
+
+        source = self._scope_normalization_source(candidate)
+        plan = inspect_scope_normalization(
+            source,
+            scope_pattern=scope_pattern,
+            exact_path=exact_path,
+            read_scopes=candidate["node"]["read_scopes"],
+            write_scopes=candidate["node"]["write_scopes"],
+        )
+        try:
+            allowed = scope_allows(
+                plan.exact_path,
+                candidate["task"]["allowed_scope"],
+                candidate["task"]["forbidden_scope"],
+            )
+        except ValueError as error:
+            raise ScopeNormalizationError("task scope limits are invalid") from error
+        if not allowed:
+            raise ScopeNormalizationError("exact_path is outside the task allowed/forbidden scope")
+
+        with self.connection() as connection:
+            current_candidate = self._indeterminate_local_recovery_candidate(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+            row = connection.execute(
+                "SELECT spec_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            assert row is not None
+            current_spec_json = str(row["spec_json"])
+            if (
+                self._scope_normalization_candidate_fingerprint(candidate)
+                != self._scope_normalization_candidate_fingerprint(current_candidate)
+                or spec_json != current_spec_json
+            ):
+                raise StateConflictError(
+                    "scope normalization node or allocation changed during source inspection"
+                )
+            running_bindings = self._scope_normalization_running_bindings(connection)
+
+        self._assert_scope_normalization_concurrency(
+            current_candidate,
+            plan,
+            running_bindings,
+        )
+        return {
+            "candidate": current_candidate,
+            "spec_json": current_spec_json,
+            "plan": plan,
+            "running_bindings": running_bindings,
+        }
+
+    def _scope_normalization_source(self, candidate: dict[str, Any]) -> Path:
+        """Validate the active allocation's source tree outside the SQLite lock."""
+
+        recovery = DirtyWorktreeRecovery(
+            ArtifactStore(self.path.parent / "artifacts"),
+            WorktreeManager(self.path.parent / "worktrees"),
+        )
+        try:
+            source = recovery.validate_retry_source(
+                repository=str(candidate["task"]["repository"]),
+                base_sha=str(candidate["task"]["base_sha"]),
+                worktree=str(candidate["node"]["worktree"]),
+                branch=str(candidate["node"]["branch"]),
+            )
+            validate_common_git_directory(str(candidate["task"]["repository"]), source)
+            return source
+        except (DirtyWorktreeRecoveryError, ScopeNormalizationError) as error:
+            raise ScopeNormalizationError(
+                f"scope-normalization source binding is invalid: {error}"
+            ) from error
+
+    @staticmethod
+    def _scope_normalization_candidate_fingerprint(candidate: dict[str, Any]) -> str:
+        return canonical_json(candidate)
+
+    @staticmethod
+    def _scope_normalization_preflight_fingerprint(preflight: dict[str, Any]) -> str:
+        plan = preflight["plan"]
+        assert isinstance(plan, ScopeNormalizationPlan)
+        return canonical_json({
+            "candidate": preflight["candidate"],
+            "spec_json": preflight["spec_json"],
+            "scope_pattern": plan.scope_pattern,
+            "exact_path": plan.exact_path,
+            "before_read_scopes": plan.before_read_scopes,
+            "before_write_scopes": plan.before_write_scopes,
+            "after_read_scopes": plan.after_read_scopes,
+            "after_write_scopes": plan.after_write_scopes,
+            "file_sha256": plan.file_sha256,
+            "matching_paths": plan.matching_paths,
+            "running_bindings": preflight["running_bindings"],
+        })
+
+    @staticmethod
+    def _scope_normalization_running_bindings(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return the durable running access set without filesystem inspection."""
+
+        rows = connection.execute(
+            """
+            SELECT n.task_id, n.node_id, n.attempt, n.spec_json, t.contract_json
+            FROM nodes n JOIN tasks t USING(task_id)
+            WHERE n.state = 'running'
+            ORDER BY n.task_id, n.node_id, n.attempt
+            """
+        ).fetchall()
+        bindings: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                spec = json.loads(str(row["spec_json"]))
+                contract = json.loads(str(row["contract_json"]))
+            except json.JSONDecodeError as error:
+                raise StateConflictError("running scope metadata is invalid JSON") from error
+            if not isinstance(spec, dict) or not isinstance(contract, dict):
+                raise StateConflictError("running scope metadata is invalid")
+            read_scopes = spec.get("read_scopes", [])
+            write_scopes = spec.get("write_scopes", [])
+            repository = contract.get("repository")
+            if not (
+                isinstance(repository, str)
+                and repository
+                and isinstance(read_scopes, list)
+                and all(isinstance(scope, str) for scope in read_scopes)
+                and isinstance(write_scopes, list)
+                and all(isinstance(scope, str) for scope in write_scopes)
+            ):
+                raise StateConflictError("running scope metadata is invalid")
+            bindings.append({
+                "task_id": str(row["task_id"]),
+                "node_id": str(row["node_id"]),
+                "attempt": int(row["attempt"]),
+                "repository": repository,
+                "read_scopes": tuple(read_scopes),
+                "write_scopes": tuple(write_scopes),
+                "spec_json": str(row["spec_json"]),
+                "contract_json": str(row["contract_json"]),
+            })
+        return tuple(bindings)
+
+    @staticmethod
+    def _assert_scope_normalization_concurrency(
+        candidate: dict[str, Any],
+        plan: ScopeNormalizationPlan,
+        running_bindings: tuple[dict[str, Any], ...],
+    ) -> None:
+        """Reject an exact scope that overlaps any active same-repository access."""
+
+        # Also rejects any second wildcard left on the recovered node. The
+        # operation fixes one persisted legacy pattern; it must not imply that
+        # another wildcard has scheduler-compatible meaning.
+        scope_conflict_pairs(
+            plan.after_read_scopes,
+            plan.after_write_scopes,
+            (),
+            (),
+        )
+        repository = _repository_identity(str(candidate["task"]["repository"]))
+        blockers: list[dict[str, Any]] = []
+        for running in running_bindings:
+            if repository != _repository_identity(str(running["repository"])):
+                continue
+            pairs = scope_conflict_pairs(
+                plan.after_read_scopes,
+                plan.after_write_scopes,
+                running["read_scopes"],
+                running["write_scopes"],
+            )
+            if pairs:
+                blockers.append({
+                    "task_id": running["task_id"],
+                    "node_id": running["node_id"],
+                    "attempt": running["attempt"],
+                    "conflict_paths": list(pairs),
+                })
+        if blockers:
+            first = blockers[0]
+            raise StateConflictError(
+                "scope normalization conflicts with active node "
+                f"{first['task_id']}/{first['node_id']} attempt {first['attempt']}"
+            )
+
+    @staticmethod
+    def _scope_normalization_response(
+        preflight: dict[str, Any],
+        *,
+        reason: str,
+        dry_run: bool,
+        changed: bool,
+        revision_after: int,
+        event_cursor: int | None,
+    ) -> dict[str, Any]:
+        plan = preflight["plan"]
+        candidate = preflight["candidate"]
+        assert isinstance(plan, ScopeNormalizationPlan)
+        return {
+            "ok": True,
+            "action": "normalize_indeterminate_scope",
+            "task_id": candidate["task"]["task_id"],
+            "node_id": candidate["node"]["node_id"],
+            "dry_run": dry_run,
+            "changed": changed,
+            "revision_before": candidate["task"]["revision"],
+            "revision_after": revision_after,
+            "attempt": candidate["node"]["attempt"],
+            "allocation_id": candidate["allocation_id"],
+            "base_sha": candidate["task"]["base_sha"],
+            "branch": candidate["node"]["branch"],
+            "worktree": candidate["node"]["worktree"],
+            "scope_pattern": plan.scope_pattern,
+            "exact_path": plan.exact_path,
+            "before": {
+                "read_scopes": list(plan.before_read_scopes),
+                "write_scopes": list(plan.before_write_scopes),
+            },
+            "after": {
+                "read_scopes": list(plan.after_read_scopes),
+                "write_scopes": list(plan.after_write_scopes),
+            },
+            "matching_paths": list(plan.matching_paths),
+            "file_sha256": plan.file_sha256,
+            "reason": reason,
+            "event_cursor": event_cursor,
+            "historical_result_unchanged": True,
+            "retrospective_compliance_claimed": False,
         }
 
     def queue_indeterminate_local_recovery(

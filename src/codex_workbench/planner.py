@@ -226,6 +226,7 @@ def _squilla_advice_for_new_plan(
 
 
 _NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
+_SCOPE_GLOB_CHARS = frozenset("*?[]")
 _NODE_KEYS = {
     "node_id",
     "task_id",
@@ -586,8 +587,15 @@ def _string_tuple(raw: Any, field: str) -> tuple[str, ...]:
 
 
 def _normalized_scopes(raw: Any, field: str) -> tuple[str, ...]:
+    scopes = _string_tuple(raw, field)
+    for scope in scopes:
+        if scope.strip() != "*" and any(char in _SCOPE_GLOB_CHARS for char in scope):
+            raise PlannerError(
+                f"plan node {field} contains an embedded glob pattern {scope!r}; "
+                "use an exact path or directory instead"
+            )
     try:
-        return tuple(sorted({normalize_scope(scope) for scope in _string_tuple(raw, field)}))
+        return tuple(sorted({normalize_scope(scope) for scope in scopes}))
     except ValueError as error:
         raise PlannerError(str(error)) from error
 
@@ -1312,6 +1320,7 @@ Context bundle ref: {contract.context_bundle_ref or "N/A"}{context_block}
 Rules:
 - Apply the research routing policy before model routing or DAG decomposition.
 {archify_rule}- Prefer independent parallel nodes when their write scopes do not overlap.
+- Declare read_scopes and write_scopes as exact repository-relative file paths or directory paths; do not generate embedded glob patterns (for example, task-template*.ts).
 - Actively decompose the request into the smallest useful independent DAG nodes: identify low-risk, short, mechanically verifiable actions (for example one focused test, formatter, notice generation, or bounded file check) that can run independently and expose their exact command and scope.
 - Do not split a coupled change, hide shared state, or create artificial nodes merely to use Spark. Preserve semantic and write-scope dependencies; every worker, including a Spark worker, must remain in the final verifier dependency closure.
 - A Spark candidate is only a low-complexity, parallelizable node with at most one write scope and either a node-level command or the task acceptance commands as its mechanical acceptance condition. Architecture, review, security, migration, release, verifier/control-plane, and ambiguous cross-module work must never be assigned to Spark.
