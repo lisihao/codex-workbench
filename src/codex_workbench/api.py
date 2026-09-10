@@ -389,6 +389,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 body = json.loads(self._read_body() or b"{}")
                 action = body.get("action")
                 expected_revision = self._expected_revision(body)
+                if any(option in body for option in (
+                    "scope_pattern", "exact_path", "expected_file_sha256",
+                    "confirm_scope_normalization",
+                )):
+                    raise ValueError("scope normalization requires the MCP control endpoint")
                 if "dry_run" in body and type(body["dry_run"]) is not bool:
                     raise ValueError("dry_run must be a boolean")
                 if body.get("dry_run") is True:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -226,6 +227,7 @@ TOOLS: list[dict[str, Any]] = [
                         "steer",
                         "resolve_indeterminate",
                         "resolve_indeterminate_locally",
+                        "normalize_indeterminate_scope",
                     ]
                 },
                 "expected_revision": {"type": "integer"},
@@ -244,6 +246,10 @@ TOOLS: list[dict[str, Any]] = [
                 "source_only": {"type": "boolean"},
                 "confirm_preserve_unknown_ignored": {"type": "boolean"},
                 "dependency_input_ref": {"type": "string"},
+                "scope_pattern": {"type": "string", "minLength": 1},
+                "exact_path": {"type": "string", "minLength": 1},
+                "expected_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "confirm_scope_normalization": {"type": "boolean"},
                 "dry_run": {"type": "boolean"},
             },
         },
@@ -995,6 +1001,15 @@ class WorkbenchMCPServer:
             action = arguments["action"]
             expected_revision = self._required_expected_revision(arguments)
             dry_run = self._optional_strict_boolean(arguments, "dry_run")
+            confirm_scope_normalization = self._optional_strict_boolean(
+                arguments, "confirm_scope_normalization"
+            )
+            normalization_fields = {
+                "scope_pattern", "exact_path", "expected_file_sha256",
+                "confirm_scope_normalization",
+            }
+            if action != "normalize_indeterminate_scope" and normalization_fields.intersection(arguments):
+                raise ValueError("scope normalization fields are only supported by normalize_indeterminate_scope")
             source_only = self._optional_strict_boolean(arguments, "source_only")
             confirm_preserve_unknown_ignored = self._optional_strict_boolean(
                 arguments, "confirm_preserve_unknown_ignored"
@@ -1006,10 +1021,33 @@ class WorkbenchMCPServer:
                     "source-only recovery flags are only supported by resolve_indeterminate_locally"
                 )
             if dry_run and not (
-                action == "resolve_indeterminate_locally"
+                action in {"resolve_indeterminate_locally", "normalize_indeterminate_scope"}
                 or (action == "resume" and self.store.get_task(task_id)["state"] == "blocked")
             ):
                 raise ValueError("dry_run is not supported for this control action or task state")
+            if action == "normalize_indeterminate_scope":
+                node_id = self._required_blocked_resume_text(arguments, "node_id")
+                scope_pattern = self._required_blocked_resume_text(arguments, "scope_pattern")
+                exact_path = self._required_blocked_resume_text(arguments, "exact_path")
+                reason = self._required_blocked_resume_text(arguments, "reason")
+                expected_attempt = self._required_blocked_resume_attempt(arguments)
+                expected_file_sha256 = arguments.get("expected_file_sha256")
+                if expected_file_sha256 is not None and (
+                    type(expected_file_sha256) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", expected_file_sha256) is None
+                ):
+                    raise ValueError("expected_file_sha256 must be a lowercase SHA-256 digest")
+                return self._text(self.store.normalize_indeterminate_scope(
+                    task_id, node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                    scope_pattern=scope_pattern,
+                    exact_path=exact_path,
+                    reason=reason,
+                    expected_file_sha256=expected_file_sha256,
+                    confirm_scope_normalization=confirm_scope_normalization,
+                    dry_run=dry_run,
+                ))
             if action in {"queue", "resume"}:
                 if action == "resume" and self.store.get_task(task_id)["state"] == "blocked":
                     return self._text(
