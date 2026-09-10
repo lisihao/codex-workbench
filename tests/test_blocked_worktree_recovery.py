@@ -355,6 +355,33 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             "patched\n",
         )
 
+    def test_mcp_dirty_dry_run_does_not_authorize_or_persist_artifacts(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",
+            untracked_path="src/root-preview.ts",
+        )
+        with self.store.connection() as connection:
+            before = list(connection.iterdump())
+        artifacts = {str(p): p.read_bytes() for p in self.store.artifacts.root.rglob("*") if p.is_file()}
+        untracked = (source / "src/root-preview.ts").read_bytes()
+        tracked_diff = self._git(source, "diff", "--binary")
+        for _ in range(2):
+            response = self._call_control({
+                "task_id": contract.task_id, "action": "resume", "node_id": "worker",
+                "expected_revision": blocked["state_revision"], "expected_attempt": 1,
+                "reason": "preview only", "confirm_recovery": True,
+                "preserve_untracked": True, "dry_run": True,
+            })
+            self.assertFalse(response.get("isError", False), response)
+            preview = json.loads(response["content"][0]["text"])
+            self.assertTrue(preview["dry_run"])
+            self.assertEqual(preview["task"]["state"], "blocked")
+        with self.store.connection() as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+        self.assertEqual({str(p): p.read_bytes() for p in self.store.artifacts.root.rglob("*") if p.is_file()}, artifacts)
+        self.assertEqual((source / "src/root-preview.ts").read_bytes(), untracked)
+        self.assertEqual(self._git(source, "diff", "--binary"), tracked_diff)
+
     def test_root_untracked_recovery_requires_confirmation_and_explicit_preservation(self) -> None:
         contract, blocked, source, _ = self._blocked_task(
             acceptance_command=f"{sys.executable} -c \"raise SystemExit(0)\"",

@@ -62,6 +62,8 @@ MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不
 
 ## 崩溃与重复请求
 
+MCP 的 blocked `resume` 支持布尔值 `dry_run=true`：无修改分支只返回重试预览，有修改分支在临时 ArtifactStore 中验证恢复补丁；两者均不写入任务、节点、事件或正式工件，不启动下一 attempt，也不修改源工作树。重复预检保持相同持久状态。字符串或数字形式的 `dry_run` 一律拒绝。除该路径与 `resolve_indeterminate_locally` 外，其他控制动作不支持预检并明确报错；HTTP control 端点同样拒绝 `dry_run=true`，不会将预检静默执行为真实操作。
+
 - assignment 前重启：recover_interrupted() 将 capture_pending 原子回滚到原失败 attempt 和 needs_fix，并在同一事务写入 orphan cleanup receipt。协调器在 SQLite 事务外把可能残留的 target 移入私有 recovery archive；归档失败或进程再次重启时，未 resolved 的 receipt 会继续重放。下一次合法 queue 再重建恢复绑定。
 - assignment 后重启或执行器崩溃：target allocation 已是 attempt 的物理状态，节点进入 indeterminate。自动 retry 被明确拒绝，直到操作人完成显式恢复裁决；不会把同一 target 再派发给新 attempt。
 - 重复 queue：旧 revision 失败，不会创建第二份恢复授权。

@@ -489,6 +489,7 @@ class WorkbenchMCPServer:
         node_id = node_id.strip()
         expected_attempt = self._required_blocked_resume_attempt(arguments)
         reason = self._required_blocked_resume_text(arguments, "reason")
+        dry_run = self._optional_strict_boolean(arguments, "dry_run")
         confirm_recovery = self._optional_strict_boolean(arguments, "confirm_recovery")
         preserve_untracked = self._optional_strict_boolean(arguments, "preserve_untracked")
         confirm_no_side_effects = self._optional_strict_boolean(
@@ -526,15 +527,25 @@ class WorkbenchMCPServer:
                 raise ValueError(
                     "confirm_no_side_effects cannot authorize a dirty blocked resume"
                 )
-            resumed = self.store.capture_and_resume_blocked_worktree(
-                task_id,
-                node_id,
+            capture_arguments = dict(
+                task_id=task_id,
+                node_id=node_id,
                 expected_revision=expected_revision,
                 expected_attempt=expected_attempt,
                 reason=reason,
                 preserve_untracked=preserve_untracked,
                 expected_checkpoint_sha=arguments.get("expected_checkpoint_sha"),
             )
+            if dry_run:
+                # CLI and MCP share the temporary-artifact preview; neither
+                # may authorize a new attempt during a dry run.
+                from .cli import _capture_blocked_worktree_recovery
+
+                resumed = _capture_blocked_worktree_recovery(
+                    self.config, self.store, dry_run=True, **capture_arguments
+                )
+            else:
+                resumed = self.store.capture_and_resume_blocked_worktree(**capture_arguments)
             return {
                 "ok": True,
                 "action": "resume-blocked-worktree",
@@ -553,6 +564,7 @@ class WorkbenchMCPServer:
             expected_attempt=expected_attempt,
             reason=reason,
             confirm_no_side_effects=confirm_no_side_effects,
+            dry_run=dry_run,
         )
         return {"ok": True, "action": "retry-blocked", **resumed}
 
@@ -971,6 +983,12 @@ class WorkbenchMCPServer:
             task_id = arguments["task_id"]
             action = arguments["action"]
             expected_revision = self._required_expected_revision(arguments)
+            dry_run = self._optional_strict_boolean(arguments, "dry_run")
+            if dry_run and not (
+                action == "resolve_indeterminate_locally"
+                or (action == "resume" and self.store.get_task(task_id)["state"] == "blocked")
+            ):
+                raise ValueError("dry_run is not supported for this control action or task state")
             if action in {"queue", "resume"}:
                 if action == "resume" and self.store.get_task(task_id)["state"] == "blocked":
                     return self._text(

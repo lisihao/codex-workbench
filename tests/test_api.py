@@ -559,6 +559,96 @@ class APITests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_task_control_queue_rejects_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            contract = TaskContract(
+                task_id="dry-run-reject",
+                repository=str(root),
+                base_sha="fixture",
+                objective="exercise dry_run regression",
+                allowed_scope=("tests",),
+            )
+            store.create_task(
+                contract,
+                [
+                    NodeSpec(
+                        "work",
+                        "dry-run-reject",
+                        "work",
+                        "fixture",
+                        "fixture",
+                        "ok",
+                    ),
+                    NodeSpec(
+                        "verify",
+                        "dry-run-reject",
+                        "verify",
+                        "fixture",
+                        "fixture",
+                        "accepted",
+                        depends_on=("work",),
+                        verifier=True,
+                    ),
+                ],
+                "dry-run-reject-create",
+            )
+            task_before = store.get_task("dry-run-reject")
+            events_before = store.read_events(task_id="dry-run-reject")
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            port = server.server_address[1]
+            headers = {
+                "Authorization": f"Bearer {config.token()}",
+                "Content-Type": "application/json",
+            }
+
+            def assert_conflict(payload: dict[str, object]) -> None:
+                request = Request(
+                    f"http://127.0.0.1:{port}/api/tasks/dry-run-reject/control",
+                    data=json.dumps(payload).encode(),
+                    method="POST",
+                    headers=headers,
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, HTTPStatus.CONFLICT)
+                caught.exception.close()
+
+            try:
+                for payload in (
+                    {
+                        "action": "queue",
+                        "expected_revision": task_before["state_revision"],
+                        "dry_run": True,
+                    },
+                    {
+                        "action": "queue",
+                        "expected_revision": task_before["state_revision"],
+                        "dry_run": "true",
+                    },
+                ):
+                    with self.subTest(payload=payload["dry_run"]):
+                        assert_conflict(payload)
+                        task_after = store.get_task("dry-run-reject")
+                        events_after = store.read_events(task_id="dry-run-reject")
+                        self.assertEqual(task_before["state"], task_after["state"])
+                        self.assertEqual(
+                            task_before["state_revision"],
+                            task_after["state_revision"],
+                        )
+                        self.assertEqual(task_before["steering"], task_after["steering"])
+                        self.assertEqual(events_before, events_after)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_host_allowlist_and_security_headers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

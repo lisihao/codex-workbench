@@ -553,6 +553,25 @@ class MCPTests(unittest.TestCase):
         self.assertIn("expected task revision", stale["content"][0]["text"])
         self.assertEqual(self.store.get_task(contract.task_id), blocked)
 
+        before_events = self.store.read_events(task_id=contract.task_id)
+        for flag in (True, True, "true", 1, None):
+            response = self.call("workbench_control_task", {
+                "task_id": contract.task_id, "action": "resume",
+                "expected_revision": blocked["state_revision"], "node_id": "work",
+                "expected_attempt": 1, "reason": "preview the clean local attempt",
+                "confirm_no_side_effects": True, "dry_run": flag,
+            })
+            if flag is True:
+                preview = json.loads(response["content"][0]["text"])
+                self.assertTrue(preview["dry_run"])
+                self.assertEqual(preview["task"]["state"], "blocked")
+                self.assertEqual(preview["would_retry"]["attempt"], 2)
+            else:
+                self.assertTrue(response["isError"])
+                self.assertIn("dry_run must be a boolean", response["content"][0]["text"])
+            self.assertEqual(self.store.get_task(contract.task_id), blocked)
+            self.assertEqual(self.store.read_events(task_id=contract.task_id), before_events)
+
         resumed = json.loads(
             self.call(
                 "workbench_control_task",
@@ -570,6 +589,19 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(resumed["action"], "retry-blocked")
         self.assertEqual(resumed["task"]["state"], "queued")
         self.assertEqual(resumed["next_attempt"], 2)
+
+    def test_unsupported_control_dry_run_does_not_queue(self) -> None:
+        self._create_list_task("unsupported-dry-run")
+        before = self.store.get_task("unsupported-dry-run")
+        events = self.store.read_events(task_id="unsupported-dry-run")
+        response = self.call("workbench_control_task", {
+            "task_id": "unsupported-dry-run", "action": "queue",
+            "expected_revision": before["state_revision"], "dry_run": True,
+        })
+        self.assertTrue(response["isError"])
+        self.assertIn("dry_run is not supported", response["content"][0]["text"])
+        self.assertEqual(self.store.get_task("unsupported-dry-run"), before)
+        self.assertEqual(self.store.read_events(task_id="unsupported-dry-run"), events)
 
     def test_harness_health_requires_real_skill_and_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
