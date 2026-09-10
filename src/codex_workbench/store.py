@@ -50,6 +50,7 @@ from .delivery_lifecycle import (
 from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
+    inspect_indeterminate_source_delta,
     partition_recovery_paths,
 )
 from .execution_attribution import ExecutionAttribution
@@ -4319,6 +4320,8 @@ class WorkbenchStore:
         authorization_revision: int,
         source_result_json: str | None = None,
         source_only_ignored: bool = False,
+        source_only_extraction: bool = False,
+        source_delta_sha256: str | None = None,
     ) -> dict[str, Any] | None:
         """Build a filesystem-free retry binding for one failed allocation.
 
@@ -4430,6 +4433,24 @@ class WorkbenchStore:
         }
         if source_only_ignored:
             source["source_only_ignored"] = True
+        if source_only_extraction:
+            if not source_only_ignored:
+                raise StateConflictError(
+                    "source-only extraction requires ignored-source retention"
+                )
+            if (
+                not isinstance(source_delta_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_delta_sha256) is None
+            ):
+                raise StateConflictError(
+                    "source-only extraction requires a verified source delta digest"
+                )
+            source["source_only_extraction"] = True
+            source["source_delta_sha256"] = source_delta_sha256
+        elif source_delta_sha256 is not None:
+            raise StateConflictError(
+                "source delta digest is only valid for source-only extraction"
+            )
         return {
             "schema_version": 1,
             "kind": _FAILED_ATTEMPT_RECOVERY_KIND,
@@ -6714,6 +6735,117 @@ class WorkbenchStore:
             "retrospective_compliance_claimed": False,
         }
 
+    def _indeterminate_local_recovery_durable_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+    ) -> dict[str, Any]:
+        """Read the durable inputs that must not drift during source inspection."""
+
+        candidate = self._indeterminate_local_recovery_candidate(
+            connection,
+            task_id,
+            node_id,
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+        )
+        task = connection.execute(
+            "SELECT contract_json FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        node = connection.execute(
+            "SELECT spec_json, result_json FROM nodes WHERE task_id = ? AND node_id = ?",
+            (task_id, node_id),
+        ).fetchone()
+        allocation = connection.execute(
+            """
+            SELECT allocation_id, state, repository, base_sha, branch, current_path, attempt
+            FROM worktree_allocations WHERE allocation_id = ?
+            """,
+            (candidate["allocation_id"],),
+        ).fetchone()
+        if task is None or node is None or allocation is None:
+            raise StateConflictError("indeterminate local recovery durable state is incomplete")
+        if not isinstance(node["result_json"], str) or not node["result_json"]:
+            raise StateConflictError(
+                "indeterminate local recovery has no historical result to preserve"
+            )
+        return {
+            "candidate": candidate,
+            "contract_json": str(task["contract_json"]),
+            "spec_json": str(node["spec_json"]),
+            "historical_result_json": str(node["result_json"]),
+            "allocation": {
+                "allocation_id": str(allocation["allocation_id"]),
+                "state": str(allocation["state"]),
+                "repository": str(allocation["repository"]),
+                "base_sha": str(allocation["base_sha"]),
+                "branch": str(allocation["branch"]),
+                "current_path": str(allocation["current_path"]),
+                "attempt": int(allocation["attempt"]),
+            },
+        }
+
+    def _prepare_source_only_indeterminate_recovery(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        dependency_input_ref: str | None,
+        observed_changed_paths: tuple[str, ...],
+        expected_source_delta_sha256: str | None,
+    ) -> tuple[dict[str, Any], str]:
+        """Verify a live source delta outside the SQLite write transaction."""
+
+        with self.connection() as connection:
+            before = self._indeterminate_local_recovery_durable_snapshot(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+        candidate = before["candidate"]
+        assert isinstance(candidate, dict)
+        self._require_indeterminate_local_recovery_dependency_input(
+            candidate,
+            dependency_input_ref,
+        )
+        delta = inspect_indeterminate_source_delta(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+        )
+        if delta.changed_paths != observed_changed_paths:
+            raise StateConflictError(
+                "observed_changed_paths do not match the verified source-only delta"
+            )
+        if (
+            expected_source_delta_sha256 is not None
+            and expected_source_delta_sha256 != delta.sha256
+        ):
+            raise StateConflictError(
+                "expected_source_delta_sha256 does not match the verified source-only delta"
+            )
+        with self.connection() as connection:
+            after = self._indeterminate_local_recovery_durable_snapshot(
+                connection,
+                task_id,
+                node_id,
+                expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
+            )
+        if canonical_json(before) != canonical_json(after):
+            raise StateConflictError(
+                "source-only recovery durable state changed during source inspection"
+            )
+        return after, delta.sha256
+
     def queue_indeterminate_local_recovery(
         self,
         task_id: str,
@@ -6723,28 +6855,27 @@ class WorkbenchStore:
         expected_attempt: int,
         reason: str,
         confirm_old_executor_ended: bool,
-        confirm_effects_restricted_to_owned_files: bool,
+        confirm_effects_restricted_to_owned_files: bool = False,
         observed_changed_paths: tuple[str, ...],
         observed_generated_residue_paths: tuple[str, ...] = (),
         dependency_input_ref: str | None = None,
         source_only: bool = False,
         confirm_preserve_unknown_ignored: bool = False,
+        confirm_source_only_extraction: bool = False,
+        expected_source_delta_sha256: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Authorize one indeterminate node's own worktree for capture-and-retry.
 
-        The caller must already have proven, outside SQLite, that the
-        previous executor process ended and that ``observed_changed_paths``
-        is the exact and complete tracked/untracked change set of the owned
-        worktree before asserting the two confirmation flags; this method
-        performs no filesystem or Git inspection itself. Authorization
-        reuses the identical ``failed-attempt-worktree-recovery`` binding,
-        capture, and pre-dispatch restoration path already used for
-        retryable failed workers: the coordinator captures this worktree's
-        patch, prepares a fresh target worktree, restores the patch there,
-        and only then assigns and dispatches -- the indeterminate source
-        worktree itself is never reused as a dispatch target and is
-        superseded once the new attempt is assigned.
+        Strict recovery records the operator's assertion that prior effects
+        were confined to owned files. Source-only extraction intentionally
+        makes no historical-effects assertion: it requires a separate
+        extraction confirmation, preserves ignored source residue, and
+        independently verifies the live tracked/untracked delta outside the
+        SQLite write transaction. Both routes reuse the existing
+        ``failed-attempt-worktree-recovery`` capture and fresh-target restore
+        path. The indeterminate source worktree is never reused as a dispatch
+        target and is superseded once the new attempt is assigned.
 
         A node with ``depends_on`` cannot reproduce accepted-ancestor
         lineage from a fabricated crash receipt, so its own recorded
@@ -6758,27 +6889,66 @@ class WorkbenchStore:
         reason = reason.strip()
         if not reason:
             raise ValueError("local indeterminate recovery reason must be non-empty")
-        if confirm_old_executor_ended is not True:
-            raise ValueError(
-                "local indeterminate recovery requires an explicit assertion that the old executor ended"
-            )
-        if confirm_effects_restricted_to_owned_files is not True:
-            raise ValueError(
-                "local indeterminate recovery requires an explicit assertion that effects are "
-                "restricted to owned files"
-            )
         if type(source_only) is not bool:
             raise ValueError("source_only must be a boolean")
+        if type(confirm_old_executor_ended) is not bool:
+            raise ValueError("confirm_old_executor_ended must be a boolean")
+        if type(confirm_effects_restricted_to_owned_files) is not bool:
+            raise ValueError("confirm_effects_restricted_to_owned_files must be a boolean")
         if type(confirm_preserve_unknown_ignored) is not bool:
             raise ValueError("confirm_preserve_unknown_ignored must be a boolean")
-        if source_only and confirm_preserve_unknown_ignored is not True:
-            raise ValueError(
-                "source-only recovery requires explicit confirmation that unknown ignored files stay in the source worktree"
-            )
-        if not source_only and confirm_preserve_unknown_ignored:
-            raise ValueError(
-                "unknown ignored-file preservation is only available in source-only recovery"
-            )
+        if type(confirm_source_only_extraction) is not bool:
+            raise ValueError("confirm_source_only_extraction must be a boolean")
+        if type(dry_run) is not bool:
+            raise ValueError("dry_run must be a boolean")
+        if expected_source_delta_sha256 is not None and (
+            not isinstance(expected_source_delta_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
+            raise ValueError("expected_source_delta_sha256 must be a lowercase SHA-256 digest")
+        if source_only:
+            if confirm_old_executor_ended is not True:
+                raise ValueError(
+                    "source-only recovery requires an explicit assertion that the old executor ended"
+                )
+            if confirm_effects_restricted_to_owned_files:
+                raise ValueError(
+                    "source-only recovery must not assert historical effects were restricted to owned files"
+                )
+            if confirm_preserve_unknown_ignored is not True:
+                raise ValueError(
+                    "source-only recovery requires explicit confirmation that unknown ignored files stay in the source worktree"
+                )
+            if confirm_source_only_extraction is not True:
+                raise ValueError(
+                    "source-only recovery requires explicit confirm_source_only_extraction=true"
+                )
+            if not dry_run and expected_source_delta_sha256 is None:
+                raise ValueError(
+                    "source-only recovery apply requires expected_source_delta_sha256 from its dry-run"
+                )
+        else:
+            if confirm_old_executor_ended is not True:
+                raise ValueError(
+                    "local indeterminate recovery requires an explicit assertion that the old executor ended"
+                )
+            if confirm_effects_restricted_to_owned_files is not True:
+                raise ValueError(
+                    "local indeterminate recovery requires an explicit assertion that effects are "
+                    "restricted to owned files"
+                )
+            if confirm_preserve_unknown_ignored:
+                raise ValueError(
+                    "unknown ignored-file preservation is only available in source-only recovery"
+                )
+            if confirm_source_only_extraction:
+                raise ValueError(
+                    "confirm_source_only_extraction is only available in source-only recovery"
+                )
+            if expected_source_delta_sha256 is not None:
+                raise ValueError(
+                    "expected_source_delta_sha256 is only available in source-only recovery"
+                )
         try:
             raw_changed_paths = tuple(observed_changed_paths)
             raw_generated_residue_paths = tuple(observed_generated_residue_paths)
@@ -6798,6 +6968,21 @@ class WorkbenchStore:
             not isinstance(dependency_input_ref, str) or not dependency_input_ref
         ):
             raise ValueError("dependency_input_ref must be a non-empty artifact reference")
+
+        source_only_snapshot: dict[str, Any] | None = None
+        source_delta_sha256: str | None = None
+        if source_only:
+            source_only_snapshot, source_delta_sha256 = (
+                self._prepare_source_only_indeterminate_recovery(
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                    dependency_input_ref=dependency_input_ref,
+                    observed_changed_paths=changed_paths,
+                    expected_source_delta_sha256=expected_source_delta_sha256,
+                )
+            )
 
         # ``changed_paths`` excludes ignored generated residue by design, but
         # the shared failed-attempt authorization derives its separate residue
@@ -6822,13 +7007,29 @@ class WorkbenchStore:
 
         if dry_run:
             with self.connection() as connection:
-                candidate = self._indeterminate_local_recovery_candidate(
-                    connection,
-                    task_id,
-                    node_id,
-                    expected_revision=expected_revision,
-                    expected_attempt=expected_attempt,
-                )
+                if source_only:
+                    assert source_only_snapshot is not None
+                    current_snapshot = self._indeterminate_local_recovery_durable_snapshot(
+                        connection,
+                        task_id,
+                        node_id,
+                        expected_revision=expected_revision,
+                        expected_attempt=expected_attempt,
+                    )
+                    if canonical_json(current_snapshot) != canonical_json(source_only_snapshot):
+                        raise StateConflictError(
+                            "source-only recovery durable state changed before dry-run response"
+                        )
+                    candidate = current_snapshot["candidate"]
+                    assert isinstance(candidate, dict)
+                else:
+                    candidate = self._indeterminate_local_recovery_candidate(
+                        connection,
+                        task_id,
+                        node_id,
+                        expected_revision=expected_revision,
+                        expected_attempt=expected_attempt,
+                    )
                 self._require_indeterminate_local_recovery_dependency_input(
                     candidate, dependency_input_ref
                 )
@@ -6843,6 +7044,8 @@ class WorkbenchStore:
                     authorization_revision=expected_revision + 1,
                     source_result_json=source_result_json,
                     source_only_ignored=source_only,
+                    source_only_extraction=source_only,
+                    source_delta_sha256=source_delta_sha256,
                 )
             if authorization is None or authorization["source"]["generated_residue_paths"] != list(
                 generated_residue_paths
@@ -6860,6 +7063,14 @@ class WorkbenchStore:
                 "operator_asserted": True,
                 "automatically_verified": False,
                 "source_only": source_only,
+                **({
+                    "recovery_authorization": "source_only_extraction",
+                    "source_delta_sha256": source_delta_sha256,
+                    "historical_effects": "unknown",
+                    "historical_result_unchanged": True,
+                    "retrospective_compliance_claimed": False,
+                    "external_replay_authorized": False,
+                } if source_only else {}),
             }
 
         # Preflight outside the write transaction, mirroring
@@ -6868,13 +7079,29 @@ class WorkbenchStore:
         # the lock, so no additional filesystem or subprocess IO ever runs
         # while SQLite's write lock is held.
         with self.connection() as connection:
-            candidate = self._indeterminate_local_recovery_candidate(
-                connection,
-                task_id,
-                node_id,
-                expected_revision=expected_revision,
-                expected_attempt=expected_attempt,
-            )
+            if source_only:
+                assert source_only_snapshot is not None
+                current_snapshot = self._indeterminate_local_recovery_durable_snapshot(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                if canonical_json(current_snapshot) != canonical_json(source_only_snapshot):
+                    raise StateConflictError(
+                        "source-only recovery durable state changed before authorization"
+                    )
+                candidate = current_snapshot["candidate"]
+                assert isinstance(candidate, dict)
+            else:
+                candidate = self._indeterminate_local_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
             self._require_indeterminate_local_recovery_dependency_input(
                 candidate, dependency_input_ref
             )
@@ -6889,6 +7116,8 @@ class WorkbenchStore:
                 authorization_revision=expected_revision + 1,
                 source_result_json=source_result_json,
                 source_only_ignored=source_only,
+                source_only_extraction=source_only,
+                source_delta_sha256=source_delta_sha256,
             )
         if preflight_authorization is None:
             raise StateConflictError(
@@ -6897,13 +7126,42 @@ class WorkbenchStore:
 
         timestamp = now_iso()
         with self.transaction() as connection:
-            candidate = self._indeterminate_local_recovery_candidate(
-                connection,
-                task_id,
-                node_id,
-                expected_revision=expected_revision,
-                expected_attempt=expected_attempt,
-            )
+            historical_result: dict[str, Any] | None = None
+            if source_only:
+                assert source_only_snapshot is not None
+                current_snapshot = self._indeterminate_local_recovery_durable_snapshot(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
+                if canonical_json(current_snapshot) != canonical_json(source_only_snapshot):
+                    raise StateConflictError(
+                        "source-only recovery durable state changed before commit"
+                    )
+                candidate = current_snapshot["candidate"]
+                assert isinstance(candidate, dict)
+                try:
+                    historical_result = json.loads(
+                        str(current_snapshot["historical_result_json"])
+                    )
+                except json.JSONDecodeError as error:
+                    raise StateConflictError(
+                        "source-only recovery historical result is invalid JSON"
+                    ) from error
+                if not isinstance(historical_result, dict):
+                    raise StateConflictError(
+                        "source-only recovery historical result is invalid"
+                    )
+            else:
+                candidate = self._indeterminate_local_recovery_candidate(
+                    connection,
+                    task_id,
+                    node_id,
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                )
             self._require_indeterminate_local_recovery_dependency_input(
                 candidate, dependency_input_ref
             )
@@ -6919,6 +7177,8 @@ class WorkbenchStore:
                 authorization_revision=revision,
                 source_result_json=source_result_json,
                 source_only_ignored=source_only,
+                source_only_extraction=source_only,
+                source_delta_sha256=source_delta_sha256,
             )
             if authorization is None:
                 raise StateConflictError(
@@ -7008,27 +7268,49 @@ class WorkbenchStore:
             ).rowcount
             if changed_task != 1:
                 raise StateConflictError("local indeterminate recovery task compare-and-set failed")
+            queue_event: dict[str, Any] = {
+                "attempt": expected_attempt,
+                "next_attempt": expected_attempt + 1,
+                "worktree": candidate["node"]["worktree"],
+                "allocation_id": candidate["allocation_id"],
+                "reason": reason,
+                "expected_changed_paths": list(changed_paths),
+                "source_only_ignored": source_only,
+                "task_revision": revision,
+            }
+            if source_only:
+                assert source_delta_sha256 is not None
+                assert historical_result is not None
+                queue_event.update({
+                    "recovery_authorization": "source_only_extraction",
+                    "source_delta_sha256": source_delta_sha256,
+                    "historical_effects": "unknown",
+                    "historical_result": historical_result,
+                    "synthetic_source_result": synthetic_result,
+                    "source_result_role": "synthetic_recovery_evidence",
+                    "operator_assertion": {
+                        "confirm_old_executor_ended": True,
+                        "confirm_preserve_unknown_ignored": True,
+                        "confirm_source_only_extraction": True,
+                        "assertion": "operator_asserted",
+                        "automatically_verified": False,
+                        "retrospective_compliance_claimed": False,
+                        "external_replay_authorized": False,
+                    },
+                })
+            else:
+                queue_event["operator_assertion"] = {
+                    "confirm_old_executor_ended": True,
+                    "confirm_effects_restricted_to_owned_files": True,
+                    "assertion": "operator_asserted",
+                    "automatically_verified": False,
+                }
             authorization_cursor = self._event(
                 connection,
                 "node.indeterminate_local_recovery_queued",
                 task_id,
                 node_id,
-                {
-                    "attempt": expected_attempt,
-                    "next_attempt": expected_attempt + 1,
-                    "worktree": candidate["node"]["worktree"],
-                    "allocation_id": candidate["allocation_id"],
-                    "reason": reason,
-                    "expected_changed_paths": list(changed_paths),
-                    "source_only_ignored": source_only,
-                    "operator_assertion": {
-                        "confirm_old_executor_ended": True,
-                        "confirm_effects_restricted_to_owned_files": True,
-                        "assertion": "operator_asserted",
-                        "automatically_verified": False,
-                    },
-                    "task_revision": revision,
-                },
+                queue_event,
                 created_at=timestamp,
             )
             self._event(
@@ -7069,6 +7351,14 @@ class WorkbenchStore:
                 "source_only": source_only,
                 "ignored_source_retained": source_only,
                 "authorization_event_cursor": authorization_cursor,
+                **({
+                    "recovery_authorization": "source_only_extraction",
+                    "source_delta_sha256": source_delta_sha256,
+                    "historical_effects": "unknown",
+                    "historical_result_unchanged": True,
+                    "retrospective_compliance_claimed": False,
+                    "external_replay_authorized": False,
+                } if source_only else {}),
             }
 
     @staticmethod
@@ -8883,6 +9173,8 @@ class WorkbenchStore:
         allowed_source_fields = source_fields | {
             "generated_residue_paths",
             "source_only_ignored",
+            "source_only_extraction",
+            "source_delta_sha256",
         }
         if (
             not isinstance(source, dict)
@@ -8920,6 +9212,25 @@ class WorkbenchStore:
             "source_only_ignored"
         ) is not True:
             raise StateConflictError("failed-attempt recovery source-only flag is invalid")
+        source_only_extraction = source.get("source_only_extraction", False)
+        if source_only_extraction is not False and source_only_extraction is not True:
+            raise StateConflictError(
+                "failed-attempt recovery source-only extraction flag is invalid"
+            )
+        source_delta_sha256 = source.get("source_delta_sha256")
+        if source_only_extraction is True:
+            if (
+                source.get("source_only_ignored") is not True
+                or not isinstance(source_delta_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_delta_sha256) is None
+            ):
+                raise StateConflictError(
+                    "failed-attempt recovery source-only extraction receipt is invalid"
+                )
+        elif source_delta_sha256 is not None:
+            raise StateConflictError(
+                "failed-attempt recovery source delta digest is invalid"
+            )
         binding: dict[str, Any] = {
             "state": state,
             "authorization_revision": int(authorization["authorization_revision"]),

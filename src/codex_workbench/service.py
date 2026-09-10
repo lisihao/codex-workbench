@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import threading
@@ -30,6 +31,7 @@ from .dirty_worktree_recovery import (
     DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
     PnpmOfflineMaterializer,
+    inspect_recovery_source_delta,
     partition_recovery_paths,
     summarize_recovery_paths,
 )
@@ -2131,6 +2133,8 @@ class Coordinator:
         expected_paths = source.get("changed_paths")
         expected_generated_residue_paths = source.get("generated_residue_paths", [])
         source_only = source.get("source_only_ignored", False)
+        source_only_extraction = source.get("source_only_extraction", False)
+        source_delta_sha256 = source.get("source_delta_sha256")
         if not (
             isinstance(source_worktree, str)
             and isinstance(source_branch, str)
@@ -2143,8 +2147,22 @@ class Coordinator:
                 for path in expected_generated_residue_paths
             )
             and isinstance(source_only, bool)
+            and isinstance(source_only_extraction, bool)
         ):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery source is invalid")
+        if source_only_extraction:
+            if (
+                source_only is not True
+                or not isinstance(source_delta_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_delta_sha256) is None
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt recovery source-only extraction digest is invalid"
+                )
+        elif source_delta_sha256 is not None:
+            raise DirtyWorktreeRecoveryError(
+                "failed-attempt recovery source delta is invalid"
+            )
         if source_base != contract["base_sha"]:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt recovery source base does not match the task contract"
@@ -2231,15 +2249,53 @@ class Coordinator:
                 "failed-attempt-base-input.json",
             )
 
-        actual_paths = tuple(
-            sorted(changed_paths_since_input_tree(source_path, dependency_input.input_tree_sha))
-        )
         expected = tuple(expected_paths)
-        if actual_paths != expected:
-            raise DirtyWorktreeRecoveryError(
-                "failed-attempt source changes drifted from its result receipt"
+
+        def validate_source_paths(paths: tuple[str, ...]) -> None:
+            if paths != expected:
+                raise DirtyWorktreeRecoveryError(
+                    "failed-attempt source changes drifted from its result receipt"
+                )
+            self._validate_failed_attempt_recovery_scope(contract, spec, paths)
+
+        source_delta = (
+            inspect_recovery_source_delta(
+                source_path,
+                dependency_input.input_tree_sha,
+                validate_paths=validate_source_paths,
             )
-        self._validate_failed_attempt_recovery_scope(contract, spec, actual_paths)
+            if source_only_extraction
+            else None
+        )
+        if source_delta is not None:
+            if source_delta.sha256 != source_delta_sha256:
+                raise DirtyWorktreeRecoveryError(
+                    "source-only recovery source delta drifted before target preparation"
+                )
+            actual_paths = source_delta.changed_paths
+        else:
+            actual_paths = tuple(
+                sorted(
+                    changed_paths_since_input_tree(
+                        source_path,
+                        dependency_input.input_tree_sha,
+                    )
+                )
+            )
+            validate_source_paths(actual_paths)
+
+        def assert_source_delta_current(phase: str) -> None:
+            if not source_only_extraction:
+                return
+            current_delta = inspect_recovery_source_delta(
+                source_path,
+                dependency_input.input_tree_sha,
+                validate_paths=validate_source_paths,
+            )
+            if current_delta.sha256 != source_delta_sha256:
+                raise DirtyWorktreeRecoveryError(
+                    "source-only recovery source delta drifted " + phase
+                )
 
         target_attempt = int(claimed["attempt"])
         target = self.worktrees.prepare_clean(
@@ -2278,8 +2334,15 @@ class Coordinator:
                     raise DirtyWorktreeRecoveryError(
                         "failed-attempt recovery input lineage changed before retry"
                     )
-                if tuple(
-                    sorted(changed_paths_since_input_tree(source_path, dependency_input.input_tree_sha))
+                if source_only_extraction:
+                    assert_source_delta_current("while its clean retry was being prepared")
+                elif tuple(
+                    sorted(
+                        changed_paths_since_input_tree(
+                            source_path,
+                            dependency_input.input_tree_sha,
+                        )
+                    )
                 ) != expected:
                     raise DirtyWorktreeRecoveryError(
                         "failed-attempt source changed while its clean retry was being prepared"
@@ -2291,6 +2354,7 @@ class Coordinator:
                         timeout_seconds=int(contract["timeout_seconds"]),
                         require_cached_template=True,
                     )
+                assert_source_delta_current("before clean retry assignment")
                 self.store.assign_failed_attempt_recovery_worktree(
                     claimed["task_id"],
                     claimed["node_id"],
@@ -2340,6 +2404,9 @@ class Coordinator:
                     expected_generated_residue_paths
                 ),
                 source_only=source_only,
+                expected_source_delta_sha256=(
+                    source_delta_sha256 if source_only_extraction else None
+                ),
             )
             recovered_paths = tuple(recovery.get("changed_paths", ()))
             if recovered_paths != actual_paths:
@@ -2382,6 +2449,7 @@ class Coordinator:
                     timeout_seconds=int(contract["timeout_seconds"]),
                     require_cached_template=True,
                 )
+            assert_source_delta_current("before retry assignment")
             self.store.assign_failed_attempt_recovery_worktree(
                 claimed["task_id"],
                 claimed["node_id"],

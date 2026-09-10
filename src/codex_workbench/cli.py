@@ -720,6 +720,8 @@ def command_task(args: argparse.Namespace) -> int:
             dependency_input_ref=args.dependency_input_ref,
             source_only=bool(args.source_only),
             confirm_preserve_unknown_ignored=bool(args.confirm_preserve_unknown_ignored),
+            confirm_source_only_extraction=bool(args.confirm_source_only_extraction),
+            expected_source_delta_sha256=args.expected_source_delta_sha256,
             dry_run=bool(args.dry_run),
         )
         result = {
@@ -1902,8 +1904,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_indeterminate_locally.add_argument(
         "--confirm-effects-restricted-to-owned-files",
         action="store_true",
-        required=True,
-        help="assert that every observed change is confined to this node's own worktree",
+        help="strict mode only: assert that effects are confined to this node's owned files",
     )
     resolve_indeterminate_locally.add_argument(
         "--dependency-input-ref",
@@ -1918,6 +1919,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-preserve-unknown-ignored",
         action="store_true",
         help="explicitly retain unknown ignored paths in the source-only source worktree",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--confirm-source-only-extraction",
+        action="store_true",
+        help="authorize verified source extraction and local-only continuation; historical effects remain unknown",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--expected-source-delta-sha256",
+        help="source-only apply: bind extraction to the source_delta_sha256 returned by dry-run",
     )
     resolve_indeterminate_locally.add_argument("--dry-run", action="store_true")
     reconcile_archify = task_sub.add_parser("reconcile-archify")

@@ -625,7 +625,8 @@ class APITests(unittest.TestCase):
                     (flag, value)
                     for flag in ("dry_run", "source_only", "confirm_preserve_unknown_ignored",
                                  "scope_pattern", "exact_path", "expected_file_sha256",
-                                 "confirm_scope_normalization")
+                                 "confirm_scope_normalization", "confirm_source_only_extraction",
+                                 "expected_source_delta_sha256")
                     for value in (True, "true", 1)
                 ):
                     payload = {

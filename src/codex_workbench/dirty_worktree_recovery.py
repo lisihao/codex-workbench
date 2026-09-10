@@ -47,6 +47,39 @@ _RECOVERY_ERROR_PATH_CHARS = 80
 _RECOVERY_ERROR_SUMMARY_CHARS = 768
 
 
+@dataclass(frozen=True)
+class SourceDeltaEntry:
+    """One verified tracked or untracked file in a recoverable source delta."""
+
+    path: str
+    kind: str
+    deleted: bool
+    mode: str | None
+    content_sha256: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the canonical digest fields for this source file."""
+
+        return {
+            "path": self.path,
+            "kind": self.kind,
+            "deleted": self.deleted,
+            "mode": self.mode,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class SourceDelta:
+    """A twice-read, content-bound delta from one immutable input tree."""
+
+    comparison_tree: str
+    changed_paths: tuple[str, ...]
+    untracked_paths: tuple[str, ...]
+    entries: tuple[SourceDeltaEntry, ...]
+    sha256: str
+
+
 def summarize_recovery_paths(paths: tuple[str, ...]) -> str:
     """Return a count and bounded escaped sample of recovery paths for an error."""
 
@@ -136,6 +169,319 @@ def validate_recovery_source_path(worktree: Path, relative_path: str) -> None:
         raise DirtyWorktreeRecoveryError(
             f"recovery source path escapes its worktree: {relative_path}"
         ) from error
+
+
+def _source_delta_json(
+    comparison_tree: str,
+    entries: tuple[SourceDeltaEntry, ...],
+) -> bytes:
+    """Serialize only the input tree and verified source-delta entries for hashing."""
+
+    return json.dumps(
+        {
+            "comparison_tree": comparison_tree,
+            "entries": [entry.to_dict() for entry in entries],
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _read_source_delta_file(worktree: Path, relative_path: str) -> tuple[str, str]:
+    """Read one regular source file twice enough to reject a concurrent rewrite."""
+
+    validate_recovery_source_path(worktree, relative_path)
+    candidate = worktree / relative_path
+    try:
+        before = candidate.lstat()
+        payload = candidate.read_bytes()
+        after = candidate.lstat()
+    except FileNotFoundError as error:
+        raise DirtyWorktreeRecoveryError(
+            f"source delta path disappeared while it was inspected: {relative_path}"
+        ) from error
+    except OSError as error:
+        raise DirtyWorktreeRecoveryError(
+            f"source delta path cannot be read: {relative_path}"
+        ) from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise DirtyWorktreeRecoveryError(
+            f"source delta path must be a regular non-symlink file: {relative_path}"
+        )
+    before_identity = (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_size),
+        int(before.st_mtime_ns),
+        stat.S_IMODE(before.st_mode),
+    )
+    after_identity = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        stat.S_IMODE(after.st_mode),
+    )
+    if (
+        before_identity != after_identity
+        or stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+    ):
+        raise DirtyWorktreeRecoveryError(
+            f"source delta path changed while it was inspected: {relative_path}"
+        )
+    return f"{stat.S_IMODE(before.st_mode):04o}", sha256(payload).hexdigest()
+
+
+def _recovery_source_delta_paths(
+    worktree: Path,
+    comparison_tree: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """List the tracked/untracked delta without reading any source-file content."""
+
+    changed_paths = tuple(
+        sorted(changed_paths_since_input_tree(worktree, comparison_tree))
+    )
+    untracked_paths = DirtyWorktreeRecovery.untracked_paths(worktree)
+    untracked = set(untracked_paths)
+    if not untracked.issubset(changed_paths):
+        raise DirtyWorktreeRecoveryError(
+            "source delta untracked paths are missing from its change set"
+        )
+    return changed_paths, untracked_paths
+
+
+def _inspect_recovery_source_delta_once(
+    worktree: Path,
+    comparison_tree: str,
+    changed_paths: tuple[str, ...],
+    untracked_paths: tuple[str, ...],
+) -> SourceDelta:
+    """Hash one previously validated complete tracked/untracked delta snapshot."""
+
+    untracked = set(untracked_paths)
+    entries: list[SourceDeltaEntry] = []
+    for relative_path in changed_paths:
+        validate_recovery_source_path(worktree, relative_path)
+        candidate = worktree / relative_path
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            if relative_path in untracked:
+                raise DirtyWorktreeRecoveryError(
+                    "source delta untracked path disappeared while it was inspected: "
+                    + relative_path
+                )
+            entries.append(
+                SourceDeltaEntry(
+                    path=relative_path,
+                    kind="tracked",
+                    deleted=True,
+                    mode=None,
+                    content_sha256=None,
+                )
+            )
+            continue
+        except OSError as error:
+            raise DirtyWorktreeRecoveryError(
+                f"source delta path cannot be inspected: {relative_path}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise DirtyWorktreeRecoveryError(
+                f"source delta path must be a regular non-symlink file: {relative_path}"
+            )
+        mode, content_sha256 = _read_source_delta_file(worktree, relative_path)
+        entries.append(
+            SourceDeltaEntry(
+                path=relative_path,
+                kind="untracked" if relative_path in untracked else "tracked",
+                deleted=False,
+                mode=mode,
+                content_sha256=content_sha256,
+            )
+        )
+    canonical_entries = tuple(entries)
+    return SourceDelta(
+        comparison_tree=comparison_tree,
+        changed_paths=changed_paths,
+        untracked_paths=untracked_paths,
+        entries=canonical_entries,
+        sha256=sha256(_source_delta_json(comparison_tree, canonical_entries)).hexdigest(),
+    )
+
+
+def inspect_recovery_source_delta(
+    worktree: Path,
+    comparison_tree: str,
+    *,
+    validate_paths: Callable[[tuple[str, ...]], None] | None = None,
+) -> SourceDelta:
+    """Return a stable digest for the current recoverable delta, excluding ignored files.
+
+    The caller supplies the recorded input tree rather than an artifact
+    reference so the digest remains identical for root and dependent workers
+    that share the same materialized input. The entire path/content snapshot
+    is read twice; a path, deletion, executable-mode, or byte change between
+    reads is rejected instead of producing a race-prone digest.
+    """
+
+    root = worktree.resolve(strict=True)
+    resolved_tree = DirtyWorktreeRecovery._git_text(
+        root,
+        "rev-parse",
+        "--verify",
+        f"{comparison_tree}^{{tree}}",
+    )
+    first_paths, first_untracked = _recovery_source_delta_paths(root, resolved_tree)
+    if validate_paths is not None:
+        validate_paths(first_paths)
+    first = _inspect_recovery_source_delta_once(
+        root,
+        resolved_tree,
+        first_paths,
+        first_untracked,
+    )
+    second_paths, second_untracked = _recovery_source_delta_paths(root, resolved_tree)
+    if validate_paths is not None:
+        validate_paths(second_paths)
+    second = _inspect_recovery_source_delta_once(
+        root,
+        resolved_tree,
+        second_paths,
+        second_untracked,
+    )
+    if first != second:
+        raise DirtyWorktreeRecoveryError(
+            "source delta changed while it was inspected; rerun source-only recovery dry-run"
+        )
+    return second
+
+
+def _validate_recovery_common_git_directory(repository: str, worktree: Path) -> None:
+    """Require the source allocation and task repository to share Git metadata."""
+
+    repository_path = Path(repository).expanduser().resolve(strict=True)
+    repository_common = DirtyWorktreeRecovery._git_text(
+        repository_path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    worktree_common = DirtyWorktreeRecovery._git_text(
+        worktree,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    if repository_common != worktree_common:
+        raise DirtyWorktreeRecoveryError(
+            "source-only recovery source belongs to a different Git repository"
+        )
+
+
+def inspect_indeterminate_source_delta(
+    candidate: Mapping[str, Any],
+    *,
+    dependency_input_ref: str | None,
+    artifacts: ArtifactStore,
+) -> SourceDelta:
+    """Validate an indeterminate allocation and return its live source delta.
+
+    This read-only preflight checks process quiescence, the physical
+    repository/base/branch/common-Git binding, dependency input, task and node
+    scopes, and every source path before the store authorizes extraction.
+    """
+
+    task = candidate.get("task")
+    node = candidate.get("node")
+    if not isinstance(task, Mapping) or not isinstance(node, Mapping):
+        raise DirtyWorktreeRecoveryError("indeterminate source recovery candidate is invalid")
+    repository = task.get("repository")
+    base_sha = task.get("base_sha")
+    worktree = node.get("worktree")
+    branch = node.get("branch")
+    depends_on = node.get("depends_on")
+    if not all(
+        isinstance(value, str) and value
+        for value in (repository, base_sha, worktree, branch)
+    ):
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate source recovery candidate has invalid repository binding"
+        )
+    if not isinstance(depends_on, tuple) or not all(
+        isinstance(dependency, str) and dependency for dependency in depends_on
+    ):
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate source recovery candidate has invalid dependency metadata"
+        )
+    recovery = DirtyWorktreeRecovery(
+        artifacts,
+        WorktreeManager(artifacts.root.parent / "worktrees"),
+    )
+    source = recovery.validate_retry_source(
+        repository=repository,
+        base_sha=base_sha,
+        worktree=worktree,
+        branch=branch,
+    )
+    _validate_recovery_common_git_directory(repository, source)
+    try:
+        assert_recovery_source_idle(source)
+    except RecoveryProcessError as error:
+        raise DirtyWorktreeRecoveryError(
+            f"source-only recovery cannot prove the source worktree is idle: {error}"
+        ) from error
+    if depends_on and dependency_input_ref is None:
+        raise DirtyWorktreeRecoveryError(
+            "indeterminate node recovery requires the recorded dependency-input artifact"
+        )
+    if dependency_input_ref is not None:
+        dependency_input = load_recorded_dependency_input(
+            artifacts,
+            dependency_input_ref,
+            task_id=str(task.get("task_id", "")),
+            node_id=str(node.get("node_id", "")),
+            base_sha=base_sha,
+        )
+        comparison_tree = dependency_input.input_tree_sha
+    else:
+        comparison_tree = base_sha
+    allowed_scope = task.get("allowed_scope")
+    forbidden_scope = task.get("forbidden_scope")
+    write_scopes = node.get("write_scopes")
+    if not (
+        isinstance(allowed_scope, tuple)
+        and all(isinstance(scope, str) for scope in allowed_scope)
+        and isinstance(forbidden_scope, tuple)
+        and all(isinstance(scope, str) for scope in forbidden_scope)
+        and isinstance(write_scopes, tuple)
+        and all(isinstance(scope, str) for scope in write_scopes)
+    ):
+        raise DirtyWorktreeRecoveryError("indeterminate source recovery scopes are invalid")
+
+    def validate_paths(paths: tuple[str, ...]) -> None:
+        for relative_path in paths:
+            if not scope_allows(
+                relative_path,
+                list(allowed_scope),
+                list(forbidden_scope),
+            ):
+                raise DirtyWorktreeRecoveryError(
+                    "indeterminate node recovery path is outside task scope: "
+                    + relative_path
+                )
+            if not scope_allows(relative_path, list(write_scopes), []):
+                raise DirtyWorktreeRecoveryError(
+                    "indeterminate node recovery path is outside node write scope: "
+                    + relative_path
+                )
+
+    return inspect_recovery_source_delta(
+        source,
+        comparison_tree,
+        validate_paths=validate_paths,
+    )
 
 
 def observed_indeterminate_recovery_paths(
@@ -906,6 +1252,7 @@ class DirtyWorktreeRecovery:
         expected_generated_residue_paths: tuple[str, ...] = (),
         expected_checkpoint_sha: str | None = None,
         source_only: bool = False,
+        expected_source_delta_sha256: str | None = None,
     ) -> dict[str, object]:
         """Capture only the blocked worker's own patch.
 
@@ -971,11 +1318,40 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError(
                 "source-only recovery must not discard generated residue"
             )
-        changed_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
-        if changed_paths != reported_recoverable:
+        if expected_source_delta_sha256 is not None and (
+            not source_only
+            or not isinstance(expected_source_delta_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
             raise DirtyWorktreeRecoveryError(
-                "worktree changed paths do not match the blocked worker receipt"
+                "source-only recovery capture has an invalid source delta digest"
             )
+
+        def validate_expected_paths(paths: tuple[str, ...]) -> None:
+            if paths != reported_recoverable:
+                raise DirtyWorktreeRecoveryError(
+                    "worktree changed paths do not match the blocked worker receipt"
+                )
+
+        source_delta = (
+            inspect_recovery_source_delta(
+                path,
+                comparison_tree,
+                validate_paths=validate_expected_paths,
+            )
+            if expected_source_delta_sha256 is not None
+            else None
+        )
+        if source_delta is not None and source_delta.sha256 != expected_source_delta_sha256:
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery source delta drifted before patch capture"
+            )
+        changed_paths = (
+            source_delta.changed_paths
+            if source_delta is not None
+            else tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
+        )
+        validate_expected_paths(changed_paths)
         for relative_path in changed_paths:
             validate_recovery_source_path(path, relative_path)
         generated_residue_ref = (
@@ -1013,6 +1389,16 @@ class DirtyWorktreeRecovery:
         patch = self.captured_patch(path, comparison_tree, untracked_paths)
         if not patch:
             raise DirtyWorktreeRecoveryError("dirty worktree has no patch to preserve")
+        if expected_source_delta_sha256 is not None:
+            final_delta = inspect_recovery_source_delta(
+                path,
+                comparison_tree,
+                validate_paths=validate_expected_paths,
+            )
+            if final_delta.sha256 != expected_source_delta_sha256:
+                raise DirtyWorktreeRecoveryError(
+                    "source-only recovery source delta drifted during patch capture"
+                )
         patch_ref = self.artifacts.put_bytes(patch, "blocked-worktree.patch")
         # Recheck the explicit HEAD binding after filesystem capture, before sealing.
         self._validate_worktree(repository, base_sha, worktree, branch,
@@ -1897,14 +2283,23 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError("recovery worktree is outside the Workbench worktree root")
         if self._git_text(path, "rev-parse", "--show-toplevel") != str(path):
             raise DirtyWorktreeRecoveryError("recovery path is not a standalone Git worktree")
+        if self._git_text(
+            path,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ) != self._git_text(
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ):
+            raise DirtyWorktreeRecoveryError("recovery source belongs to another repository")
         base = self._git_text(repo, "rev-parse", f"{base_sha}^{{commit}}")
         expected_head = base
         if checkpoint_sha is not None:
             if not isinstance(checkpoint_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", checkpoint_sha):
                 raise DirtyWorktreeRecoveryError("checkpoint requires an exact full commit SHA")
-            common = self._git_text(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-            if common != self._git_text(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"):
-                raise DirtyWorktreeRecoveryError("checkpoint source belongs to another repository")
             if self._git_text(path, "merge-base", base, checkpoint_sha) != base:
                 raise DirtyWorktreeRecoveryError("checkpoint does not descend from the contract base")
             expected_head = checkpoint_sha

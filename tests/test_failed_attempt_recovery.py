@@ -18,6 +18,7 @@ from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.dirty_worktree_recovery import (
+    DirtyWorktreeRecovery,
     DirtyWorktreeRecoveryError,
     PnpmOfflineMaterializer,
     observed_indeterminate_recovery_paths,
@@ -1414,6 +1415,38 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         # These executor fixtures are in-process functions, not native workers.
         self.enterContext(isolated_process_catalog(()))
 
+    def _preview_source_only_recovery(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+        changed_paths: tuple[str, ...],
+        generated_residue_paths: tuple[str, ...],
+        dependency_input_ref: str | None = None,
+    ) -> str:
+        """Return the live source-only digest required by a later apply request."""
+
+        preview = self.store.queue_indeterminate_local_recovery(
+            task_id,
+            "worker",
+            expected_revision=expected_revision,
+            expected_attempt=expected_attempt,
+            reason=reason,
+            confirm_old_executor_ended=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        source_delta_sha256 = preview["source_delta_sha256"]
+        self.assertIsInstance(source_delta_sha256, str)
+        return source_delta_sha256
+
     def _indeterminate_owned_worktree_task(
         self,
         *,
@@ -1707,6 +1740,9 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         )
         self.assertEqual(changed_paths, ("src/continuation.txt", "src/value.txt"))
         self.assertEqual(generated_residue_paths, ())
+        historical_result = next(
+            node for node in task["nodes"] if node["node_id"] == "worker"
+        )["result"]
         with self.store.connection() as connection:
             database_before = tuple(connection.iterdump())
         artifact_bytes = tuple(
@@ -1727,9 +1763,10 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
                     "expected_attempt": 2,
                     "reason": "retain unknown ignored source files and recover only source changes",
                     "confirm_old_executor_ended": True,
-                    "confirm_effects_restricted_to_owned_files": True,
                     "dependency_input_ref": dependency_input_ref,
-                    "source_only": True, "confirm_preserve_unknown_ignored": True,
+                    "source_only": True,
+                    "confirm_preserve_unknown_ignored": True,
+                    "confirm_source_only_extraction": True,
                     "dry_run": True,
                 },
             },
@@ -1739,6 +1776,11 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         preview = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(preview["dry_run"])
         self.assertTrue(preview["source_only"])
+        self.assertRegex(preview["source_delta_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(preview["recovery_authorization"], "source_only_extraction")
+        self.assertEqual(preview["historical_effects"], "unknown")
+        self.assertFalse(preview["retrospective_compliance_claimed"])
+        self.assertFalse(preview["external_replay_authorized"])
         self.assertEqual(self.store.get_task(contract.task_id), task)
         with self.store.connection() as connection:
             self.assertEqual(tuple(connection.iterdump()), database_before)
@@ -1770,14 +1812,32 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             expected_attempt=2,
             reason="retain unknown ignored source files and recover only source changes",
             confirm_old_executor_ended=True,
-            confirm_effects_restricted_to_owned_files=True,
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             dependency_input_ref=dependency_input_ref,
             source_only=True,
             confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=preview["source_delta_sha256"],
         )
         self.assertTrue(queued["source_only"])
+        self.assertEqual(queued["recovery_authorization"], "source_only_extraction")
+        self.assertEqual(queued["historical_effects"], "unknown")
+        self.assertFalse(queued["retrospective_compliance_claimed"])
+        self.assertFalse(queued["external_replay_authorized"])
+        queued_event = next(
+            event
+            for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.indeterminate_local_recovery_queued"
+        )
+        queue_payload = queued_event["payload"]
+        self.assertEqual(queue_payload["historical_result"], historical_result)
+        self.assertEqual(queue_payload["source_result_role"], "synthetic_recovery_evidence")
+        self.assertEqual(queue_payload["historical_effects"], "unknown")
+        self.assertNotIn(
+            "confirm_effects_restricted_to_owned_files",
+            queue_payload["operator_assertion"],
+        )
         with self.assertRaisesRegex(StateConflictError, "retains this source worktree"):
             self.store.begin_worktree_quarantine(
                 source_allocation_id,
@@ -1849,6 +1909,14 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             source_only=True,
         )
         self.assertEqual(changed_paths, ("src/value.txt", "tests/root-new.py"))
+        source_delta_sha256 = self._preview_source_only_recovery(
+            contract.task_id,
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="recover root source files while retaining ignored residue",
+            changed_paths=changed_paths,
+            generated_residue_paths=generated_residue_paths,
+        )
         self.store.queue_indeterminate_local_recovery(
             contract.task_id,
             "worker",
@@ -1856,11 +1924,12 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             expected_attempt=1,
             reason="recover root source files while retaining ignored residue",
             confirm_old_executor_ended=True,
-            confirm_effects_restricted_to_owned_files=True,
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             source_only=True,
             confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=source_delta_sha256,
         )
         coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
         observed: dict[str, object] = {}
@@ -1922,6 +1991,14 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             artifacts=self.artifacts,
             source_only=True,
         )
+        source_delta_sha256 = self._preview_source_only_recovery(
+            contract.task_id,
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="materialize dependencies only in the fresh source-only target",
+            changed_paths=changed_paths,
+            generated_residue_paths=generated_residue_paths,
+        )
         self.store.queue_indeterminate_local_recovery(
             contract.task_id,
             "worker",
@@ -1929,11 +2006,12 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             expected_attempt=1,
             reason="materialize dependencies only in the fresh source-only target",
             confirm_old_executor_ended=True,
-            confirm_effects_restricted_to_owned_files=True,
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             source_only=True,
             confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=source_delta_sha256,
         )
         pnpm_store = self.root / "pnpm-store"
         pnpm_store.mkdir()
@@ -2061,6 +2139,15 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             artifacts=self.artifacts,
             source_only=True,
         )
+        source_delta_sha256 = self._preview_source_only_recovery(
+            contract.task_id,
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="retain source after cancellation",
+            changed_paths=changed_paths,
+            generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+        )
         self.store.queue_indeterminate_local_recovery(
             contract.task_id,
             "worker",
@@ -2068,12 +2155,13 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             expected_attempt=2,
             reason="retain source after cancellation",
             confirm_old_executor_ended=True,
-            confirm_effects_restricted_to_owned_files=True,
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             dependency_input_ref=dependency_input_ref,
             source_only=True,
             confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=source_delta_sha256,
         )
         with self.store.transaction() as connection:
             connection.execute(
@@ -2112,6 +2200,110 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
                 str(self.state_root / "quarantine" / candidate["allocation_id"]),
             )
 
+    def test_source_only_capture_rejects_digest_drift_during_patch_capture(self) -> None:
+        contract, source = self._indeterminate_root_worktree_task(
+            task_id="indeterminate-source-only-capture-drift"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=None,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        source_delta_sha256 = self._preview_source_only_recovery(
+            contract.task_id,
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="detect a source rewrite during patch capture",
+            changed_paths=changed_paths,
+            generated_residue_paths=generated_residue_paths,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="detect a source rewrite during patch capture",
+            confirm_old_executor_ended=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=source_delta_sha256,
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        original_capture = coordinator.failed_attempt_recovery.captured_patch
+
+        def capture_then_mutate(*args: object, **kwargs: object) -> bytes:
+            patch_bytes = original_capture(*args, **kwargs)
+            (source / "src" / "value.txt").write_bytes(b"changed-during-patch-capture")
+            return patch_bytes
+
+        try:
+            claimed = coordinator._claim_next_ready_node("source-only-capture-drift")
+            assert claimed is not None
+            with (
+                patch.object(
+                    coordinator.failed_attempt_recovery,
+                    "captured_patch",
+                    side_effect=capture_then_mutate,
+                ),
+                patch.object(
+                    coordinator,
+                    "_executor",
+                    side_effect=AssertionError("capture drift must not dispatch"),
+                ),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        rejected = self.store.get_task(contract.task_id)
+        node = next(item for item in rejected["nodes"] if item["node_id"] == "worker")
+        self.assertEqual(
+            (rejected["state"], node["state"], node["attempt"]),
+            ("needs_fix", "failed", 1),
+        )
+
+    def test_legacy_source_only_capture_without_a_digest_remains_supported(self) -> None:
+        contract, source = self._indeterminate_root_worktree_task(
+            task_id="indeterminate-source-only-legacy-capture"
+        )
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=None,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        recovery = DirtyWorktreeRecovery(self.artifacts, self.worktrees)
+        receipt = recovery.capture(
+            repository=contract.repository,
+            base_sha=contract.base_sha,
+            worktree=str(source),
+            branch=self.worktrees.branch_name(contract.task_id, "worker", 1),
+            attempt=1,
+            expected_changed_paths=changed_paths,
+            preserve_untracked_paths=recovery.untracked_paths(source),
+            expected_generated_residue_paths=generated_residue_paths,
+            source_only=True,
+        )
+        self.assertEqual(receipt["changed_paths"], list(changed_paths))
+        self.assertIn("patch_ref", receipt)
+
     def test_source_only_capture_rejects_a_tracked_path_replaced_by_a_symlink(self) -> None:
         contract, source, dependency_input_ref = self._indeterminate_owned_worktree_task(
             task_id="indeterminate-source-only-symlink"
@@ -2132,6 +2324,15 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             artifacts=self.artifacts,
             source_only=True,
         )
+        source_delta_sha256 = self._preview_source_only_recovery(
+            contract.task_id,
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="source-only symlink race must reject",
+            changed_paths=changed_paths,
+            generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+        )
         self.store.queue_indeterminate_local_recovery(
             contract.task_id,
             "worker",
@@ -2139,12 +2340,13 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
             expected_attempt=2,
             reason="source-only symlink race must reject",
             confirm_old_executor_ended=True,
-            confirm_effects_restricted_to_owned_files=True,
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             dependency_input_ref=dependency_input_ref,
             source_only=True,
             confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=source_delta_sha256,
         )
         value = source / "src" / "value.txt"
         value.unlink()
@@ -2259,17 +2461,44 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
                 confirm_effects_restricted_to_owned_files=False,
                 observed_changed_paths=("src/value.txt",),
             )
-        with self.assertRaisesRegex(ValueError, "requires explicit confirmation"):
+        with self.assertRaisesRegex(ValueError, "confirm_source_only_extraction"):
             self.store.queue_indeterminate_local_recovery(
                 contract.task_id,
                 "worker",
                 expected_revision=int(task["state_revision"]),
                 expected_attempt=2,
-                reason="missing ignored-file confirmation",
+                reason="missing source-only extraction authorization",
+                confirm_old_executor_ended=True,
+                observed_changed_paths=("src/value.txt",),
+                source_only=True,
+                confirm_preserve_unknown_ignored=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must not assert historical effects"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="old effects assertion is forbidden for source-only extraction",
                 confirm_old_executor_ended=True,
                 confirm_effects_restricted_to_owned_files=True,
                 observed_changed_paths=("src/value.txt",),
                 source_only=True,
+                confirm_preserve_unknown_ignored=True,
+                confirm_source_only_extraction=True,
+            )
+        with self.assertRaisesRegex(ValueError, "apply requires expected_source_delta_sha256"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="source-only apply needs a dry-run digest",
+                confirm_old_executor_ended=True,
+                observed_changed_paths=("src/value.txt",),
+                source_only=True,
+                confirm_preserve_unknown_ignored=True,
+                confirm_source_only_extraction=True,
             )
         unchanged = self.store.get_task(contract.task_id)
         self.assertEqual(unchanged, task)

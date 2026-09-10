@@ -82,12 +82,12 @@ MCP `resolve_indeterminate_locally` 动作（CLI `task resolve-indeterminate-loc
 
 1. `WorkbenchStore.indeterminate_local_recovery_candidate` 只读校验：任务必须仍处于 `needs_approval`，节点必须是 `indeterminate`、没有待处理的 `recovery_json`、拥有一个仍然 `active` 的物理 worktree allocation，且该 allocation 与任务合同的 repository/base_sha 一致。该合同还必须明确禁止 external write 与 destructive action；本恢复路径只适用于可由本地 worktree 证据覆盖的执行。
 2. `observed_indeterminate_recovery_paths`（`dirty_worktree_recovery.py`）在 SQLite 事务之外检查该 worktree：默认拒绝任何未知 ignored 路径、越出任务 `allowed_scope`/`forbidden_scope` 或节点 `write_scopes` 的路径、以及源码符号链接、父链逃逸或非常规文件；只返回可信的 tracked/untracked changed_paths 与 generated-residue 路径。
-3. 调用方必须显式声明 `confirm_old_executor_ended=true`（旧执行器进程已退出的证据，例如 `ps`/`pgrep` 核实）与 `confirm_effects_restricted_to_owned_files=true`（第 2 步已核实的范围结论）；这是记录在案的操作员断言，不是自动验证。
+3. 所有模式都要求 `confirm_old_executor_ended=true`。严格模式还要求 `confirm_effects_restricted_to_owned_files=true`；当前文件差异或进程结束本身不是完整历史副作用证明。source-only 模式使用下述源码提取授权，不要求或记录这个历史副作用断言。
 4. `WorkbenchStore.queue_indeterminate_local_recovery` 用观测到的 changed_paths 构造与失败 attempt 完全相同形状的 `capture_pending` 恢复绑定（`_failed_attempt_recovery_authorization`），把节点原子地转回 `pending` 并清空其 `worktree`，同时决定任何待处理的 `indeterminate_resolution` approval。
 5. 该节点重新排队后，协调器沿用既有的失败 attempt 续修流程：在新的干净 attempt 上捕获补丁、复原已记录的 dependency-input、核对范围与哈希，只有装配成功后才派发执行器；indeterminate 源 worktree 本身永不被复用为派发目标，assign 成功后其 allocation 转为 superseded。
 6. 若节点 `depends_on` 其他节点，调用方必须显式提供该节点原 attempt 记录的 `dependency-input` artifact ref（结算前已写入 ArtifactStore，即使进程随后崩溃也仍然存在），否则拒绝恢复，防止用未核实的祖先输入静默替换已验收的依赖。
 
-与 `resume-blocked-worktree`/`retry-blocked` 一样，`confirm_*` 字段是留痕断言而非自动核验；未知副作用、越权路径、哈希漂移或过期 revision/attempt 一律 fail closed。
+`confirm_*` 字段是留痕授权或断言，而非全历史自动核验。严格模式的历史副作用限制不变；source-only 只授权当前已验证源码的提取和原 local-only 合同内的续修，不授权未知外部操作重放。越权路径、哈希漂移或过期 revision/attempt 一律拒绝。
 
 ### 历史 glob 范围的显式规范化
 
@@ -101,7 +101,13 @@ MCP `resolve_indeterminate_locally` 动作（CLI `task resolve-indeterminate-loc
 
 ### Source-only ignored 留存模式
 
-默认严格模式不变。只有 MCP `resolve_indeterminate_locally` 或 CLI `task resolve-indeterminate-locally` 同时提交 `source_only=true`/`--source-only` 与 `confirm_preserve_unknown_ignored=true`/`--confirm-preserve-unknown-ignored` 时，才允许未知 ignored 内容留在原 source allocation。该模式不把 ignored 内容认定为合法产物：包括 `node_modules`、`.pnpm-store`、`lib` 和 `__pycache__` 在内的 ignored 路径均不删除、不写入 ArtifactStore、不进入 patch，也不复制到新 target；只恢复已通过 scope 和普通文件检查的 tracked 及普通 untracked 源码/测试文件。原 allocation 的授权事件持久保留 hold，取消、重启或 recovery binding 清理后仍不能自动回收或 quarantine。新的干净 Node target 只能克隆已验证的本地 pnpm linker 模板；模板缺失、失效或不匹配时恢复明确拒绝，绝不 seed 或执行安装，也绝不从 source 复制依赖树。source cwd 的同 UID 进程检查只是本地观察，不能替代 `confirm_old_executor_ended`，后者仍覆盖已 chdir 进程和外部副作用。HTTP control 明确拒绝这两个字段，不会将其静默当作 queue。
+MCP `resolve_indeterminate_locally` 或 CLI `task resolve-indeterminate-locally` 的 source-only 请求须显式提供 `source_only=true`、`confirm_source_only_extraction=true`、`confirm_preserve_unknown_ignored=true` 和 `confirm_old_executor_ended=true`（CLI 对应连字符选项）。这授权提取当前经过验证的 tracked/untracked delta 并在原合同内继续本地工作，不是宣称过去没有其他副作用。此模式拒绝 `confirm_effects_restricted_to_owned_files=true`；严格模式拒绝 source-only 专用授权和摘要字段。
+
+先用 `dry_run=true` 获取 `source_delta_sha256`；预检不修改任务、节点、事件、正式工件或源码。正式应用必须提交该摘要作为 `expected_source_delta_sha256`，并重新通过 revision/attempt、base/allocation、任务及节点范围、源空闲和普通文件/父链检查。摘要只覆盖已验证 delta 的路径、删除状态、文件模式及内容，不哈希 ignored 内容或整个仓库。排队后到捕获期间发生内容或路径漂移也拒绝恢复。正式应用会排队新的本地 attempt，不是单纯下载文件；合同必须仍明确禁止 external write 和 destructive action。
+
+回执及审计保留 `historical_effects=unknown`、`retrospective_compliance_claimed=false`、`external_replay_authorized=false`。原 indeterminate result 不被追认为成功或合规；恢复用 synthetic blocked 凭据只描述提取输入，不是旧执行结果。已知外部操作的状态和权限必须单独核对，不能用此字段允许重复执行。
+
+未知 ignored 内容原地留在 source allocation，包括 `node_modules`、`.pnpm-store`、`lib` 和 `__pycache__`；均不删除、不写入 ArtifactStore、不进入 patch，也不复制到新 target。这不把它们认定为合法产物。原 allocation 的授权事件持久保留 hold，取消、重启或 recovery binding 清理后仍不能自动回收或 quarantine。新的干净 Node target 只能克隆已验证的本地 pnpm linker 模板；模板缺失、失效或不匹配时明确拒绝，绝不 seed 或执行安装，也绝不从 source 复制依赖树。source cwd 的同 UID 进程检查只是本地观察，不能证明已 chdir 的旧子进程退出或外部副作用不存在。HTTP control 拒绝这些专用字段，不会将其静默当作 queue。
 
 ### 提供方响应故障后的重新准入
 

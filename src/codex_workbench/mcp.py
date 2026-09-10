@@ -245,6 +245,8 @@ TOOLS: list[dict[str, Any]] = [
                 "confirm_effects_restricted_to_owned_files": {"type": "boolean"},
                 "source_only": {"type": "boolean"},
                 "confirm_preserve_unknown_ignored": {"type": "boolean"},
+                "confirm_source_only_extraction": {"type": "boolean"},
+                "expected_source_delta_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "dependency_input_ref": {"type": "string"},
                 "scope_pattern": {"type": "string", "minLength": 1},
                 "exact_path": {"type": "string", "minLength": 1},
@@ -599,6 +601,15 @@ class WorkbenchMCPServer:
         confirm_preserve_unknown_ignored = self._optional_strict_boolean(
             arguments, "confirm_preserve_unknown_ignored"
         )
+        confirm_source_only_extraction = self._optional_strict_boolean(
+            arguments, "confirm_source_only_extraction"
+        )
+        expected_source_delta_sha256 = arguments.get("expected_source_delta_sha256")
+        if expected_source_delta_sha256 is not None and (
+            type(expected_source_delta_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_source_delta_sha256) is None
+        ):
+            raise ValueError("expected_source_delta_sha256 must be a lowercase SHA-256 digest")
         dependency_input_ref = arguments.get("dependency_input_ref")
         if dependency_input_ref is not None and type(dependency_input_ref) is not str:
             raise ValueError("dependency_input_ref must be a string")
@@ -629,6 +640,8 @@ class WorkbenchMCPServer:
             dependency_input_ref=dependency_input_ref,
             source_only=source_only,
             confirm_preserve_unknown_ignored=confirm_preserve_unknown_ignored,
+            confirm_source_only_extraction=confirm_source_only_extraction,
+            expected_source_delta_sha256=expected_source_delta_sha256,
             dry_run=dry_run,
         )
         return {
@@ -999,6 +1012,10 @@ class WorkbenchMCPServer:
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]
+            if action != "resolve_indeterminate_locally" and {
+                "confirm_source_only_extraction", "expected_source_delta_sha256",
+            }.intersection(arguments):
+                raise ValueError("source-only extraction fields are only supported by resolve_indeterminate_locally")
             expected_revision = self._required_expected_revision(arguments)
             dry_run = self._optional_strict_boolean(arguments, "dry_run")
             confirm_scope_normalization = self._optional_strict_boolean(
