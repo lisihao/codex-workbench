@@ -539,7 +539,7 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         untracked.symlink_to(source / "src" / "value.txt")
         worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
 
-        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "regular file inside"):
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "must not be a symlink"):
             self.store.capture_and_resume_blocked_worktree(
                 contract.task_id,
                 "worker",

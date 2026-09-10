@@ -241,6 +241,8 @@ TOOLS: list[dict[str, Any]] = [
                 "resolution": {"enum": ["retry", "fail", "cancel"]},
                 "confirm_old_executor_ended": {"type": "boolean"},
                 "confirm_effects_restricted_to_owned_files": {"type": "boolean"},
+                "source_only": {"type": "boolean"},
+                "confirm_preserve_unknown_ignored": {"type": "boolean"},
                 "dependency_input_ref": {"type": "string"},
                 "dry_run": {"type": "boolean"},
             },
@@ -587,6 +589,10 @@ class WorkbenchMCPServer:
         confirm_effects_restricted_to_owned_files = self._optional_strict_boolean(
             arguments, "confirm_effects_restricted_to_owned_files"
         )
+        source_only = self._optional_strict_boolean(arguments, "source_only")
+        confirm_preserve_unknown_ignored = self._optional_strict_boolean(
+            arguments, "confirm_preserve_unknown_ignored"
+        )
         dependency_input_ref = arguments.get("dependency_input_ref")
         if dependency_input_ref is not None and type(dependency_input_ref) is not str:
             raise ValueError("dependency_input_ref must be a string")
@@ -602,6 +608,7 @@ class WorkbenchMCPServer:
             candidate,
             dependency_input_ref=dependency_input_ref,
             artifacts=self.artifacts,
+            source_only=source_only,
         )
         resumed = self.store.queue_indeterminate_local_recovery(
             task_id,
@@ -614,12 +621,16 @@ class WorkbenchMCPServer:
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             dependency_input_ref=dependency_input_ref,
+            source_only=source_only,
+            confirm_preserve_unknown_ignored=confirm_preserve_unknown_ignored,
             dry_run=dry_run,
         )
         return {
             "ok": True,
             "action": "resolve-indeterminate-locally",
             "operator_confirmed": True,
+            "source_only": source_only,
+            "ignored_source_retained": source_only,
             **resumed,
         }
 
@@ -984,6 +995,16 @@ class WorkbenchMCPServer:
             action = arguments["action"]
             expected_revision = self._required_expected_revision(arguments)
             dry_run = self._optional_strict_boolean(arguments, "dry_run")
+            source_only = self._optional_strict_boolean(arguments, "source_only")
+            confirm_preserve_unknown_ignored = self._optional_strict_boolean(
+                arguments, "confirm_preserve_unknown_ignored"
+            )
+            if action != "resolve_indeterminate_locally" and (
+                source_only or confirm_preserve_unknown_ignored
+            ):
+                raise ValueError(
+                    "source-only recovery flags are only supported by resolve_indeterminate_locally"
+                )
             if dry_run and not (
                 action == "resolve_indeterminate_locally"
                 or (action == "resume" and self.store.get_task(task_id)["state"] == "blocked")

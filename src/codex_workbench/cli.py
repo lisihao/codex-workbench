@@ -705,6 +705,7 @@ def command_task(args: argparse.Namespace) -> int:
             candidate,
             dependency_input_ref=args.dependency_input_ref,
             artifacts=ArtifactStore(config.state_root / "artifacts"),
+            source_only=bool(args.source_only),
         )
         result = store.queue_indeterminate_local_recovery(
             args.task_id,
@@ -717,12 +718,16 @@ def command_task(args: argparse.Namespace) -> int:
             observed_changed_paths=changed_paths,
             observed_generated_residue_paths=generated_residue_paths,
             dependency_input_ref=args.dependency_input_ref,
+            source_only=bool(args.source_only),
+            confirm_preserve_unknown_ignored=bool(args.confirm_preserve_unknown_ignored),
             dry_run=bool(args.dry_run),
         )
         result = {
             "ok": True,
             "action": "resolve-indeterminate-locally",
             "operator_confirmed": True,
+            "source_only": bool(args.source_only),
+            "ignored_source_retained": bool(args.source_only),
             **result,
         }
     elif args.action == "resolve":
@@ -1903,6 +1908,16 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_indeterminate_locally.add_argument(
         "--dependency-input-ref",
         help="recorded dependency-input artifact ref, required when the node depends on other nodes",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--source-only",
+        action="store_true",
+        help="leave every ignored path in the retained source worktree and recover only tracked/untracked source files",
+    )
+    resolve_indeterminate_locally.add_argument(
+        "--confirm-preserve-unknown-ignored",
+        action="store_true",
+        help="explicitly retain unknown ignored paths in the source-only source worktree",
     )
     resolve_indeterminate_locally.add_argument("--dry-run", action="store_true")
     reconcile_archify = task_sub.add_parser("reconcile-archify")

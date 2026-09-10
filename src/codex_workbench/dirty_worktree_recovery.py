@@ -26,6 +26,7 @@ from .dependency_inputs import (
     load_recorded_dependency_input,
 )
 from .executors import codex_subscription_environment
+from .recovery_processes import RecoveryProcessError, assert_recovery_source_idle
 from .worktrees import WorktreeError, WorktreeManager, scope_allows
 
 
@@ -90,11 +91,59 @@ def partition_recovery_paths(paths: tuple[str, ...]) -> tuple[tuple[str, ...], t
     return recoverable, generated
 
 
+def validate_recovery_source_path(worktree: Path, relative_path: str) -> None:
+    """Reject a source path whose existing leaf or parent is a symlink."""
+
+    relative = PurePosixPath(relative_path)
+    if (
+        not relative_path
+        or "\\" in relative_path
+        or "\x00" in relative_path
+        or relative.is_absolute()
+        or str(relative) != relative_path
+        or ".." in relative.parts
+    ):
+        raise DirtyWorktreeRecoveryError(
+            f"recovery source path is invalid: {relative_path!r}"
+        )
+    root = worktree.resolve(strict=True)
+    candidate = root
+    for index, component in enumerate(relative.parts):
+        candidate = candidate / component
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise DirtyWorktreeRecoveryError(
+                f"recovery source path cannot be inspected: {relative_path}"
+            ) from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise DirtyWorktreeRecoveryError(
+                f"recovery source path or parent must not be a symlink: {relative_path}"
+            )
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise DirtyWorktreeRecoveryError(
+                f"recovery source path has a non-directory parent: {relative_path}"
+            )
+        if index == len(relative.parts) - 1 and not stat.S_ISREG(metadata.st_mode):
+            raise DirtyWorktreeRecoveryError(
+                f"recovery source path must be a regular file when present: {relative_path}"
+            )
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except (OSError, ValueError) as error:
+        raise DirtyWorktreeRecoveryError(
+            f"recovery source path escapes its worktree: {relative_path}"
+        ) from error
+
+
 def observed_indeterminate_recovery_paths(
     candidate: Mapping[str, Any],
     *,
     dependency_input_ref: str | None,
     artifacts: ArtifactStore,
+    source_only: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Inspect one owned indeterminate worktree and prove every change is in scope.
 
@@ -108,6 +157,13 @@ def observed_indeterminate_recovery_paths(
     task = candidate["task"]
     node = candidate["node"]
     worktree = Path(str(node["worktree"])).expanduser().resolve(strict=True)
+    if source_only:
+        try:
+            assert_recovery_source_idle(worktree)
+        except RecoveryProcessError as error:
+            raise DirtyWorktreeRecoveryError(
+                f"source-only recovery cannot prove the source worktree is idle: {error}"
+            ) from error
     base_sha = str(task["base_sha"])
     depends_on = node.get("depends_on")
     if not isinstance(depends_on, tuple) or not all(
@@ -134,11 +190,13 @@ def observed_indeterminate_recovery_paths(
 
     ignored = DirtyWorktreeRecovery.ignored_paths(worktree)
     recoverable_ignored, generated_residue_paths = partition_recovery_paths(ignored)
-    if recoverable_ignored:
+    if recoverable_ignored and not source_only:
         raise DirtyWorktreeRecoveryError(
             "indeterminate node worktree contains ignored paths that cannot be recovered safely: "
             + summarize_recovery_paths(recoverable_ignored)
         )
+    if source_only:
+        generated_residue_paths = ()
     changed_paths = tuple(sorted(changed_paths_since_input_tree(worktree, comparison_tree)))
     allowed_scope = list(task["allowed_scope"])
     forbidden_scope = list(task["forbidden_scope"])
@@ -152,10 +210,7 @@ def observed_indeterminate_recovery_paths(
             raise DirtyWorktreeRecoveryError(
                 f"indeterminate node recovery path is outside node write scope: {relative_path}"
             )
-        if (worktree / relative_path).is_symlink():
-            raise DirtyWorktreeRecoveryError(
-                f"indeterminate node recovery path must not be a symlink: {relative_path}"
-            )
+        validate_recovery_source_path(worktree, relative_path)
     return changed_paths, generated_residue_paths
 
 
@@ -235,7 +290,13 @@ class PnpmOfflineMaterializer:
         self.template_dir = template_dir
         self.runner = runner
 
-    def materialize(self, worktree: Path, *, timeout_seconds: int) -> dict[str, object]:
+    def materialize(
+        self,
+        worktree: Path,
+        *,
+        timeout_seconds: int,
+        require_cached_template: bool = False,
+    ) -> dict[str, object]:
         manifest_path = worktree / "package.json"
         lockfile = worktree / "pnpm-lock.yaml"
         if not manifest_path.is_file() and not lockfile.is_file():
@@ -346,7 +407,7 @@ class PnpmOfflineMaterializer:
         # can observe a partially copied template.
         template_publish: CommandOutcome | None = None
         with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
-            if self._has_template_marker(
+            if not require_cached_template and self._has_template_marker(
                 worktree / "node_modules", template_signature["key"]
             ):
                 return {
@@ -399,6 +460,10 @@ class PnpmOfflineMaterializer:
                         },
                         "commands": [version.to_dict(), clone.to_dict()],
                     }
+            if require_cached_template:
+                raise DirtyWorktreeRecoveryError(
+                    "source-only recovery requires a cached verified pnpm linker template"
+                )
             self._discard_incomplete_node_modules(worktree)
             install = self._run(
                 install_command,
@@ -840,6 +905,7 @@ class DirtyWorktreeRecovery:
         preserve_untracked_paths: tuple[str, ...] = (),
         expected_generated_residue_paths: tuple[str, ...] = (),
         expected_checkpoint_sha: str | None = None,
+        source_only: bool = False,
     ) -> dict[str, object]:
         """Capture only the blocked worker's own patch.
 
@@ -853,6 +919,13 @@ class DirtyWorktreeRecovery:
 
         path = self._validate_worktree(repository, base_sha, worktree, branch,
                                        checkpoint_sha=expected_checkpoint_sha)
+        if source_only:
+            try:
+                assert_recovery_source_idle(path)
+            except RecoveryProcessError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"source-only recovery cannot prove the source worktree is idle: {error}"
+                ) from error
         if dependency_input_ref is None:
             if any(value is not None for value in (task_id, node_id, input_tree_sha)):
                 raise DirtyWorktreeRecoveryError(
@@ -894,14 +967,21 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError(
                 "generated residue receipt contains a non-bytecode path"
             )
+        if source_only and expected_generated:
+            raise DirtyWorktreeRecoveryError(
+                "source-only recovery must not discard generated residue"
+            )
         changed_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if changed_paths != reported_recoverable:
             raise DirtyWorktreeRecoveryError(
                 "worktree changed paths do not match the blocked worker receipt"
             )
-        generated_residue_ref = self.discard_generated_residue(
-            path,
-            expected_generated,
+        for relative_path in changed_paths:
+            validate_recovery_source_path(path, relative_path)
+        generated_residue_ref = (
+            None
+            if source_only
+            else self.discard_generated_residue(path, expected_generated)
         )
         untracked_paths = self.untracked_paths(path)
         requested_untracked = tuple(sorted(preserve_untracked_paths))
@@ -1099,6 +1179,7 @@ class DirtyWorktreeRecovery:
         target_branch: str,
         target_attempt: int,
         recovery: Mapping[str, object],
+        source_only: bool = False,
     ) -> RecoveryOutcome:
         """Restore a sealed failed attempt before its normal executor runs.
 
@@ -1110,7 +1191,9 @@ class DirtyWorktreeRecovery:
         """
 
         try:
-            source = self._validate_snapshot(repository, source_worktree, recovery)
+            source = self._validate_snapshot(
+                repository, source_worktree, recovery, source_only=source_only
+            )
             target = self._validate_target(
                 repository,
                 target_worktree,
@@ -1129,7 +1212,9 @@ class DirtyWorktreeRecovery:
                 raise DirtyWorktreeRecoveryError(
                     "retry target patch does not exactly match the captured failed attempt"
                 )
-            self._validate_snapshot(repository, str(source), recovery)
+            self._validate_snapshot(
+                repository, str(source), recovery, source_only=source_only
+            )
             return RecoveryOutcome(
                 "succeeded",
                 "captured failed-attempt patch was restored on a clean retry target before model dispatch",
@@ -1190,6 +1275,8 @@ class DirtyWorktreeRecovery:
         repository: str,
         worktree: str,
         recovery: Mapping[str, object],
+        *,
+        source_only: bool = False,
     ) -> Path:
         required = {
             "source_attempt",
@@ -1217,6 +1304,13 @@ class DirtyWorktreeRecovery:
             raise DirtyWorktreeRecoveryError("blocked recovery receipt has invalid changed_paths")
         path = self._validate_worktree(repository, base_sha, worktree, branch,
                                        checkpoint_sha=recovery.get("source_checkpoint_sha"))
+        if source_only:
+            try:
+                assert_recovery_source_idle(path)
+            except RecoveryProcessError as error:
+                raise DirtyWorktreeRecoveryError(
+                    f"source-only recovery cannot prove the source worktree is idle: {error}"
+                ) from error
         try:
             expected_source = Path(source_worktree).expanduser().resolve(strict=True)
         except OSError as error:
@@ -1229,8 +1323,10 @@ class DirtyWorktreeRecovery:
         current_paths = tuple(sorted(changed_paths_since_input_tree(path, comparison_tree)))
         if current_paths != tuple(sorted(changed_paths)):
             raise DirtyWorktreeRecoveryError("dirty worktree changed paths drifted after recovery was scheduled")
+        for relative_path in current_paths:
+            validate_recovery_source_path(path, relative_path)
         ignored_paths = self.ignored_paths(path)
-        if ignored_paths:
+        if ignored_paths and not source_only:
             raise DirtyWorktreeRecoveryError(
                 "dirty worktree acquired ignored paths after recovery was scheduled: "
                 + summarize_recovery_paths(ignored_paths)
@@ -1576,6 +1672,7 @@ class DirtyWorktreeRecovery:
         paths = tuple(sorted(item.decode("utf-8", errors="surrogateescape") for item in raw.split(b"\0") if item))
         for relative_path in paths:
             candidate = worktree / relative_path
+            validate_recovery_source_path(worktree, relative_path)
             try:
                 resolved = candidate.resolve(strict=True)
             except OSError as error:

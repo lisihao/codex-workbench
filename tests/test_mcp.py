@@ -603,6 +603,30 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(self.store.get_task("unsupported-dry-run"), before)
         self.assertEqual(self.store.read_events(task_id="unsupported-dry-run"), events)
 
+    def test_source_only_flags_are_rejected_outside_local_indeterminate_recovery(self) -> None:
+        self._create_list_task("unsupported-source-only")
+        before = self.store.get_task("unsupported-source-only")
+        events = self.store.read_events(task_id="unsupported-source-only")
+        for arguments, expected in (
+            ({"source_only": True}, "only supported"),
+            ({"confirm_preserve_unknown_ignored": True}, "only supported"),
+            ({"source_only": "true"}, "must be a boolean"),
+            ({"confirm_preserve_unknown_ignored": 1}, "must be a boolean"),
+        ):
+            response = self.call(
+                "workbench_control_task",
+                {
+                    "task_id": "unsupported-source-only",
+                    "action": "queue",
+                    "expected_revision": before["state_revision"],
+                    **arguments,
+                },
+            )
+            self.assertTrue(response["isError"])
+            self.assertIn(expected, response["content"][0]["text"])
+            self.assertEqual(self.store.get_task("unsupported-source-only"), before)
+            self.assertEqual(self.store.read_events(task_id="unsupported-source-only"), events)
+
     def test_harness_health_requires_real_skill_and_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
             home = Path(directory)

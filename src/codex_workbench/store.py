@@ -4310,6 +4310,7 @@ class WorkbenchStore:
         *,
         authorization_revision: int,
         source_result_json: str | None = None,
+        source_only_ignored: bool = False,
     ) -> dict[str, Any] | None:
         """Build a filesystem-free retry binding for one failed allocation.
 
@@ -4411,6 +4412,16 @@ class WorkbenchStore:
         base_sha = contract.get("base_sha")
         if not isinstance(base_sha, str) or not base_sha or allocation["base_sha"] != base_sha:
             raise StateConflictError("failed node recovery allocation base does not match its contract")
+        source = {
+            "attempt": int(node["attempt"]),
+            "worktree": str(allocation["current_path"]),
+            "branch": str(allocation["branch"]),
+            "base_sha": base_sha,
+            "changed_paths": list(recoverable_paths),
+            "generated_residue_paths": list(generated_residue_paths),
+        }
+        if source_only_ignored:
+            source["source_only_ignored"] = True
         return {
             "schema_version": 1,
             "kind": _FAILED_ATTEMPT_RECOVERY_KIND,
@@ -4418,14 +4429,7 @@ class WorkbenchStore:
             "authorization_revision": authorization_revision,
             "source_allocation_id": str(allocation["allocation_id"]),
             "source_result_json": source_result_json,
-            "source": {
-                "attempt": int(node["attempt"]),
-                "worktree": str(allocation["current_path"]),
-                "branch": str(allocation["branch"]),
-                "base_sha": base_sha,
-                "changed_paths": list(recoverable_paths),
-                "generated_residue_paths": list(generated_residue_paths),
-            },
+            "source": source,
         }
 
     @staticmethod
@@ -6254,6 +6258,8 @@ class WorkbenchStore:
         observed_changed_paths: tuple[str, ...],
         observed_generated_residue_paths: tuple[str, ...] = (),
         dependency_input_ref: str | None = None,
+        source_only: bool = False,
+        confirm_preserve_unknown_ignored: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Authorize one indeterminate node's own worktree for capture-and-retry.
@@ -6292,6 +6298,18 @@ class WorkbenchStore:
                 "local indeterminate recovery requires an explicit assertion that effects are "
                 "restricted to owned files"
             )
+        if type(source_only) is not bool:
+            raise ValueError("source_only must be a boolean")
+        if type(confirm_preserve_unknown_ignored) is not bool:
+            raise ValueError("confirm_preserve_unknown_ignored must be a boolean")
+        if source_only and confirm_preserve_unknown_ignored is not True:
+            raise ValueError(
+                "source-only recovery requires explicit confirmation that unknown ignored files stay in the source worktree"
+            )
+        if not source_only and confirm_preserve_unknown_ignored:
+            raise ValueError(
+                "unknown ignored-file preservation is only available in source-only recovery"
+            )
         try:
             raw_changed_paths = tuple(observed_changed_paths)
             raw_generated_residue_paths = tuple(observed_generated_residue_paths)
@@ -6305,6 +6323,8 @@ class WorkbenchStore:
         generated_residue_paths = tuple(sorted(set(raw_generated_residue_paths)))
         if partition_recovery_paths(generated_residue_paths)[1] != generated_residue_paths:
             raise ValueError("observed generated residue paths are not recognized recovery residue")
+        if source_only and generated_residue_paths:
+            raise ValueError("source-only recovery must not discard generated residue")
         if dependency_input_ref is not None and (
             not isinstance(dependency_input_ref, str) or not dependency_input_ref
         ):
@@ -6353,6 +6373,7 @@ class WorkbenchStore:
                     node,
                     authorization_revision=expected_revision + 1,
                     source_result_json=source_result_json,
+                    source_only_ignored=source_only,
                 )
             if authorization is None or authorization["source"]["generated_residue_paths"] != list(
                 generated_residue_paths
@@ -6369,6 +6390,7 @@ class WorkbenchStore:
                 "would_authorize": authorization,
                 "operator_asserted": True,
                 "automatically_verified": False,
+                "source_only": source_only,
             }
 
         # Preflight outside the write transaction, mirroring
@@ -6397,6 +6419,7 @@ class WorkbenchStore:
                 preflight_node,
                 authorization_revision=expected_revision + 1,
                 source_result_json=source_result_json,
+                source_only_ignored=source_only,
             )
         if preflight_authorization is None:
             raise StateConflictError(
@@ -6426,6 +6449,7 @@ class WorkbenchStore:
                 node,
                 authorization_revision=revision,
                 source_result_json=source_result_json,
+                source_only_ignored=source_only,
             )
             if authorization is None:
                 raise StateConflictError(
@@ -6527,6 +6551,7 @@ class WorkbenchStore:
                     "allocation_id": candidate["allocation_id"],
                     "reason": reason,
                     "expected_changed_paths": list(changed_paths),
+                    "source_only_ignored": source_only,
                     "operator_assertion": {
                         "confirm_old_executor_ended": True,
                         "confirm_effects_restricted_to_owned_files": True,
@@ -6572,6 +6597,8 @@ class WorkbenchStore:
                 },
                 "operator_asserted": True,
                 "automatically_verified": False,
+                "source_only": source_only,
+                "ignored_source_retained": source_only,
                 "authorization_event_cursor": authorization_cursor,
             }
 
@@ -7402,6 +7429,7 @@ class WorkbenchStore:
             states=("active", "quarantine_pending", "quarantined", "archive_failed", "archived_verified", "purge_failed")
         )
         with self.connection() as connection:
+            source_only_holds = self._source_only_recovery_hold_ids(connection)
             pending_delivery = {
                 str(row["task_id"])
                 for row in connection.execute(
@@ -7416,6 +7444,8 @@ class WorkbenchStore:
             }
         result: list[dict[str, Any]] = []
         for allocation in candidates:
+            if allocation["allocation_id"] in source_only_holds:
+                continue
             if allocation["task_id"] in pending_delivery:
                 continue
             if allocation["task_state"] not in {"accepted", "cancelled"}:
@@ -7432,6 +7462,31 @@ class WorkbenchStore:
                 result.append(allocation)
         return result
 
+    @staticmethod
+    def _source_only_recovery_hold_ids(connection: sqlite3.Connection) -> set[str]:
+        """Return source allocations permanently retained by source-only recovery."""
+
+        holds: set[str] = set()
+        rows = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'node.indeterminate_local_recovery_queued'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError(
+                    "source-only recovery retention event is invalid"
+                ) from error
+            if not isinstance(payload, dict):
+                raise StateConflictError("source-only recovery retention event is invalid")
+            allocation_id = payload.get("allocation_id")
+            if payload.get("source_only_ignored") is True:
+                if not isinstance(allocation_id, str) or not allocation_id:
+                    raise StateConflictError("source-only recovery retention event is invalid")
+                holds.add(allocation_id)
+        return holds
+
     def begin_worktree_quarantine(self, allocation_id: str, destination: str) -> dict[str, Any]:
         timestamp = now_iso()
         with self.transaction() as connection:
@@ -7441,6 +7496,10 @@ class WorkbenchStore:
             ).fetchone()
             if row is None:
                 raise KeyError(allocation_id)
+            if allocation_id in self._source_only_recovery_hold_ids(connection):
+                raise StateConflictError(
+                    "source-only recovery retains this source worktree; it cannot be quarantined"
+                )
             pending_delivery = connection.execute(
                 "SELECT 1 FROM delivery_objectives WHERE task_id = ? "
                 "AND state NOT IN ('complete', 'cancelled')",
@@ -8352,10 +8411,15 @@ class WorkbenchStore:
             "base_sha",
             "changed_paths",
         }
-        if not isinstance(source, dict) or frozenset(source) not in {
-            frozenset(source_fields),
-            frozenset(source_fields | {"generated_residue_paths"}),
-        }:
+        allowed_source_fields = source_fields | {
+            "generated_residue_paths",
+            "source_only_ignored",
+        }
+        if (
+            not isinstance(source, dict)
+            or not source_fields.issubset(source)
+            or not set(source).issubset(allowed_source_fields)
+        ):
             raise StateConflictError("failed-attempt recovery source is invalid")
         source_attempt = source["attempt"]
         changed_paths = source["changed_paths"]
@@ -8383,6 +8447,10 @@ class WorkbenchStore:
             != tuple(generated_residue_paths)
         ):
             raise StateConflictError("failed-attempt recovery generated residue paths are invalid")
+        if source.get("source_only_ignored", False) is not False and source.get(
+            "source_only_ignored"
+        ) is not True:
+            raise StateConflictError("failed-attempt recovery source-only flag is invalid")
         binding: dict[str, Any] = {
             "state": state,
             "authorization_revision": int(authorization["authorization_revision"]),

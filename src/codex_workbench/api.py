@@ -393,6 +393,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     raise ValueError("dry_run must be a boolean")
                 if body.get("dry_run") is True:
                     raise ValueError("dry_run is not supported by the HTTP control endpoint")
+                for option in ("source_only", "confirm_preserve_unknown_ignored"):
+                    if option in body and type(body[option]) is not bool:
+                        raise ValueError(f"{option} must be a boolean")
+                    if body.get(option) is True:
+                        raise ValueError("source-only recovery is not supported by the HTTP control endpoint")
                 if action in {"queue", "resume"}:
                     if "instruction" not in body:
                         receipt = {

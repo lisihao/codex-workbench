@@ -621,19 +621,17 @@ class APITests(unittest.TestCase):
                 caught.exception.close()
 
             try:
-                for payload in (
-                    {
-                        "action": "queue",
-                        "expected_revision": task_before["state_revision"],
-                        "dry_run": True,
-                    },
-                    {
-                        "action": "queue",
-                        "expected_revision": task_before["state_revision"],
-                        "dry_run": "true",
-                    },
+                for flag, value in (
+                    (flag, value)
+                    for flag in ("dry_run", "source_only", "confirm_preserve_unknown_ignored")
+                    for value in (True, "true", 1)
                 ):
-                    with self.subTest(payload=payload["dry_run"]):
+                    payload = {
+                        "action": "queue",
+                        "expected_revision": task_before["state_revision"],
+                        flag: value,
+                    }
+                    with self.subTest(flag=flag, value=value):
                         assert_conflict(payload)
                         task_after = store.get_task("dry-run-reject")
                         events_after = store.read_events(task_id="dry-run-reject")

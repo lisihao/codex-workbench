@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,6 +18,7 @@ from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.dirty_worktree_recovery import (
     DirtyWorktreeRecoveryError,
+    PnpmOfflineMaterializer,
     observed_indeterminate_recovery_paths,
 )
 from codex_workbench.executors import ExecutionRequest
@@ -456,7 +460,7 @@ class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCas
         self.assertEqual((task["state"], worker["state"], worker["attempt"]), ("needs_fix", "failed", 1))
         self.assertEqual(worker["worktree"], str(source))
         self.assertTrue((source / "src" / "shortcut.txt").is_symlink())
-        self.assertIn("regular file", str(task["blocker"]))
+        self.assertIn("must not be a symlink", str(task["blocker"]))
 
     def test_running_steering_receipt_never_claims_current_delivery(self) -> None:
         contract = TaskContract(
@@ -882,7 +886,9 @@ class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCas
         try:
             claimed = coordinator._claim_next_ready_node("crash-after-assignment")
             assert claimed is not None
-            target, _, _, _ = coordinator._prepare_failed_attempt_recovery(claimed)
+            target, _, _, _ = coordinator._prepare_failed_attempt_recovery(
+                claimed, coordinator._execution_attribution_context(claimed)
+            )
             self.assertEqual(
                 (target / "src" / "continuation.txt").read_text(encoding="utf-8"),
                 "untracked prior attempt\n",
@@ -941,7 +947,9 @@ class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCas
                 side_effect=KeyboardInterrupt("fixture process termination"),
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    coordinator._prepare_failed_attempt_recovery(claimed)
+                    coordinator._prepare_failed_attempt_recovery(
+                        claimed, coordinator._execution_attribution_context(claimed)
+                    )
         finally:
             coordinator._pool.shutdown(wait=True)
         self.assertTrue(target.is_dir())
@@ -1138,7 +1146,9 @@ class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCas
                     side_effect=outside_write_transaction(original_prepare_retry),
                 ),
             ):
-                target, _, _, _ = coordinator._prepare_failed_attempt_recovery(claimed)
+                target, _, _, _ = coordinator._prepare_failed_attempt_recovery(
+                    claimed, coordinator._execution_attribution_context(claimed)
+                )
         finally:
             coordinator._pool.shutdown(wait=True)
 
@@ -1457,6 +1467,77 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         )
         return contract, target, dependency_input_ref
 
+    def _indeterminate_root_worktree_task(
+        self, *, task_id: str
+    ) -> tuple[TaskContract, Path]:
+        """Leave a root worker indeterminate without a dependency-input receipt."""
+
+        contract = TaskContract(
+            task_id=task_id,
+            repository=str(self.repository),
+            base_sha=self.base_sha,
+            objective="recover only root source changes from an indeterminate worktree",
+            allowed_scope=("src", "tests"),
+            executor_model="fixture",
+            verifier_model="fixture",
+            external_write_permission=False,
+            destructive_action_permission=False,
+        )
+        worker = NodeSpec(
+            "worker",
+            contract.task_id,
+            "root worker",
+            "fixture",
+            "fixture",
+            "recover root source files",
+            write_scopes=("src", "tests"),
+        )
+        verifier = NodeSpec(
+            "verify",
+            contract.task_id,
+            "root verifier",
+            "fixture",
+            "fixture",
+            "accepted",
+            depends_on=("worker",),
+            verifier=True,
+        )
+        self.store.create_task(contract, [worker, verifier], f"{task_id}-create")
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("root-indeterminate", self.epoch)
+        assert claimed is not None
+        source = self.worktrees.prepare(
+            contract.repository,
+            contract.base_sha,
+            contract.task_id,
+            "worker",
+            int(claimed["attempt"]),
+        )
+        self.store.assign_worktree(
+            contract.task_id,
+            "worker",
+            str(source),
+            attempt=int(claimed["attempt"]),
+            coordinator_epoch=int(claimed["coordinator_epoch"]),
+            lease_epoch=int(claimed["lease_epoch"]),
+        )
+        (source / "src" / "value.txt").write_text("root dirty change\n", encoding="utf-8")
+        (source / "tests").mkdir()
+        (source / "tests" / "root-new.py").write_text("root untracked\n", encoding="utf-8")
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "indeterminate",
+                "fixture root worker crashed after source changes",
+                result_kind="worker",
+                changed_paths=("src/value.txt", "tests/root-new.py"),
+            ),
+        )
+        task = self.store.get_task(contract.task_id)
+        node = next(item for item in task["nodes"] if item["node_id"] == "worker")
+        self.assertEqual((task["state"], node["state"], node["attempt"]), ("needs_approval", "indeterminate", 1))
+        return contract, source
+
     def test_candidate_requires_owned_worktree_with_no_pending_recovery_binding(self) -> None:
         contract, target, _ = self._indeterminate_owned_worktree_task()
         task = self.store.get_task(contract.task_id)
@@ -1592,6 +1673,494 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
         node = next(item for item in accepted["nodes"] if item["node_id"] == "worker")
         self.assertEqual((node["state"], node["attempt"]), ("accepted", 3))
 
+    def test_source_only_recovery_retains_ignored_source_and_restores_dependency_worker(
+        self,
+    ) -> None:
+        contract, source, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-source-only-dependent"
+        )
+        ignored = source / ".workbench-ignored" / "private.cache"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"keep this source-only residue\0")
+        bytecode = source / "tests" / "__pycache__" / "fixture.cpython-313.pyc"
+        bytecode.parent.mkdir(parents=True)
+        bytecode.write_bytes(b"keep this bytecode\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        source_allocation_id = candidate["allocation_id"]
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        self.assertEqual(changed_paths, ("src/continuation.txt", "src/value.txt"))
+        self.assertEqual(generated_residue_paths, ())
+        with self.store.connection() as connection:
+            database_before = tuple(connection.iterdump())
+        artifact_bytes = tuple(
+            sorted(
+                (str(path.relative_to(self.artifacts.root)), path.read_bytes())
+                for path in self.artifacts.root.rglob("*")
+                if path.is_file()
+            )
+        )
+        response = self.mcp.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workbench_control_task",
+                "arguments": {
+                    "task_id": contract.task_id, "node_id": "worker",
+                    "action": "resolve_indeterminate_locally",
+                    "expected_revision": int(task["state_revision"]),
+                    "expected_attempt": 2,
+                    "reason": "retain unknown ignored source files and recover only source changes",
+                    "confirm_old_executor_ended": True,
+                    "confirm_effects_restricted_to_owned_files": True,
+                    "dependency_input_ref": dependency_input_ref,
+                    "source_only": True, "confirm_preserve_unknown_ignored": True,
+                    "dry_run": True,
+                },
+            },
+        })
+        assert response is not None
+        self.assertNotIn("isError", response["result"], response)
+        preview = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(preview["dry_run"])
+        self.assertTrue(preview["source_only"])
+        self.assertEqual(self.store.get_task(contract.task_id), task)
+        with self.store.connection() as connection:
+            self.assertEqual(tuple(connection.iterdump()), database_before)
+        self.assertEqual(
+            tuple(
+                sorted(
+                    (str(path.relative_to(self.artifacts.root)), path.read_bytes())
+                    for path in self.artifacts.root.rglob("*")
+                    if path.is_file()
+                )
+            ),
+            artifact_bytes,
+        )
+        self.assertEqual(ignored.read_bytes(), b"keep this source-only residue\0")
+        self.assertEqual(bytecode.read_bytes(), b"keep this bytecode\0")
+        self.assertEqual(
+            (source / "src" / "value.txt").read_text(encoding="utf-8"),
+            "dirty prior attempt\n",
+        )
+        self.assertEqual(
+            (source / "src" / "continuation.txt").read_text(encoding="utf-8"),
+            "untracked prior attempt\n",
+        )
+
+        queued = self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="retain unknown ignored source files and recover only source changes",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+        )
+        self.assertTrue(queued["source_only"])
+        with self.assertRaisesRegex(StateConflictError, "retains this source worktree"):
+            self.store.begin_worktree_quarantine(
+                source_allocation_id,
+                str(self.state_root / "quarantine" / source_allocation_id),
+            )
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        observed: dict[str, object] = {}
+
+        def execute(request: object) -> NodeResult:
+            worktree = request.worktree  # type: ignore[attr-defined]
+            assert worktree is not None
+            observed["attempt"] = request.attempt  # type: ignore[attr-defined]
+            observed["tracked"] = (worktree / "src" / "value.txt").read_text(encoding="utf-8")
+            observed["untracked"] = (worktree / "src" / "continuation.txt").read_text(encoding="utf-8")
+            observed["ancestor"] = (worktree / "src" / "ancestor.txt").read_text(encoding="utf-8")
+            observed["ignored_copied"] = (worktree / ".workbench-ignored").exists()
+            observed["bytecode_copied"] = (worktree / "tests" / "__pycache__").exists()
+            return NodeResult("succeeded", "source-only retry completed", checks=("fixture",))
+
+        try:
+            claimed = coordinator._claim_next_ready_node("source-only-dependent")
+            assert claimed is not None
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = execute
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        self.assertEqual(
+            observed,
+            {
+                "attempt": 3,
+                "tracked": "dirty prior attempt\n",
+                "untracked": "untracked prior attempt\n",
+                "ancestor": "accepted ancestor\n",
+                "ignored_copied": False,
+                "bytecode_copied": False,
+            },
+        )
+        self.assertEqual(ignored.read_bytes(), b"keep this source-only residue\0")
+        self.assertEqual(bytecode.read_bytes(), b"keep this bytecode\0")
+        self.assertEqual(
+            self.store.get_worktree_allocation(source_allocation_id)["state"], "superseded"
+        )
+        self.assertNotIn(
+            source_allocation_id,
+            {item["allocation_id"] for item in self.store.reclaimable_worktree_allocations()},
+        )
+
+    def test_source_only_recovery_restores_root_worker_without_dependency_input(self) -> None:
+        contract, source = self._indeterminate_root_worktree_task(
+            task_id="indeterminate-source-only-root"
+        )
+        ignored = source / ".workbench-ignored" / "root-private.cache"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"root ignored source residue\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=None,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        self.assertEqual(changed_paths, ("src/value.txt", "tests/root-new.py"))
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="recover root source files while retaining ignored residue",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+        )
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        observed: dict[str, object] = {}
+
+        def execute(request: object) -> NodeResult:
+            worktree = request.worktree  # type: ignore[attr-defined]
+            assert worktree is not None
+            observed["attempt"] = request.attempt  # type: ignore[attr-defined]
+            observed["tracked"] = (worktree / "src" / "value.txt").read_text(encoding="utf-8")
+            observed["untracked"] = (worktree / "tests" / "root-new.py").read_text(encoding="utf-8")
+            observed["ignored_copied"] = (worktree / ".workbench-ignored").exists()
+            return NodeResult("succeeded", "root source-only retry completed", checks=("fixture",))
+
+        try:
+            claimed = coordinator._claim_next_ready_node("source-only-root")
+            assert claimed is not None
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = execute
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        self.assertEqual(
+            observed,
+            {
+                "attempt": 2,
+                "tracked": "root dirty change\n",
+                "untracked": "root untracked\n",
+                "ignored_copied": False,
+            },
+        )
+        self.assertEqual(ignored.read_bytes(), b"root ignored source residue\0")
+
+    def test_source_only_target_uses_a_cached_pnpm_template(self) -> None:
+        (self.repository / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (self.repository / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+        with (self.repository / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write("node_modules/\n")
+        self._git(self.repository, "add", ".gitignore", "package.json", "pnpm-lock.yaml")
+        self._git(self.repository, "commit", "-m", "pnpm root fixture")
+        self.base_sha = self._git(self.repository, "rev-parse", "HEAD")
+        contract, source = self._indeterminate_root_worktree_task(
+            task_id="indeterminate-source-only-pnpm"
+        )
+        ignored = source / ".workbench-ignored" / "pnpm-source.cache"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"retain pnpm source residue\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=None,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=1,
+            reason="materialize dependencies only in the fresh source-only target",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+        )
+        pnpm_store = self.root / "pnpm-store"
+        pnpm_store.mkdir()
+        template_root = self.root / "pnpm-templates"
+        materializer_calls: list[tuple[str, ...]] = []
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            materializer_calls.append(tuple(args))
+            if args[0] == "/bin/cp":
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template cloned\n", "")
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            node_modules = cwd / "node_modules"
+            node_modules.mkdir()
+            (node_modules / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            (node_modules / ".bin").mkdir()
+            return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=pnpm_store,
+            template_dir=template_root,
+            runner=runner,
+        )
+        shim = self.root / "pnpm-shim"
+        shim.write_text("#!/bin/sh\nprintf '%s\\n' '11.25.0'\n", encoding="utf-8")
+        shim.chmod(0o755)
+        seed = self.root / "pnpm-template-seed"
+        seed.mkdir()
+        for name in ("package.json", "pnpm-lock.yaml"):
+            shutil.copy2(self.repository / name, seed / name)
+        seed_receipt = materializer.materialize(seed, timeout_seconds=5)
+        self.assertEqual(seed_receipt["template"]["state"], "seeded")
+        materializer_calls.clear()
+        coordinator = Coordinator(
+            self.store,
+            self.state_root,
+            coordinator_epoch=self.epoch,
+            pnpm_materializer=materializer,
+        )
+        observed: dict[str, object] = {}
+
+        def execute(request: object) -> NodeResult:
+            worktree = request.worktree  # type: ignore[attr-defined]
+            assert worktree is not None
+            observed["linker"] = (worktree / "node_modules" / ".modules.yaml").is_file()
+            observed["ignored_copied"] = (worktree / ".workbench-ignored").exists()
+            return NodeResult("succeeded", "pnpm source-only retry completed", checks=("fixture",))
+
+        try:
+            claimed = coordinator._claim_next_ready_node("source-only-pnpm")
+            assert claimed is not None
+            with (
+                patch.dict(os.environ, {"CODEX_WORKBENCH_PNPM": str(shim)}),
+                patch.object(coordinator, "_executor") as executor,
+            ):
+                executor.return_value.execute.side_effect = execute
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        task_after_recovery = self.store.get_task(contract.task_id)
+        node = next(
+            item for item in task_after_recovery["nodes"] if item["node_id"] == "worker"
+        )
+        self.assertEqual(node["state"], "accepted", node)
+        self.assertEqual(observed, {"linker": True, "ignored_copied": False})
+        self.assertTrue(any(call[0] == "/bin/cp" for call in materializer_calls))
+        self.assertFalse(
+            any(len(call) > 1 and call[1] == "install" for call in materializer_calls)
+        )
+        receipt = json.loads(
+            self.artifacts.verify(node["result"]["artifacts"]["dependency-materialization"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(receipt["kind"], "pnpm-offline-materialization")
+        self.assertEqual(receipt["template"]["state"], "hit")
+        self.assertEqual(ignored.read_bytes(), b"retain pnpm source residue\0")
+
+        missing = self.root / "pnpm-template-missing"
+        missing.mkdir()
+        (missing / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (missing / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.1'\n", encoding="utf-8"
+        )
+        calls_before_missing = len(materializer_calls)
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError,
+            "requires a cached verified pnpm linker template",
+        ):
+            materializer.materialize(
+                missing,
+                timeout_seconds=5,
+                require_cached_template=True,
+            )
+        self.assertFalse(
+            any(
+                len(call) > 1 and call[1] == "install"
+                for call in materializer_calls[calls_before_missing:]
+            )
+        )
+
+    def test_source_only_event_hold_survives_binding_clear_and_cancel(self) -> None:
+        contract, source, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-source-only-hold"
+        )
+        ignored = source / ".workbench-ignored" / "private.cache"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"retain after cancellation\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="retain source after cancellation",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET recovery_json = NULL WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            )
+        restarted = WorkbenchStore(self.config.database)
+        restarted.initialize()
+        current = restarted.get_task(contract.task_id)
+        restarted.transition_task(
+            contract.task_id,
+            "cancelled",
+            expected_revision=int(current["state_revision"]),
+        )
+        with self.assertRaisesRegex(StateConflictError, "retains this source worktree"):
+            restarted.begin_worktree_quarantine(
+                candidate["allocation_id"],
+                str(self.state_root / "quarantine" / candidate["allocation_id"]),
+            )
+        self.assertNotIn(
+            candidate["allocation_id"],
+            {item["allocation_id"] for item in restarted.reclaimable_worktree_allocations()},
+        )
+        self.assertEqual(ignored.read_bytes(), b"retain after cancellation\0")
+        with restarted.transaction() as connection:
+            connection.execute(
+                "UPDATE events SET payload_json = ? "
+                "WHERE event_type = 'node.indeterminate_local_recovery_queued' AND task_id = ?",
+                (json.dumps({"source_only_ignored": True}), contract.task_id),
+            )
+        with self.assertRaisesRegex(StateConflictError, "retention event is invalid"):
+            restarted.reclaimable_worktree_allocations()
+        with self.assertRaisesRegex(StateConflictError, "retention event is invalid"):
+            restarted.begin_worktree_quarantine(
+                candidate["allocation_id"],
+                str(self.state_root / "quarantine" / candidate["allocation_id"]),
+            )
+
+    def test_source_only_capture_rejects_a_tracked_path_replaced_by_a_symlink(self) -> None:
+        contract, source, dependency_input_ref = self._indeterminate_owned_worktree_task(
+            task_id="indeterminate-source-only-symlink"
+        )
+        ignored = source / ".workbench-ignored" / "private.cache"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"retain beside rejected symlink\0")
+        task = self.store.get_task(contract.task_id)
+        candidate = self.store.indeterminate_local_recovery_candidate(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+        )
+        changed_paths, generated_residue_paths = observed_indeterminate_recovery_paths(
+            candidate,
+            dependency_input_ref=dependency_input_ref,
+            artifacts=self.artifacts,
+            source_only=True,
+        )
+        self.store.queue_indeterminate_local_recovery(
+            contract.task_id,
+            "worker",
+            expected_revision=int(task["state_revision"]),
+            expected_attempt=2,
+            reason="source-only symlink race must reject",
+            confirm_old_executor_ended=True,
+            confirm_effects_restricted_to_owned_files=True,
+            observed_changed_paths=changed_paths,
+            observed_generated_residue_paths=generated_residue_paths,
+            dependency_input_ref=dependency_input_ref,
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+        )
+        value = source / "src" / "value.txt"
+        value.unlink()
+        value.symlink_to("continuation.txt")
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("source-only-symlink")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("source-only symlink race must not dispatch"),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        rejected = self.store.get_task(contract.task_id)
+        node = next(item for item in rejected["nodes"] if item["node_id"] == "worker")
+        self.assertEqual((rejected["state"], node["state"], node["attempt"]), ("needs_fix", "failed", 2))
+        self.assertTrue(value.is_symlink())
+        self.assertEqual(ignored.read_bytes(), b"retain beside rejected symlink\0")
+
     def test_local_recovery_via_mcp_control_action(self) -> None:
         contract, _, dependency_input_ref = self._indeterminate_owned_worktree_task(
             task_id="indeterminate-mcp"
@@ -1683,6 +2252,18 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
                 confirm_old_executor_ended=True,
                 confirm_effects_restricted_to_owned_files=False,
                 observed_changed_paths=("src/value.txt",),
+            )
+        with self.assertRaisesRegex(ValueError, "requires explicit confirmation"):
+            self.store.queue_indeterminate_local_recovery(
+                contract.task_id,
+                "worker",
+                expected_revision=int(task["state_revision"]),
+                expected_attempt=2,
+                reason="missing ignored-file confirmation",
+                confirm_old_executor_ended=True,
+                confirm_effects_restricted_to_owned_files=True,
+                observed_changed_paths=("src/value.txt",),
+                source_only=True,
             )
         unchanged = self.store.get_task(contract.task_id)
         self.assertEqual(unchanged, task)
