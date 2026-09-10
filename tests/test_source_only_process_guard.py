@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from tests.process_probe_fixture import isolated_process_catalog
 
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.dirty_worktree_recovery import (
@@ -12,6 +13,10 @@ from codex_workbench.dirty_worktree_recovery import (
 
 
 class SourceOnlyProcessGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.process_ids = []
+        self.enterContext(isolated_process_catalog(self.process_ids))
+
     @unittest.skipUnless(sys.platform == "darwin" or sys.platform.startswith("linux"), "local process probe")
     def test_observer_rejects_live_executor_without_touching_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -39,6 +44,7 @@ class SourceOnlyProcessGuardTests(unittest.TestCase):
                 [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(30)"],
                 cwd=source, stdout=subprocess.PIPE, text=True,
             )
+            self.process_ids.append(child.pid)
             try:
                 self.assertEqual(child.stdout.readline().strip(), "ready")
                 with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "active process"):

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from tests.process_probe_fixture import isolated_process_catalog
 
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.authority import authority_machine_id
@@ -1407,6 +1408,11 @@ class FailedAttemptRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCas
 
 class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.TestCase):
     """Explicit operator-confirmed local recovery for owned-worktree indeterminate nodes."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # These executor fixtures are in-process functions, not native workers.
+        self.enterContext(isolated_process_catalog(()))
 
     def _indeterminate_owned_worktree_task(
         self,
