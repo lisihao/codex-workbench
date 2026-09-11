@@ -11,6 +11,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
+from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .dirty_worktree_recovery import observed_indeterminate_recovery_paths
 from .governance import code_as_harness_health
@@ -44,6 +45,7 @@ _LIST_TASKS_NODE_STATES = (
 
 
 TOOLS: list[dict[str, Any]] = [
+    VALIDATION_TOOL,
     {
         "name": "workbench_create_delivery_objective",
         "description": "Attach a durable delivery objective to an existing task or planning reservation. Repeating the same command is idempotent. This does not grant external authority or accept work.",
@@ -142,6 +144,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["source_thread_id", "instruction"],
             "properties": {
                 "source_thread_id": {"type": "string"},
+                "expected_task_id": {"type": "string", "minLength": 1},
                 "instruction": {"type": "string", "minLength": 1, "maxLength": 500},
                 "expected_revision": {"type": "integer", "minimum": 0},
             },
@@ -856,6 +859,8 @@ class WorkbenchMCPServer:
         return str(row["task_id"])
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "workbench_validate_blocked_node":
+            return self._text(validate_blocked_node(self.config, self.store, arguments))
         if name == "workbench_request":
             source_thread_id = arguments.get("source_thread_id")
             binding = (
@@ -924,6 +929,7 @@ class WorkbenchMCPServer:
                     if "expected_revision" in arguments
                     else None
                 ),
+                expected_task_id=arguments.get("expected_task_id"),
             )
             return self._text(
                 {

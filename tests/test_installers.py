@@ -74,6 +74,28 @@ class InstallerTests(unittest.TestCase):
         node.chmod(0o755)
         return node
 
+    @staticmethod
+    def _write_stdio_registration(
+        path: Path,
+        command: tuple[str, ...],
+        *,
+        prefix: str = "",
+        suffix: str = "",
+    ) -> None:
+        """Make the fake Codex CLI persist exactly the registered stdio argv."""
+
+        separator = command.index("--")
+        executable = command[separator + 1]
+        arguments = list(command[separator + 2:])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            prefix
+            + "[mcp_servers.codex-workbench]\n"
+            + f"command = {json.dumps(executable)}\n"
+            + f"args = {json.dumps(arguments)}\n"
+            + suffix
+        )
+
     def _run_selector(self, runtime: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["CODEX_WORKBENCH_PYTHON"] = str(runtime)
@@ -1307,12 +1329,7 @@ class InstallerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
                 if len(command) >= 3 and command[1:3] == ("mcp", "add"):
                     mcp_config = home / ".codex" / "config.toml"
-                    mcp_config.parent.mkdir(parents=True, exist_ok=True)
-                    mcp_config.write_text(
-                        "[mcp_servers.codex-workbench]\n"
-                        'command = "ssh"\n'
-                        'args = ["-T", "fixture-authority"]\n'
-                    )
+                    self._write_stdio_registration(mcp_config, command)
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             def fake_which(name: str) -> str | None:
@@ -1384,6 +1401,10 @@ class InstallerTests(unittest.TestCase):
             heartbeat_arguments = plistlib.loads(heartbeat_plist.read_bytes())["ProgramArguments"]
             heartbeat_launcher = client_root / "bin" / "workbench-client-heartbeat"
             heartbeat_runtime = client_root / "libexec" / "workbench-client-heartbeat.py"
+            bridge_runtime = client_root / "libexec" / "workbench-mcp-bridge.py"
+            diagnose_runtime = client_root / "libexec" / "workbench-connection-diagnose.py"
+            bridge_config = client_root / "mcp-bridge.json"
+            bridge_state = client_root / "mcp-bridge-state.json"
             self.assertEqual(heartbeat_arguments[0], str(heartbeat_launcher))
             self.assertIn(str(proxy), heartbeat_arguments)
             self.assertIn(str(configuration), heartbeat_arguments)
@@ -1391,11 +1412,31 @@ class InstallerTests(unittest.TestCase):
                 heartbeat_runtime.read_bytes(),
                 (source / "scripts" / "workbench-client-heartbeat.py").read_bytes(),
             )
+            self.assertEqual(bridge_runtime.read_bytes(), (source / "scripts" / "workbench-mcp-bridge.py").read_bytes())
+            self.assertEqual(
+                diagnose_runtime.read_bytes(),
+                (source / "scripts" / "workbench-connection-diagnose.py").read_bytes(),
+            )
+            self.assertEqual(bridge_runtime.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(diagnose_runtime.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(bridge_config.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(bridge_state.exists())
             mcp_add = next(
                 command for command in calls if len(command) >= 3 and command[1:3] == ("mcp", "add")
             )
-            for value in expected_transport:
-                self.assertIn(value, mcp_add)
+            self.assertEqual(mcp_add[5], module.sys.executable)
+            self.assertEqual(mcp_add[6:], (str(bridge_runtime), "--config", str(bridge_config)))
+            bridge_payload = json.loads(bridge_config.read_text())
+            self.assertEqual(bridge_payload["schema_version"], 1)
+            self.assertEqual(bridge_payload["state_file"], str(bridge_state))
+            self.assertEqual(
+                bridge_payload["command"],
+                list(module.authority_mcp_child_command(
+                    "macmini",
+                    expected_transport,
+                    "$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench",
+                )),
+            )
             self.assertEqual(preflight.call_args.args[1], source_proxy)
             self.assertEqual(
                 preflight.call_args.args[2].configuration["status_file"],
@@ -1420,14 +1461,11 @@ class InstallerTests(unittest.TestCase):
                 if command[:2] == ("launchctl", "print"):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
                 if len(command) >= 3 and command[1:3] == ("mcp", "add"):
-                    configuration.parent.mkdir(parents=True, exist_ok=True)
-                    configuration.write_text(
-                        'model = "gpt-fixture"\n\n'
-                        "[mcp_servers.codex-workbench]\n"
-                        'command = "ssh"\n'
-                        'args = ["-T", "fixture-slow-ssh"]\n\n'
-                        "[mcp_servers.unrelated]\n"
-                        'url = "https://example.test/mcp"\n'
+                    self._write_stdio_registration(
+                        configuration,
+                        command,
+                        prefix='model = "gpt-fixture"\n\n',
+                        suffix='\n[mcp_servers.unrelated]\nurl = "https://example.test/mcp"\n',
                     )
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
@@ -1466,8 +1504,18 @@ class InstallerTests(unittest.TestCase):
             mcp_add = next(
                 command for command in calls if len(command) >= 3 and command[1:3] == ("mcp", "add")
             )
-            self.assertIn("fixture-slow-ssh", configuration.read_text())
-            self.assertIn("ssh", mcp_add)
+            client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+            bridge_runtime = client_root / "libexec" / "workbench-mcp-bridge.py"
+            bridge_config = client_root / "mcp-bridge.json"
+            self.assertEqual(mcp_add[5], module.sys.executable)
+            self.assertEqual(mcp_add[6:], (str(bridge_runtime), "--config", str(bridge_config)))
+            bridge_payload = json.loads(bridge_config.read_text())
+            self.assertEqual(
+                bridge_payload["command"],
+                list(module.authority_mcp_child_command(
+                    "macmini", (), "$HOME/Library/Application Support/Codex Workbench/app/bin/codex-workbench"
+                )),
+            )
 
     def test_macbook_mcp_timeout_config_rolls_back_to_existing_registration(self) -> None:
         module = self._macbook_installer_module()
@@ -1487,6 +1535,17 @@ class InstallerTests(unittest.TestCase):
                 'url = "https://example.test/mcp"\n'
             )
             configuration.write_text(original)
+            client_root = home / "Library" / "Application Support" / "Codex Workbench Client"
+            bridge_runtime = client_root / "libexec" / "workbench-mcp-bridge.py"
+            diagnose_runtime = client_root / "libexec" / "workbench-connection-diagnose.py"
+            bridge_config = client_root / "mcp-bridge.json"
+            bridge_state = client_root / "mcp-bridge-state.json"
+            bridge_runtime.parent.mkdir(parents=True)
+            bridge_runtime.write_text("old bridge\n")
+            diagnose_runtime.write_text("old diagnose\n")
+            bridge_config.write_text("old config\n")
+            bridge_state.write_text('{"writes":{"stable":"sent"},"event_cursors":{"task":9}}\n')
+            bridge_state_before = bridge_state.read_bytes()
             registered_configs: list[str] = []
             mcp_add_count = 0
 
@@ -1515,11 +1574,7 @@ class InstallerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
                 if len(command) >= 3 and command[1:3] == ("mcp", "add"):
                     mcp_add_count += 1
-                    configuration.write_text(
-                        "[mcp_servers.codex-workbench]\n"
-                        'command = "ssh"\n'
-                        'args = ["-T", "replacement-authority"]\n'
-                    )
+                    self._write_stdio_registration(configuration, command)
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             real_persist_mcp_timeouts = module.persist_mcp_timeouts
@@ -1560,10 +1615,16 @@ class InstallerTests(unittest.TestCase):
             registered = tomllib.loads(registered_configs[0])["mcp_servers"]["codex-workbench"]
             self.assertEqual(registered["startup_timeout_sec"], 60)
             self.assertEqual(registered["tool_timeout_sec"], 3600)
+            self.assertEqual(registered["command"], module.sys.executable)
+            self.assertEqual(registered["args"], [str(bridge_runtime), "--config", str(bridge_config)])
             self.assertEqual(configuration.read_text(), original)
             restored = tomllib.loads(configuration.read_text())["mcp_servers"]["codex-workbench"]
             self.assertEqual(restored["startup_timeout_sec"], 17)
             self.assertEqual(restored["tool_timeout_sec"], 91)
+            self.assertEqual(bridge_runtime.read_text(), "old bridge\n")
+            self.assertEqual(diagnose_runtime.read_text(), "old diagnose\n")
+            self.assertEqual(bridge_config.read_text(), "old config\n")
+            self.assertEqual(bridge_state.read_bytes(), bridge_state_before)
 
     def test_macbook_static_install_disables_stale_location_profile_for_git_sync(self) -> None:
         module = self._macbook_installer_module()
@@ -1574,10 +1635,16 @@ class InstallerTests(unittest.TestCase):
             proxy = client_root / "bin" / "workbench-location-proxy"
             configuration = client_root / "transport.json"
             status = client_root / "status.json"
+            bridge_state = client_root / "mcp-bridge-state.json"
             proxy.parent.mkdir(parents=True)
             proxy.write_text("#!/bin/sh\n")
             configuration.write_text('{"schema_version":1}\n')
             status.write_text('{"route":"tailscale"}\n')
+            bridge_state.write_text(
+                '{"writes":{"request-digest":{"state":"sent"}},'
+                '"event_cursors":{"task-digest":42}}\n'
+            )
+            bridge_state_before = bridge_state.read_bytes()
 
             def fake_run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                 if command[:2] == ("id", "-u"):
@@ -1588,12 +1655,7 @@ class InstallerTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stdout="", stderr="not-loaded")
                 if len(command) >= 3 and command[1:3] == ("mcp", "add"):
                     mcp_config = home / ".codex" / "config.toml"
-                    mcp_config.parent.mkdir(parents=True, exist_ok=True)
-                    mcp_config.write_text(
-                        "[mcp_servers.codex-workbench]\n"
-                        'command = "ssh"\n'
-                        'args = ["-T", "fixture-authority"]\n'
-                    )
+                    self._write_stdio_registration(mcp_config, command)
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
@@ -1622,6 +1684,10 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(proxy.exists())
             self.assertFalse(configuration.exists())
             self.assertFalse(status.exists())
+            self.assertEqual(bridge_state.read_bytes(), bridge_state_before)
+            self.assertTrue((client_root / "libexec" / "workbench-mcp-bridge.py").is_file())
+            self.assertTrue((client_root / "libexec" / "workbench-connection-diagnose.py").is_file())
+            self.assertEqual((client_root / "mcp-bridge.json").stat().st_mode & 0o777, 0o600)
 
     def test_macbook_location_aware_dry_run_does_not_write_or_connect(self) -> None:
         module = self._macbook_installer_module()
@@ -1910,6 +1976,73 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual((app / "version").read_text(), "old")
             self.assertEqual((previous / "version").read_text(), "older")
 
+    def test_macbook_preflight_rejects_legacy_or_invalid_authority_service_status(self) -> None:
+        module = self._macbook_installer_module()
+        cases = (
+            ("legacy", '{"ok": true}', "incompatible protocol"),
+            (
+                "error receipt",
+                json.dumps({"ok": False, "service_protocol": module.AUTHORITY_SERVICE_PROTOCOL}),
+                "did not report ok=true",
+            ),
+            ("invalid JSON", "not-json", "invalid JSON"),
+        )
+        for label, stdout, expected in cases:
+            with self.subTest(label=label), mock.patch.object(
+                module,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+            ):
+                with self.assertRaisesRegex(SystemExit, expected):
+                    module.preflight_remote_mcp("authority-fixture", (), "/srv/codex-workbench")
+
+    def test_macbook_service_preflight_timeout_rejects_before_local_writes(self) -> None:
+        module = self._macbook_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            home = Path(directory) / "home"
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(
+                *command: str,
+                check: bool = True,
+                timeout_seconds: float | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                if command[:2] == ("id", "-u"):
+                    return subprocess.CompletedProcess(command, 0, stdout="501\n", stderr="")
+                if len(command) >= 3 and command[1:3] == ("mcp", "get"):
+                    return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+                if command and command[0] == "ssh":
+                    self.assertEqual(timeout_seconds, module.REMOTE_MCP_PREFLIGHT_TIMEOUT_SECONDS)
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(module, "run", side_effect=fake_run), mock.patch.object(
+                module, "preflight_global_agent_targets"
+            ), mock.patch.object(module, "preflight_managed_agent_skills"), mock.patch.object(
+                module, "install_code_as_harness"
+            ) as install_harness, mock.patch.object(module, "install_archify") as install_archify, mock.patch.object(
+                module.sys,
+                "argv",
+                ["install-macbook-client.py", "--source", str(source), "--ssh-transport", "system"],
+            ):
+                with self.assertRaisesRegex(SystemExit, "preflight timed out"):
+                    module.main()
+
+            install_harness.assert_not_called()
+            install_archify.assert_not_called()
+            self.assertFalse((home / "Library" / "Application Support" / "Codex Workbench Client").exists())
+            self.assertFalse((home / "Library" / "LaunchAgents").exists())
+            self.assertFalse(
+                any(
+                    len(command) >= 3 and command[1:3] in (("mcp", "remove"), ("mcp", "add"))
+                    for command in calls
+                )
+            )
+
     def test_macbook_custom_authority_state_root_reaches_remote_paths(self) -> None:
         module = self._macbook_installer_module()
         self.assertEqual(
@@ -1934,19 +2067,38 @@ class InstallerTests(unittest.TestCase):
             "/srv/codex-workbench/app/bin/codex-workbench",
             payload["ProgramArguments"][-1],
         )
-        with mock.patch.object(module, "run") as run:
+        status_receipt = json.dumps(
+            {
+                "ok": True,
+                "service_protocol": module.AUTHORITY_SERVICE_PROTOCOL,
+            }
+        )
+        with mock.patch.object(
+            module,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=status_receipt, stderr=""),
+        ) as run:
             module.preflight_remote_mcp("authority-fixture", (), "/srv/codex-workbench")
         self.assertEqual(
             run.call_args.args,
             (
                 "ssh",
+                "-T",
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=10",
+                "-o",
+                "ServerAliveCountMax=2",
                 "authority-fixture",
-                "test -x /srv/codex-workbench/app/bin/codex-workbench",
+                "exec /srv/codex-workbench/app/bin/codex-workbench --home /srv/codex-workbench service status",
             ),
+        )
+        self.assertEqual(
+            run.call_args.kwargs,
+            {"timeout_seconds": module.REMOTE_MCP_PREFLIGHT_TIMEOUT_SECONDS},
         )
 
     def test_authority_dry_run_is_local_and_does_not_install(self) -> None:

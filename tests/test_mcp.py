@@ -164,6 +164,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
+                "workbench_validate_blocked_node",
                 "workbench_request",
                 "workbench_get_request",
                 "workbench_get_session",

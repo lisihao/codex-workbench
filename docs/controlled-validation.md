@@ -2,6 +2,20 @@
 
 本页是操作者控制的确定性验证入口，不改变 Worker 的默认权限，不创建任务 attempt，也不把验证通过当作任务 accepted。Workbench 继续使用项目原有命令；仅当证据已定位为宿主沙箱拒绝 Unix IPC 或具体 Git 快照写入时，由拥有该任务授权的操作者执行。不得直接在被封存的恢复 source 上写入；选择已获准的验证工作树，并重新获取后续恢复需要的源码摘要。
 
+## 正式 MCP 入口
+
+`workbench_validate_blocked_node` 仅接受当前 blocked 任务的 blocked、active、尚未封存 allocation。调用方必须给出精确 `task_id`、`node_id`、`expected_revision`、`expected_attempt`、绝对 `worktree`、`reason` 和固定 `check_id`。不接受 shell、任意命令、环境变量或额外可写目录。该入口由同一 Authority 服务执行，不启动第二个调度器。
+
+固定检查为 `dsh-b-ipc-v1`（六个已定位的 Unix IPC fixture）、`dsh-b-pairing-check-v1`（五对 README）和 `dsh-b-pairing-write-v1`（更新同五个 sidecar 后立即检查）。IPC 检查不是 B 全部行为回归；通过也不表示 B accepted。五对 README 限于 connection、system-prompt、resident-operator-local、resident-operator 和 tool-physical-operator，不包含祖先任务的 task-template 文档，不允许 `--all`。
+
+IPC 命令固定使用 `--no-cache --configLoader=runner`，避免 Vitest results cache 和 Vite bundle 配置临时文件写入 `node_modules/.vite`、`.vite-temp` 或源码旁边。已核对目标的 Vitest 4.1.8/Vite 8.0.16 实现支持这些选项；不额外开放 `node_modules` 写权限。每条命令的 JSON report 留在私有临时目录，并要求精确测试标题实际通过，退出 0 但未命中或被跳过也视为失败。
+
+先用 `dry_run: true` 预览。预览无任务、事件、artifact 或源码写入，返回当前完整绑定的 `fingerprint`、source delta、固定命令和权限计划。运行使用相同字段、`dry_run: false`、预览的 `expected_fingerprint`，并令 `validation_id` 等于稳定的 Authority `request_id`。pairing-write 另外要求 `confirm_pairing_write: true`。源码、分配、revision、attempt、依赖输入或执行计划变化时拒绝运行，必须重新预览。
+
+运行回执复用 Authority 请求 journal，保留命令、隔离环境、退出码、超时、权限和日志 artifact 引用，并返回 `audit_ref`。响应丢失后通过 `workbench_get_service_request` 查询同一 ID，禁止自动换 ID 重跑。执行期间同一任务的恢复 CAS 被挡住；结束后历史 worker result、revision、attempt 和已接受祖先不被这个工具修改。pairing-write 改变当前源码摘要，因此后续 source-only 恢复必须重新预览，不能沿用写入前摘要。
+
+下述原生 sandbox 配方是该入口的权限依据和本地 fixture 说明，不是 MCP-only 任务的 shell 绕行授权。安装新源码前，旧版本的 MCP 不具备此入口；提供说明文档或通过权限 fixture 都不能代替实际工具部署和目标任务验收。
+
 ## 执行器与权限
 
 使用 Authority 实际固定的 Codex binary，先核对 `--version` 和 `sandbox --help`。受支持的调用是 `codex sandbox -P <profile> -c <complete-inline-profile> -C <worktree> --allow-unix-socket <private-temp> -- <exact-argv>`，不是 `codex exec`，不调用模型、登录或订阅。当前验证的 CLI 提供 `--allow-unix-socket`，只允许该路径下的 Unix bind/connect；旧 CLI 不支持时明确停止，不能退化为全网络或全权限执行。

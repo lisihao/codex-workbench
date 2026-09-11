@@ -27,6 +27,8 @@ LOCATION_AWARE_HOST_KEY_ALIAS = "codex-workbench-authority"
 MCP_REGISTRATION_NAME = "codex-workbench"
 MCP_STARTUP_TIMEOUT_SECONDS = 60
 MCP_TOOL_TIMEOUT_SECONDS = 3600
+AUTHORITY_SERVICE_PROTOCOL = "workbench-authority-service/v1"
+REMOTE_MCP_PREFLIGHT_TIMEOUT_SECONDS = 20
 MCP_REGISTRATION_TABLE = re.compile(
     r"^\s*\[\s*mcp_servers\s*\.\s*(?:codex-workbench|\"codex-workbench\"|'codex-workbench')\s*\]\s*(?:#.*)?$"
 )
@@ -67,8 +69,18 @@ def relaunch_with_supported_runtime() -> None:
 relaunch_with_supported_runtime()
 
 
-def run(*command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, check=check)
+def run(
+    *command: str,
+    check: bool = True,
+    timeout_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=check,
+        timeout=timeout_seconds,
+    )
 
 
 def configured_ssh_hostname(destination: str) -> str:
@@ -212,6 +224,17 @@ def location_proxy_source(source: Path) -> Path:
     return proxy
 
 
+def mcp_bridge_sources(source: Path) -> tuple[Path, Path]:
+    """Return the checked-in supervisor and read-only diagnostic scripts."""
+
+    bridge = source / "scripts" / "workbench-mcp-bridge.py"
+    diagnose = source / "scripts" / "workbench-connection-diagnose.py"
+    for path, label in ((bridge, "MCP bridge"), (diagnose, "connection diagnostic")):
+        if not path.is_file():
+            raise SystemExit(f"{label} is missing: {path}")
+    return bridge, diagnose
+
+
 def local_tailscale_binary() -> str:
     tailscale = shutil.which("tailscale")
     if not tailscale:
@@ -283,6 +306,39 @@ def write_location_aware_config(path: Path, configuration: dict[str, object]) ->
     path.chmod(0o600)
 
 
+def write_mcp_bridge_config(
+    path: Path,
+    command: tuple[str, ...],
+    state_file: Path,
+) -> None:
+    """Atomically update the private bridge command without touching its state."""
+
+    if not command or any(not isinstance(argument, str) or not argument for argument in command):
+        raise SystemExit("MCP bridge command must be a non-empty argv list")
+    payload = {
+        "schema_version": 1,
+        "command": list(command),
+        "state_file": str(state_file),
+    }
+    temporary = path.with_name(f".{path.name}.codex-workbench-{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    except OSError as error:
+        raise SystemExit("cannot persist private MCP bridge configuration") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def install_private_python_script(source: Path, runtime: Path) -> None:
+    """Install one Python source file as a private libexec runtime."""
+
+    runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(source, runtime)
+    runtime.chmod(0o600)
+
+
 def install_location_proxy(
     source: Path,
     launcher: Path,
@@ -292,9 +348,7 @@ def install_location_proxy(
     """Install a launchd-safe wrapper bound to the current Python 3.11+ runtime."""
 
     launcher.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    shutil.copy2(source, runtime)
-    runtime.chmod(0o600)
+    install_private_python_script(source, runtime)
     launcher.write_text(
         "#!/bin/sh\n"
         f"exec {shlex.quote(python_executable)} {shlex.quote(str(runtime))} \"$@\"\n"
@@ -635,24 +689,94 @@ def authority_mcp_binary(state_root: str) -> str:
     return remote_state_root(state_root).rstrip("/") + "/app/bin/codex-workbench"
 
 
+def authority_mcp_child_command(
+    authority_ssh_alias: str,
+    transport_arguments: tuple[str, ...],
+    remote_binary: str,
+) -> tuple[str, ...]:
+    """Build the exact existing SSH argv now supervised by the local bridge."""
+
+    remote_command = f"exec {remote_shell_quote(remote_binary)} mcp"
+    return (
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        *transport_arguments,
+        authority_ssh_alias,
+        remote_command,
+    )
+
+
+def authority_service_status_command(
+    authority_ssh_alias: str,
+    transport_arguments: tuple[str, ...],
+    state_root: str,
+) -> tuple[str, ...]:
+    """Build the authenticated remote Authority service-status invocation."""
+
+    remote_root = remote_state_root(state_root)
+    binary = authority_mcp_binary(state_root)
+    remote_command = (
+        f"exec {remote_shell_quote(binary)} --home {remote_shell_quote(remote_root)} service status"
+    )
+    return (
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        *transport_arguments,
+        authority_ssh_alias,
+        remote_command,
+    )
+
+
 def preflight_remote_mcp(
     authority_ssh_alias: str,
     transport_arguments: tuple[str, ...],
     state_root: str,
 ) -> str:
-    """Verify the exact remote MCP executable before local writes begin."""
+    """Require the authenticated Authority service capability before local writes."""
 
     binary = authority_mcp_binary(state_root)
-    run(
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=15",
-        *transport_arguments,
+    command = authority_service_status_command(
         authority_ssh_alias,
-        "test -x " + remote_shell_quote(binary),
+        transport_arguments,
+        state_root,
     )
+    try:
+        result = run(
+            *command,
+            timeout_seconds=REMOTE_MCP_PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit("Authority service preflight timed out") from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit("Authority service preflight command failed") from error
+    if result.returncode != 0:
+        raise SystemExit("Authority service preflight command failed")
+    try:
+        receipt = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise SystemExit("Authority service preflight returned invalid JSON") from error
+    if not isinstance(receipt, dict):
+        raise SystemExit("Authority service preflight did not return an object")
+    if receipt.get("ok") is not True:
+        raise SystemExit("Authority service preflight did not report ok=true")
+    if receipt.get("service_protocol") != AUTHORITY_SERVICE_PROTOCOL:
+        raise SystemExit("Authority service preflight reported an incompatible protocol")
     return binary
 
 
@@ -970,6 +1094,10 @@ def main() -> int:
     )
     client_bin = client_root / "bin"
     client_libexec = client_root / "libexec"
+    mcp_bridge_runtime = client_libexec / "workbench-mcp-bridge.py"
+    connection_diagnose_runtime = client_libexec / "workbench-connection-diagnose.py"
+    mcp_bridge_config = client_root / "mcp-bridge.json"
+    mcp_bridge_state = client_root / "mcp-bridge-state.json"
     location_proxy = client_bin / "workbench-location-proxy"
     location_proxy_runtime = client_libexec / "workbench-location-proxy.py"
     heartbeat_launcher = client_bin / "workbench-client-heartbeat"
@@ -987,6 +1115,7 @@ def main() -> int:
     )
     source_location_proxy: Path | None = None
     location_transport: LocationAwareTransport | None = None
+    source_mcp_bridge, source_connection_diagnose = mcp_bridge_sources(source)
     if dynamic_transport:
         source_location_proxy = location_proxy_source(source)
         source_heartbeat = source / "scripts" / "workbench-client-heartbeat.py"
@@ -1014,13 +1143,24 @@ def main() -> int:
             args.tailscale_native_ssh_port,
             probe_config=not args.dry_run,
         )
+    mcp_child_command = authority_mcp_child_command(
+        authority_ssh_alias,
+        transport_arguments,
+        remote_binary,
+    )
 
     assert_directory_target(log_root, "log root")
     assert_directory_target(launch_agents, "LaunchAgents root")
+    assert_directory_target(client_root, "MacBook Workbench client root")
+    assert_directory_target(client_libexec, "MacBook Workbench client libexec")
+    assert_file_target(mcp_bridge_runtime, "MCP bridge runtime")
+    assert_file_target(connection_diagnose_runtime, "connection diagnostic runtime")
+    assert_file_target(mcp_bridge_config, "MCP bridge configuration")
+    # This is durable bridge data, not an installer artifact.  It must remain
+    # untouched so write identities and event cursors survive an upgrade.
+    assert_file_target(mcp_bridge_state, "MCP bridge state")
     if dynamic_transport:
-        assert_directory_target(client_root, "MacBook Workbench client root")
         assert_directory_target(client_bin, "MacBook Workbench client bin")
-        assert_directory_target(client_libexec, "MacBook Workbench client libexec")
         assert_file_target(location_proxy, "location-aware proxy")
         assert_file_target(location_proxy_runtime, "location-aware proxy runtime")
         assert_file_target(heartbeat_launcher, "location-aware heartbeat launcher")
@@ -1073,6 +1213,10 @@ def main() -> int:
         print(f"plan: authority={authority_ssh_alias}")
         print(f"plan: authority state-root={authority_state_root}")
         print(f"plan: remote MCP executable={remote_binary}")
+        print(f"plan: MCP bridge runtime={mcp_bridge_runtime} (0600)")
+        print(f"plan: connection diagnostic={connection_diagnose_runtime} (0600)")
+        print(f"plan: MCP bridge config={mcp_bridge_config} (0600)")
+        print(f"plan: MCP bridge state={mcp_bridge_state} (preserved)")
         if dynamic_transport:
             assert location_transport is not None
             lan = location_transport.configuration["lan"]
@@ -1109,13 +1253,12 @@ def main() -> int:
         transaction.track_created_directory(log_root)
     if not launch_agents.exists():
         transaction.track_created_directory(launch_agents)
-    if dynamic_transport:
-        if not client_root.exists():
-            transaction.track_created_directory(client_root)
-        if not client_bin.exists():
-            transaction.track_created_directory(client_bin)
-        if not client_libexec.exists():
-            transaction.track_created_directory(client_libexec)
+    if not client_root.exists():
+        transaction.track_created_directory(client_root)
+    if not client_libexec.exists():
+        transaction.track_created_directory(client_libexec)
+    if dynamic_transport and not client_bin.exists():
+        transaction.track_created_directory(client_bin)
     snapshot_paths = [
         *[(path, f"{label} LaunchAgent") for label, path in service_paths.items()],
         (Path.home() / ".codex" / "skills" / "code-as-harness", "Codex Code-as-Harness skill"),
@@ -1125,6 +1268,9 @@ def main() -> int:
         (Path.home() / ".claude" / "CLAUDE.md", "Claude policy"),
         (Path.home() / ".claude" / "skills" / "archify", "Claude Archify skill"),
         (codex_config, "Codex MCP configuration"),
+        (mcp_bridge_runtime, "MCP bridge runtime"),
+        (connection_diagnose_runtime, "connection diagnostic runtime"),
+        (mcp_bridge_config, "MCP bridge configuration"),
     ]
     snapshot_paths.extend(
         (
@@ -1151,6 +1297,11 @@ def main() -> int:
 
         log_root.mkdir(parents=True, exist_ok=True)
         launch_agents.mkdir(parents=True, exist_ok=True)
+        client_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        client_libexec.mkdir(parents=True, exist_ok=True, mode=0o700)
+        install_private_python_script(source_mcp_bridge, mcp_bridge_runtime)
+        install_private_python_script(source_connection_diagnose, connection_diagnose_runtime)
+        write_mcp_bridge_config(mcp_bridge_config, mcp_child_command, mcp_bridge_state)
         if dynamic_transport:
             assert source_location_proxy is not None and location_transport is not None
             client_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1193,7 +1344,6 @@ def main() -> int:
             run("launchctl", "bootstrap", domain, str(plist_path))
             run("launchctl", "enable", f"{domain}/{label}")
             run("launchctl", "kickstart", "-k", f"{domain}/{label}")
-        remote_command = f"exec {remote_shell_quote(remote_binary)} mcp"
         mcp_touched = True
         run(codex, "mcp", "remove", MCP_REGISTRATION_NAME, check=False)
         run(
@@ -1202,19 +1352,10 @@ def main() -> int:
             "add",
             MCP_REGISTRATION_NAME,
             "--",
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=15",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=2",
-            *transport_arguments,
-            authority_ssh_alias,
-            remote_command,
+            sys.executable,
+            str(mcp_bridge_runtime),
+            "--config",
+            str(mcp_bridge_config),
         )
         persist_mcp_timeouts(codex_config)
     except BaseException as error:

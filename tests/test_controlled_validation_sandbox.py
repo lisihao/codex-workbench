@@ -17,6 +17,9 @@ import sys
 import tempfile
 import unittest
 
+from codex_workbench.artifacts import ArtifactStore
+from codex_workbench.controlled_validation import ValidationRuntime, plan_validation, run_validation
+
 
 CODEX = os.environ.get("WB_SANDBOX_CODEX") or shutil.which("codex")
 
@@ -133,3 +136,69 @@ print(json.dumps(result))
         self.assertEqual((common / "config").read_bytes(), config)
         self.assertEqual(subprocess.check_output(
             ["git", "-C", str(self.worktree), "cat-file", "blob", digest]), content)
+
+    def test_real_runner_executes_exact_pairing_plan_with_private_ipc_and_denied_source_writes(self) -> None:
+        """A fixture pnpm entry exercises the new runner, not DSH task acceptance."""
+        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
+        anchors = (
+            "packages/client/connection/README.md",
+            "packages/core/system-prompt/README.md",
+            "packages/physical-operator/resident-operator-local/README.md",
+            "packages/physical-operator/resident-operator/README.md",
+            "packages/physical-operator/tool-physical-operator/README.md",
+        )
+        for anchor in anchors:
+            english = self.worktree / anchor
+            english.parent.mkdir(parents=True)
+            english.write_text("English fixture: " + anchor + "\n")
+            english.with_name("README.zh.md").write_text("Translated fixture: " + anchor + "\n")
+            english.with_name("README.i18n.yaml").write_text("before\n")
+        pnpm = self.root / "fixture-pnpm"
+        pnpm.write_text("#!" + sys.executable + "\n" + r'''
+import errno, json, os, pathlib, socket, subprocess, sys
+if sys.argv[1:3] != ['run', 'verify-translation-pairing']:
+    raise SystemExit(2)
+arguments = sys.argv[3:]
+write = arguments[0] == '--write'
+anchors = arguments[1:] if write else arguments
+assert len(anchors) == 5
+sock_path = pathlib.Path(os.environ['TMPDIR']) / ('pair-' + str(os.getpid()) + '.sock')
+probe = socket.socket(socket.AF_UNIX)
+probe.bind(str(sock_path))
+probe.close()
+sock_path.unlink()
+denied = []
+for relative in ('forbidden-source.txt', '.git/config'):
+    try:
+        pathlib.Path(relative).write_text('forbidden')
+        raise AssertionError('unexpected write grant')
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EACCES)
+        denied.append(relative)
+for anchor in anchors:
+    source = pathlib.Path(anchor)
+    sidecar = source.with_name('README.i18n.yaml')
+    if write:
+        for selected in (source, source.with_name('README.zh.md')):
+            blob = subprocess.check_output(['git', 'hash-object', '-w', '--', str(selected)], text=True).strip()
+            subprocess.run(['git', 'update-ref', 'refs/dsh/translation-pairing/snapshots/' + blob, blob], check=True)
+        sidecar.write_text('paired\n')
+    else:
+        assert sidecar.read_text() == 'paired\n'
+print(json.dumps({'selected_pairs': len(anchors), 'denied': denied, 'private_ipc': True}))
+''')
+        pnpm.chmod(0o700)
+        config_before = (self.worktree / ".git/config").read_bytes()
+        # The fixture does not invoke Node; use a real pinned executable for
+        # the runtime identity field while its pnpm shim runs fixture Python.
+        runtime = ValidationRuntime(Path(str(CODEX)).resolve(), pnpm, Path(sys.executable).resolve())
+        plan = plan_validation(self.worktree, "dsh-b-pairing-write-v1", runtime)
+        artifacts = ArtifactStore(self.root / "artifacts")
+        result = run_validation(plan, artifacts).to_dict()
+        logs = "\n".join(artifacts.verify(command["stderr_ref"]).read_text() for command in result["commands"])
+        self.assertTrue(result["ok"], (result, logs))
+        self.assertEqual(len(result["commands"]), 2)
+        self.assertEqual((self.worktree / ".git/config").read_bytes(), config_before)
+        self.assertFalse((self.worktree / "forbidden-source.txt").exists())
+        for anchor in anchors:
+            self.assertEqual((self.worktree / anchor).with_name("README.i18n.yaml").read_text(), "paired\n")
