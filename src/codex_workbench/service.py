@@ -2837,6 +2837,21 @@ class Coordinator:
                 target=target,
                 branch=target_branch,
             )
+            artifacts["recovery-preparation"] = self.artifacts.put_text(
+                canonical_json({
+                    "schema_version": 1,
+                    "kind": "recovery-preparation-failure",
+                    "task_id": claimed["task_id"],
+                    "node_id": claimed["node_id"],
+                    "source_attempt": recovery["source_attempt"],
+                    "recovery_attempt": target_attempt,
+                    "phase": "acceptance" if outcome.failure_code else "preparation",
+                    "code": outcome.failure_code or "preparation-failed",
+                    "executor_started": False,
+                    "evidence_refs": dict(artifacts),
+                }),
+                "recovery-preparation.json",
+            )
             return NodeResult(
                 status=outcome.status,
                 summary=f"deterministic clean-target recovery: {outcome.summary}",

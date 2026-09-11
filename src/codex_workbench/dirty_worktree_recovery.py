@@ -623,6 +623,7 @@ class RecoveryOutcome:
     changed_paths: tuple[str, ...]
     exit_code: int | None = None
     prepared_recovery: dict[str, object] | None = None
+    failure_code: str | None = None
 
 
 def _bounded(text: str, *, limit: int = 1_000_000) -> str:
@@ -1827,6 +1828,7 @@ class DirtyWorktreeRecovery:
                         tuple(checks),
                         tuple(str(path) for path in recovery["changed_paths"]),
                         outcome.exit_code,
+                        failure_code="acceptance-command-failed",
                     )
                 if outcome.evidence_fingerprint is not None:
                     prior_successful_command_fingerprints.append(outcome.evidence_fingerprint)

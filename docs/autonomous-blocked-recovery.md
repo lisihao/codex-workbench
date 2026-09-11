@@ -43,6 +43,8 @@ The verifier now returns `repair_node_ids` (empty when the source owner is unkno
 
 Only a bounded internal error before executor start, with its deepest frame in Workbench package code, can produce the new typed `tooling_bug` receipt. Execution-started or external-frame failures remain indeterminate. Free-form summaries are not recovery authority. A ready environment is not proof that code is complete.
 
+Failed clean-target preparation emits a `recovery-preparation-failure` artifact with source and recovery attempts, the failed phase, an explicit code and existing evidence refs. `acceptance-command-failed` identifies a failed check, not its cause: it does not establish a missing dependency, a business-code defect or permission to change acceptance. Rollback keeps the original source result while retaining this separate failed-attempt evidence.
+
 A repair request fingerprint and a verified deployment fingerprint are separate values. The parent waits for the repair task's exact deploy/live-verify receipt and dispatch chain, current installation identity and fresh readiness. An accepted repair is not a deployed repair. If the Authority restarted, historical live verification remains historical; a current, content-addressed readiness proof may confirm the same installation for parent validation, without inventing a new HTTP probe. Missing publication authority is one explicit user-action wait, not an automatic deployment.
 
 ## Evidence and release boundary

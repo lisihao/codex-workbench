@@ -6,7 +6,7 @@ neither a background thread nor another task database.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from typing import Any, Callable, Mapping, Protocol
 
@@ -36,8 +36,14 @@ _PROGRESS_FIELDS = frozenset({
 })
 _EVENT_TYPES = frozenset({
     "node.blocked", "node.failed", "node.accepted", "node.started",
+    "node.blocked_worktree_recovery_rolled_back",
     "task.state_changed", "approval.decided", "node_recovery.policy_configured",
-    "delivery_objective.stage_completed", "delivery_objective.completed",
+})
+_REPAIR_DELIVERY_EVENT_TYPES = frozenset({
+    "delivery_objective.rollback_verified",
+    "delivery_objective.stage_succeeded",
+    "delivery_objective.retry_scheduled",
+    "delivery_objective.decision_required",
 })
 
 
@@ -74,13 +80,28 @@ class NodeRecoveryReconciler:
         current["now"] = now_iso()
         current["elapsed_seconds"] = _elapsed(episode["created_at"], current["now"]) if episode else 0
         current["action_attempts"] = 0
+        decision = plan_recovery(policy, current)
+        if current.get("observation_available") is False:
+            if decision["state"] == "suspended" and decision["reason_kind"] in {"policy_disabled", "user_pause"}:
+                return {
+                    "category": current["category"], "state": "suspended", "action": None,
+                    "reason_kind": "observation_unavailable", "control_reason": decision["reason_kind"],
+                    "owner": "authority", "requires_authorization": False, "next_wakeup_at": None,
+                }
+            return {
+                "category": current["category"], "state": "waiting", "action": None,
+                "reason_kind": "observation_unavailable", "owner": "authority",
+                "requires_authorization": False,
+                "next_wakeup_at": (
+                    datetime.fromisoformat(current["now"]) + timedelta(seconds=policy.backoff_seconds)
+                ).isoformat(),
+            }
         if current.get("recovery_resumed") is True:
             return {
                 "category": current["category"], "state": "resolved", "action": None,
                 "reason_kind": "original_node_resumed", "owner": "authority",
                 "requires_authorization": False, "next_wakeup_at": None,
             }
-        decision = plan_recovery(policy, current)
         action = decision.get("action")
         stage = (
             f"narrow_validation:{current.get('validation_profile')}"
@@ -99,6 +120,8 @@ class NodeRecoveryReconciler:
         observed = self.observer(self.store, task_id, node_id, source_event_cursor=cursor)
         observed["attempt"] = observed["node_attempt"]
         policy = RecoveryPolicy.from_dict(self.recovery.get_policy(task_id)["policy"])
+        if observed.get("observation_available") is False:
+            return self._decision(observed, None, policy)
         prior = None
         for item in self.recovery.list_summary(task_id=task_id, limit=100):
             if (item["node_id"] == node_id and item["node_attempt"] == observed["node_attempt"]
@@ -197,6 +220,23 @@ class NodeRecoveryReconciler:
                     "next_action": "retain the existing executor deadline and await substantive evidence",
                 }, created_at=timestamp)
 
+    def _linked_repair_parents(self, repair_task_id: str) -> tuple[str, ...]:
+        """Return the bounded set of enabled parents waiting on one repair task."""
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT repairs.task_id
+                FROM node_recovery_repairs AS repairs
+                JOIN node_recovery_policies AS policies ON policies.task_id = repairs.task_id
+                WHERE repairs.repair_task_id = ?
+                  AND json_extract(policies.policy_json, '$.enabled') = 1
+                ORDER BY repairs.task_id
+                LIMIT 100
+                """,
+                (repair_task_id,),
+            ).fetchall()
+        return tuple(str(row["task_id"]) for row in rows)
+
     def _observe(self) -> None:
         cursor = self.recovery.read_cursor()
         with self.store.connection() as connection:
@@ -205,9 +245,17 @@ class NodeRecoveryReconciler:
                 (cursor,),
             ).fetchall()
         dirty: dict[str, int] = {}
+        repair_events: dict[str, int] = {}
         for event in events:
             if event["task_id"] and event["event_type"] in _EVENT_TYPES:
-                dirty[str(event["task_id"])] = int(event["cursor"])
+                task_id = str(event["task_id"])
+                dirty[task_id] = max(dirty.get(task_id, 0), int(event["cursor"]))
+            elif event["task_id"] and event["event_type"] in _REPAIR_DELIVERY_EVENT_TYPES:
+                task_id = str(event["task_id"])
+                repair_events[task_id] = max(repair_events.get(task_id, 0), int(event["cursor"]))
+        for repair_task_id, event_cursor in repair_events.items():
+            for parent_task_id in self._linked_repair_parents(repair_task_id):
+                dirty[parent_task_id] = max(dirty.get(parent_task_id, 0), event_cursor)
         for task_id, event_cursor in dirty.items():
             self._refresh_task(task_id, event_cursor)
         if events:

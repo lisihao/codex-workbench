@@ -92,12 +92,14 @@ class NodeRecoveryLoopTests(unittest.TestCase):
         )
         self.actions = FixtureActions(self.store)
         self.category = "dependency"
+        self.observed: list[tuple[str, str, int]] = []
         self.loop = self.make_loop()
 
     def task(self):
         return self.store.get_task(self.task_id)
 
     def observe(self, store, task_id, node_id, *, source_event_cursor=0):
+        self.observed.append((task_id, node_id, source_event_cursor))
         task = store.get_task(task_id)
         node = next(node for node in task["nodes"] if node["node_id"] == node_id)
         return {
@@ -115,6 +117,80 @@ class NodeRecoveryLoopTests(unittest.TestCase):
             self.store, coordinator_epoch=self.epoch, observer=self.observe,
             adapters={action: self.actions for action in self.policy.allowed_actions},
         )
+
+    def _event_loop(self):
+        loop = NodeRecoveryReconciler(
+            self.store, coordinator_epoch=self.epoch, observer=self.observe,
+            adapters={}, monotonic=lambda: 0,
+        )
+        loop._next_sweep = 1
+        return loop
+
+    def _advance_recovery_cursor(self):
+        current = self.recovery.read_cursor()
+        latest = self.store.health()["cursor"]
+        if current < latest:
+            self.recovery.advance_cursor(current, latest)
+
+    def _append_event(self, event_type, task_id, payload):
+        with self.store.transaction() as connection:
+            return self.store._event(connection, event_type, task_id, None, payload)
+
+    def _create_blocked_task(self, task_id):
+        contract = TaskContract(
+            task_id, self.temp.name, "fixture", "fixture blocked task", allowed_scope=("src",), retry_limit=0,
+        )
+        self.store.create_task(contract, [
+            NodeSpec("worker", task_id, "implement", "fixture", "fixture", "fixture", write_scopes=("src",)),
+            NodeSpec("verify", task_id, "verify", "fixture", "fixture", "fixture", depends_on=("worker",), verifier=True),
+        ], f"create-{task_id}")
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET state = 'blocked', attempt = 1 WHERE task_id = ? AND node_id = 'worker'",
+                (task_id,),
+            )
+            connection.execute(
+                "UPDATE tasks SET state = 'blocked', state_revision = state_revision + 1 WHERE task_id = ?",
+                (task_id,),
+            )
+        self.recovery.configure_policy(
+            task_id, RecoveryPolicy(enabled=True, allowed_actions=("observe_readiness",)),
+            expected_task_revision=self.store.get_task(task_id)["state_revision"], actor="fixture",
+        )
+
+    def _create_repair_task(self, task_id):
+        contract = TaskContract(
+            task_id, self.temp.name, "fixture", "fixture repair task", allowed_scope=("src",), retry_limit=0,
+        )
+        self.store.create_task(contract, [
+            NodeSpec("repair", task_id, "repair", "fixture", "fixture", "fixture", write_scopes=("src",)),
+            NodeSpec("verify", task_id, "verify", "fixture", "fixture", "fixture", depends_on=("repair",), verifier=True),
+        ], f"create-{task_id}")
+
+    def _link_repair(self, episode, repair_task_id):
+        timestamp = datetime.now(UTC).isoformat()
+        repair_fingerprint = canonical_hash({"episode_id": episode["episode_id"], "repair_task_id": repair_task_id})
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO node_recovery_repairs(
+                    repair_link_id, task_id, failure_fingerprint, episode_id,
+                    repair_request_id, repair_task_id, repair_fingerprint,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "fixture-link-" + repair_task_id,
+                    episode["task_id"],
+                    episode["failure_fingerprint"],
+                    episode["episode_id"],
+                    "fixture-request-" + repair_task_id,
+                    repair_task_id,
+                    repair_fingerprint,
+                    timestamp,
+                    timestamp,
+                ),
+            )
 
     def test_dependency_recovery_continues_original_node_without_worker_reimplementation(self):
         for _ in range(3):
@@ -167,6 +243,175 @@ class NodeRecoveryLoopTests(unittest.TestCase):
         self.loop.reconcile_once()
         self.assertEqual(self.actions.calls, [])
         self.assertEqual(self.recovery.metrics(task_id=self.task_id)["total_action_count"], 0)
+
+    def test_unavailable_rollback_observation_waits_without_an_action(self):
+        observation = self.observe(self.store, self.task_id, "B")
+        observation.update({
+            "observation_available": False,
+            "observation_unavailable_reason": "snapshot_conflict",
+        })
+
+        decision = self.loop._decision(observation, None, self.policy)
+
+        self.assertEqual(
+            (decision["state"], decision["action"], decision["reason_kind"]),
+            ("waiting", None, "observation_unavailable"),
+        )
+        self.assertIsNotNone(decision["next_wakeup_at"])
+        stale_resumed = self.loop._decision({**observation, "recovery_resumed": True}, None, self.policy)
+        self.assertEqual((stale_resumed["state"], stale_resumed["reason_kind"]), ("waiting", "observation_unavailable"))
+        stale_accepted = self.loop._decision({**observation, "task_state": "accepted"}, None, self.policy)
+        self.assertEqual((stale_accepted["state"], stale_accepted["reason_kind"]), ("waiting", "observation_unavailable"))
+        paused = self.loop._decision({**observation, "task_state": "paused"}, None, self.policy)
+        self.assertEqual(
+            (paused["state"], paused["reason_kind"], paused["control_reason"]),
+            ("suspended", "observation_unavailable", "user_pause"),
+        )
+        cancelled = self.loop._decision({**observation, "node_state": "cancelled"}, None, self.policy)
+        self.assertEqual(
+            (cancelled["state"], cancelled["reason_kind"], cancelled["control_reason"]),
+            ("suspended", "observation_unavailable", "user_pause"),
+        )
+        disabled = self.loop._decision(observation, None, RecoveryPolicy())
+        self.assertEqual(
+            (disabled["state"], disabled["reason_kind"], disabled["control_reason"]),
+            ("suspended", "observation_unavailable", "policy_disabled"),
+        )
+
+    def test_unavailable_rollback_observation_skips_repair_deployment_side_effects(self):
+        original = self.loop._refresh_node(self.task_id, "B", 0)
+        repair_task_id = "rollback-conflict-repair"
+        self._create_repair_task(repair_task_id)
+        self._link_repair(original, repair_task_id)
+        stale_task_revision = self.task()["state_revision"]
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE tasks SET state_revision = state_revision + 1 WHERE task_id = ?",
+                (self.task_id,),
+            )
+        task_before = self.task()
+        original_before = self.recovery.get_episode(original["episode_id"])
+        events_before = self.store.read_events()
+        self.actions.calls.clear()
+
+        def unavailable_observer(store, task_id, node_id, *, source_event_cursor=0):
+            observed = self.observe(store, task_id, node_id, source_event_cursor=source_event_cursor)
+            observed.update({
+                "task_revision": stale_task_revision,
+                "category": "unknown",
+                "origin": "unknown",
+                "failure_fingerprint": canonical_hash({
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "attempt": observed["node_attempt"],
+                    "reason": "snapshot_conflict",
+                }),
+                "observation_available": False,
+                "observation_unavailable_reason": "snapshot_conflict",
+            })
+            return observed
+
+        loop = NodeRecoveryReconciler(
+            self.store,
+            coordinator_epoch=self.epoch,
+            adapters={action: self.actions for action in self.policy.allowed_actions},
+            observer=unavailable_observer,
+            delivery_observer=lambda _episode: self.fail("unavailable observation must not inspect delivery"),
+            monotonic=lambda: 0,
+        )
+        loop._next_sweep = 1
+
+        waiting = loop._refresh_node(self.task_id, "B", 0)
+
+        self.assertEqual((waiting["state"], waiting["action"], waiting["owner"]), ("waiting", None, "authority"))
+        self.assertEqual(waiting["reason_kind"], "observation_unavailable")
+        self.assertIsNotNone(waiting["next_wakeup_at"])
+        self.assertEqual(loop.reconcile_once(), [])
+        self.assertEqual(self.actions.calls, [])
+        self.assertEqual(self.task(), task_before)
+        original_after = self.recovery.get_episode(original["episode_id"])
+        self.assertEqual(original_after, original_before)
+        self.assertEqual(self.store.read_events(), events_before)
+
+    def test_rollback_events_wake_the_parent_once_before_the_sweep(self):
+        loop = self._event_loop()
+        self._advance_recovery_cursor()
+        self.observed.clear()
+        first = self._append_event(
+            "node.blocked_worktree_recovery_rolled_back",
+            self.task_id,
+            {"attempt": 0, "source_attempt": 0, "task_revision": self.task()["state_revision"]},
+        )
+        second = self._append_event(
+            "node.blocked_worktree_recovery_rolled_back",
+            self.task_id,
+            {"attempt": 0, "source_attempt": 0, "task_revision": self.task()["state_revision"]},
+        )
+
+        loop._observe()
+        self.assertEqual(first + 1, second)
+        self.assertEqual(self.observed, [(self.task_id, "B", second)])
+        self.assertEqual(self.recovery.read_cursor(), second)
+
+        loop._observe()
+        self.assertEqual(self.observed, [(self.task_id, "B", second)])
+
+    def test_repair_delivery_events_wake_only_the_linked_enabled_parent_before_the_sweep(self):
+        episode = self.loop._refresh_node(self.task_id, "B", 0)
+        repair_task_id = "repair-task"
+        self._create_repair_task(repair_task_id)
+        self._link_repair(episode, repair_task_id)
+        self._create_blocked_task("unrelated-parent")
+        loop = self._event_loop()
+        self._advance_recovery_cursor()
+        self.observed.clear()
+        self._append_event(
+            "delivery_objective.rollback_verified",
+            repair_task_id,
+            {"objective_id": "repair-objective", "dispatch_id": "repair-dispatch", "receipt": {}},
+        )
+        self._append_event(
+            "delivery_objective.retry_scheduled",
+            repair_task_id,
+            {"objective_id": "repair-objective", "receipt_id": "retry", "stage": "deploy"},
+        )
+        final_cursor = self._append_event(
+            "delivery_objective.decision_required",
+            repair_task_id,
+            {"objective_id": "repair-objective", "receipt_id": "decision", "stage": "deploy"},
+        )
+
+        loop._observe()
+        self.assertEqual(self.observed, [(self.task_id, "B", final_cursor)])
+        self.assertEqual(self.recovery.read_cursor(), final_cursor)
+
+        self.observed.clear()
+        succeeded_cursor = self._append_event(
+            "delivery_objective.stage_succeeded",
+            repair_task_id,
+            {"objective_id": "repair-objective", "receipt_id": "succeeded", "stage": "deploy"},
+        )
+        loop._observe()
+        self.assertEqual(self.observed, [(self.task_id, "B", succeeded_cursor)])
+        self.assertEqual(self.recovery.read_cursor(), succeeded_cursor)
+
+        self.recovery.configure_policy(
+            self.task_id,
+            RecoveryPolicy(enabled=False, allowed_actions=self.policy.allowed_actions),
+            expected_task_revision=self.task()["state_revision"],
+            actor="fixture-disabled",
+        )
+        self._advance_recovery_cursor()
+        self.observed.clear()
+        disabled_cursor = self._append_event(
+            "delivery_objective.retry_scheduled",
+            repair_task_id,
+            {"objective_id": "repair-objective", "receipt_id": "disabled", "stage": "deploy"},
+        )
+
+        loop._observe()
+        self.assertEqual(self.observed, [])
+        self.assertEqual(self.recovery.read_cursor(), disabled_cursor)
 
     def test_persistent_same_fault_has_bounded_actions_and_one_notification(self):
         self.actions.fail_readiness = True
