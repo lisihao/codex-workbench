@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from hashlib import sha256
 import io
 import json
 import os
@@ -88,6 +89,17 @@ class ControlledValidationTests(unittest.TestCase):
         return target
 
     def _write_inputs(self) -> None:
+        self.vitest_entrypoint = self.worktree / "node_modules" / "vitest" / "vitest.mjs"
+        self.vitest_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        self.vitest_entrypoint.write_text("export {}\n", encoding="utf-8")
+        self.tsx_entrypoint = (
+            self.worktree / "node_modules" / "tsx" / "dist" / "esm" / "index.mjs"
+        )
+        self.tsx_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        self.tsx_entrypoint.write_text("export {}\n", encoding="utf-8")
+        self.pairing_entrypoint = self.worktree / "scripts" / "verify-translation-pairing.ts"
+        self.pairing_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        self.pairing_entrypoint.write_text("export {}\n", encoding="utf-8")
         for index, anchor in enumerate(validation._README_ANCHORS, start=1):
             source = self.worktree / anchor
             source.parent.mkdir(parents=True, exist_ok=True)
@@ -114,15 +126,21 @@ class ControlledValidationTests(unittest.TestCase):
         ipc = validation.plan_validation(self.worktree, "dsh-b-ipc-v1", self.runtime)
         self.assertTrue(ipc.allow_unix_socket)
         self.assertEqual(len(ipc.commands), 6)
+        vitest = self.vitest_entrypoint.resolve()
         for number, (command, (_path, title)) in enumerate(
             zip(ipc.commands, validation._IPC_VITEST_CASES, strict=True), start=1
         ):
+            self.assertEqual(command.argv[:3], (str(self.runtime.node_binary), str(vitest), "run"))
             self.assertEqual(command.expected_test_title, title)
             self.assertEqual(command.report_file, f"<private-scratch>/case-{number}.json")
             self.assertIn("--reporter=json", command.argv)
             self.assertNotIn("--cache", command.argv)
             self.assertIn("--no-cache", command.argv)
             self.assertIn("--configLoader=runner", command.argv)
+            self.assertEqual(
+                command.to_dict()["entrypoint_sha256"],
+                {str(vitest): sha256(vitest.read_bytes()).hexdigest()},
+            )
         self.assertEqual(ipc.to_dict()["sandbox"]["private_scratch"], "<private-scratch>")
 
         write = validation.plan_validation(self.worktree, "dsh-b-pairing-write-v1", self.runtime)
@@ -130,8 +148,19 @@ class ControlledValidationTests(unittest.TestCase):
         self.assertTrue(check.allow_unix_socket)
         self.assertEqual(len(write.readme_bindings), 5)
         self.assertEqual(len(write.commands), 2)
-        self.assertEqual(write.commands[0].argv[1:4], ("run", "verify-translation-pairing", "--write"))
-        self.assertEqual(write.commands[1].argv[1:3], ("run", "verify-translation-pairing"))
+        loader = self.tsx_entrypoint.resolve()
+        script = self.pairing_entrypoint.resolve()
+        prefix = (str(self.runtime.node_binary), "--import", loader.as_uri(), str(script))
+        self.assertEqual(write.commands[0].argv[:5], (*prefix, "--write"))
+        self.assertEqual(write.commands[1].argv[:4], prefix)
+        self.assertEqual(write.commands[0].argv[5:], validation._README_ANCHORS)
+        self.assertEqual(write.commands[1].argv[4:], validation._README_ANCHORS)
+        expected_entrypoints = {
+            str(loader): sha256(loader.read_bytes()).hexdigest(),
+            str(script): sha256(script.read_bytes()).hexdigest(),
+        }
+        self.assertEqual(write.commands[0].to_dict()["entrypoint_sha256"], expected_entrypoints)
+        self.assertEqual(write.commands[1].to_dict()["entrypoint_sha256"], expected_entrypoints)
         assert write.git_common_dir is not None
         self.assertNotIn(write.git_common_dir, write.grants)
         self.assertNotIn(write.git_common_dir / "refs", write.grants)
@@ -173,15 +202,33 @@ class ControlledValidationTests(unittest.TestCase):
         identity = runtime.to_dict()["executable_identity"]
         self.assertEqual(identity["pnpm"]["st_ino"], self.pnpm.stat().st_ino)
         plan = validation.plan_validation(self.worktree, "dsh-b-ipc-v1", runtime)
-        replacement = self.root / "pnpm-replacement"
+        replacement = self.root / "node-replacement"
         replacement.write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
         replacement.chmod(0o700)
-        os.replace(replacement, self.pnpm)
+        os.replace(replacement, self.node)
         with patch.object(validation.subprocess, "Popen") as popen:
             result = validation.run_validation(plan, self.artifacts).to_dict()
         self.assertFalse(result["ok"])
-        self.assertIn("pnpm_binary changed", result["error"])
+        self.assertIn("node_binary changed", result["error"])
         popen.assert_not_called()
+
+    def test_missing_or_drifted_entrypoint_never_reaches_subprocess(self) -> None:
+        self.vitest_entrypoint.unlink()
+        with self.assertRaisesRegex(validation.ControlledValidationError, "entrypoint"):
+            validation.plan_validation(self.worktree, "dsh-b-ipc-v1", self.runtime)
+
+        self.vitest_entrypoint.write_text("export {}\n", encoding="utf-8")
+        plan = validation.plan_validation(self.worktree, "dsh-b-ipc-v1", self.runtime)
+        self.vitest_entrypoint.write_text("export { changed }\n", encoding="utf-8")
+        with patch.object(validation.subprocess, "Popen") as popen:
+            result = validation.run_validation(plan, self.artifacts).to_dict()
+        self.assertFalse(result["ok"])
+        self.assertIn("plan changed", result["error"])
+        popen.assert_not_called()
+
+        self.tsx_entrypoint.unlink()
+        with self.assertRaisesRegex(validation.ControlledValidationError, "entrypoint"):
+            validation.plan_validation(self.worktree, "dsh-b-pairing-check-v1", self.runtime)
 
     def test_runner_uses_private_environment_exact_argv_and_closes_pipes(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "HTTP_PROXY": "http://proxy"}):

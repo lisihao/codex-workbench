@@ -42,6 +42,28 @@ _RECOVERY_ACCEPTANCE_ENVIRONMENT = frozenset(
     }
 )
 
+# These are the only child-environment values that the recovery verifier sets
+# or explicitly permits.  The record deliberately omits HOME, credential
+# names, and every inherited environment value; runtime executables are bound
+# separately by their resolved file identities.
+_RECOVERY_EVIDENCE_ENVIRONMENT = (
+    "CI",
+    "NO_UPDATE_NOTIFIER",
+    "npm_config_offline",
+    "npm_config_pm_on_fail",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPATH",
+    "PYTHONPYCACHEPREFIX",
+    "ZDOTDIR",
+)
+_RECOVERY_EVIDENCE_PATH_VALUES = frozenset(
+    {"PATH", "PYTHONPATH", "PYTHONPYCACHEPREFIX", "ZDOTDIR"}
+)
+_RECOVERY_EVIDENCE_LAUNCHER_SUFFIXES = frozenset(
+    {".cjs", ".js", ".jsx", ".mjs", ".py", ".sh", ".ts", ".tsx"}
+)
+_RECOVERY_EVIDENCE_MAX_LAUNCHER_BYTES = 1_048_576
+
 _RECOVERY_ERROR_PATH_LIMIT = 8
 _RECOVERY_ERROR_PATH_CHARS = 80
 _RECOVERY_ERROR_SUMMARY_CHARS = 768
@@ -572,14 +594,24 @@ class CommandOutcome:
     exit_code: int
     stdout: str
     stderr: str
+    evidence_inputs: Mapping[str, object] | None = None
+    evidence_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "command": list(self.command),
             "exit_code": self.exit_code,
             "stdout": self.stdout,
             "stderr": self.stderr,
         }
+        # Existing materialization and legacy recovery receipts do not invent
+        # a fingerprint.  Consumers that know only the original four fields
+        # can therefore continue reading them unchanged.
+        if self.evidence_inputs is not None:
+            result["evidence_inputs"] = dict(self.evidence_inputs)
+        if self.evidence_fingerprint is not None:
+            result["evidence_fingerprint"] = self.evidence_fingerprint
+        return result
 
 
 @dataclass(frozen=True)
@@ -598,6 +630,236 @@ def _bounded(text: str, *, limit: int = 1_000_000) -> str:
         return text
     encoded = text.encode("utf-8", errors="replace")[:limit]
     return encoded.decode("utf-8", errors="ignore") + "\n[output truncated by Workbench recovery]\n"
+
+
+def _canonical_evidence_json(value: object) -> bytes:
+    """Encode a JSON-safe evidence value with a stable digest representation."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _json_evidence_copy(value: object) -> dict[str, object] | None:
+    """Copy one bounded evidence object only when it is safe to serialize."""
+
+    try:
+        encoded = _canonical_evidence_json(value)
+        decoded = json.loads(encoded.decode("utf-8"))
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _evidence_path_reference(path: Path, cwd: Path) -> str:
+    """Return a worktree-relative path or a non-reversible external identity."""
+
+    try:
+        return "worktree:" + str(path.relative_to(cwd))
+    except ValueError:
+        return "sha256:" + sha256(os.fsencode(str(path))).hexdigest()
+
+
+def _small_launcher_digest(path: Path, metadata: os.stat_result) -> tuple[str | None, bool]:
+    """Digest a small script launcher, never a large runtime binary."""
+
+    if metadata.st_size > _RECOVERY_EVIDENCE_MAX_LAUNCHER_BYTES:
+        return None, False
+    should_hash = path.suffix.lower() in _RECOVERY_EVIDENCE_LAUNCHER_SUFFIXES
+    if not should_hash:
+        try:
+            with path.open("rb") as handle:
+                should_hash = handle.read(2) == b"#!"
+        except OSError:
+            return None, True
+    if not should_hash:
+        return None, False
+    try:
+        return sha256(path.read_bytes()).hexdigest(), False
+    except OSError:
+        return None, True
+
+
+def _runtime_file_identity(path: Path | None, cwd: Path) -> dict[str, object]:
+    """Bind one resolved launcher to inexpensive file metadata and script content."""
+
+    if path is None:
+        return {"status": "unresolved"}
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError:
+        return {"status": "unavailable"}
+    if not stat.S_ISREG(metadata.st_mode):
+        return {
+            "status": "not-regular",
+            "resolved_path": _evidence_path_reference(resolved, cwd),
+        }
+    result: dict[str, object] = {
+        "status": "resolved",
+        "resolved_path": _evidence_path_reference(resolved, cwd),
+        "stat": {
+            "dev": int(metadata.st_dev),
+            "ino": int(metadata.st_ino),
+            "size": int(metadata.st_size),
+            "mtime_ns": int(metadata.st_mtime_ns),
+        },
+    }
+    digest, hash_unavailable = _small_launcher_digest(resolved, metadata)
+    if digest is not None:
+        result["launcher_sha256"] = digest
+    if hash_unavailable:
+        result["launcher_hash_status"] = "unavailable"
+    return result
+
+
+def _resolve_child_executable(
+    executable: str,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> Path | None:
+    """Resolve an argv entry exactly as the direct child environment can find it."""
+
+    if not executable:
+        return None
+    if os.sep in executable or (os.altsep is not None and os.altsep in executable):
+        candidate = Path(executable)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        try:
+            return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
+        except OSError:
+            return None
+    # ``shutil.which`` resolves relative PATH entries against this authority
+    # process, not the child ``cwd``.  Recovery evidence must describe the
+    # latter, because that is what execvp will use for an argv-only command.
+    search_path = environment.get("PATH", os.defpath)
+    for raw_entry in search_path.split(os.pathsep):
+        directory = cwd if not raw_entry else Path(raw_entry)
+        if not directory.is_absolute():
+            directory = cwd / directory
+        candidate = directory / executable
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _same_resolved_path(left: Path | None, right: Path) -> bool:
+    """Compare a PATH result with the private per-command pnpm shim safely."""
+
+    if left is None:
+        return False
+    try:
+        return left.resolve(strict=True) == right.resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _effective_command_entry(
+    command: tuple[str, ...],
+    cwd: Path,
+    environment: Mapping[str, str],
+    shim_directory: Path,
+) -> Path | None:
+    """Resolve the executable ultimately selected by the controlled pnpm shim."""
+
+    entry = _resolve_child_executable(command[0], cwd, environment)
+    shim = shim_directory / "pnpm"
+    if command[0] != "pnpm" or not _same_resolved_path(entry, shim):
+        return entry
+    if len(command) >= 3 and command[1] == "exec":
+        local_name = command[2]
+        if re.fullmatch(r"[A-Za-z0-9._-]+", local_name):
+            local_entry = cwd / "node_modules" / ".bin" / local_name
+            if local_entry.is_file() and os.access(local_entry, os.X_OK):
+                return local_entry
+    configured_pnpm = environment.get("CODEX_WORKBENCH_PNPM")
+    if configured_pnpm:
+        return _resolve_child_executable(configured_pnpm, cwd, environment)
+    # The private shim itself is not a stable input: it is created afresh for
+    # every command.  Treat the missing underlying launcher as incomplete
+    # coverage rather than binding an ephemeral inode into the fingerprint.
+    return None
+
+
+def _direct_node_script_entry(
+    command: tuple[str, ...], cwd: Path
+) -> tuple[Path | None, bool]:
+    """Return the direct Node script argument when its location is unambiguous."""
+
+    if Path(command[0]).name != "node" or len(command) < 2 or command[1].startswith("-"):
+        return None, False
+    candidate = Path(command[1])
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    try:
+        return (candidate if candidate.is_file() else None), True
+    except OSError:
+        return None, True
+
+
+def _recovery_evidence_coverage(incomplete: list[str]) -> dict[str, object]:
+    """Describe the bounded inputs for which a recovery fingerprint is evidence."""
+
+    return {
+        "complete": not incomplete,
+        "incomplete_reasons": sorted(set(incomplete)),
+        "scope": {
+            "kind": "recorded-recovery-command-inputs-v1",
+            "environment": "fixed-child-fields-only",
+            "dependency_closure": "not-recorded",
+            "direct_node_entry": "recorded-when-unambiguous",
+        },
+        "reuse_authorized": False,
+    }
+
+
+def _environment_evidence(
+    environment: Mapping[str, str], shim_directory: Path
+) -> dict[str, object]:
+    """Record only verification-relevant child environment inputs without secrets."""
+
+    fixed: dict[str, object] = {}
+    for name in _RECOVERY_EVIDENCE_ENVIRONMENT:
+        value = environment.get(name)
+        if value is None:
+            fixed[name] = None
+        elif name == "ZDOTDIR" and _same_resolved_path(Path(value), shim_directory):
+            # The helper creates this directory per invocation.  Its role and
+            # the resolved pnpm runtime are inputs, but its random directory
+            # name is not.
+            fixed[name] = "private-recovery-pnpm-shim"
+        elif name in _RECOVERY_EVIDENCE_PATH_VALUES:
+            fixed[name] = {
+                "value_sha256": sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest(),
+                "bytes": len(value.encode("utf-8", errors="surrogateescape")),
+            }
+        else:
+            fixed[name] = value
+    path_value = environment.get("PATH", "")
+    path_entries = tuple(entry for entry in path_value.split(os.pathsep) if entry)
+    path_identities = tuple(
+        "private-recovery-pnpm-shim"
+        if _same_resolved_path(Path(entry), shim_directory)
+        else "sha256:" + sha256(os.fsencode(entry)).hexdigest()
+        for entry in path_entries
+    )
+    return {
+        "fixed": fixed,
+        "PATH": {
+            "entries": len(path_entries),
+            "identity_sha256": sha256(
+                _canonical_evidence_json(path_identities)
+            ).hexdigest(),
+        },
+    }
 
 
 class PnpmOfflineMaterializer:
@@ -1515,7 +1777,13 @@ class DirtyWorktreeRecovery:
                 raise DirtyWorktreeRecoveryError(
                     "blocked worktree recovery requires declared acceptance_commands"
                 )
+            evidence_inputs = self._acceptance_evidence_inputs(
+                comparison_tree=comparison_tree,
+                recovery=recovery,
+                materialization=materialization,
+            )
             outcomes: list[CommandOutcome] = []
+            prior_successful_command_fingerprints: list[str] = []
             for command_source in acceptance_commands:
                 declared_command, command, environment_overrides = self._parse_command(
                     command_source
@@ -1526,6 +1794,8 @@ class DirtyWorktreeRecovery:
                     timeout_seconds,
                     executable=command,
                     environment_overrides=environment_overrides,
+                    evidence_inputs=evidence_inputs,
+                    prior_evidence_fingerprints=tuple(prior_successful_command_fingerprints),
                 )
                 outcomes.append(outcome)
                 checks.append(
@@ -1558,6 +1828,8 @@ class DirtyWorktreeRecovery:
                         tuple(str(path) for path in recovery["changed_paths"]),
                         outcome.exit_code,
                     )
+                if outcome.evidence_fingerprint is not None:
+                    prior_successful_command_fingerprints.append(outcome.evidence_fingerprint)
             if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target changed after offline materialization or acceptance"
@@ -2440,6 +2712,239 @@ class DirtyWorktreeRecovery:
             )
         return declared, command, tuple(environment)
 
+    @staticmethod
+    def _acceptance_evidence_inputs(
+        *,
+        comparison_tree: str,
+        recovery: Mapping[str, object],
+        materialization: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Return the static, already-known inputs for one acceptance command.
+
+        This receipt is evidence for a command that still executes on every
+        recovery attempt.  It neither authorizes a result cache nor makes a
+        fingerprint reusable across another worktree.
+        """
+
+        incomplete: list[str] = []
+
+        def required_string(container: Mapping[str, object], name: str, label: str) -> str | None:
+            value = container.get(name)
+            if isinstance(value, str) and value:
+                return value
+            incomplete.append(label)
+            return None
+
+        base_sha = required_string(recovery, "base_sha", "recovery base_sha")
+        patch_sha256 = required_string(recovery, "patch_sha256", "recovery patch_sha256")
+        if not isinstance(comparison_tree, str) or not comparison_tree:
+            incomplete.append("comparison tree")
+        dependency_input_ref = recovery.get("dependency_input_ref")
+        if dependency_input_ref is not None and not isinstance(dependency_input_ref, str):
+            incomplete.append("dependency input ref")
+            dependency_input_ref = None
+
+        materialization_kind = materialization.get("kind")
+        if not isinstance(materialization_kind, str) or not materialization_kind:
+            incomplete.append("dependency materialization kind")
+            materialization_kind = None
+        materialization_inputs: dict[str, object] = {"kind": materialization_kind}
+        if materialization_kind == "pnpm-offline-materialization":
+            lockfile_sha256 = required_string(
+                materialization, "lockfile_sha256", "pnpm lockfile digest"
+            )
+            template = materialization.get("template")
+            if not isinstance(template, Mapping):
+                incomplete.append("pnpm template receipt")
+                template_inputs: dict[str, object] | None = None
+            else:
+                template_inputs = {
+                    key: template[key]
+                    for key in ("state", "key")
+                    if key in template
+                }
+                if not isinstance(template_inputs.get("state"), str):
+                    incomplete.append("pnpm template state")
+                # A disabled template legitimately has no key.  A cache hit,
+                # reuse, or seed must bind the actual template identity.
+                if template_inputs.get("state") in {"hit", "reuse", "seeded"} and not isinstance(
+                    template_inputs.get("key"), str
+                ):
+                    incomplete.append("pnpm template key")
+            materialization_inputs["lockfile_sha256"] = lockfile_sha256
+            materialization_inputs["template"] = template_inputs
+        else:
+            # A non-Node target has no lockfile/template input.  Its complete
+            # materialization receipt hash still records that explicit state.
+            materialization_inputs["lockfile_sha256"] = None
+            materialization_inputs["template"] = None
+
+        # Lock acquisition timing and private cache paths describe the local
+        # materializer's mechanics, not an acceptance input.  Bind the pnpm
+        # receipt's stable command/result identities instead, so identical
+        # inputs do not receive a new fingerprint merely because a lock waited.
+        command_receipts = materialization.get("commands")
+        normalized_commands: list[dict[str, object]] | None
+        if materialization_kind == "pnpm-offline-materialization":
+            if not isinstance(command_receipts, list):
+                normalized_commands = None
+            else:
+                normalized_commands = []
+                for command_receipt in command_receipts:
+                    if not isinstance(command_receipt, Mapping):
+                        normalized_commands = None
+                        break
+                    command_value = command_receipt.get("command")
+                    exit_code = command_receipt.get("exit_code")
+                    stdout = command_receipt.get("stdout")
+                    stderr = command_receipt.get("stderr")
+                    if (
+                        not isinstance(command_value, list)
+                        or not all(isinstance(value, str) for value in command_value)
+                        or isinstance(exit_code, bool)
+                        or not isinstance(exit_code, int)
+                        or not isinstance(stdout, str)
+                        or not isinstance(stderr, str)
+                    ):
+                        normalized_commands = None
+                        break
+                    normalized_commands.append(
+                        {
+                            "command_sha256": sha256(
+                                _canonical_evidence_json(command_value)
+                            ).hexdigest(),
+                            "exit_code": exit_code,
+                            "stdout_sha256": sha256(stdout.encode("utf-8")).hexdigest(),
+                            "stderr_sha256": sha256(stderr.encode("utf-8")).hexdigest(),
+                        }
+                    )
+            if normalized_commands is None:
+                incomplete.append("pnpm materialization receipt")
+        else:
+            normalized_commands = []
+        pnpm_receipt = {
+            "kind": materialization_kind,
+            "package_manager": materialization.get("package_manager"),
+            "pnpm_version": materialization.get("pnpm_version"),
+            "materialization_timeout_seconds": materialization.get(
+                "materialization_timeout_seconds"
+            ),
+            "template": materialization_inputs["template"],
+            "commands": normalized_commands,
+        }
+        try:
+            materialization_inputs["pnpm_receipt_sha256"] = sha256(
+                _canonical_evidence_json(pnpm_receipt)
+            ).hexdigest()
+        except (TypeError, ValueError, UnicodeError):
+            materialization_inputs["pnpm_receipt_sha256"] = None
+            incomplete.append("pnpm materialization receipt")
+
+        return {
+            "schema_version": 1,
+            "recovery": {
+                "comparison_tree": comparison_tree if isinstance(comparison_tree, str) else None,
+                "base_sha": base_sha,
+                "patch_sha256": patch_sha256,
+                "dependency_input_ref": dependency_input_ref,
+            },
+            "materialization": materialization_inputs,
+            "coverage": _recovery_evidence_coverage(incomplete),
+        }
+
+    @staticmethod
+    def _command_evidence_inputs(
+        *,
+        static_inputs: Mapping[str, object],
+        declared_command: tuple[str, ...],
+        command: tuple[str, ...],
+        cwd: Path,
+        environment: Mapping[str, str],
+        shim_directory: Path,
+        prior_evidence_fingerprints: tuple[str, ...],
+    ) -> dict[str, object]:
+        """Bind one direct child invocation to static recovery inputs.
+
+        The evidence records executable metadata rather than recursively
+        hashing a runtime or dependency graph.  A missing executable identity
+        is visible as incomplete coverage, never treated as equivalent input.
+        """
+
+        evidence = _json_evidence_copy(static_inputs)
+        incomplete: list[str] = []
+        if evidence is None:
+            evidence = {"schema_version": 1, "static_inputs": "unavailable"}
+            incomplete.append("declared recovery inputs")
+        existing_coverage = evidence.get("coverage")
+        if not isinstance(existing_coverage, Mapping):
+            incomplete.append("declared recovery input coverage")
+        else:
+            existing_reasons = existing_coverage.get("incomplete_reasons")
+            if existing_coverage.get("complete") is not True:
+                incomplete.append("declared recovery inputs")
+            if isinstance(existing_reasons, list):
+                incomplete.extend(
+                    reason for reason in existing_reasons if isinstance(reason, str)
+                )
+
+        try:
+            actual_cwd = cwd.resolve(strict=True)
+        except OSError:
+            actual_cwd = cwd.resolve(strict=False)
+            incomplete.append("command cwd")
+        node_identity = _runtime_file_identity(
+            _resolve_child_executable("node", actual_cwd, environment), actual_cwd
+        )
+        command_identity = _runtime_file_identity(
+            _effective_command_entry(command, actual_cwd, environment, shim_directory),
+            actual_cwd,
+        )
+        command_name = Path(command[0]).name
+        node_script_path, node_script_expected = _direct_node_script_entry(command, actual_cwd)
+        node_script_identity = (
+            _runtime_file_identity(node_script_path, actual_cwd)
+            if node_script_expected
+            else {"status": "not-applicable"}
+        )
+        if command_identity.get("status") != "resolved":
+            incomplete.append("command entry")
+        if command_identity.get("launcher_hash_status") == "unavailable":
+            incomplete.append("command launcher hash")
+        node_required = command_name in {"node", "pnpm"}
+        if node_required and node_identity.get("status") != "resolved":
+            incomplete.append("node runtime")
+        if node_required and node_identity.get("launcher_hash_status") == "unavailable":
+            incomplete.append("node launcher hash")
+        if node_script_expected and node_script_identity.get("status") != "resolved":
+            incomplete.append("node script entry")
+        if node_script_expected and node_script_identity.get("launcher_hash_status") == "unavailable":
+            incomplete.append("node script hash")
+        if any(
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            for fingerprint in prior_evidence_fingerprints
+        ):
+            incomplete.append("prior successful command fingerprint")
+
+        evidence["command"] = {
+            "declared_argv": list(declared_command),
+            "effective_argv": list(command),
+        }
+        evidence["execution_scope"] = {
+            "cwd": str(actual_cwd),
+            "cross_worktree_reuse": "not-supported",
+            "cache": "none",
+        }
+        evidence["environment"] = _environment_evidence(environment, shim_directory)
+        evidence["runtime"] = {
+            "node": node_identity,
+            "command_entry": command_identity,
+            "node_script_entry": node_script_identity,
+        }
+        evidence["prior_successful_command_fingerprints"] = list(prior_evidence_fingerprints)
+        evidence["coverage"] = _recovery_evidence_coverage(incomplete)
+        return evidence
+
     def _run_command(
         self,
         declared_command: tuple[str, ...],
@@ -2448,8 +2953,12 @@ class DirtyWorktreeRecovery:
         *,
         executable: tuple[str, ...] | None = None,
         environment_overrides: tuple[tuple[str, str], ...] = (),
+        evidence_inputs: Mapping[str, object] | None = None,
+        prior_evidence_fingerprints: tuple[str, ...] = (),
     ) -> CommandOutcome:
         command = executable or declared_command
+        command_evidence: dict[str, object] | None = None
+        evidence_fingerprint: str | None = None
         try:
             # Recovery first materializes an independent worktree-local linker.
             # Its acceptance command must use the same process-local pnpm shim
@@ -2465,6 +2974,19 @@ class DirtyWorktreeRecovery:
                     "npm_config_offline": "true",
                 })
                 environment.update(environment_overrides)
+                if evidence_inputs is not None:
+                    command_evidence = self._command_evidence_inputs(
+                        static_inputs=evidence_inputs,
+                        declared_command=declared_command,
+                        command=command,
+                        cwd=cwd,
+                        environment=environment,
+                        shim_directory=Path(shim_directory),
+                        prior_evidence_fingerprints=prior_evidence_fingerprints,
+                    )
+                    evidence_fingerprint = sha256(
+                        _canonical_evidence_json(command_evidence)
+                    ).hexdigest()
                 completed = self.runner(
                     list(command),
                     cwd=cwd,
@@ -2484,6 +3006,8 @@ class DirtyWorktreeRecovery:
             int(completed.returncode),
             _bounded(completed.stdout or ""),
             _bounded(completed.stderr or ""),
+            command_evidence,
+            evidence_fingerprint,
         )
 
     def _store_logs(self, materialization: Mapping[str, object], outcomes: list[CommandOutcome]) -> str:

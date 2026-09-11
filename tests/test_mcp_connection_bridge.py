@@ -53,7 +53,14 @@ def log(value: str) -> None:
 
 
 def send(request_id: object, result: object) -> None:
-    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    payload = json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\n"
+    if mode == "chunked":
+        encoded = payload.encode("utf-8")
+        for offset in range(0, len(encoded), 7):
+            sys.stdout.buffer.write(encoded[offset:offset + 7])
+            sys.stdout.buffer.flush()
+        return
+    print(payload, end="", flush=True)
 
 
 if mode == "exit255":
@@ -104,6 +111,19 @@ for raw in sys.stdin:
     arguments = params.get("arguments") or {}
     if name == "workbench_read":
         log("read")
+        if mode == "large":
+            send(request_id, {"content": [{"type": "text", "text": "x" * (8 * 1024 * 1024)}]})
+            continue
+        if mode == "oversize":
+            send(request_id, {"content": [{"type": "text", "text": "x" * (16 * 1024 * 1024 + 1)}]})
+            continue
+        if mode == "echo-large":
+            payload = arguments.get("payload")
+            send(
+                request_id,
+                {"content": [{"type": "text", "text": str(len(payload)) if isinstance(payload, str) else "missing"}]},
+            )
+            continue
         if mode in {"read-crash", "upgrade", "events", "events-list"} and launch == 1:
             sys.stderr.write("prompt=do-not-store-this-secret\n")
             sys.stderr.flush()
@@ -169,14 +189,14 @@ class MCPConnectionBridgeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _config(self, mode: str) -> object:
+    def _config(self, mode: str, *, request_timeout_seconds: float = 0.5) -> object:
         return bridge.validate_config(
             {
                 "schema_version": 1,
                 "command": [sys.executable, "-u", str(self.child), mode, str(self.fixture)],
                 "state_file": str(self.state_file),
                 "connect_timeout_seconds": 0.5,
-                "request_timeout_seconds": 0.5,
+                "request_timeout_seconds": request_timeout_seconds,
                 "max_reconnect_attempts": 3,
                 "initial_backoff_seconds": 0.001,
                 "max_backoff_seconds": 0.004,
@@ -196,10 +216,20 @@ class MCPConnectionBridgeTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         ]
 
-    def _run(self, mode: str, messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _run(
+        self,
+        mode: str,
+        messages: list[dict[str, object]],
+        *,
+        request_timeout_seconds: float = 0.5,
+    ) -> list[dict[str, object]]:
         input_stream = io.StringIO("\n".join(json.dumps(item) for item in messages) + "\n")
         output_stream = io.StringIO()
-        server = bridge.MCPConnectionBridge(self._config(mode), output_stream, sleep=lambda _: None)
+        server = bridge.MCPConnectionBridge(
+            self._config(mode, request_timeout_seconds=request_timeout_seconds),
+            output_stream,
+            sleep=lambda _: None,
+        )
         server.run(input_stream)
         return [json.loads(line) for line in output_stream.getvalue().splitlines()]
 
@@ -238,6 +268,96 @@ class MCPConnectionBridgeTests(unittest.TestCase):
         self.assertEqual(state["connection"]["state"], "connected")
         self.assertRegex(state["server"]["canonical_tools_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(self.state_file.stat().st_mode & 0o777, 0o600)
+
+    def test_buffered_pipe_returns_eight_megabyte_json_response_within_budget(self) -> None:
+        started = time.monotonic()
+        output = self._run(
+            "large",
+            [
+                *self._initialize(),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "workbench_read", "arguments": {}},
+                },
+            ],
+            request_timeout_seconds=5.0,
+        )
+        elapsed = time.monotonic() - started
+        text = self._by_id(output, 3)["result"]["content"][0]["text"]
+        self.assertEqual(len(text), 8 * 1024 * 1024)
+        self.assertLess(elapsed, 5.0)
+
+    def test_chunked_jsonl_response_preserves_complete_bytes(self) -> None:
+        output = self._run(
+            "chunked",
+            [
+                *self._initialize(),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "workbench_read", "arguments": {}},
+                },
+            ],
+        )
+        self.assertEqual(
+            self._by_id(output, 3)["result"]["content"][0]["text"],
+            "read-ok",
+        )
+
+    def test_buffered_stdin_sends_complete_large_jsonl_request(self) -> None:
+        payload = "y" * (8 * 1024 * 1024)
+        output = self._run(
+            "echo-large",
+            [
+                *self._initialize(),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "workbench_read", "arguments": {"payload": payload}},
+                },
+            ],
+            request_timeout_seconds=5.0,
+        )
+        self.assertEqual(
+            self._by_id(output, 3)["result"]["content"][0]["text"],
+            str(len(payload)),
+        )
+
+    def test_oversize_response_is_explicit_and_never_retries_the_request(self) -> None:
+        started = time.monotonic()
+        output = self._run(
+            "oversize",
+            [
+                *self._initialize(),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "workbench_read", "arguments": {}},
+                },
+            ],
+            request_timeout_seconds=5.0,
+        )
+        elapsed = time.monotonic() - started
+        result = self._by_id(output, 3)["result"]
+        self.assertTrue(result["isError"])
+        self.assertIn("response_too_large", result["content"][0]["text"])
+        self.assertTrue(
+            any(
+                item.get("method") == "notifications/message"
+                and "response_too_large" in str(item)
+                for item in output
+            )
+        )
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(self._log().count("read"), 1)
+        self.assertEqual((self.fixture / "launches").read_text(), "1")
+        state = json.loads(self.state_file.read_text())
+        self.assertEqual(state["connection"]["error"]["kind"], "response_too_large")
 
     def test_server_upgrade_notifies_once_and_requires_host_tools_list_before_write(self) -> None:
         messages = [

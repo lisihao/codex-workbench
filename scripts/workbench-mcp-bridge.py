@@ -40,7 +40,8 @@ MAX_REQUEST_ID_CHARS = 200
 MAX_STORED_EVENT_DIGESTS = 512
 MAX_STDERR_TAIL_LINES = 16
 MAX_STDERR_LINE_BYTES = 4096
-MAX_JSONL_LINE_BYTES = 4 * 1024 * 1024
+MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
+_RESPONSE_TOO_LARGE = "response_too_large"
 
 
 class ConfigError(ValueError):
@@ -492,7 +493,7 @@ class ChildTransport:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
-                bufsize=0,
+                bufsize=64 * 1024,
             )
         except OSError as error:
             raise TransportError("start_failed") from error
@@ -528,10 +529,12 @@ class ChildTransport:
                 self._put(_ChildEvent("eof"))
                 return
             if len(line) > MAX_JSONL_LINE_BYTES:
-                if not line.endswith(b"\n"):
-                    self._discard_to_newline(stream)
-                self._put(_ChildEvent("protocol"))
-                continue
+                # The child is closed as soon as the bounded reader reports
+                # this event.  Draining an arbitrarily long line would turn a
+                # protocol error into an unbounded wait before the host gets
+                # its explicit tool error.
+                self._put(_ChildEvent(_RESPONSE_TOO_LARGE))
+                return
             try:
                 decoded = line.decode("utf-8")
                 message = json.loads(decoded)
@@ -615,6 +618,8 @@ class ChildTransport:
                 raise TransportError("request_timeout", exit_code=self.exit_code) from error
             if event.kind == "eof":
                 raise TransportError("eof", exit_code=self._eof_exit_code())
+            if event.kind == _RESPONSE_TOO_LARGE:
+                raise TransportError(_RESPONSE_TOO_LARGE, exit_code=self.exit_code)
             if event.kind != "message" or event.message is None:
                 raise TransportError("protocol", exit_code=self.exit_code)
             message = event.message
@@ -870,8 +875,13 @@ class MCPConnectionBridge:
             exit_code=exit_code,
             stderr_tail=tail,
         )
+        diagnostic_state = (
+            _RESPONSE_TOO_LARGE
+            if error.kind == _RESPONSE_TOO_LARGE
+            else "connection unavailable"
+        )
         self._diagnostic_once(
-            f"disconnected:{error.kind}:{exit_code}", "connection unavailable"
+            f"disconnected:{error.kind}:{exit_code}", diagnostic_state
         )
         self.close()
 
@@ -957,6 +967,10 @@ class MCPConnectionBridge:
                 return self._send_request(message, self.config.request_timeout_seconds)
             except TransportError as error:
                 self._record_transport_failure(error)
+                if error.kind == _RESPONSE_TOO_LARGE:
+                    if message.get("method") == "tools/call":
+                        return _tool_error(message.get("id"), _RESPONSE_TOO_LARGE)
+                    return _rpc_error(message.get("id"), _RESPONSE_TOO_LARGE)
                 if retry == 0 and self._recover_connection():
                     continue
                 return None
@@ -1178,6 +1192,11 @@ class MCPConnectionBridge:
             response = self._forward_read_only(message)
             if response is None:
                 return _rpc_error(message.get("id"), "connection_unavailable")
+            if (
+                isinstance(response.get("error"), Mapping)
+                and response["error"].get("message") == _RESPONSE_TOO_LARGE
+            ):
+                return response
             if method == "tools/list":
                 try:
                     self._observe_catalog(response, reconnect=False, host_requested=True)

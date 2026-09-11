@@ -1428,6 +1428,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(mcp_add[6:], (str(bridge_runtime), "--config", str(bridge_config)))
             bridge_payload = json.loads(bridge_config.read_text())
             self.assertEqual(bridge_payload["schema_version"], 1)
+            self.assertEqual(bridge_payload["command"][:3], ["ssh", "-T", "-C"])
             self.assertEqual(bridge_payload["state_file"], str(bridge_state))
             self.assertEqual(
                 bridge_payload["command"],
@@ -1496,6 +1497,10 @@ class InstallerTests(unittest.TestCase):
             registration = payload["mcp_servers"]["codex-workbench"]
             self.assertEqual(registration["startup_timeout_sec"], 60)
             self.assertEqual(registration["tool_timeout_sec"], 3600)
+            self.assertEqual(
+                module.authority_mcp_child_command("macmini", (), "/srv/workbench")[0:3],
+                ("ssh", "-T", "-C"),
+            )
             self.assertGreater(registration["startup_timeout_sec"], slow_ssh_startup_seconds)
             self.assertEqual(
                 payload["mcp_servers"]["unrelated"]["url"],
