@@ -293,11 +293,25 @@ def _status_from_state(value: Mapping[str, object] | None) -> dict[str, object]:
     return result
 
 
-def _child_state(value: Mapping[str, object] | None) -> dict[str, object]:
-    """Require explicit child exit evidence; a ready marker alone is unknown."""
+def _child_state(
+    value: Mapping[str, object] | None,
+    *,
+    bridge_connected: bool = False,
+) -> dict[str, object]:
+    """Require explicit child exit evidence; a ready marker alone is unknown.
+
+    A persisted connected bridge has no child exit observation until a
+    transport failure records one.  Keep that absence distinct from an
+    unknown child after a disconnected bridge so status-only diagnostics do
+    not report a healthy bridge's missing exit evidence as a child fault.
+    """
+
+    missing_summary = (
+        "child_exit_not_observed" if bridge_connected else "child_exit_stderr_unknown"
+    )
 
     if value is None:
-        return {"status": "unknown", "summary": "child_exit_stderr_unknown"}
+        return {"status": "unknown", "summary": missing_summary}
     exit_code = value.get("exit_code", value.get("child_exit_code"))
     stderr_key = "stderr" if "stderr" in value else "child_stderr" if "child_stderr" in value else None
     stderr = value.get(stderr_key) if stderr_key is not None else None
@@ -324,7 +338,7 @@ def _child_state(value: Mapping[str, object] | None) -> dict[str, object]:
     ):
         result: dict[str, object] = {
             "status": "unknown",
-            "summary": "child_exit_stderr_unknown",
+            "summary": missing_summary,
         }
         if sample is not None:
             result["stderr_sample"] = sample
@@ -388,6 +402,10 @@ def _failure_key(components: Mapping[str, Mapping[str, object]], state_result: s
     if process.get("status") == "error":
         return "process-error"
     if child.get("status") == "unknown":
+        if child.get("summary") == "child_exit_not_observed":
+            if http.get("status") == "unknown":
+                return "authority-http-unknown"
+            return "mcp-child-not-observed"
         return "mcp-child-unknown"
     if http.get("status") == "unknown":
         return "authority-http-unknown"
@@ -411,6 +429,8 @@ def _recovery_steps(fault_key: str) -> list[str]:
         return ["check the existing Authority service and its /health endpoint"]
     if fault_key == "authority-http-unknown":
         return ["check the existing Authority service and its /health endpoint"]
+    if fault_key == "mcp-child-not-observed":
+        return []
     if fault_key.startswith("mcp-child-"):
         return ["reconnect the existing MCP bridge", "inspect the existing MCP child exit and stderr evidence"]
     if fault_key in {"state-missing", "state-unreadable", "state-invalid"}:
@@ -440,7 +460,10 @@ def diagnose(config_path: Path, *, status_only: bool = False) -> dict[str, objec
         },
         "ssh_or_local_process": {"status": "unknown", "summary": "probe_not_run"},
         "authority_http": {"status": "unknown", "summary": "probe_not_run"},
-        "mcp_child": _child_state(layers.get("mcp_child")),
+        "mcp_child": _child_state(
+            layers.get("mcp_child"),
+            bridge_connected=process_state.get("summary") == "bridge_state_connected",
+        ),
     }
     if configured_state["status"] != "unknown":
         components["configured_transport"]["state_status"] = configured_state["status"]
