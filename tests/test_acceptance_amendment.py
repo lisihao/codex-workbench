@@ -8,10 +8,12 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codex_workbench import acceptance_amendment as amendment
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.model import (
     NodeResult,
     NodeSpec,
@@ -65,6 +67,7 @@ class AcceptanceAmendmentTests(unittest.TestCase):
         self._run_git(self.repository, "config", "user.name", "Fixture")
         (self.repository / "src").mkdir()
         (self.repository / "src" / "value.ts").write_text("export const value = 1\n")
+        (self.repository / ".gitignore").write_text("node_modules/\n")
         (self.repository / "package.json").write_text(
             json.dumps(
                 {
@@ -82,6 +85,7 @@ class AcceptanceAmendmentTests(unittest.TestCase):
             self.repository,
             "add",
             "package.json",
+            ".gitignore",
             "src/value.ts",
             "tsconfig.host.json",
             "tsdown.config.ts",
@@ -161,6 +165,7 @@ class AcceptanceAmendmentTests(unittest.TestCase):
             "accepted dependency",
             "fixture",
             "fixture",
+            write_scopes=("src",),
         )
         worker = NodeSpec(
             "worker",
@@ -185,17 +190,38 @@ class AcceptanceAmendmentTests(unittest.TestCase):
         claimed_ancestor = self.store.claim_ready_node("fixture-ancestor", self.epoch)
         self.assertIsNotNone(claimed_ancestor)
         self.assertEqual(claimed_ancestor["node_id"], ancestor.node_id)
+        ancestor_source = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            self.contract.task_id,
+            ancestor.node_id,
+            int(claimed_ancestor["attempt"]),
+        )
+        self.store.assign_worktree(
+            self.contract.task_id,
+            ancestor.node_id,
+            str(ancestor_source),
+            attempt=int(claimed_ancestor["attempt"]),
+            coordinator_epoch=int(claimed_ancestor["coordinator_epoch"]),
+            lease_epoch=int(claimed_ancestor["lease_epoch"]),
+        )
+        (ancestor_source / "src" / "ancestor.ts").write_text("export const ancestor = true\n")
         self.ancestor_artifact = self.store.artifacts.put_text(
             "accepted ancestor evidence\n", "ancestor.log"
         )
+        ancestor_patch = self.worktrees.diff_patch(ancestor_source, self.base_sha)
         self.store.settle_claimed(
             claimed_ancestor,
             NodeResult(
                 "succeeded",
                 "fixture predecessor completed",
-                artifacts={"test-log": self.ancestor_artifact},
+                artifacts={
+                    "patch": self.store.artifacts.put_bytes(ancestor_patch, "ancestor.patch"),
+                    "test-log": self.ancestor_artifact,
+                },
                 actual_model="fixture",
                 result_kind="worker",
+                changed_paths=("src/ancestor.ts",),
             ),
         )
         claimed_worker = self.store.claim_ready_node("fixture-worker", self.epoch)
@@ -217,14 +243,28 @@ class AcceptanceAmendmentTests(unittest.TestCase):
             coordinator_epoch=int(claimed_worker["coordinator_epoch"]),
             lease_epoch=int(claimed_worker["lease_epoch"]),
         )
+        dependency_input = apply_accepted_ancestor_patches(
+            self.store.get_task(self.contract.task_id),
+            worker.node_id,
+            self.source,
+            self.store.artifacts,
+            self.worktrees,
+        )
+        self.assertIsNotNone(dependency_input)
+        self.dependency_input_ref = self.store.artifacts.put_text(
+            json.dumps(dependency_input.receipt, ensure_ascii=False, sort_keys=True),
+            "dependency-input.json",
+        )
+        (self.source / "src" / "value.ts").write_text("export const value = 2\n")
         self.store.settle_claimed(
             claimed_worker,
             NodeResult(
                 "blocked",
                 "fixture stops before the Client aggregate can run",
+                artifacts={"dependency-input": self.dependency_input_ref},
                 actual_model="fixture",
                 result_kind="worker",
-                changed_paths=(),
+                changed_paths=("src/value.ts",),
             ),
         )
         self.blocked = self.store.get_task(self.contract.task_id)
@@ -282,6 +322,86 @@ class AcceptanceAmendmentTests(unittest.TestCase):
                 (self.contract.task_id,),
             ).fetchall()
         return tuple(tuple(row) for row in rows)
+
+    def _worker_source_allocation(self) -> dict:
+        return next(
+            allocation
+            for allocation in self.store.list_worktree_allocations(states=("active",))
+            if allocation["node_id"] == "worker" and allocation["attempt"] == 1
+        )
+
+    def _source_only_hold_ids(self) -> set[str]:
+        with self.store.connection() as connection:
+            return self.store._source_only_recovery_hold_ids(connection)
+
+    @patch("codex_workbench.recovery_processes.source_process_ids", return_value=())
+    def _rollback_source_only_recovery(self, _source_process_ids) -> dict:
+        """Authorize a real source-only retry and settle its unprepared a2 back to a1."""
+
+        # This fixture launches no worker process. Host /proc visibility is
+        # covered separately by the recovery process tests, not this lifecycle.
+
+        blocked = self.store.get_task(self.contract.task_id)
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        preview = self.store.capture_and_resume_blocked_worktree(
+            self.contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="preview source-only recovery for the retained original source",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        self.store.capture_and_resume_blocked_worktree(
+            self.contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="authorize source-only recovery for the retained original source",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=preview["source_delta_sha256"],
+        )
+        claimed = self.store.claim_ready_node("source-only-rollback", self.epoch)
+        self.assertIsNotNone(claimed)
+        self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 2))
+        self.store.settle_claimed(
+            claimed,
+            NodeResult(
+                "blocked",
+                "source-only preparation failed before allocating a later worktree",
+                artifacts={
+                    "recovery": self.store.artifacts.put_text(
+                        "source-only preparation did not allocate a2\n",
+                        "source-only-preparation.log",
+                    )
+                },
+                provider="workbench-dirty-worktree-recovery",
+                result_kind="worker",
+                checks=("source-only recovery preparation was not allocated",),
+            ),
+        )
+        restored = self.store.get_task(self.contract.task_id)
+        restored_worker = next(node for node in restored["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(
+            (restored["state"], restored_worker["state"], restored_worker["attempt"]),
+            ("blocked", "blocked", 1),
+        )
+        self.assertEqual(restored_worker["worktree"], str(self.source))
+        self.assertIn(
+            "node.blocked_worktree_recovery_rolled_back",
+            [event["event_type"] for event in self.store.read_events(task_id=self.contract.task_id)],
+        )
+        self.blocked = restored
+        self.arguments.update(
+            expected_revision=restored["state_revision"],
+            expected_attempt=1,
+            expected_contract_hash=restored["contract_hash"],
+        )
+        return restored
 
     def test_tool_schema_has_only_explicit_preview_and_cas_fields(self) -> None:
         schema = amendment.ACCEPTANCE_AMENDMENT_TOOL["inputSchema"]
@@ -495,7 +615,7 @@ class AcceptanceAmendmentTests(unittest.TestCase):
         with self.assertRaisesRegex(StateConflictError, "does not match its active allocation"):
             self._preview()
 
-    def test_active_validation_pending_approval_and_retained_source_are_fenced(self) -> None:
+    def test_active_validation_and_pending_approval_are_fenced(self) -> None:
         timestamp = now_iso()
         with self.store.transaction() as connection:
             connection.execute(
@@ -530,19 +650,108 @@ class AcceptanceAmendmentTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(StateConflictError, "pending approval"):
             self._preview()
-        with self.store.transaction() as connection:
-            connection.execute("DELETE FROM approvals WHERE approval_id = ?", ("pending-approval",))
-            allocation_id = self.store.list_worktree_allocations(states=("active",))[0]["allocation_id"]
-            self.store._event(
-                connection,
-                "node.blocked_worktree_recovery_authorized",
-                self.contract.task_id,
-                "worker",
-                {"source_allocation_id": allocation_id, "source_only_ignored": True},
-                created_at=timestamp,
+
+    def test_retained_source_after_real_source_only_rollback_permits_amendment(self) -> None:
+        before = self._rollback_source_only_recovery()
+        ancestor_before = next(node for node in before["nodes"] if node["node_id"] == "ancestor")
+        worker_before = next(node for node in before["nodes"] if node["node_id"] == "worker")
+        source_bytes = {
+            relative: (self.source / relative).read_bytes()
+            for relative in (
+                "package.json",
+                "src/ancestor.ts",
+                "src/value.ts",
+                "tsconfig.host.json",
+                "tsdown.config.ts",
             )
-        with self.assertRaisesRegex(StateConflictError, "retained recovery source"):
-            self._preview()
+        }
+        events_before = self.store.read_events(task_id=self.contract.task_id)
+        allocation_id = self._worker_source_allocation()["allocation_id"]
+        allocations_before = self._raw_allocations()
+        self.assertIn(allocation_id, self._source_only_hold_ids())
+
+        preview = self._preview()
+        applied = amendment.amend_task_acceptance(
+            self.config,
+            self.store,
+            {
+                **self.arguments,
+                "dry_run": False,
+                "expected_fingerprint": preview["fingerprint"],
+            },
+        )
+
+        after = self.store.get_task(self.contract.task_id)
+        ancestor_after = next(node for node in after["nodes"] if node["node_id"] == "ancestor")
+        worker_after = next(node for node in after["nodes"] if node["node_id"] == "worker")
+        self.assertEqual(after["state"], "blocked")
+        self.assertEqual((worker_after["state"], worker_after["attempt"]), ("blocked", 1))
+        self.assertEqual(ancestor_after, ancestor_before)
+        self.assertEqual(worker_after, worker_before)
+        self.assertFalse(applied["queued"])
+        self.assertFalse(applied["nodes_changed"])
+        self.assertFalse(applied["allocations_changed"])
+        self.assertEqual(self._raw_allocations(), allocations_before)
+        self.assertIn(allocation_id, self._source_only_hold_ids())
+        self.assertEqual(
+            {
+                relative: (self.source / relative).read_bytes()
+                for relative in source_bytes
+            },
+            source_bytes,
+        )
+        events_after = self.store.read_events(task_id=self.contract.task_id)
+        self.assertEqual(events_after[:-1], events_before)
+        self.assertEqual(events_after[-1]["event_type"], "task.acceptance_amended")
+        with self.assertRaisesRegex(StateConflictError, "source-only recovery retains"):
+            self.store.begin_worktree_quarantine(
+                allocation_id,
+                str(self.root / "quarantine"),
+            )
+
+    def test_active_or_quarantine_pending_later_attempt_allocation_is_fenced(self) -> None:
+        target = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            self.contract.task_id,
+            "worker",
+            2,
+        )
+        timestamp = now_iso()
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO worktree_allocations(
+                    allocation_id, task_id, node_id, attempt, repository, base_sha, branch,
+                    current_path, state, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "later-attempt-allocation",
+                    self.contract.task_id,
+                    "worker",
+                    2,
+                    str(self.repository),
+                    self.base_sha,
+                    self.worktrees.branch_name(self.contract.task_id, "worker", 2),
+                    str(target),
+                    "active",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        for state in ("active", "quarantine_pending"):
+            with self.subTest(state=state):
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE worktree_allocations SET state = ? WHERE allocation_id = ?",
+                        (state, "later-attempt-allocation"),
+                    )
+                with self.assertRaisesRegex(
+                    StateConflictError,
+                    "active later-attempt allocation",
+                ):
+                    self._preview()
 
 
 if __name__ == "__main__":
