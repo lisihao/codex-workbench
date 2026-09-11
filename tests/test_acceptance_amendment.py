@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codex_workbench import acceptance_amendment as amendment
 from codex_workbench.authority import authority_machine_id
@@ -333,8 +334,12 @@ class AcceptanceAmendmentTests(unittest.TestCase):
         with self.store.connection() as connection:
             return self.store._source_only_recovery_hold_ids(connection)
 
-    def _rollback_source_only_recovery(self) -> dict:
+    @patch("codex_workbench.recovery_processes.source_process_ids", return_value=())
+    def _rollback_source_only_recovery(self, _source_process_ids) -> dict:
         """Authorize a real source-only retry and settle its unprepared a2 back to a1."""
+
+        # This fixture launches no worker process. Host /proc visibility is
+        # covered separately by the recovery process tests, not this lifecycle.
 
         blocked = self.store.get_task(self.contract.task_id)
         worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
