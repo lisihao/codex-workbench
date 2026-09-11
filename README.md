@@ -433,6 +433,7 @@ codex-workbench deliver <task-id> --base-branch <branch>
 
 - [AI 安装与配置指南](docs/AI_INSTALL.md) — 面向 AI 操作者和人工复核者的部署、连接、回退与验收步骤。
 - [任务控制与失败恢复](docs/task-control-recovery.md) — caller CAS、指导送达回执、失败 attempt 续修、崩溃 fencing 与事务边界。
+- [验收前置修正](docs/acceptance-amendment.md) — 固定 Host 声明前置、合同预览/CAS 审计和旧检查证据的保留边界。
 - [原设计忠实度矩阵](docs/fidelity-matrix.md) — 已实现、部分实现和需真实外部 Evidence 的边界。
 - [Archify 集成保真矩阵](docs/archify-fidelity-matrix.md) — 上游来源、适配范围及不可夸大的结论。
 - [Codex Radar 集成](docs/codex-radar-integration.md) — 通用 Provider、personal-use consent、SQLite 断网缓存、Workbench 先验与未来 DSH 消费合同。

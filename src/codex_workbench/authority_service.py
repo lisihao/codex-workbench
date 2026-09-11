@@ -42,6 +42,7 @@ CREATE INDEX IF NOT EXISTS authority_requests_state_updated_idx
 # These names deliberately mirror the current ``mcp.TOOLS`` catalog. The
 # adapter never accepts a callable tool name from a client without this fence.
 MCP_TOOL_NAMES = frozenset({
+    "workbench_amend_task_acceptance",
     "workbench_validate_blocked_node",
     "workbench_acceptance_report",
     "workbench_continue_session",
@@ -91,7 +92,7 @@ def is_read_only_tool(name: object, arguments: object) -> bool:
         return False
     if name in READ_ONLY_TOOL_NAMES:
         return True
-    return name in {"workbench_control_task", "workbench_validate_blocked_node"} and arguments.get("dry_run") is True
+    return name in {"workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance"} and arguments.get("dry_run") is True
 
 
 class AuthorityService:

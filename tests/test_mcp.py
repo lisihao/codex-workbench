@@ -165,6 +165,7 @@ class MCPTests(unittest.TestCase):
             names,
             {
                 "workbench_validate_blocked_node",
+                "workbench_amend_task_acceptance",
                 "workbench_request",
                 "workbench_get_request",
                 "workbench_get_session",
