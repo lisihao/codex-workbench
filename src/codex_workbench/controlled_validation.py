@@ -149,6 +149,7 @@ class ValidationCommand:
     argv: tuple[str, ...]
     expected_test_title: str | None = None
     report_file: str | None = None
+    entrypoint_sha256: tuple[tuple[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Return JSON-safe command evidence."""
@@ -158,6 +159,7 @@ class ValidationCommand:
             "argv": list(self.argv),
             "expected_test_title": self.expected_test_title,
             "report_file": self.report_file,
+            "entrypoint_sha256": dict(self.entrypoint_sha256),
         }
 
 
@@ -336,7 +338,7 @@ def plan_validation(
     if check_id not in _CHECK_IDS:
         raise ControlledValidationError(f"unsupported controlled validation check: {check_id}")
     root = _worktree_root(worktree)
-    commands = _commands_for(check_id, runtime)
+    commands = _commands_for(root, check_id, runtime)
     if check_id == _CHECK_IPC:
         for path, _title in _IPC_VITEST_CASES:
             _safe_regular_file(root, path)
@@ -421,16 +423,30 @@ def _worktree_root(worktree: Path) -> Path:
     return root
 
 
-def _commands_for(check_id: str, runtime: ValidationRuntime) -> tuple[ValidationCommand, ...]:
-    pnpm = str(runtime.pnpm_binary)
+def _installed_entrypoint(worktree: Path, relative: str) -> tuple[Path, tuple[str, str]]:
+    """Bind a fixed installed JS entry, including pnpm dependency symlinks."""
+    try:
+        path = (worktree / relative).resolve(strict=True)
+        if not path.is_file():
+            raise ControlledValidationError(f"validation entrypoint is not a file: {relative}")
+        digest = sha256(path.read_bytes()).hexdigest()
+    except (OSError, RuntimeError) as error:
+        raise ControlledValidationError(f"validation entrypoint is unavailable: {relative}") from error
+    return path, (str(path), digest)
+
+
+def _commands_for(
+    worktree: Path, check_id: str, runtime: ValidationRuntime,
+) -> tuple[ValidationCommand, ...]:
+    node = str(runtime.node_binary)
     if check_id == _CHECK_IPC:
+        vitest, vitest_identity = _installed_entrypoint(worktree, "node_modules/vitest/vitest.mjs")
         return tuple(
             ValidationCommand(
                 "dsh-b-ipc-v1",
                 (
-                    pnpm,
-                    "exec",
-                    "vitest",
+                    node,
+                    str(vitest),
                     "run",
                     path,
                     "-t",
@@ -441,19 +457,26 @@ def _commands_for(check_id: str, runtime: ValidationRuntime) -> tuple[Validation
                 ),
                 expected_test_title=title,
                 report_file=f"{_SCRATCH_PLACEHOLDER}/case-{index}.json",
+                entrypoint_sha256=(vitest_identity,),
             )
             for index, (path, title) in enumerate(_IPC_VITEST_CASES, start=1)
         )
-    check = (pnpm, "run", "verify-translation-pairing", *_README_ANCHORS)
+    loader, loader_identity = _installed_entrypoint(worktree, "node_modules/tsx/dist/esm/index.mjs")
+    script = _safe_regular_file(worktree, "scripts/verify-translation-pairing.ts")
+    script_identity = (str(script), sha256(script.read_bytes()).hexdigest())
+    entrypoints = (loader_identity, script_identity)
+    prefix = (node, "--import", loader.as_uri(), str(script))
+    check = (*prefix, *_README_ANCHORS)
     if check_id == _CHECK_PAIRING:
-        return (ValidationCommand("dsh-b-pairing-check-v1", check),)
+        return (ValidationCommand("dsh-b-pairing-check-v1", check, entrypoint_sha256=entrypoints),)
     if check_id == _CHECK_PAIRING_WRITE:
         return (
             ValidationCommand(
                 "dsh-b-pairing-write-v1",
-                (pnpm, "run", "verify-translation-pairing", "--write", *_README_ANCHORS),
+                (*prefix, "--write", *_README_ANCHORS),
+                entrypoint_sha256=entrypoints,
             ),
-            ValidationCommand("dsh-b-pairing-check-v1", check),
+            ValidationCommand("dsh-b-pairing-check-v1", check, entrypoint_sha256=entrypoints),
         )
     raise ControlledValidationError(f"unsupported controlled validation check: {check_id}")
 
