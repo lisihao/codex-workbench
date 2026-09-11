@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import io
+import json
+import unittest
+from unittest.mock import Mock
+
+from codex_workbench.service_client import IndeterminateServiceRequest
+from codex_workbench.service_mcp import AuthorityMCPAdapter, serve_authority_stdio
+
+
+class ServiceMCPTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.client.status.return_value = {"ok": True, "version": "fixture", "service_instance": "instance-1"}
+        self.client.tools.return_value = {"tools": [
+            {"name": "workbench_list_tasks", "annotations": {"readOnlyHint": True}},
+            {"name": "workbench_control_task", "annotations": {"readOnlyHint": False}},
+            {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
+        ]}
+        self.result = {"content": [{"type": "text", "text": "accepted request, not task acceptance"}]}
+        self.client.dispatch.return_value = {"state": "completed", "result": self.result}
+        self.adapter = AuthorityMCPAdapter(self.client)
+
+    def call(self, name, arguments):
+        return self.adapter.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                    "params": {"name": name, "arguments": arguments}})["result"]
+
+    def test_mutation_passes_original_cas_through_shared_service(self):
+        result = self.call("workbench_control_task", {
+            "request_id": "mutation-1", "task_id": "task", "action": "pause", "expected_revision": 7,
+        })
+        self.assertEqual(result, self.result)
+        envelope = self.client.dispatch.call_args.args[0]
+        self.assertEqual(envelope["request_id"], "mutation-1")
+        self.assertEqual(envelope["arguments"], {"task_id": "task", "action": "pause", "expected_revision": 7})
+        self.assertFalse(self.client.dispatch.call_args.kwargs["read_only"])
+
+    def test_mutation_requires_stable_id_but_read_does_not(self):
+        result = self.call("workbench_control_task", {"task_id": "task", "action": "pause"})
+        self.assertTrue(result["isError"])
+        self.client.dispatch.assert_not_called()
+        self.assertEqual(self.call("workbench_list_tasks", {}), self.result)
+        self.assertTrue(self.client.dispatch.call_args.kwargs["read_only"])
+
+    def test_unknown_write_returns_original_id_without_retry(self):
+        self.client.dispatch.side_effect = IndeterminateServiceRequest("mutation-1")
+        result = self.call("workbench_control_task", {"request_id": "mutation-1"})
+        self.assertTrue(result["isError"])
+        receipt = json.loads(result["content"][0]["text"])
+        self.assertEqual(receipt["request_id"], "mutation-1")
+        self.assertEqual(receipt["state"], "indeterminate")
+        self.client.dispatch.assert_called_once()
+
+    def test_request_lookup_does_not_dispatch_mutation(self):
+        self.client.get_request.return_value = {"request_id": "mutation-1", "state": "unknown"}
+        result = self.call("workbench_get_service_request", {"request_id": "mutation-1"})
+        self.assertEqual(json.loads(result["content"][0]["text"])["state"], "unknown")
+        self.client.dispatch.assert_not_called()
+
+    def test_stdio_bad_request_does_not_close_connection(self):
+        source = io.StringIO('not-json\n' + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize"}) + '\n')
+        output = io.StringIO()
+        serve_authority_stdio(self.client, source, output)
+        replies = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(replies[0]["error"]["code"], -32700)
+        self.assertEqual(replies[1]["result"]["serverInfo"]["version"], "fixture")

@@ -662,6 +662,8 @@ class FeatureCLITests(unittest.TestCase):
             coordinator_started = threading.Event()
             stop_called = threading.Event()
             release_coordinator = threading.Event()
+            service_drain_entered = threading.Event()
+            release_service = threading.Event()
 
             class BlockingCoordinator:
                 def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -678,6 +680,10 @@ class FeatureCLITests(unittest.TestCase):
                     stop_called.set()
 
             server = mock.Mock()
+            def wait_for_service() -> None:
+                service_drain_entered.set()
+                self.assertTrue(release_service.wait(timeout=5))
+            server.authority_service.wait_for_idle.side_effect = wait_for_service
             command_result: list[int] = []
             command_output = io.StringIO()
 
@@ -702,9 +708,16 @@ class FeatureCLITests(unittest.TestCase):
                     }
                     self.assertNotIn("coordinator.stopped", event_types)
                     release_coordinator.set()
+                    self.assertTrue(service_drain_entered.wait(timeout=2))
+                    self.assertTrue(thread.is_alive())
+                    self.assertNotIn("coordinator.stopped", {
+                        event["event_type"] for event in WorkbenchStore(root / "state.sqlite").read_events()
+                    })
+                    release_service.set()
                     thread.join(timeout=2)
             finally:
                 release_coordinator.set()
+                release_service.set()
 
             self.assertFalse(thread.is_alive())
             self.assertEqual(command_result, [0])

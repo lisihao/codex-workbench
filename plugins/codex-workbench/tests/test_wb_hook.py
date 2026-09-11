@@ -202,6 +202,22 @@ class WBHookTests(unittest.TestCase):
                 ],
             )
 
+    def test_supervised_transport_uses_the_same_configured_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = root / "mcp-connection.json"
+            connection.write_text(json.dumps({"schema_version": 1, "command": [
+                "ssh", "-T", "authority-fixture", 'exec "$HOME/app/codex-workbench" mcp',
+            ]}))
+            (root / "config.toml").write_text(
+                '[mcp_servers.codex-workbench]\ncommand = "/usr/bin/python3"\nargs = '
+                + json.dumps(["/fixture/workbench-mcp-bridge.py", "--config", str(connection)]) + "\n"
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": str(root)}):
+                command = wb_hook._mcp_ssh_command("same-context-import")
+            self.assertEqual(command[:3], ["ssh", "-T", "authority-fixture"])
+            self.assertTrue(command[-1].endswith("context import --archive - --command-id same-context-import"))
+
     def test_active_binding_is_reused_without_a_new_sync(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

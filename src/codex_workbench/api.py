@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from copy import deepcopy
 import hmac
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -12,16 +13,19 @@ import os
 from pathlib import Path
 import threading
 import time
+import uuid
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
 from .acceptance import build_acceptance_report
 from .ai_frontier import WorkbenchAIFrontier
 from .artifacts import ArtifactStore
+from .authority_service import AuthorityService, READ_ONLY_TOOL_NAMES
 from .capabilities import CapabilityRegistry
 from .config import WorkbenchConfig
 from .governance import code_as_harness_health, governance_status
 from .model import DEFAULT_QUOTA_TTL_SECONDS
+from .model import canonical_hash
 from .performance import PERFORMANCE_SEMANTIC_VERSION, PerformanceRegistry
 from .quota_productivity import build_quota_productivity
 from .radar import WorkbenchRadar
@@ -92,6 +96,40 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.store = store
         self.artifacts = ArtifactStore(config.state_root / "artifacts")
+        from .mcp import TOOLS, WorkbenchMCPServer
+
+        self.service_instance = uuid.uuid4().hex
+        dispatcher = WorkbenchMCPServer(config, store)
+
+        def invoke_tool(name, arguments):
+            response = dispatcher.handle({
+                "jsonrpc": "2.0", "id": "authority-service", "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            })
+            assert response is not None
+            return response["result"]
+
+        self.authority_service = AuthorityService(store, invoke_tool, self.service_instance)
+        self.service_tools = deepcopy(TOOLS)
+        for tool in self.service_tools:
+            read_only = tool["name"] in READ_ONLY_TOOL_NAMES
+            tool["annotations"] = {**tool.get("annotations", {}), "readOnlyHint": read_only}
+            if not read_only:
+                schema = tool["inputSchema"]
+                schema["properties"]["request_id"] = {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                    "description": "Stable mutation ID. After a lost receipt, query this ID; never resend with a new ID.",
+                }
+                schema["required"] = [*schema.get("required", []), "request_id"]
+        self.service_tools.append({
+            "name": "workbench_get_service_request",
+            "description": "Read the durable outcome of one Authority service request without replaying it.",
+            "annotations": {"readOnlyHint": True},
+            "inputSchema": {"type": "object", "additionalProperties": False,
+                            "required": ["request_id"], "properties": {
+                                "request_id": {"type": "string", "minLength": 1, "maxLength": 200}}},
+        })
+        self.service_tools_sha256 = canonical_hash(self.service_tools)
         self._login_failures: OrderedDict[str, deque[float]] = OrderedDict()
         self._login_failures_lock = threading.Lock()
 
@@ -141,6 +179,30 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if not self._host_allowed():
             return self._json({"error": "host not allowed"}, HTTPStatus.BAD_REQUEST)
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/service/"):
+            if not self._authenticated():
+                return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
+            if parsed.path == "/api/service/status":
+                health = self.server.store.health()
+                return self._json({"ok": bool(health["ok"]), "version": __version__,
+                                   "service_protocol": "workbench-authority-service/v1",
+                                   "build": self._build_manifest(),
+                                   "service_instance": self.server.service_instance,
+                                   "tools_sha256": self.server.service_tools_sha256,
+                                   "event_cursor": health["cursor"],
+                                   "http_status": 200, "scope": "service-interface-only"})
+            if parsed.path == "/api/service/tools":
+                return self._json({"tools": self.server.service_tools,
+                                   "tools_sha256": self.server.service_tools_sha256})
+            if parsed.path.startswith("/api/service/requests/"):
+                request_id = unquote(parsed.path.removeprefix("/api/service/requests/"))
+                try:
+                    return self._json(self.server.authority_service.get_request(request_id))
+                except KeyError:
+                    return self._json({"error": "service request not found", "retry_mutation": False}, HTTPStatus.NOT_FOUND)
+                except ValueError as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return self._json({"error": "service endpoint not found"}, HTTPStatus.NOT_FOUND)
         if parsed.path == "/":
             return self._html(self._static("index.html"))
         if parsed.path == "/app.css":
@@ -288,6 +350,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if not self._authenticated():
             return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
+        if parsed.path == "/api/service/requests":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 2 * 1024 * 1024:
+                    raise ValueError("service request body must be between 1 byte and 2 MiB")
+                envelope = json.loads(self.rfile.read(length))
+                receipt = self.server.authority_service.dispatch(
+                    envelope, authenticated_actor="authority-control-token",
+                )
+                return self._json(receipt)
+            except (CommandConflictError, StateConflictError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
         if parsed.path == "/api/clients/observe":
             try:
                 body = json.loads(self._read_body() or b"{}")
@@ -848,7 +924,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # The peer disconnected after the response was prepared. Durable
+            # mutation receipts remain queryable; never re-execute here.
+            return
 
     def _html(
         self,

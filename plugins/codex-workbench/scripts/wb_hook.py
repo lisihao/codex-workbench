@@ -350,6 +350,16 @@ def _mcp_ssh_command(command_id: str) -> list[str]:
     arguments = values.get("args")
     if not isinstance(command, str) or not isinstance(arguments, list) or not arguments:
         raise RuntimeError("codex-workbench MCP transport is incomplete")
+    if Path(str(arguments[0])).name == "workbench-mcp-bridge.py":
+        if len(arguments) != 3 or arguments[1] != "--config":
+            raise RuntimeError("Workbench MCP bridge configuration is unsupported")
+        bridge = json.loads(Path(arguments[2]).expanduser().read_text())
+        transport = bridge.get("command") if isinstance(bridge, dict) else None
+        if (not isinstance(bridge, dict) or bridge.get("schema_version") != 1 or not isinstance(transport, list)
+                or len(transport) < 2
+                or not all(isinstance(value, str) and value for value in transport)):
+            raise RuntimeError("Workbench MCP bridge transport is invalid")
+        command, arguments = transport[0], transport[1:]
     # The MacBook client normally uses SSH to reach the Mac mini.  A native
     # Codex Remote Control session on the authority host may instead register
     # the Workbench MCP command directly.  Keep the former shell command
@@ -426,7 +436,7 @@ def main() -> int:
             _json_output(
                 "WB_SYNC_RECEIPT "
                 + json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
-                + "\nThis session is already bound. Reuse the durable receipt and route executable work through the Workbench MCP tools; do not create a duplicate task for ordinary conversation."
+                + "\nThis session is already bound. Use the same controlled Authority service; prefer Workbench MCP tools. Preserve the task, accepted nodes, permissions and expected_revision. If MCP fails, use the supported read-only connection diagnosis; an authorized fallback must call the same service with a stable request_id. Lost write receipts require lookup, not resend. Do not create a duplicate task or restart production because of a transport error."
             )
             return 0
     try:
@@ -448,7 +458,7 @@ def main() -> int:
         _json_output(
             "WB_SYNC_RECEIPT "
             + json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-            + "\nThe user activated Workbench. The authority accepted and durably bound this context. Route executable work through the Workbench MCP tools and continue the latest unfinished request when one exists."
+            + "\nThe user activated Workbench. The Authority accepted this context. Continue the latest unfinished request through the same controlled Authority service, preferably Workbench MCP tools. Preserve the task/session binding, expected_revision and request_id. MCP transport failure permits bounded read-only diagnosis, not duplicate work, unapproved restart or direct SQLite writes."
         )
     except Exception as error:
         data_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -464,7 +474,7 @@ def main() -> int:
         state = {
             "state": "degraded",
             "source_thread_id": session_id,
-            "execution_host": "macbook-local",
+            "execution_host": "unconfirmed",
             "error": str(error)[-1200:],
             "retry": "next prompt",
         }
@@ -472,7 +482,7 @@ def main() -> int:
         _json_output(
             "WB_SYNC_RECEIPT "
             + json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-            + "\nWorkbench takeover is not active. Use the current MacBook checkout as the explicit fallback and do not claim remote execution."
+            + "\nWorkbench takeover is unconfirmed. Diagnose the named component with the supported read-only connection tool; do not assume the Authority is down or the import never happened. Preserve the existing task/context and query any lost receipt by its original command ID. Local implementation fallback needs an explicit decision; no direct SQLite writes, duplicate tasks or automatic production restarts."
         )
     return 0
 

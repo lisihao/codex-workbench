@@ -176,8 +176,12 @@ def command_serve(args: argparse.Namespace) -> int:
         server: WorkbenchHTTPServer | None = None
         try:
             server = WorkbenchHTTPServer(config, store)
+            # The lease excludes a second Authority; no HTTP requests can
+            # arrive yet. Unknown writes are fenced, never replayed.
+            server.authority_service.recover_interrupted()
 
             def stop(*_args) -> None:
+                server.authority_service.begin_drain()
                 coordinator.stop()
                 threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -198,12 +202,17 @@ def command_serve(args: argparse.Namespace) -> int:
             )
             server.serve_forever(poll_interval=0.5)
         finally:
+            if server is not None:
+                server.authority_service.begin_drain()
             coordinator.stop()
             # Keep the authority lease through real coordinator termination.
             # A timed join could record a false stopped event and allow a
             # second authority while planner or recovery work still runs.
             coordinator_thread.join()
             if server is not None:
+                # The stopped receipt must also exclude in-flight HTTP tool
+                # writes, not only coordinator workers and planning jobs.
+                server.authority_service.wait_for_idle()
                 server.server_close()
             store.record_system_event(
                 "coordinator.stopped",
@@ -285,10 +294,61 @@ def command_request_status(args: argparse.Namespace) -> int:
 
 
 def command_mcp(args: argparse.Namespace) -> int:
-    from .mcp import serve_stdio
+    from .service_mcp import serve_authority_stdio
 
-    config = _config(args)
-    serve_stdio(config, _store(config))
+    serve_authority_stdio(_authority_service_client(args))
+    return 0
+
+
+def _authority_service_client(args: argparse.Namespace):
+    """Read existing connection credentials without initializing local state."""
+
+    from .service_client import AuthorityHTTPClient, ServiceTransportError
+
+    root = Path(args.home).expanduser() if getattr(args, "home", None) else None
+    config = WorkbenchConfig.load(root)
+    try:
+        token = config.token()
+    except OSError:
+        raise ServiceTransportError("existing Authority control token is unavailable") from None
+    host = "[::1]" if config.host in {"::", "::1"} else "127.0.0.1"
+    return AuthorityHTTPClient(f"http://{host}:{config.port}", token)
+
+
+def command_service(args: argparse.Namespace) -> int:
+    """Use the same Authority endpoint as MCP without opening its database."""
+
+    from .authority_service import is_read_only_tool
+    from .service_client import IndeterminateServiceRequest, ServiceTransportError
+
+    try:
+        client = _authority_service_client(args)
+        if args.service_action == "status":
+            result = client.status()
+        elif args.service_action == "tools":
+            result = client.tools()
+        elif args.service_action == "request-status":
+            result = client.get_request(args.request_id)
+        else:
+            envelope = json.load(sys.stdin)
+            if not isinstance(envelope, dict):
+                raise ValueError("service invoke expects an envelope object on stdin")
+            if args.request_id is not None:
+                if envelope.get("request_id", args.request_id) != args.request_id:
+                    raise ValueError("CLI request_id does not match the envelope")
+                envelope["request_id"] = args.request_id
+            result = client.dispatch(envelope, read_only=is_read_only_tool(
+                envelope.get("tool"), envelope.get("arguments"),
+            ))
+    except IndeterminateServiceRequest as error:
+        print(json.dumps({"ok": False, "state": "indeterminate", "request_id": error.request_id,
+                          "retry_mutation": False, "component": "authority_http"}))
+        return 3
+    except ServiceTransportError as error:
+        print(json.dumps({"ok": False, "component": "authority_http", "error": str(error),
+                          "http_status": getattr(error, "status", None)}))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1792,6 +1852,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     mcp = sub.add_parser("mcp", help="serve the Codex-native Workbench tools over stdio")
     mcp.set_defaults(func=command_mcp)
+
+    service = sub.add_parser("service", help="authenticated Authority access; never opens the task database")
+    service_sub = service.add_subparsers(dest="service_action", required=True)
+    service_sub.add_parser("status")
+    service_sub.add_parser("tools")
+    service_status = service_sub.add_parser("request-status")
+    service_status.add_argument("request_id")
+    service_invoke = service_sub.add_parser("invoke", help="read an exact service envelope from stdin")
+    service_invoke.add_argument("--request-id", help="stable request ID; never replace it after a lost response")
+    service.set_defaults(func=command_service)
 
     context = sub.add_parser("context", help="import and bind a Codex session context")
     context_sub = context.add_subparsers(dest="context_action", required=True)

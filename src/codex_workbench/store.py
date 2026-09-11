@@ -322,6 +322,8 @@ class WorkbenchStore:
         )
 
     def initialize(self) -> None:
+        from .authority_service import AUTHORITY_REQUEST_JOURNAL_DDL
+
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._init_lock, self.connection() as connection:
             schema_sql = """
@@ -616,6 +618,7 @@ class WorkbenchStore:
                 CREATE INDEX IF NOT EXISTS worktree_archives_state_idx
                     ON worktree_archives(state, updated_at);
                 """
+            schema_sql += AUTHORITY_REQUEST_JOURNAL_DDL
             # Read-only version fencing precedes every DDL statement. An
             # unknown newer database must remain untouched by an older binary.
             prior_schema_version = self._preflight_schema_version(connection)
@@ -4613,6 +4616,17 @@ class WorkbenchStore:
             }
         return None
 
+    @staticmethod
+    def assert_no_active_validation(connection: sqlite3.Connection, task_id: str) -> None:
+        """Fence recovery CAS while the Authority owns a bounded validation."""
+        row = connection.execute(
+            "SELECT request_id FROM authority_requests WHERE task_id = ? "
+            "AND tool = 'workbench_validate_blocked_node' AND state = 'executing' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None:
+            raise StateConflictError("controlled validation is executing; query its request receipt before recovery")
+
     def retry_blocked_node(
         self,
         task_id: str,
@@ -4652,6 +4666,7 @@ class WorkbenchStore:
 
         timestamp = now_iso()
         with self.transaction() as connection:
+            self.assert_no_active_validation(connection, task_id)
             candidate = self._blocked_retry_candidate(
                 connection,
                 task_id,
@@ -5829,6 +5844,7 @@ class WorkbenchStore:
             )
         timestamp = now_iso()
         with self.transaction() as connection:
+            self.assert_no_active_validation(connection, task_id)
             if source_only_authorization is not None:
                 current_snapshot = self._blocked_source_only_recovery_durable_snapshot(
                     connection,
@@ -6341,6 +6357,7 @@ class WorkbenchStore:
         instruction: str,
         *,
         expected_revision: int | None = None,
+        expected_task_id: str | None = None,
     ) -> dict[str, Any]:
         """Append a user message to its bound task without changing that task's objective or state."""
 
@@ -6354,6 +6371,8 @@ class WorkbenchStore:
             if binding is None:
                 raise KeyError(source_thread_id)
             task_id = binding["active_task_id"]
+            if expected_task_id is not None and task_id != expected_task_id:
+                raise StateConflictError("session active task changed before continuation")
             if task_id is None:
                 raise StateConflictError("session has no active task to continue")
             task = connection.execute(
