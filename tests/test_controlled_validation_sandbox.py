@@ -18,10 +18,47 @@ import tempfile
 import unittest
 
 from codex_workbench.artifacts import ArtifactStore
+from codex_workbench import controlled_validation as validation
 from codex_workbench.controlled_validation import ValidationRuntime, plan_validation, run_validation
 
 
 CODEX = os.environ.get("WB_SANDBOX_CODEX") or shutil.which("codex")
+_configured_node = os.environ.get("WB_VALIDATION_NODE") or shutil.which("node")
+NODE = Path(_configured_node).expanduser() if _configured_node else None
+_configured_dsh_source = os.environ.get("WB_VALIDATION_DSH_SOURCE")
+DSH_ROOT = Path(_configured_dsh_source).expanduser() if _configured_dsh_source else None
+DSH_NODE_MODULES = DSH_ROOT / "node_modules" if DSH_ROOT is not None else None
+_PAIRING_SOURCES = (
+    "scripts/verify-translation-pairing.ts",
+    "scripts/translation-pairing-git.ts",
+    "scripts/translation-pairing-record.ts",
+    "scripts/translation-pairing.ts",
+    "scripts/translation-pairing.manifest.json",
+)
+
+
+def _real_launcher_dependencies_available() -> bool:
+    return (
+        NODE is not None
+        and DSH_ROOT is not None
+        and DSH_NODE_MODULES is not None
+        and NODE.is_file()
+        and os.access(NODE, os.X_OK)
+        and (DSH_NODE_MODULES / "vitest" / "vitest.mjs").is_file()
+        and (DSH_NODE_MODULES / "tsx" / "dist" / "esm" / "index.mjs").is_file()
+        and all((DSH_ROOT / relative).is_file() for relative in _PAIRING_SOURCES)
+    )
+
+
+def _copy_pairing_sources(destination: Path) -> None:
+    """Copy the real DSH pairing entrypoint and its fixed relative imports."""
+
+    assert DSH_ROOT is not None
+    for relative in _PAIRING_SOURCES:
+        source = DSH_ROOT / relative
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 @unittest.skipUnless(sys.platform == "darwin" and CODEX, "requires macOS and Codex sandbox CLI")
@@ -137,68 +174,95 @@ print(json.dumps(result))
         self.assertEqual(subprocess.check_output(
             ["git", "-C", str(self.worktree), "cat-file", "blob", digest]), content)
 
-    def test_real_runner_executes_exact_pairing_plan_with_private_ipc_and_denied_source_writes(self) -> None:
-        """A fixture pnpm entry exercises the new runner, not DSH task acceptance."""
+    @unittest.skipUnless(
+        _real_launcher_dependencies_available(),
+        "requires local Node plus installed DSH Vitest/tsx dependencies",
+    )
+    def test_real_node_vitest_launcher_runs_fixed_fixture_title_with_json_proof(self) -> None:
+        """Prove the launcher only; it does not substitute for B's business tests."""
+
         subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
-        anchors = (
-            "packages/client/connection/README.md",
-            "packages/core/system-prompt/README.md",
-            "packages/physical-operator/resident-operator-local/README.md",
-            "packages/physical-operator/resident-operator/README.md",
-            "packages/physical-operator/tool-physical-operator/README.md",
+        assert DSH_NODE_MODULES is not None
+        assert NODE is not None
+        (self.worktree / "node_modules").symlink_to(DSH_NODE_MODULES, target_is_directory=True)
+        for path, title in validation._IPC_VITEST_CASES:
+            target = self.worktree / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "import { it, expect } from 'vitest'\n"
+                "import { writeFileSync } from 'node:fs'\n"
+                f"it({json.dumps(title)}, () => {{\n"
+                f"  expect(process.cwd()).toBe({json.dumps(str(self.worktree))})\n"
+                "  for (const target of ['unrelated-source.txt', '.git/config']) {\n"
+                "    let denied = false\n"
+                "    try { writeFileSync(target, 'forbidden') }\n"
+                "    catch (error) { denied = error && ['EACCES', 'EPERM'].includes(error.code) }\n"
+                "    expect(denied).toBe(true)\n"
+                "  }\n"
+                "})\n",
+                encoding="utf-8",
+            )
+        config_before = (self.worktree / ".git" / "config").read_bytes()
+        runtime = ValidationRuntime(Path(str(CODEX)).resolve(), NODE.resolve(), NODE.resolve())
+        plan = plan_validation(self.worktree, "dsh-b-ipc-v1", runtime)
+        first = plan.commands[0]
+        self.assertEqual(first.argv[:3], (
+            str(NODE.resolve()),
+            str((self.worktree / "node_modules" / "vitest" / "vitest.mjs").resolve()),
+            "run",
+        ))
+        artifacts = ArtifactStore(self.root / "artifacts")
+        result = run_validation(plan, artifacts).to_dict()
+        logs = "\n".join(
+            artifacts.verify(command["stderr_ref"]).read_text(encoding="utf-8")
+            for command in result["commands"]
         )
+        self.assertTrue(result["ok"], (result, logs))
+        first_receipt = result["commands"][0]
+        self.assertEqual(first_receipt["test_assertion"]["matched_count"], 1)
+        self.assertEqual((self.worktree / ".git" / "config").read_bytes(), config_before)
+        self.assertFalse((self.worktree / "unrelated-source.txt").exists())
+
+    @unittest.skipUnless(
+        _real_launcher_dependencies_available(),
+        "requires local Node plus installed DSH Vitest/tsx dependencies",
+    )
+    def test_real_node_pairing_entrypoint_writes_and_checks_selected_pairs(self) -> None:
+        """Run the real DSH pairing entrypoint in an isolated fixture only."""
+
+        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
+        assert DSH_NODE_MODULES is not None
+        assert NODE is not None
+        (self.worktree / "node_modules").symlink_to(DSH_NODE_MODULES, target_is_directory=True)
+        _copy_pairing_sources(self.worktree)
+        anchors = validation._README_ANCHORS
         for anchor in anchors:
             english = self.worktree / anchor
             english.parent.mkdir(parents=True)
-            english.write_text("English fixture: " + anchor + "\n")
-            english.with_name("README.zh.md").write_text("Translated fixture: " + anchor + "\n")
-            english.with_name("README.i18n.yaml").write_text("before\n")
-        pnpm = self.root / "fixture-pnpm"
-        pnpm.write_text("#!" + sys.executable + "\n" + r'''
-import errno, json, os, pathlib, socket, subprocess, sys
-if sys.argv[1:3] != ['run', 'verify-translation-pairing']:
-    raise SystemExit(2)
-arguments = sys.argv[3:]
-write = arguments[0] == '--write'
-anchors = arguments[1:] if write else arguments
-assert len(anchors) == 5
-sock_path = pathlib.Path(os.environ['TMPDIR']) / ('pair-' + str(os.getpid()) + '.sock')
-probe = socket.socket(socket.AF_UNIX)
-probe.bind(str(sock_path))
-probe.close()
-sock_path.unlink()
-denied = []
-for relative in ('forbidden-source.txt', '.git/config'):
-    try:
-        pathlib.Path(relative).write_text('forbidden')
-        raise AssertionError('unexpected write grant')
-    except OSError as error:
-        assert error.errno in (errno.EPERM, errno.EACCES)
-        denied.append(relative)
-for anchor in anchors:
-    source = pathlib.Path(anchor)
-    sidecar = source.with_name('README.i18n.yaml')
-    if write:
-        for selected in (source, source.with_name('README.zh.md')):
-            blob = subprocess.check_output(['git', 'hash-object', '-w', '--', str(selected)], text=True).strip()
-            subprocess.run(['git', 'update-ref', 'refs/dsh/translation-pairing/snapshots/' + blob, blob], check=True)
-        sidecar.write_text('paired\n')
-    else:
-        assert sidecar.read_text() == 'paired\n'
-print(json.dumps({'selected_pairs': len(anchors), 'denied': denied, 'private_ipc': True}))
-''')
-        pnpm.chmod(0o700)
+            english.write_text(
+                "# English fixture\n\n[中文](README.zh.md)\n", encoding="utf-8"
+            )
+            english.with_name("README.zh.md").write_text(
+                "# 中文 fixture\n\n[English](README.md)\n", encoding="utf-8"
+            )
+            english.with_name("README.i18n.yaml").write_text("", encoding="utf-8")
         config_before = (self.worktree / ".git/config").read_bytes()
-        # The fixture does not invoke Node; use a real pinned executable for
-        # the runtime identity field while its pnpm shim runs fixture Python.
-        runtime = ValidationRuntime(Path(str(CODEX)).resolve(), pnpm, Path(sys.executable).resolve())
+        runtime = ValidationRuntime(Path(str(CODEX)).resolve(), NODE.resolve(), NODE.resolve())
         plan = plan_validation(self.worktree, "dsh-b-pairing-write-v1", runtime)
+        loader = (self.worktree / "node_modules" / "tsx" / "dist" / "esm" / "index.mjs").resolve()
+        script = (self.worktree / "scripts" / "verify-translation-pairing.ts").resolve()
+        self.assertEqual(plan.commands[0].argv[:5], (
+            str(NODE.resolve()), "--import", loader.as_uri(), str(script), "--write",
+        ))
         artifacts = ArtifactStore(self.root / "artifacts")
         result = run_validation(plan, artifacts).to_dict()
-        logs = "\n".join(artifacts.verify(command["stderr_ref"]).read_text() for command in result["commands"])
+        logs = "\n".join(
+            artifacts.verify(command["stderr_ref"]).read_text(encoding="utf-8")
+            for command in result["commands"]
+        )
         self.assertTrue(result["ok"], (result, logs))
         self.assertEqual(len(result["commands"]), 2)
         self.assertEqual((self.worktree / ".git/config").read_bytes(), config_before)
-        self.assertFalse((self.worktree / "forbidden-source.txt").exists())
         for anchor in anchors:
-            self.assertEqual((self.worktree / anchor).with_name("README.i18n.yaml").read_text(), "paired\n")
+            sidecar = (self.worktree / anchor).with_name("README.i18n.yaml")
+            self.assertIn("README.md:", sidecar.read_text(encoding="utf-8"))
