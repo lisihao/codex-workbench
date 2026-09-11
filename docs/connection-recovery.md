@@ -12,7 +12,9 @@ Event continuation uses the Authority cursor. A reconnect continues after the la
 
 ## Installation and private state
 
-`scripts/install-macbook-client.py` installs `workbench-mcp-bridge.py` and `workbench-connection-diagnose.py` under the existing client `libexec/` directory and registers the bridge through the installation's Python interpreter. Both static SSH and location-aware routing retain their previous exact SSH command in private `mcp-bridge.json`. The tunnel and home-presence heartbeat retain their existing responsibilities.
+The bridge uses buffered binary pipes for JSONL, so a large valid response does not incur a raw file read for every byte. Responses are bounded to 16 MiB per line. An oversized response is reported explicitly and is not retried as a connection failure; use a smaller event page or a recent explicit cursor. This is a transport bound, not permission to omit events or fabricate a successful response. Mutation outcomes still use their original Authority receipts.
+
+`scripts/install-macbook-client.py` installs `workbench-mcp-bridge.py` and `workbench-connection-diagnose.py` under the existing client `libexec/` directory and registers the bridge through the installation's Python interpreter. Both static SSH and location-aware routing retain their destinations and authentication options in private `mcp-bridge.json`, with `-C` compression enabled for the MCP connection to reduce large JSON transfer time on slow links. Global SSH settings, service preflight, request deadlines, tunnels and the home-presence heartbeat are unchanged.
 
 The installer snapshots and can roll back its managed scripts and configuration. It never replaces or rolls back `mcp-bridge-state.json`: live request IDs and event cursors are data, not installation artifacts. Private config, state and scripts have mode 0600. Stderr evidence is bounded and fingerprinted rather than exposing credentials in diagnostic output.
 

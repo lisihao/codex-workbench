@@ -383,6 +383,8 @@ class AuthorityServiceTests(unittest.TestCase):
         })
         self.assertEqual(self._database_dump(), database_before)
         self.assertTrue(is_read_only_tool("workbench_validate_blocked_node", {"dry_run": True}))
+        self.assertTrue(is_read_only_tool("workbench_amend_task_acceptance", {"dry_run": True}))
+        self.assertFalse(is_read_only_tool("workbench_amend_task_acceptance", {"dry_run": False}))
         with self.assertRaises(KeyError):
             service.get_request("validation-preview")
         for invalid in (

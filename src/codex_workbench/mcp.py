@@ -9,6 +9,7 @@ from typing import Any, TextIO
 
 from . import __version__
 from .acceptance import build_acceptance_report
+from .acceptance_amendment import ACCEPTANCE_AMENDMENT_TOOL, amend_task_acceptance
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
@@ -46,6 +47,7 @@ _LIST_TASKS_NODE_STATES = (
 
 TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
+    ACCEPTANCE_AMENDMENT_TOOL,
     {
         "name": "workbench_create_delivery_objective",
         "description": "Attach a durable delivery objective to an existing task or planning reservation. Repeating the same command is idempotent. This does not grant external authority or accept work.",
@@ -859,6 +861,8 @@ class WorkbenchMCPServer:
         return str(row["task_id"])
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "workbench_amend_task_acceptance":
+            return self._text(amend_task_acceptance(self.config, self.store, arguments))
         if name == "workbench_validate_blocked_node":
             return self._text(validate_blocked_node(self.config, self.store, arguments))
         if name == "workbench_request":

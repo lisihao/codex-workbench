@@ -694,12 +694,13 @@ def authority_mcp_child_command(
     transport_arguments: tuple[str, ...],
     remote_binary: str,
 ) -> tuple[str, ...]:
-    """Build the exact existing SSH argv now supervised by the local bridge."""
+    """Build the compressed MCP-only SSH connection supervised by the bridge."""
 
     remote_command = f"exec {remote_shell_quote(remote_binary)} mcp"
     return (
         "ssh",
         "-T",
+        "-C",
         "-o",
         "BatchMode=yes",
         "-o",
