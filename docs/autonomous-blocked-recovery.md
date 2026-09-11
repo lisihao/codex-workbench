@@ -19,6 +19,8 @@ The fixed validation profiles currently cover the bounded DSH B IPC and pairing 
 
 ## Configuration and observation
 
+`workbench_list_tasks` includes a compact `current_status` read in the same database snapshot as each summary: current revision/state, active scheduler phases, latest material-event metadata and UTC `observed_at`. Recovery preparation, verification and ordinary execution can appear together when independent nodes run concurrently. These are scheduler phases, not proof of CPU activity or a particular compiler step. The projection reads no result bodies, steering, event payloads or artifact content; detailed history remains in the existing paginated event and artifact tools. A database read failure returns `observation_unavailable` and changes no task state.
+
 Use `workbench_configure_node_recovery` through the same authenticated Authority service with `task_id`, `expected_revision` and a strict `policy` object. Mutations require a stable service `request_id`. `workbench_get_node_recovery` is read-only and reports the policy, actually available actions, compact episodes and measured ledger counts. Policy installation does not transfer recovery ownership from another operator or grant release/deployment permissions.
 
 ```json

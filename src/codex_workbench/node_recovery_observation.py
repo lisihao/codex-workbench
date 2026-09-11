@@ -25,6 +25,7 @@ _ARTIFACT_BYTES_LIMIT = 256 * 1024
 _MAX_ARTIFACT_REFS = 64
 _MAX_ANCESTORS = 64
 _MAX_FAILURES = 64
+_MAX_RECOVERY_PREPARATION_EVIDENCE_REFS = 64
 _REF_RE = re.compile(r"^sha256:[0-9a-f]{64}:[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 _VALIDATION_PROFILES = frozenset(
     {
@@ -54,6 +55,13 @@ _KNOWN_ARTIFACT_KEYS = frozenset(
         "controlled-validation",
         "structured-result",
         "harness-failure",
+        "recovery-preparation",
+    }
+)
+_RECOVERY_PREPARATION_CODES = frozenset(
+    {
+        "acceptance-command-failed",
+        "preparation-failed",
     }
 )
 
@@ -99,14 +107,67 @@ def collect_node_observation(
     node_attempt = _integer(node.get("attempt"), "node.attempt", minimum=0)
     node_state = _text(node.get("state"), "unknown")
     raw_result = node.get("result")
-    result = dict(raw_result) if isinstance(raw_result, Mapping) else {}
+    source_result = dict(raw_result) if isinstance(raw_result, Mapping) else {}
+    rollback = store.current_blocked_worktree_recovery_rollback(
+        task_id,
+        node_id,
+        task_revision=task_revision,
+        node_state=node_state,
+        node_attempt=node_attempt,
+        settled_at=node.get("settled_at"),
+        worktree=node.get("worktree"),
+    )
+    if rollback is not None and rollback["state"] == "unavailable":
+        return _observation_unavailable(
+            task_id=task_id,
+            node_id=node_id,
+            task_revision=int(rollback.get("current_task_revision", task_revision)),
+            task_state=str(rollback.get("current_task_state", task_state)),
+            node_attempt=int(rollback.get("current_node_attempt", node_attempt)),
+            node_state=str(rollback.get("current_node_state", node_state)),
+            source_event_cursor=source_event_cursor,
+            reason=str(rollback["reason"]),
+            rollback_event_cursor=rollback.get("rollback_event_cursor"),
+        )
+
+    rollback_event_cursor: int | None = None
+    rollback_provenance: dict[str, Any] | None = None
+    preparation_attempt: int | None = None
+    typed_failure_code: str | None = None
+    preparation_phase: str | None = None
+    preparation_executor_not_started = False
+    rollback_preparation = rollback is not None
+    if rollback_preparation:
+        rollback_event_cursor = int(rollback["rollback_event_cursor"])
+        rollback_provenance = dict(rollback["rollback_provenance"])
+        preparation_attempt = int(rollback_provenance["preparation_attempt"])
+        source_artifacts = _result_artifact_refs(source_result)
+        raw_preparation = rollback["preparation_result"]
+        if raw_preparation is None:
+            result: dict[str, Any] = {}
+        else:
+            result = dict(raw_preparation)
+        typed_failure_code, preparation_phase, preparation_executor_not_started = _recovery_preparation_facts(
+            store,
+            result,
+            task_id=task_id,
+            node_id=node_id,
+            source_attempt=node_attempt,
+            recovery_attempt=preparation_attempt,
+        )
+        attribution_attempt = preparation_attempt
+    else:
+        result = source_result
+        attribution_attempt = node_attempt
     artifacts, artifact_payloads = _result_artifacts(store, result)
+    if not rollback_preparation:
+        source_artifacts = artifacts
 
     attribution, attribution_present, attribution_current = _current_attribution(
-        result.get("execution_attribution"), task_id, node_id, node_attempt
+        result.get("execution_attribution"), task_id, node_id, attribution_attempt
     )
     origin = attribution.failure.origin if attribution_current else "unknown"
-    effective_cursor = source_event_cursor
+    effective_cursor = max(source_event_cursor, rollback_event_cursor or 0)
     if attribution_current and attribution is not None and attribution.state.event_cursor is not None:
         effective_cursor = max(effective_cursor, attribution.state.event_cursor)
 
@@ -141,14 +202,18 @@ def collect_node_observation(
         readiness_failure=readiness_failure,
         materialization=materialization,
     )
-    phase = _phase(
-        result,
-        attribution_current=attribution_current,
-        attribution=attribution,
-        readiness_failed=readiness_failed,
+    phase = (
+        "recovery_preparation"
+        if rollback_preparation
+        else _phase(
+            result,
+            attribution_current=attribution_current,
+            attribution=attribution,
+            readiness_failed=readiness_failed,
+        )
     )
     harness_failure = artifact_payloads.get("harness-failure")
-    if (attribution_current and origin == "tooling_bug" and attribution is not None
+    if (not rollback_preparation and attribution_current and origin == "tooling_bug" and attribution is not None
             and attribution.timings.execute.status == "unknown" and attribution.timings.verify.status == "unknown"
             and isinstance(harness_failure, Mapping)
             and harness_failure.get("kind") == "harness-failure"
@@ -159,7 +224,7 @@ def collect_node_observation(
         phase = "pre_execution"
 
     implementation_ready: bool | None = None
-    if phase == "pre_execution" and attribution_current:
+    if not rollback_preparation and phase == "pre_execution" and attribution_current:
         implementation_ready = False
 
     accepted_ancestors, ancestor_source_refs = _accepted_ancestors(task, node_id)
@@ -167,13 +232,16 @@ def collect_node_observation(
         implementation_ready = True
     source_refs = list(ancestor_source_refs)
     dependency_refs: list[str] = []
-    for key in ("dependency-input", "dependency-materialization"):
-        ref = artifacts.get(key)
-        if ref is not None and ref not in dependency_refs:
-            dependency_refs.append(ref)
-    current_patch = artifacts.get("patch")
-    if current_patch is not None and current_patch not in source_refs:
-        source_refs.append(current_patch)
+    source_artifact_sets = (source_artifacts, artifacts) if rollback_preparation else (artifacts,)
+    for artifact_set in source_artifact_sets:
+        for key in ("dependency-input", "dependency-materialization"):
+            ref = artifact_set.get(key)
+            if ref is not None and ref not in dependency_refs:
+                dependency_refs.append(ref)
+        for key in ("patch", "recovery-snapshot"):
+            source_patch = artifact_set.get(key)
+            if source_patch is not None and source_patch not in source_refs:
+                source_refs.append(source_patch)
 
     verification_wait = bool(
         bool(node.get("verifier"))
@@ -203,10 +271,11 @@ def collect_node_observation(
             validation_profile=validation_profile,
             attribution_current=attribution_current,
             accepted_ancestors=accepted_ancestors,
+            rollback_event_cursor=rollback_event_cursor,
         ),
     }
 
-    fingerprint_code = _failure_code(
+    fingerprint_code = typed_failure_code or _failure_code(
         readiness_failure=readiness_failure,
         materialization=materialization,
         validation_profile=validation_profile,
@@ -218,6 +287,8 @@ def collect_node_observation(
     fingerprint_refs.update(
         {f"ancestor:{item['node_id']}": item["patch_ref"] for item in accepted_ancestors if item.get("patch_ref")}
     )
+    if rollback_preparation:
+        fingerprint_refs.update({f"source:{key}": value for key, value in source_artifacts.items()})
     failure_fingerprint = _failure_fingerprint(
         task_id=task_id,
         node_id=node_id,
@@ -225,6 +296,8 @@ def collect_node_observation(
         code=fingerprint_code,
         origin=origin,
         evidence_refs=fingerprint_refs,
+        recovery_phase=phase if rollback_preparation else None,
+        preparation_attempt=preparation_attempt,
     )
 
     observation: dict[str, Any] = {
@@ -238,7 +311,9 @@ def collect_node_observation(
         "category": category,
         "origin": origin,
         "phase": phase,
+        "observation_available": True,
         "evidence_refs": artifacts,
+        **({"source_evidence_refs": source_artifacts} if rollback_preparation else {}),
         "source_refs": source_refs,
         "dependency_refs": dependency_refs,
         "accepted_ancestors": accepted_ancestors,
@@ -246,7 +321,11 @@ def collect_node_observation(
         "failure_code": fingerprint_code,
         "failure_fingerprint": failure_fingerprint,
         "implementation_ready": implementation_ready,
-        "executor_not_started": phase == "pre_execution" and attribution_current,
+        "executor_not_started": (
+            preparation_executor_not_started
+            if rollback_preparation
+            else phase == "pre_execution" and attribution_current
+        ),
         "only_missing_dependency": only_missing_dependency,
         "dependencies_ready": dependencies_ready,
         "validation_profile": validation_profile,
@@ -255,6 +334,12 @@ def collect_node_observation(
         "source_event_cursor": effective_cursor,
         "material_progress": material_progress,
         "authoritative_material_progress": progress_detail,
+        **({
+            "rollback_event_cursor": rollback_event_cursor,
+            "rollback_provenance": rollback_provenance,
+            "preparation_attempt": preparation_attempt,
+        } if rollback_preparation else {}),
+        **({"preparation_phase": preparation_phase} if preparation_phase is not None else {}),
     }
     if validation_succeeded is None:
         observation.pop("validation_succeeded")
@@ -279,6 +364,68 @@ def _integer(value: object, name: str, *, minimum: int) -> int:
     return value
 
 
+def _observation_unavailable(
+    *,
+    task_id: str,
+    node_id: str,
+    task_revision: int,
+    task_state: str,
+    node_attempt: int,
+    node_state: str,
+    source_event_cursor: int,
+    reason: str,
+    rollback_event_cursor: int | None = None,
+) -> dict[str, Any]:
+    """Return a non-actionable observation when rollback pairing is unsafe."""
+
+    bounded_reason = _text(reason, "rollback_projection_invalid")[:128]
+    effective_cursor = max(source_event_cursor, rollback_event_cursor or 0)
+    failure_code = "observation-unavailable:" + bounded_reason
+    return {
+        "task_id": task_id,
+        "node_id": node_id,
+        "node_attempt": node_attempt,
+        "attempt": node_attempt,
+        "task_revision": task_revision,
+        "task_state": task_state,
+        "node_state": node_state,
+        "category": "unknown",
+        "origin": "unknown",
+        "phase": "observation_unavailable",
+        "observation_available": False,
+        "observation_unavailable_reason": bounded_reason,
+        "evidence_refs": {},
+        "source_refs": [],
+        "dependency_refs": [],
+        "accepted_ancestors": [],
+        "verification_wait": False,
+        "failure_code": failure_code,
+        "failure_fingerprint": _failure_fingerprint(
+            task_id=task_id,
+            node_id=node_id,
+            attempt=node_attempt,
+            code=failure_code,
+            origin="unknown",
+            evidence_refs={},
+            recovery_phase="observation_unavailable",
+            preparation_attempt=None,
+        ),
+        "implementation_ready": None,
+        "executor_not_started": False,
+        "only_missing_dependency": None,
+        "dependencies_ready": None,
+        "validation_profile": None,
+        "source_event_cursor": effective_cursor,
+        "material_progress": False,
+        "authoritative_material_progress": {
+            "authoritative": False,
+            "source_event_cursor": effective_cursor,
+            "sources": ["rollback-event"] if rollback_event_cursor is not None else [],
+        },
+        **({"rollback_event_cursor": rollback_event_cursor} if rollback_event_cursor is not None else {}),
+    }
+
+
 def _valid_ref(value: object) -> bool:
     return isinstance(value, str) and _REF_RE.fullmatch(value) is not None
 
@@ -287,11 +434,22 @@ def _result_artifacts(
     store: Any,
     result: Mapping[str, Any],
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    refs = _result_artifact_refs(result)
+    payloads: dict[str, dict[str, Any]] = {}
+    for key, reference in refs.items():
+        payload = _read_json_artifact(store, reference)
+        if payload is not None:
+            payloads[key] = payload
+    return refs, payloads
+
+
+def _result_artifact_refs(result: Mapping[str, Any]) -> dict[str, str]:
+    """Return bounded content-addressed references without opening artifacts."""
+
     raw = result.get("artifacts")
     if not isinstance(raw, Mapping):
-        return {}, {}
+        return {}
     refs: dict[str, str] = {}
-    payloads: dict[str, dict[str, Any]] = {}
     for index, (raw_key, raw_ref) in enumerate(raw.items()):
         if index >= _MAX_ARTIFACT_REFS:
             break
@@ -299,10 +457,7 @@ def _result_artifacts(
             continue
         key = raw_key if raw_key in _KNOWN_ARTIFACT_KEYS else raw_key[:128]
         refs[key] = raw_ref
-        payload = _read_json_artifact(store, raw_ref)
-        if payload is not None:
-            payloads[key] = payload
-    return refs, payloads
+    return refs
 
 
 def _read_json_artifact(store: Any, ref: str) -> dict[str, Any] | None:
@@ -341,6 +496,71 @@ def _read_json_artifact(store: Any, ref: str) -> dict[str, Any] | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _recovery_preparation_facts(
+    store: Any,
+    result: Mapping[str, Any],
+    *,
+    task_id: str,
+    node_id: str,
+    source_attempt: int,
+    recovery_attempt: int,
+) -> tuple[str | None, str | None, bool]:
+    """Return typed pre-dispatch facts only from the matching a2 receipt."""
+
+    raw_artifacts = result.get("artifacts")
+    if not isinstance(raw_artifacts, Mapping):
+        return None, None, False
+    reference = raw_artifacts.get("recovery-preparation")
+    if not _valid_ref(reference):
+        return None, None, False
+    payload = _read_json_artifact(store, reference)
+    required = {
+        "schema_version",
+        "kind",
+        "task_id",
+        "node_id",
+        "source_attempt",
+        "recovery_attempt",
+        "phase",
+        "code",
+        "executor_started",
+        "evidence_refs",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        return None, None, False
+    evidence_refs = payload.get("evidence_refs")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("kind") != "recovery-preparation-failure"
+        or payload.get("task_id") != task_id
+        or payload.get("node_id") != node_id
+        or payload.get("source_attempt") != source_attempt
+        or payload.get("recovery_attempt") != recovery_attempt
+        or recovery_attempt != source_attempt + 1
+        or payload.get("executor_started") is not False
+        or not isinstance(evidence_refs, Mapping)
+        or len(evidence_refs) > _MAX_RECOVERY_PREPARATION_EVIDENCE_REFS
+        or not all(
+            isinstance(key, str) and key and _valid_ref(reference)
+            for key, reference in evidence_refs.items()
+        )
+    ):
+        return None, None, False
+    phase = payload.get("phase")
+    code = payload.get("code")
+    if (
+        not isinstance(phase, str)
+        or not isinstance(code, str)
+        or code not in _RECOVERY_PREPARATION_CODES
+        or (phase, code) not in {
+            ("acceptance", "acceptance-command-failed"),
+            ("preparation", "preparation-failed"),
+        }
+    ):
+        return None, None, False
+    return code, phase, True
 
 
 def _current_attribution(
@@ -541,10 +761,13 @@ def _progress_sources(
     validation_profile: str | None,
     attribution_current: bool,
     accepted_ancestors: Sequence[Mapping[str, Any]],
+    rollback_event_cursor: int | None = None,
 ) -> list[str]:
     sources: list[str] = []
     if source_event_cursor > 0:
         sources.append("event-cursor")
+    if rollback_event_cursor is not None:
+        sources.append("rollback-event")
     if attribution_current:
         sources.append("current-attribution")
     if readiness is not None:
@@ -586,6 +809,8 @@ def _failure_fingerprint(
     code: str | None,
     origin: str,
     evidence_refs: Mapping[str, str],
+    recovery_phase: str | None = None,
+    preparation_attempt: int | None = None,
 ) -> str:
     stable_refs = {
         key: value
@@ -600,6 +825,10 @@ def _failure_fingerprint(
         "code": code,
         "origin": origin,
         "evidence_refs": stable_refs,
+        **({
+            "recovery_phase": recovery_phase,
+            "preparation_attempt": preparation_attempt,
+        } if recovery_phase is not None else {}),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 

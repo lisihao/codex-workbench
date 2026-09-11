@@ -30,6 +30,8 @@ Baseline: released 1.17.3, including the Authority journal, controlled validatio
 11. Retention forbids reclamation; current allocations and recovery records govern execution ownership. A preparation rollback ends one attempt, not the durable original objective. Observe the failed preparation's receipt while preserving the original source result; wake the original parent through existing repair linkage when a deployment event arrives.
 12. Read failure is `observation_unavailable`, not worker failure or evidence that work is running. Compact phase, last material event, revision and freshness must not require serializing task history or artifacts. Retain paginated history and content-addressed details separately; the bridge's transport limit is not a substitute for bounded projections.
 
+The existing `Coordinator._prepare_failed_attempt_recovery` and `DirtyWorktreeRecovery.prepare_for_retry` already restore source and dependency inputs before entering the normal executor path. Reuse that separation for a future explicitly authorized blocked-source repair transition. Do not replace strict `source_only_recovery` with unconditional acceptance, silently convert a blocked snapshot into a failed result, or drop the final verifier. The missing work is the typed blocked-source authorization and its policy/receipt integration, not another executor pool.
+
 ## Implementation sequence and file ownership
 
 | Slice | Owned files | Acceptance |

@@ -1986,6 +1986,14 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual((receipt["task_id"], receipt["node_id"]), (contract.task_id, "worker"))
         self.assertFalse(receipt["executor_started"])
         self.assertIn("test-log", receipt["evidence_refs"])
+        from codex_workbench.node_recovery_observation import collect_node_observation
+
+        observation = collect_node_observation(self.store, contract.task_id, "worker")
+        self.assertEqual((observation["node_attempt"], observation["preparation_attempt"]), (1, 2))
+        self.assertEqual(observation["phase"], "recovery_preparation")
+        self.assertEqual(observation["failure_code"], "acceptance-command-failed")
+        self.assertTrue(observation["executor_not_started"])
+        self.assertEqual(self.store.get_task(contract.task_id), task)
 
         # The archived a2 does not consume the deterministic a2 slot. A later
         # explicit authorization reaches the declared acceptance failure again,

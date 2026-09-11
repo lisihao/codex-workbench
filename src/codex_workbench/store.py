@@ -55,6 +55,7 @@ from .dirty_worktree_recovery import (
     partition_recovery_paths,
 )
 from .execution_attribution import ExecutionAttribution
+from .task_observation import MATERIAL_EVENT_INDEX_SQL
 from .governance import governance_identity
 from .legacy_evidence import load_manifest, validate_manifest
 from .planner import propose_archify_reconciliation
@@ -90,6 +91,8 @@ _DIRTY_WORKTREE_RECOVERY_KIND = "blocked-worktree-recovery"
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_KIND = "failed-attempt-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_PROVIDER = "workbench-failed-attempt-recovery"
+_ROLLBACK_PROJECTION_ARTIFACTS_BYTES_LIMIT = 16 * 1024
+_ROLLBACK_PROJECTION_ATTRIBUTION_BYTES_LIMIT = 32 * 1024
 
 def _repository_identity(repository: str) -> str:
     root = Path(repository).expanduser().resolve()
@@ -595,6 +598,8 @@ class WorkbenchStore:
                 );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
+                CREATE INDEX IF NOT EXISTS events_task_node_type_created_cursor_idx
+                    ON events(task_id, node_id, event_type, created_at, cursor);
                 CREATE UNIQUE INDEX IF NOT EXISTS planning_requests_task_id_unique_idx
                     ON planning_requests(task_id);
                 CREATE INDEX IF NOT EXISTS planning_requests_state_idx
@@ -621,6 +626,7 @@ class WorkbenchStore:
                 """
             schema_sql += AUTHORITY_REQUEST_JOURNAL_DDL
             schema_sql += NODE_RECOVERY_SCHEMA_SQL
+            schema_sql += MATERIAL_EVENT_INDEX_SQL + ";"
             # Read-only version fencing precedes every DDL statement. An
             # unknown newer database must remain untouched by an older binary.
             prior_schema_version = self._preflight_schema_version(connection)
@@ -8055,6 +8061,256 @@ class WorkbenchStore:
             if row is None:
                 raise KeyError(task_id)
             return self._task_row(connection, row)
+
+    def current_blocked_worktree_recovery_rollback(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        task_revision: int,
+        node_state: str,
+        node_attempt: int,
+        settled_at: str | None,
+        worktree: str | None,
+    ) -> dict[str, Any] | None:
+        """Project one current rollback without loading its complete event receipt.
+
+        The caller supplies the snapshot it is projecting.  The lookup rejects
+        a changed current node instead of pairing a restored a1 result with an
+        old a2 preparation receipt.  It reads only scalar provenance plus the
+        preparation status, artifacts, and execution attribution; summaries,
+        checks, and arbitrary historical payload fields never leave SQLite.
+        """
+
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be non-empty")
+        if not isinstance(node_id, str) or not node_id:
+            raise ValueError("node_id must be non-empty")
+        if isinstance(task_revision, bool) or not isinstance(task_revision, int) or task_revision < 0:
+            raise ValueError("task_revision must be a non-negative integer")
+        if isinstance(node_attempt, bool) or not isinstance(node_attempt, int) or node_attempt < 0:
+            raise ValueError("node_attempt must be a non-negative integer")
+        if node_state != "blocked":
+            return None
+
+        current_identity: dict[str, Any] = {}
+
+        def unavailable(reason: str, **extra: Any) -> dict[str, Any]:
+            return {
+                "state": "unavailable",
+                "reason": reason,
+                **current_identity,
+                **extra,
+            }
+
+        with self.connection() as connection:
+            # Keep the snapshot row and its event lookup in one SQLite read
+            # transaction.  A later writer cannot make the projection pair an
+            # event from one state with a node from another.
+            connection.execute("BEGIN")
+            malformed_json = object()
+
+            def fetchone(statement: str, parameters: tuple[Any, ...]) -> sqlite3.Row | object | None:
+                try:
+                    return connection.execute(statement, parameters).fetchone()
+                except sqlite3.OperationalError as error:
+                    if "malformed JSON" in str(error):
+                        return malformed_json
+                    raise
+
+            current = fetchone(
+                """
+                SELECT t.state AS task_state, t.state_revision, n.state AS node_state,
+                       n.attempt, n.settled_at, n.worktree,
+                       n.recovery_json
+                FROM tasks t JOIN nodes n USING(task_id)
+                WHERE t.task_id = ? AND n.node_id = ?
+                """,
+                (task_id, node_id),
+            )
+            if current is malformed_json:
+                return unavailable("malformed_rollback_event")
+            if current is None:
+                return unavailable("snapshot_conflict")
+            assert isinstance(current, sqlite3.Row)
+            current_identity = {
+                "current_task_revision": int(current["state_revision"]),
+                "current_node_attempt": int(current["attempt"]),
+                "current_task_state": str(current["task_state"]),
+                "current_node_state": str(current["node_state"]),
+            }
+            if (
+                int(current["state_revision"]) != task_revision
+                or current["node_state"] != node_state
+                or int(current["attempt"]) != node_attempt
+                or current["settled_at"] != settled_at
+                or current["worktree"] != worktree
+                or current["recovery_json"] is not None
+            ):
+                return unavailable(
+                    "current_recovery_pending"
+                    if current["recovery_json"] is not None
+                    else "snapshot_conflict"
+                )
+            # A blocked node without a settled source allocation cannot be a
+            # restored rollback source.  It is an ordinary blocked snapshot.
+            if not isinstance(settled_at, str) or not settled_at or not isinstance(worktree, str) or not worktree:
+                return None
+
+            projection = fetchone(
+                """
+                SELECT e.cursor, e.created_at,
+                       json_extract(e.payload_json, '$.source_attempt') AS source_attempt,
+                       json_extract(e.payload_json, '$.attempt') AS preparation_attempt,
+                       json_extract(e.payload_json, '$.task_revision') AS rollback_task_revision,
+                       json_extract(e.payload_json, '$.source_allocation_id') AS source_allocation_id,
+                       json_extract(e.payload_json, '$.recovery.source_worktree') AS source_worktree,
+                       json_extract(e.payload_json, '$.recovery.source_branch') AS source_branch,
+                       json_type(e.payload_json, '$.preparation_result') AS preparation_result_type,
+                       json_type(e.payload_json, '$.preparation_result.status') AS preparation_status_type,
+                       json_extract(e.payload_json, '$.preparation_result.status') AS preparation_status,
+                       json_type(e.payload_json, '$.preparation_result.artifacts') AS preparation_artifacts_type,
+                       length(CAST(json_extract(e.payload_json, '$.preparation_result.artifacts') AS BLOB)) AS preparation_artifacts_bytes,
+                       CASE
+                           WHEN length(CAST(json_extract(e.payload_json, '$.preparation_result.artifacts') AS BLOB)) <= ?
+                           THEN json_extract(e.payload_json, '$.preparation_result.artifacts')
+                       END AS preparation_artifacts_json,
+                       json_type(e.payload_json, '$.preparation_result.execution_attribution') AS preparation_attribution_type,
+                       length(CAST(json_extract(e.payload_json, '$.preparation_result.execution_attribution') AS BLOB)) AS preparation_attribution_bytes,
+                       CASE
+                           WHEN length(CAST(json_extract(e.payload_json, '$.preparation_result.execution_attribution') AS BLOB)) <= ?
+                           THEN json_extract(e.payload_json, '$.preparation_result.execution_attribution')
+                       END AS preparation_attribution_json
+                FROM events e
+                JOIN worktree_allocations a
+                  ON a.allocation_id = json_extract(e.payload_json, '$.source_allocation_id')
+                 AND a.task_id = e.task_id
+                 AND a.node_id = e.node_id
+                 AND a.attempt = ?
+                 AND a.state = 'active'
+                 AND a.current_path = ?
+                 AND a.branch = json_extract(e.payload_json, '$.recovery.source_branch')
+                WHERE e.task_id = ?
+                  AND e.node_id = ?
+                  AND e.event_type = 'node.blocked_worktree_recovery_rolled_back'
+                  AND e.created_at = ?
+                  AND json_type(e.payload_json, '$.source_attempt') = 'integer'
+                  AND json_extract(e.payload_json, '$.source_attempt') = ?
+                  AND json_type(e.payload_json, '$.attempt') = 'integer'
+                  AND json_extract(e.payload_json, '$.attempt') = ?
+                  AND json_type(e.payload_json, '$.task_revision') = 'integer'
+                  AND json_extract(e.payload_json, '$.task_revision') <= ?
+                  AND json_extract(e.payload_json, '$.recovery.source_worktree') = ?
+                ORDER BY e.cursor DESC
+                LIMIT 1
+                """,
+                (
+                    _ROLLBACK_PROJECTION_ARTIFACTS_BYTES_LIMIT,
+                    _ROLLBACK_PROJECTION_ATTRIBUTION_BYTES_LIMIT,
+                    node_attempt,
+                    worktree,
+                    task_id,
+                    node_id,
+                    settled_at,
+                    node_attempt,
+                    node_attempt + 1,
+                    task_revision,
+                    worktree,
+                ),
+            )
+            if projection is malformed_json:
+                return unavailable("malformed_rollback_event")
+            if projection is None:
+                # A same-settlement event with the current source attempt is
+                # either malformed or no longer bound to the active source;
+                # do not silently attach it to the restored a1 snapshot.
+                probe = fetchone(
+                    """
+                    SELECT e.cursor,
+                           json_extract(e.payload_json, '$.source_attempt') AS source_attempt,
+                           json_extract(e.payload_json, '$.attempt') AS preparation_attempt
+                    FROM events e
+                    WHERE e.task_id = ?
+                      AND e.node_id = ?
+                      AND e.event_type = 'node.blocked_worktree_recovery_rolled_back'
+                      AND e.created_at = ?
+                      AND json_type(e.payload_json, '$.source_attempt') = 'integer'
+                      AND json_extract(e.payload_json, '$.source_attempt') = ?
+                    ORDER BY e.cursor DESC
+                    LIMIT 1
+                    """,
+                    (task_id, node_id, settled_at, node_attempt),
+                )
+                if probe is malformed_json:
+                    return unavailable("malformed_rollback_event")
+                if probe is None:
+                    return None
+                assert isinstance(probe, sqlite3.Row)
+                return unavailable("snapshot_conflict", rollback_event_cursor=int(probe["cursor"]))
+
+        assert isinstance(projection, sqlite3.Row)
+        rollback_event_cursor = int(projection["cursor"])
+        preparation_type = projection["preparation_result_type"]
+        provenance = {
+            "event_type": "node.blocked_worktree_recovery_rolled_back",
+            "event_cursor": rollback_event_cursor,
+            "created_at": str(projection["created_at"]),
+            "task_revision": int(projection["rollback_task_revision"]),
+            "source_attempt": int(projection["source_attempt"]),
+            "preparation_attempt": int(projection["preparation_attempt"]),
+            "source_allocation_id": str(projection["source_allocation_id"]),
+            "source_worktree": str(projection["source_worktree"]),
+            "source_branch": str(projection["source_branch"]),
+        }
+        if preparation_type is None:
+            return {
+                "state": "available",
+                "rollback_event_cursor": rollback_event_cursor,
+                "rollback_provenance": provenance,
+                "preparation_result": None,
+            }
+        if preparation_type != "object":
+            return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+        if projection["preparation_status_type"] != "text" or projection["preparation_status"] not in {"blocked", "failed"}:
+            return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+        if projection["preparation_artifacts_type"] != "object":
+            return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+        artifact_size = projection["preparation_artifacts_bytes"]
+        if not isinstance(artifact_size, int) or artifact_size > _ROLLBACK_PROJECTION_ARTIFACTS_BYTES_LIMIT:
+            return unavailable("projection_too_large", rollback_event_cursor=rollback_event_cursor)
+        try:
+            artifacts = json.loads(str(projection["preparation_artifacts_json"]))
+        except (TypeError, json.JSONDecodeError):
+            return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+        if not isinstance(artifacts, dict):
+            return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+
+        attribution: object = None
+        attribution_type = projection["preparation_attribution_type"]
+        if attribution_type not in {None, "null"}:
+            if attribution_type != "object":
+                return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+            attribution_size = projection["preparation_attribution_bytes"]
+            if not isinstance(attribution_size, int) or attribution_size > _ROLLBACK_PROJECTION_ATTRIBUTION_BYTES_LIMIT:
+                return unavailable("projection_too_large", rollback_event_cursor=rollback_event_cursor)
+            try:
+                attribution = json.loads(str(projection["preparation_attribution_json"]))
+            except (TypeError, json.JSONDecodeError):
+                return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+            if not isinstance(attribution, dict):
+                return unavailable("malformed_rollback_event", rollback_event_cursor=rollback_event_cursor)
+        preparation_result: dict[str, Any] = {
+            "status": projection["preparation_status"],
+            "artifacts": artifacts,
+        }
+        if attribution is not None:
+            preparation_result["execution_attribution"] = attribution
+        return {
+            "state": "available",
+            "rollback_event_cursor": rollback_event_cursor,
+            "rollback_provenance": provenance,
+            "preparation_result": preparation_result,
+        }
 
     @staticmethod
     def _task_row(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:

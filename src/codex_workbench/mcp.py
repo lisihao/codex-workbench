@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from .planner import PlannerError
 from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
 from .worktrees import WorktreeError
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
+from .task_observation import current_task_observations
 from .submission import enqueue_natural_language_request, planning_request_receipt
 from .sync import RepositorySynchronizer, RepositorySyncError
 
@@ -733,6 +735,7 @@ class WorkbenchMCPServer:
 
     def _list_task_summaries(self, limit: int, cursor: int) -> dict[str, Any]:
         with self.store.connection() as connection:
+            connection.execute("BEGIN")
             rows = connection.execute(
                 """
                 WITH page AS (
@@ -784,6 +787,9 @@ class WorkbenchMCPServer:
                 """,
                 (cursor, limit + 1),
             ).fetchall()
+            observations = current_task_observations(
+                connection, [str(row["task_id"]) for row in rows[:limit]],
+            )
 
         summaries: list[tuple[int, dict[str, Any]]] = []
         for row in rows[:limit]:
@@ -815,6 +821,7 @@ class WorkbenchMCPServer:
                         "contract_hash": contract_hash,
                         "created_at": created_at,
                         "updated_at": updated_at,
+                        "current_status": observations[str(row["task_id"])],
                         "node_counts": {
                             "total": int(row["node_total"]),
                             **{
@@ -958,7 +965,17 @@ class WorkbenchMCPServer:
             )
         if name == "workbench_list_tasks":
             limit, cursor = self._list_tasks_arguments(arguments)
-            return self._text(self._list_task_summaries(limit, cursor))
+            try:
+                summary = self._list_task_summaries(limit, cursor)
+            except (sqlite3.Error, OSError) as error:
+                result = self._text({
+                    "state": "observation_unavailable",
+                    "error_type": type(error).__name__,
+                    "task_state_changed": False,
+                })
+                result["isError"] = True
+                return result
+            return self._text(summary)
         if name == "workbench_inspect_task":
             return self._text(self.store.get_task(self._inspect_task_id(arguments)))
         if name == "workbench_read_events":
