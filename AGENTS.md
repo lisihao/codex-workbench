@@ -1,6 +1,7 @@
 # Codex Workbench development contract
 
 - This repository is independent from DSH, Solar, and AI4Research. Do not copy their state or create a runtime dependency on them.
+- The canonical Workbench/DSH project boundary and recovery handoff wording is `src/codex_workbench/project_identity.py`; derive installer and runtime policy text from that source instead of copying a second full version.
 - The Mac mini SQLite database is the single task-state authority. Clients consume snapshot plus cursor events.
 - A worker result is never acceptance. Only the verifier transition may set a task to `accepted`.
 - Claude execution is fail-closed when subscription auth or quota is unknown, or any protected pool is at or below 25% remaining.
@@ -9,4 +10,3 @@
 - Development uses fixture executors. Run at most one minimal real subscription acceptance after the committed release candidate is stable.
 - Reuse passing evidence while source, configuration, runtime version, and affected dependency closure are unchanged.
 - Apply Adaptive Verification: focused tests while editing; full tests once before release/deployment.
-

@@ -1073,6 +1073,8 @@ class NodeResult:
     checks: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
     verdict: Literal["accepted", "needs_fix", "blocked"] | None = None
+    # Only a verifier may request an explicit, source-preserving owner repair.
+    repair_node_ids: tuple[str, ...] = ()
     governance_profile: str = CODE_AS_HARNESS_PROFILE
     verification_tier: VerificationTier = DEFAULT_VERIFICATION_TIER
     # Execution provenance is optional for legacy receipts.  Executors can
@@ -1095,7 +1097,7 @@ class NodeResult:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "NodeResult":
-        tuple_fields = {"changed_paths", "checks", "evidence"}
+        tuple_fields = {"changed_paths", "checks", "evidence", "repair_node_ids"}
         normalized = {
             key: tuple(value) if key in tuple_fields else value
             for key, value in raw.items()

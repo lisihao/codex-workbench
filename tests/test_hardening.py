@@ -591,7 +591,7 @@ class WorkbenchHardeningTests(unittest.TestCase):
         self.assertEqual(result.result_kind, "worker")
         self.assertIn("worker", result.summary.lower())
 
-    def test_sol_rejection_runs_worker_repair_with_retry_escalation(self) -> None:
+    def test_verifier_rejection_without_source_owner_preserves_accepted_worker(self) -> None:
         repository = self.root / "repository"
         repository.mkdir()
         contract = TaskContract(
@@ -637,31 +637,17 @@ class WorkbenchHardeningTests(unittest.TestCase):
         )
 
         task = self.store.get_task(contract.task_id)
-        self.assertEqual(task["state"], "queued")
-        self.assertIn("Verifier rejected attempt 1", task["steering"][-1]["instruction"])
-        repaired = self.store.claim_ready_node("worker-2", self.epoch)
-        assert repaired is not None
-        self.assertEqual(repaired["node_id"], "worker")
-        self.assertEqual(repaired["attempt"], 2)
-        self.assertEqual(repaired["spec"]["model"], "gpt-5.6-terra")
-        self.store.settle_claimed(repaired, self._worker_result("repaired patch", "gpt-5.6-terra"))
-        reverify = self.store.claim_ready_node("sol-2", self.epoch)
-        assert reverify is not None
-        self.store.settle_claimed(
-            reverify,
-            self._verifier_result("accepted", "verified"),
-        )
-        self.assertEqual(self.store.get_task(contract.task_id)["state"], "accepted")
+        self.assertEqual(task["state"], "needs_fix")
+        preserved = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((preserved["state"], preserved["attempt"]), ("accepted", 1))
+        self.assertEqual(preserved["result"]["summary"], "first patch")
+        self.assertIsNone(self.store.claim_ready_node("must-not-reimplement", self.epoch))
         event_types = {
             event["event_type"]
             for event in self.store.read_events(task_id=contract.task_id)
         }
-        self.assertIn("task.repair_scheduled", event_types)
-        a5 = next(
-            check for check in build_acceptance_report(self.store)["checks"]
-            if check["id"] == "A5"
-        )
-        self.assertEqual(a5["status"], "ok")
+        self.assertIn("task.repair_owner_required", event_types)
+        self.assertNotIn("task.repair_scheduled", event_types)
 
     def test_verifier_shape_evidence_and_epoch_are_fenced(self) -> None:
         repository = self.root / "fenced"

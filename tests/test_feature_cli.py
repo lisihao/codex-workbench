@@ -660,6 +660,7 @@ class FeatureCLITests(unittest.TestCase):
             ).initialize()
             args = build_parser().parse_args(["--home", directory, "serve"])
             coordinator_started = threading.Event()
+            authority_bound = threading.Event()
             stop_called = threading.Event()
             release_coordinator = threading.Event()
             service_drain_entered = threading.Event()
@@ -672,7 +673,13 @@ class FeatureCLITests(unittest.TestCase):
                 def recover(self) -> int:
                     return 0
 
+                def bind_authority_service(self, authority_service) -> None:
+                    server.authority_service.recover_interrupted.assert_called_once()
+                    authority_bound.set()
+
                 def run_forever(self) -> None:
+                    if not authority_bound.is_set():
+                        raise AssertionError("coordinator started before the Authority journal was bound")
                     coordinator_started.set()
                     release_coordinator.wait(timeout=5)
 

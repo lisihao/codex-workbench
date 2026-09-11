@@ -42,6 +42,8 @@ CREATE INDEX IF NOT EXISTS authority_requests_state_updated_idx
 # These names deliberately mirror the current ``mcp.TOOLS`` catalog. The
 # adapter never accepts a callable tool name from a client without this fence.
 MCP_TOOL_NAMES = frozenset({
+    "workbench_configure_node_recovery",
+    "workbench_get_node_recovery",
     "workbench_validate_blocked_node",
     "workbench_acceptance_report",
     "workbench_continue_session",
@@ -67,6 +69,7 @@ MCP_TOOL_NAMES = frozenset({
 
 
 READ_ONLY_TOOL_NAMES = frozenset({
+    "workbench_get_node_recovery",
     "workbench_acceptance_report",
     "workbench_get_delivery_objective",
     "workbench_get_request",

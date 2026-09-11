@@ -145,7 +145,7 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.store.get_task(task_id)
 
-    def test_additive_lifecycle_schema_reinitializes_idempotently_at_v13(self) -> None:
+    def test_additive_lifecycle_schema_reinitializes_idempotently_at_v14(self) -> None:
         with self.store.connection() as connection:
             connection.execute("DROP TABLE delivery_stage_dispatches")
             connection.execute("DROP TABLE delivery_stage_receipts")
@@ -174,7 +174,7 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
             }.issubset(tables)
         )
         self.assertEqual(marker["value"], "1")
-        self.assertEqual(self.store.health()["schema_version"], 13)
+        self.assertEqual(self.store.health()["schema_version"], 14)
 
     def _accept_task(self, task_id: str) -> dict:
         self.store.queue_task(task_id)
@@ -202,7 +202,7 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
         )
         self.assertEqual(objective["stage"], "plan")
         self.assertEqual(objective["state"], "active")
-        self.assertEqual(self.store.health()["schema_version"], 13)
+        self.assertEqual(self.store.health()["schema_version"], 14)
         objective = self._claim_objective(objective)
         duplicate_claim = self.store.claim_delivery_objective(
             objective["objective_id"],

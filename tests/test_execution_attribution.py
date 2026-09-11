@@ -235,6 +235,7 @@ class ExecutionAttributionTests(unittest.TestCase):
                     "transport",
                     "model",
                     "verification",
+                    "tooling_bug",
                     "scope",
                     "cancel",
                     "unknown",

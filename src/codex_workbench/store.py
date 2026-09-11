@@ -81,7 +81,7 @@ from .worktrees import (
 )
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 _DELIVERY_LEASE_SECONDS = 60 * 60
@@ -323,6 +323,7 @@ class WorkbenchStore:
 
     def initialize(self) -> None:
         from .authority_service import AUTHORITY_REQUEST_JOURNAL_DDL
+        from .node_recovery_store import NODE_RECOVERY_SCHEMA_SQL
 
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._init_lock, self.connection() as connection:
@@ -619,6 +620,7 @@ class WorkbenchStore:
                     ON worktree_archives(state, updated_at);
                 """
             schema_sql += AUTHORITY_REQUEST_JOURNAL_DDL
+            schema_sql += NODE_RECOVERY_SCHEMA_SQL
             # Read-only version fencing precedes every DDL statement. An
             # unknown newer database must remain untouched by an older binary.
             prior_schema_version = self._preflight_schema_version(connection)
@@ -4109,6 +4111,7 @@ class WorkbenchStore:
             "verifying": {"paused", "cancelled"},
             "needs_fix": {"queued", "cancelled"},
             "needs_approval": {"queued", "cancelled"},
+            "blocked": {"paused", "cancelled"},
             "paused": {"queued", "cancelled"},
         }
         with self.transaction() as connection:
@@ -8409,6 +8412,8 @@ class WorkbenchStore:
             "worktree.purge_failed",
             "delivery_objective.decision_required",
             "delivery_objective.authorization_denied",
+            "node_recovery.needs_action",
+            "node_recovery.reconcile_failed",
         }
         with self.connection() as connection:
             rows = connection.execute(
@@ -8826,10 +8831,11 @@ class WorkbenchStore:
         holds: set[str] = set()
         rows = connection.execute(
             "SELECT event_type, payload_json FROM events "
-            "WHERE event_type IN (?, ?) ",
+            "WHERE event_type IN (?, ?, ?) ",
             (
                 "node.indeterminate_local_recovery_queued",
                 "node.blocked_worktree_recovery_authorized",
+                "node.accepted_source_repair_authorized",
             ),
         ).fetchall()
         for row in rows:
@@ -8842,7 +8848,7 @@ class WorkbenchStore:
             if not isinstance(payload, dict):
                 raise StateConflictError("source-only recovery retention event is invalid")
             allocation_id = payload.get("allocation_id", payload.get("source_allocation_id"))
-            if payload.get("source_only_ignored") is True:
+            if payload.get("source_only_ignored") is True or row["event_type"] == "node.accepted_source_repair_authorized":
                 if not isinstance(allocation_id, str) or not allocation_id:
                     raise StateConflictError("source-only recovery retention event is invalid")
                 holds.add(allocation_id)
@@ -10294,7 +10300,12 @@ class WorkbenchStore:
                 """
                 SELECT n.*, t.contract_json, t.state AS task_state, t.priority AS task_priority
                 FROM nodes n JOIN tasks t USING(task_id)
-                WHERE n.state = 'pending' AND t.state IN ('queued', 'running', 'verifying', 'needs_fix')
+                WHERE n.state = 'pending' AND (
+                    t.state IN ('queued', 'running', 'verifying', 'needs_fix')
+                    OR (t.state = 'blocked'
+                        AND EXISTS (SELECT 1 FROM nodes b WHERE b.task_id = t.task_id AND b.state = 'blocked')
+                        AND NOT EXISTS (SELECT 1 FROM nodes u WHERE u.task_id = t.task_id AND u.state = 'indeterminate'))
+                )
                 ORDER BY t.priority DESC, t.created_at,
                          json_extract(n.spec_json, '$.ordinal'), n.node_id
                 """
@@ -10366,6 +10377,7 @@ class WorkbenchStore:
             selected_blocked_retry_authorization_cursor: int | None = None
             selected_dirty_worktree_recovery: dict[str, Any] | None = None
             selected_failed_attempt_recovery: dict[str, Any] | None = None
+            selected_accepted_source_repair: dict[str, Any] | None = None
             selected_provider_readmission: dict[str, Any] | None = None
             for candidate in candidates:
                 provider_readmission = None
@@ -10380,9 +10392,14 @@ class WorkbenchStore:
                 failed_attempt_recovery = self._failed_attempt_recovery_binding(
                     candidate["recovery_json"], next_attempt=candidate_attempt
                 )
+                from .accepted_source_repair import parse_accepted_source_repair_binding
+
+                accepted_source_repair = parse_accepted_source_repair_binding(
+                    candidate["recovery_json"], next_attempt=candidate_attempt,
+                )
                 dirty_worktree_recovery = (
                     None
-                    if failed_attempt_recovery is not None
+                    if failed_attempt_recovery is not None or accepted_source_repair is not None
                     else self._current_dirty_worktree_recovery_binding(
                         candidate["recovery_json"],
                         next_attempt=candidate_attempt,
@@ -10535,6 +10552,7 @@ class WorkbenchStore:
                 selected_blocked_retry_authorization_cursor = authorization["event_cursor"] if authorization is not None else None
                 selected_dirty_worktree_recovery = dirty_worktree_recovery
                 selected_failed_attempt_recovery = failed_attempt_recovery
+                selected_accepted_source_repair = accepted_source_repair
                 selected_provider_readmission = provider_readmission
                 break
 
@@ -10629,6 +10647,10 @@ class WorkbenchStore:
                     "lane_capacity": capacities.get(selected_lane),
                     "lane_active_units": running_lane_active[selected_lane] + 1,
                     "claimed_at": timestamp,
+                    **({"accepted_source_repair": {
+                        "source_attempt": selected_accepted_source_repair["source"]["attempt"],
+                        "source_allocation_id": selected_accepted_source_repair["source_allocation_id"],
+                    }} if selected_accepted_source_repair is not None else {}),
                     **({"provider_readmission": selected_provider_readmission}
                        if selected_provider_readmission is not None else {}),
                     **({
@@ -10713,6 +10735,8 @@ class WorkbenchStore:
                 **({
                     "failed_attempt_recovery": selected_failed_attempt_recovery,
                 } if selected_failed_attempt_recovery is not None else {}),
+                **({"accepted_source_repair": selected_accepted_source_repair}
+                   if selected_accepted_source_repair is not None else {}),
             }
 
     def _claim_repository_identities(self) -> dict[str, str]:
@@ -10724,7 +10748,7 @@ class WorkbenchStore:
                 SELECT DISTINCT t.contract_json
                 FROM tasks t JOIN nodes n USING(task_id)
                 WHERE n.state IN ('pending', 'running')
-                  AND t.state IN ('queued', 'running', 'verifying', 'needs_fix')
+                  AND t.state IN ('queued', 'running', 'verifying', 'needs_fix', 'blocked')
                 """
             ).fetchall()
         repositories = {
@@ -10872,10 +10896,12 @@ class WorkbenchStore:
         lease_epoch: int,
         recovery_preflight: dict[str, Any] | None = None,
     ) -> None:
+        from .accepted_source_repair import parse_accepted_source_repair_binding
+
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
             task = connection.execute(
-                "SELECT contract_json FROM tasks WHERE task_id = ?",
+                "SELECT contract_json, state FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if task is None:
@@ -10905,7 +10931,26 @@ class WorkbenchStore:
             recovery_binding = None
             consumed_recovery_json = None
             assigned_worktree = worktree
-            if node["recovery_json"] is not None:
+            accepted_binding = parse_accepted_source_repair_binding(
+                node["recovery_json"], next_attempt=attempt,
+            )
+            if accepted_binding is not None:
+                if task["state"] in {"paused", "cancelled"} or node["worktree"] is not None:
+                    raise StateConflictError("accepted-source assignment was paused, cancelled or already assigned")
+                expected_preflight = {
+                    "kind": "accepted-source-repair-v1", "state": "prepared",
+                    "binding_sha256": canonical_hash(accepted_binding),
+                    "source_allocation_id": accepted_binding["source_allocation_id"],
+                    "source_attempt": accepted_binding["source"]["attempt"],
+                    "target_attempt": attempt, "target_worktree": worktree, "target_branch": branch,
+                    "patch_sha256": accepted_binding["source"]["patch_sha256"],
+                }
+                if not isinstance(recovery_preflight, dict) or any(
+                    recovery_preflight.get(key) != value for key, value in expected_preflight.items()
+                ):
+                    raise StateConflictError("accepted-source target lacks matching prepared evidence")
+                recovery_binding = accepted_binding
+            elif node["recovery_json"] is not None:
                 if node["worktree"] is not None:
                     raise StateConflictError("dirty-worktree recovery target was already assigned")
                 recovery_binding = self._current_dirty_worktree_recovery_binding(
@@ -11012,7 +11057,13 @@ class WorkbenchStore:
                     "branch": branch,
                 },
             )
-            if recovery_binding is not None:
+            if accepted_binding is not None:
+                self._event(connection, "node.accepted_source_repair_assigned", task_id, node_id, {
+                    "attempt": attempt, "source_allocation_id": accepted_binding["source_allocation_id"],
+                    "source_attempt": accepted_binding["source"]["attempt"],
+                    "target_worktree": assigned_worktree, "prepared_receipt": recovery_preflight,
+                }, created_at=timestamp)
+            elif recovery_binding is not None:
                 self._event(
                     connection,
                     "node.blocked_worktree_recovery_consumed",
@@ -11736,6 +11787,23 @@ class WorkbenchStore:
             task_revision = int(task["state_revision"])
             retry_recovery: dict[str, Any] | None = None
             retry_recovery_error: str | None = None
+            owner_repair_bindings: dict[str, dict] = {}
+            owner_repair_error: str | None = None
+            if spec.get("verifier") and node_state == "failed":
+                if not result.repair_node_ids:
+                    owner_repair_error = "verifier did not identify source owners; preserve accepted implementations"
+                elif int(row["attempt"]) > int(contract.get("retry_limit", 0)):
+                    owner_repair_error = "verifier repair budget exhausted"
+                else:
+                    from .accepted_source_repair import build_accepted_repair_bindings
+
+                    try:
+                        owner_repair_bindings = build_accepted_repair_bindings(
+                            self, connection, task_id, result.repair_node_ids, node_id,
+                            int(row["attempt"]), task_revision + 1,
+                        )
+                    except StateConflictError as error:
+                        owner_repair_error = str(error)
             if (
                 node_state in {"failed", "blocked"}
                 and not spec.get("verifier")
@@ -11885,9 +11953,15 @@ class WorkbenchStore:
                 next_state = "blocked"
                 blocker = result.summary
             elif node_state == "failed":
-                if spec.get("verifier") and int(row["attempt"]) <= int(
-                    contract.get("retry_limit", 0)
-                ):
+                if spec.get("verifier") and not owner_repair_bindings:
+                    next_state = "needs_fix"
+                    blocker = f"{result.summary}; {owner_repair_error}"
+                    self._event(connection, "task.repair_owner_required", task_id, node_id, {
+                        "verifier_attempt": int(row["attempt"]), "reason": owner_repair_error,
+                        "requested_repair_node_ids": list(result.repair_node_ids),
+                        "accepted_implementations_preserved": True,
+                    })
+                elif spec.get("verifier"):
                     feedback = f"Verifier rejected attempt {row['attempt']}: {result.summary}"[:500]
                     steering_id = "steering-" + canonical_hash(
                         {
@@ -11914,11 +11988,25 @@ class WorkbenchStore:
                             started_at = NULL, settled_at = NULL,
                             result_json = NULL,
                             coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
-                        WHERE task_id = ?
-                          AND (node_id = ? OR json_extract(spec_json, '$.verifier') = 0)
+                        WHERE task_id = ? AND node_id = ?
                         """,
                         (timestamp, task_id, node_id),
                     )
+                    for owner_id, source_binding in owner_repair_bindings.items():
+                        connection.execute(
+                            """UPDATE nodes SET state = 'pending', worker_id = NULL, worktree = NULL,
+                               effective_executor = NULL, effective_model = NULL, started_at = NULL,
+                               settled_at = NULL, result_json = NULL, recovery_json = ?,
+                               coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+                               WHERE task_id = ? AND node_id = ? AND state = 'accepted'""",
+                            (canonical_json(source_binding), timestamp, task_id, owner_id),
+                        )
+                        self._event(connection, "node.accepted_source_repair_authorized", task_id, owner_id, {
+                            "source_allocation_id": source_binding["source_allocation_id"],
+                            "source_attempt": source_binding["source"]["attempt"],
+                            "verifier_node_id": node_id, "verifier_attempt": int(row["attempt"]),
+                            "authorization_revision": task_revision + 1,
+                        })
                     next_state = "queued"
                     self._event(
                         connection,
@@ -11928,6 +12016,8 @@ class WorkbenchStore:
                         {
                             "verifier_attempt": int(row["attempt"]),
                             "feedback_steering_id": steering_id,
+                            "repair_node_ids": list(owner_repair_bindings),
+                            "accepted_ancestors_preserved": True,
                         },
                     )
                 elif result.retryable and int(row["attempt"]) <= int(contract.get("retry_limit", 0)):
@@ -12152,6 +12242,12 @@ class WorkbenchStore:
             result=result,
             verify_artifacts=verify_artifacts,
         )
+        if result.repair_node_ids:
+            if (not spec.get("verifier") or result.status != "failed"
+                    or result.verdict != "needs_fix" or len(result.repair_node_ids) > 32
+                    or any(not isinstance(value, str) or not value for value in result.repair_node_ids)
+                    or len(set(result.repair_node_ids)) != len(result.repair_node_ids)):
+                raise ValueError("repair_node_ids require a failed verifier and unique bounded owner IDs")
         if spec.get("executor") == "fixture" or spec.get("model") == "fixture":
             if recovery is None:
                 return

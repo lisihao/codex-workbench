@@ -172,13 +172,16 @@ def command_serve(args: argparse.Namespace) -> int:
             },
         )
         coordinator_thread = threading.Thread(target=coordinator.run_forever, name="coordinator", daemon=True)
-        coordinator_thread.start()
+        coordinator_started = False
         server: WorkbenchHTTPServer | None = None
         try:
             server = WorkbenchHTTPServer(config, store)
             # The lease excludes a second Authority; no HTTP requests can
             # arrive yet. Unknown writes are fenced, never replayed.
             server.authority_service.recover_interrupted()
+            coordinator.bind_authority_service(server.authority_service)
+            coordinator_thread.start()
+            coordinator_started = True
 
             def stop(*_args) -> None:
                 server.authority_service.begin_drain()
@@ -208,7 +211,8 @@ def command_serve(args: argparse.Namespace) -> int:
             # Keep the authority lease through real coordinator termination.
             # A timed join could record a false stopped event and allow a
             # second authority while planner or recovery work still runs.
-            coordinator_thread.join()
+            if coordinator_started:
+                coordinator_thread.join()
             if server is not None:
                 # The stopped receipt must also exclude in-flight HTTP tool
                 # writes, not only coordinator workers and planning jobs.

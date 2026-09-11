@@ -19,6 +19,7 @@ from .archify import (
     verify_skill_projection,
     verify_vendor,
 )
+from .project_identity import WORKBENCH_PROJECT_IDENTITY
 
 
 CODE_AS_HARNESS_PROFILE = "code-as-harness/v1"
@@ -99,6 +100,7 @@ def governance_directive(contract: Mapping[str, Any]) -> str:
     }[tier]
     return (
         f"Governance profile: {profile}. Verification tier: {tier}.\n"
+        f"{WORKBENCH_PROJECT_IDENTITY}\n"
         "Define the observable acceptance boundary and affected-path envelope before editing. Stay inside the "
         "declared scope; give every node only the read/write scopes it needs. Maximize useful safe parallelism "
         "up to the coordinator capacity: do not serialize independent nodes, and never overlap conflicting access. "
