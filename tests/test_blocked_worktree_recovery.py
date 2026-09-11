@@ -32,6 +32,7 @@ from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
+from tests.process_probe_fixture import isolated_process_catalog
 
 
 class BlockedWorktreeRecoveryTests(unittest.TestCase):
@@ -67,6 +68,10 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.worktrees = WorktreeManager(self.state_root / "worktrees")
         self.recovery = DirtyWorktreeRecovery(self.store.artifacts, self.worktrees)
         self.mcp = WorkbenchMCPServer(self.config, self.store)
+        # Fixture executors run in-process. Keep Linux recovery observations
+        # limited to this test's explicitly owned process catalog; live-process
+        # and unreadable-proc fail-closed behavior stays covered separately.
+        self.enterContext(isolated_process_catalog(()))
 
     def tearDown(self) -> None:
         self.temp.cleanup()
