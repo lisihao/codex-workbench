@@ -32,6 +32,8 @@ _CHECK_IDS = frozenset({_CHECK_IPC, _CHECK_PAIRING, _CHECK_PAIRING_WRITE})
 _MAX_TIMEOUT_SECONDS = 60
 _OUTPUT_LIMIT_BYTES = 128 * 1024
 _SCRATCH_PLACEHOLDER = "<private-scratch>"
+# macOS resolves /tmp to /private/tmp; Linux CI uses /tmp directly.
+_PRIVATE_TEMP_ROOT = Path("/tmp").resolve()
 _GIT_BINARY = "/usr/bin/git"
 
 _README_ANCHORS = (
@@ -659,7 +661,7 @@ def run_validation(
         deadline = started + timeout_seconds
         if time.monotonic() >= deadline:
             raise ControlledValidationError("controlled validation reached its total timeout before execution")
-        scratch = Path(tempfile.mkdtemp(prefix="wb-v.", dir="/private/tmp"))
+        scratch = Path(tempfile.mkdtemp(prefix="wb-v.", dir=str(_PRIVATE_TEMP_ROOT))).resolve()
         _ensure_private_scratch(scratch)
         environment = _controlled_environment(scratch, plan.runtime)
         controlled_environment = _redact_scratch_environment(environment, scratch)
@@ -1075,10 +1077,9 @@ def _validate_timeout(timeout_seconds: int) -> None:
 
 
 def _cleanup_private_scratch(scratch: Path) -> None:
-    try:
-        scratch.absolute().relative_to(Path("/private/tmp"))
-    except ValueError as error:
-        raise ControlledValidationError("controlled validation scratch escaped /private/tmp") from error
+    if (scratch.parent != _PRIVATE_TEMP_ROOT or not scratch.name.startswith("wb-v.")
+            or scratch.is_symlink()):
+        raise ControlledValidationError("controlled validation scratch escaped its private temporary root")
     shutil.rmtree(scratch)
 
 

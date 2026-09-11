@@ -60,11 +60,11 @@ class ConnectionServiceEndToEndTests(unittest.TestCase):
             bridge.validate_config({
                 "schema_version": 1,
                 "command": [
-                    str(ROOT / "scripts" / "python-runtime"),
+                    sys.executable,
                     # The module exposes its CLI via ``main()`` rather than a
                     # module-level execution guard.
                     "-c",
-                    "from codex_workbench.cli import main; main()",
+                    "import sys; sys.path.insert(0, " + repr(str(ROOT / "src")) + "); from codex_workbench.cli import main; main()",
                     "--home",
                     str(self.root),
                     "mcp",
