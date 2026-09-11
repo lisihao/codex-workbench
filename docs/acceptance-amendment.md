@@ -10,7 +10,11 @@ The amendment inserts two fixed commands before the original Client `tsc -b`: th
 
 Read the current blocked task and node. Supply `task_id`, `node_id`, `expected_revision`, `expected_attempt`, `expected_contract_hash`, `profile_id`, `reason`, and `dry_run: true`. The preview is read-only and binds the current allocation, source prerequisite files, installed entrypoints, runtime and old contract to its returned fingerprint.
 
+The MCP catalog requires `request_id` for both preview and apply. Use distinct stable IDs for the two different payloads. The Authority recognizes the preview as read-only even though the catalog marks the tool as potentially mutating.
+
 Apply with the same fields, `dry_run: false`, the preview's `expected_fingerprint`, and a stable Authority `request_id`. The transaction repeats the task/node/revision/hash/allocation and concurrent-validation checks. A paused, cancelled, running, stale or sealed recovery target is rejected. A lost response is resolved by querying that same request ID, never by resending with a new ID.
+
+Permanent source-only retention prevents reclaiming or quarantining the original worktree; it does not freeze the task's acceptance commands. After preparation rolls back to the original blocked attempt, that retained allocation may be amended while the source files and retention events remain unchanged. A current recovery record or an active later-attempt allocation still prevents amendment, as do concurrent validation, approval and normal revision/hash fences.
 
 After a successful amendment the task is still blocked. Its authorized coordinator reads the new revision and contract digest before choosing the existing recovery operation. The amendment does not transfer recovery ownership or authorize parallel CAS writers. Old validation logs and patches remain evidence of the earlier attempt.
 

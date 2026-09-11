@@ -199,8 +199,21 @@ def _candidate(
         raise StateConflictError(
             "blocked node worktree does not match its active allocation"
         )
-    if str(allocation["allocation_id"]) in store._source_only_recovery_hold_ids(connection):
-        raise StateConflictError("acceptance amendment is blocked by a retained recovery source")
+    # Source retention prevents reclamation, not contract amendments after
+    # rollback. A later live allocation still owns recovery work for this node.
+    later_allocation = connection.execute(
+        """
+        SELECT allocation_id FROM worktree_allocations
+        WHERE task_id = ? AND node_id = ? AND attempt > ?
+          AND state IN ('active', 'quarantine_pending')
+        LIMIT 1
+        """,
+        (task_id, node_id, arguments["expected_attempt"]),
+    ).fetchone()
+    if later_allocation is not None:
+        raise StateConflictError(
+            "acceptance amendment is blocked by an active later-attempt allocation"
+        )
     try:
         contract = json.loads(str(task["contract_json"]))
     except (TypeError, json.JSONDecodeError) as error:
