@@ -86,6 +86,14 @@ class _Response:
 
 class AIFrontierProviderTests(unittest.TestCase):
     def setUp(self) -> None:
+        original_status = AIFrontierRegistry.status
+
+        def fixture_status(registry, now=None):
+            return original_status(registry, now if now is not None else datetime(2026, 9, 4, 13, 0, tzinfo=UTC))
+
+        # Imports use fixed September fixtures; explicit freshness tests keep
+        # their own timestamps instead of depending on the CI wall clock.
+        self.enterContext(patch.object(AIFrontierRegistry, "status", fixture_status))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.registry = AIFrontierRegistry(self.root / "state")

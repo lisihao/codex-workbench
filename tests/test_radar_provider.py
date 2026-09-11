@@ -145,6 +145,14 @@ class _Response:
 
 class RadarProviderTests(unittest.TestCase):
     def setUp(self) -> None:
+        original_status = RadarRegistry.status
+
+        def fixture_status(registry, now=None):
+            return original_status(registry, now if now is not None else datetime(2026, 9, 4, 13, 0, tzinfo=UTC))
+
+        # Imports use fixed September fixtures; explicit freshness tests keep
+        # their own timestamps instead of depending on the CI wall clock.
+        self.enterContext(patch.object(RadarRegistry, "status", fixture_status))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.registry = RadarRegistry(self.root / "state")

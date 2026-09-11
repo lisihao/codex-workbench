@@ -32,6 +32,7 @@ from codex_workbench.model import NodeResult, NodeSpec, TaskContract
 from codex_workbench.service import Coordinator
 from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
+from tests.process_probe_fixture import isolated_process_catalog
 
 
 class BlockedWorktreeRecoveryTests(unittest.TestCase):
@@ -67,6 +68,10 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.worktrees = WorktreeManager(self.state_root / "worktrees")
         self.recovery = DirtyWorktreeRecovery(self.store.artifacts, self.worktrees)
         self.mcp = WorkbenchMCPServer(self.config, self.store)
+        # Fixture executors run in-process. Keep Linux recovery observations
+        # limited to this test's explicitly owned process catalog; live-process
+        # and unreadable-proc fail-closed behavior stays covered separately.
+        self.enterContext(isolated_process_catalog(()))
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -703,6 +708,276 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(receipt["task"]["state"], "queued")
         self.assertEqual(receipt["next_attempt"], 2)
         self.assertEqual(self.store.get_task(contract.task_id)["state"], "queued")
+
+    def _enable_node_modules_ignore(self) -> None:
+        with (self.repository / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write("node_modules/\n")
+        self._git(self.repository, "add", ".gitignore")
+        self._git(self.repository, "commit", "-m", "ignore node modules")
+        self.base_sha = self._git(self.repository, "rev-parse", "HEAD")
+
+    def test_source_only_blocked_preview_and_apply_keep_ignored_residue_in_a1(self) -> None:
+        self._enable_node_modules_ignore()
+        command = (
+            f"{sys.executable} -c \"from pathlib import Path; "
+            "assert Path('src/value.txt').read_text() == 'patched\\n'\""
+        )
+        contract, blocked, source, _ = self._blocked_task(acceptance_command=command)
+        residue = source / "node_modules" / "lib" / ".pnpm-store"
+        residue.mkdir(parents=True)
+        for index in range(12):
+            (residue / f"entry-{index:02d}.json").write_text("ignored\n", encoding="utf-8")
+        historical_paths = [
+            "src/value.txt",
+            *(f"node_modules/lib/.pnpm-store/entry-{index:02d}.json" for index in range(12)),
+        ]
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (contract.task_id, "worker"),
+            ).fetchone()
+            assert row is not None
+            historical_result_json = json.loads(str(row["result_json"]))
+            historical_result_json["changed_paths"] = historical_paths
+            connection.execute(
+                "UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = ?",
+                (json.dumps(historical_result_json, sort_keys=True), contract.task_id, "worker"),
+            )
+        blocked = self.store.get_task(contract.task_id)
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        historical_result = worker["result"]
+        with self.store.connection() as connection:
+            database_before = tuple(connection.iterdump())
+        artifacts_before = {
+            str(path.relative_to(self.store.artifacts.root)): path.read_bytes()
+            for path in self.store.artifacts.root.rglob("*")
+            if path.is_file()
+        }
+        source_status = self._git(source, "status", "--porcelain=v1", "--untracked-files=all")
+
+        preview = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=1,
+            reason="preview verified source-only blocked extraction",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["recovery_authorization"], "source_only_extraction")
+        self.assertEqual(preview["historical_effects"], "unknown")
+        self.assertFalse(preview["retrospective_compliance_claimed"])
+        self.assertFalse(preview["external_replay_authorized"])
+        self.assertRegex(preview["source_delta_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(preview["changed_paths"], ["src/value.txt"])
+        self.assertEqual(preview["source"]["changed_paths"], ["src/value.txt"])
+        self.assertEqual(preview["historical_changed_path_count"], len(historical_paths))
+        self.assertEqual(preview["historical_changed_path_sample"], historical_paths[:8])
+        self.assertNotIn("node_modules/lib/.pnpm-store/entry-11.json", preview["source"])
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        with self.store.connection() as connection:
+            self.assertEqual(tuple(connection.iterdump()), database_before)
+        self.assertEqual(
+            {
+                str(path.relative_to(self.store.artifacts.root)): path.read_bytes()
+                for path in self.store.artifacts.root.rglob("*")
+                if path.is_file()
+            },
+            artifacts_before,
+        )
+        self.assertEqual(self._git(source, "status", "--porcelain=v1", "--untracked-files=all"), source_status)
+
+        authorized = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=1,
+            reason="extract verified blocked source without replaying ignored residue",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=preview["source_delta_sha256"],
+        )
+        self.assertEqual(authorized["recovery_authorization"], "source_only_extraction")
+        self.assertEqual(authorized["source"]["changed_paths"], ["src/value.txt"])
+        self.assertEqual(authorized["recovery"]["changed_paths"], ["src/value.txt"])
+        self.assertEqual(authorized["historical_changed_path_count"], len(historical_paths))
+        event = next(
+            item
+            for item in self.store.read_events(task_id=contract.task_id)
+            if item["event_type"] == "node.blocked_worktree_recovery_authorized"
+        )
+        self.assertEqual(event["payload"]["historical_result"], historical_result)
+        self.assertEqual(event["payload"]["historical_effects"], "unknown")
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("blocked-source-only")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("blocked recovery must not dispatch a model"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        recovered = self.store.get_task(contract.task_id)
+        recovered_worker = next(node for node in recovered["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((recovered_worker["state"], recovered_worker["attempt"]), ("accepted", 2))
+        target = Path(str(recovered_worker["worktree"]))
+        self.assertFalse((target / "node_modules").exists())
+        self.assertTrue((residue / "entry-11.json").is_file())
+        self.assertNotIn(
+            worker["worktree"],
+            {allocation["path"] for allocation in self.store.reclaimable_worktree_allocations()},
+        )
+
+    def test_source_only_blocked_execution_drift_rolls_back_to_the_original_block(self) -> None:
+        self._enable_node_modules_ignore()
+        contract, blocked, source, _ = self._blocked_task(acceptance_command="git diff --check")
+        residue = source / "node_modules" / "lib" / ".pnpm-store"
+        residue.mkdir(parents=True)
+        (residue / "entry.json").write_text("ignored\n", encoding="utf-8")
+        preview = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=1,
+            reason="preview drift-sensitive blocked source extraction",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=1,
+            reason="authorize drift-sensitive blocked source extraction",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=preview["source_delta_sha256"],
+        )
+        (source / "src" / "value.txt").write_text("drifted after authorization\n", encoding="utf-8")
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("blocked-source-only-drift")
+            assert claimed is not None
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("drifted recovery must not dispatch a model"),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        current = self.store.get_task(contract.task_id)
+        worker = next(node for node in current["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((current["state"], worker["state"], worker["attempt"]), ("blocked", "blocked", 1))
+        self.assertTrue((residue / "entry.json").is_file())
+        self.assertIn(
+            "node.blocked_worktree_recovery_rolled_back",
+            [event["event_type"] for event in self.store.read_events(task_id=contract.task_id)],
+        )
+
+    def test_source_only_blocked_apply_rejects_preview_digest_drift_before_capture(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command="git diff --check"
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        with self.assertRaisesRegex(ValueError, "confirm_source_only_extraction"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=int(blocked["state_revision"]),
+                expected_attempt=int(worker["attempt"]),
+                reason="unconfirmed source extraction",
+                source_only=True,
+                confirm_preserve_unknown_ignored=True,
+                dry_run=True,
+            )
+        preview = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="preview source-only digest",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        artifacts_before = {
+            str(path.relative_to(self.store.artifacts.root)): path.read_bytes()
+            for path in self.store.artifacts.root.rglob("*")
+            if path.is_file()
+        }
+        events_before = self.store.read_events(task_id=contract.task_id)
+        (source / "src" / "value.txt").write_text("changed after preview\n", encoding="utf-8")
+        with self.assertRaisesRegex(StateConflictError, "expected_source_delta_sha256"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=int(blocked["state_revision"]),
+                expected_attempt=int(worker["attempt"]),
+                reason="reject stale preview digest",
+                source_only=True,
+                confirm_preserve_unknown_ignored=True,
+                confirm_source_only_extraction=True,
+                expected_source_delta_sha256=preview["source_delta_sha256"],
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(self.store.read_events(task_id=contract.task_id), events_before)
+        self.assertEqual(
+            {
+                str(path.relative_to(self.store.artifacts.root)): path.read_bytes()
+                for path in self.store.artifacts.root.rglob("*")
+                if path.is_file()
+            },
+            artifacts_before,
+        )
+
+    def test_source_only_blocked_untracked_paths_require_explicit_preservation(self) -> None:
+        contract, blocked, source, _ = self._blocked_task(
+            acceptance_command="git diff --check"
+        )
+        untracked = source / "src" / "source-only-untracked.ts"
+        untracked.write_text("export const fixture = true;\n", encoding="utf-8")
+        arguments = {
+            "expected_revision": int(blocked["state_revision"]),
+            "expected_attempt": 1,
+            "reason": "inspect source-only untracked delta",
+            "source_only": True,
+            "confirm_preserve_unknown_ignored": True,
+            "confirm_source_only_extraction": True,
+            "dry_run": True,
+        }
+        with self.assertRaisesRegex(StateConflictError, "preserve_untracked"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id, "worker", **arguments
+            )
+        preview = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            preserve_untracked=True,
+            **arguments,
+        )
+        self.assertTrue(preview["dry_run"])
+        self.assertRegex(preview["source_delta_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual(
+            untracked.read_text(encoding="utf-8"), "export const fixture = true;\n"
+        )
 
     def _blocked_dependent_task(
         self,
@@ -1386,6 +1661,82 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
 
     def test_dependent_recovery_replays_recorded_input_and_only_worker_delta(self) -> None:
         self._exercise_dependent_recovery(checkpoint=False)
+
+    def test_source_only_dependent_recovery_replays_recorded_input_without_replaying_ancestor(self) -> None:
+        contract, blocked, source, dependency_input_ref, _ = self._blocked_dependent_task()
+        residue = source / "src" / "__pycache__" / "source_only.cpython-313.pyc"
+        residue.parent.mkdir(parents=True)
+        residue.write_bytes(b"ignored dependent fixture\0")
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        preview = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="preview dependent source-only extraction",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            dry_run=True,
+        )
+        self.assertEqual(preview["changed_paths"], ["src/value.txt"])
+        self.assertEqual(preview["historical_changed_path_count"], 1)
+        authorized = self.store.capture_and_resume_blocked_worktree(
+            contract.task_id,
+            "worker",
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=int(worker["attempt"]),
+            reason="recover the verified dependent source-only delta",
+            source_only=True,
+            confirm_preserve_unknown_ignored=True,
+            confirm_source_only_extraction=True,
+            expected_source_delta_sha256=preview["source_delta_sha256"],
+        )
+        self.assertEqual(authorized["recovery"]["dependency_input_ref"], dependency_input_ref)
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed = coordinator._claim_next_ready_node("dependent-source-only")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 2))
+            with patch.object(
+                coordinator,
+                "_executor",
+                side_effect=AssertionError("source-only blocked recovery must not replay a model"),
+            ) as executor:
+                coordinator._execute_claimed(claimed)
+            executor.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        recovered = self.store.get_task(contract.task_id)
+        schema = next(node for node in recovered["nodes"] if node["node_id"] == "schema")
+        recovered_worker = next(node for node in recovered["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((schema["state"], schema["attempt"]), ("accepted", 1))
+        self.assertEqual((recovered_worker["state"], recovered_worker["attempt"]), ("accepted", 2))
+        target = Path(str(recovered_worker["worktree"]))
+        self.assertEqual((target / "src" / "schema.txt").read_text(encoding="utf-8"), "schema\n")
+        self.assertEqual((target / "src" / "value.txt").read_text(encoding="utf-8"), "patched\n")
+        self.assertFalse((target / "src" / "__pycache__").exists())
+        self.assertTrue(residue.is_file())
+
+    def test_source_only_dependent_recovery_rejects_missing_recorded_input(self) -> None:
+        contract, blocked, source, _, _ = self._blocked_dependent_task(
+            record_dependency_input=False
+        )
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "recorded dependency-input"):
+            self.store.capture_and_resume_blocked_worktree(
+                contract.task_id,
+                "worker",
+                expected_revision=int(blocked["state_revision"]),
+                expected_attempt=int(worker["attempt"]),
+                reason="reject fabricated dependent source-only input",
+                source_only=True,
+                confirm_preserve_unknown_ignored=True,
+                confirm_source_only_extraction=True,
+                dry_run=True,
+            )
+        self.assertEqual(self.store.get_task(contract.task_id), blocked)
+        self.assertEqual((source / "src" / "value.txt").read_text(encoding="utf-8"), "patched\n")
 
     def test_dependent_checkpoint_preserves_accepted_ancestor_and_worker_delta(self) -> None:
         self._exercise_dependent_recovery(checkpoint=True)

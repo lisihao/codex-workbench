@@ -64,6 +64,26 @@ task.steering_delivered 事件绑定 steering_id、node_id 和 attempt。它证�
 
 MCP 控制面可以安全续跑已经进入 `blocked` 的历史 attempt，而不是把通用 `resume` 直接交给只接受 `paused`/`needs_fix` 的 queue 路径。调用方必须同时提交最新 `expected_revision`、精确 `node_id`、`expected_attempt` 和持久化 `reason`。若 receipt 含业务修改，调用方还必须声明 `confirm_recovery=true`；Workbench 在 SQLite 写事务之外捕获内容寻址补丁，再用 revision/attempt CAS 授权一次新 attempt。若 receipt 明确没有修改，只能以 `confirm_no_side_effects=true` 授权原路重试。无依赖根 Worker 与有依赖 Worker 的合法 untracked 文件都需显式 `preserve_untracked=true`；根 Worker 收据只绑定合同 base tree，绝不伪造 dependency-input。有 `depends_on` 的节点若缺少已记录 dependency-input 一律拒绝恢复。未知副作用或不确定捕获继续 fail closed。`instruction` 仍是模型指导而不是恢复理由；需要新指导时先 `steer`，再以更新后的 revision 执行 `resume`。
 
+### Blocked 历史回执的 source-only 恢复
+
+旧版失败路径观察可能把 Git ignored 依赖和构建文件并入 `changed_paths`。严格恢复仍逐项比对原回执，不会猜测哪些历史路径可以丢弃。MCP `workbench_control_task` 的 blocked `resume` 和 CLI `task resume-blocked-worktree` 另提供显式 source-only 分支：它只提取当前真实的非 ignored 源码差异，不改写旧回执。
+
+请求必须绑定最新 `expected_revision`、节点 `expected_attempt`、`reason`，并提供 `source_only=true`、`confirm_source_only_extraction=true`、`confirm_preserve_unknown_ignored=true`。有合法 untracked 文件时还需 `preserve_untracked=true`。先以 `dry_run=true` 获取 `source_delta_sha256`，再以相同 revision/attempt 和 `expected_source_delta_sha256` 应用。此分支不要求旧的 `confirm_recovery` 或“历史无副作用”断言；旧严格分支继续要求其原确认。
+
+```sh
+codex-workbench task resume-blocked-worktree <task-id> <node-id> \
+  --expected-revision <revision> --expected-attempt <attempt> \
+  --reason "提取当前经过核实的源码，保留旧回执与 ignored 内容" \
+  --source-only --confirm-source-only-extraction \
+  --confirm-preserve-unknown-ignored --dry-run
+```
+
+正式应用去掉 `--dry-run` 并加 `--expected-source-delta-sha256 <preview-digest>`，不是重复提交旧 recovery file。预检不创建正式工件、事件或新 attempt；正式应用会 CAS 授权 deterministic clean-target 恢复。源分支/base、物理 allocation、已验收祖先输入、Task 与 Node scope、文件类型、路径/模式/字节摘要必须同时匹配。源码变化或持久状态漂移需要重新预检，不能只复用相同路径名。
+
+旧 result 原文保留在恢复授权中，`historical_effects=unknown`、`retrospective_compliance_claimed=false`、`external_replay_authorized=false` 保持明确。ignored 留在被 hold 的 source allocation，不删除、复制或重放；本地恢复合同必须仍禁止 external write 与 destructive action。新 target 沿用现有 deterministic `prepare` 和合同冻结的 acceptance commands，不重新调用模型；Worker 成功也不替代独立 verifier 的 accepted 转移。验证命令需要的局部 IPC／Git 快照权限见 [受限验证执行](controlled-validation.md)，它们不是 source-only 参数隐含授予的权限。
+
+新的失败路径观察只把真实源码差异和既有可识别 Python bytecode 残留写入 `changed_paths`；其他 ignored 路径以独立、有界摘要留证，并继续阻断无条件自动重试。是否忽略由 Git 判定，不能按 `lib` 或 `node_modules` 的目录名排除合法 tracked 源码。
+
 ## 崩溃与重复请求
 
 MCP 的 blocked `resume` 支持布尔值 `dry_run=true`：无修改分支只返回重试预览，有修改分支在临时 ArtifactStore 中验证恢复补丁；两者均不写入任务、节点、事件或正式工件，不启动下一 attempt，也不修改源工作树。重复预检保持相同持久状态。字符串或数字形式的 `dry_run` 一律拒绝。除该路径、`resolve_indeterminate_locally` 与 `normalize_indeterminate_scope` 外，其他控制动作不支持预检并明确报错；HTTP control 端点同样拒绝 `dry_run=true`，不会将预检静默执行为真实操作。
