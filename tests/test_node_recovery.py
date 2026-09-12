@@ -224,6 +224,16 @@ class NodeRecoveryLoopTests(unittest.TestCase):
         self.loop.reconcile_once()
         self.assertEqual(self.actions.calls, [])
 
+    def test_pause_wins_over_a_known_resume_receipt(self):
+        observed = self.observe(self.store, self.task_id, "B")
+        for state in ("paused", "cancelled"):
+            with self.subTest(state=state):
+                decision = self.loop._decision(
+                    {**observed, "task_state": state, "recovery_resumed": True}, None, self.policy,
+                )
+                self.assertEqual(decision["state"], "suspended")
+                self.assertIsNone(decision["action"])
+
     def test_restart_settles_original_receipt_without_replaying_completed_action(self):
         self.actions.crash = True
         with self.assertRaises(SystemExit):

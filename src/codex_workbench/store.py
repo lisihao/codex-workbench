@@ -91,6 +91,7 @@ _DIRTY_WORKTREE_RECOVERY_KIND = "blocked-worktree-recovery"
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_KIND = "failed-attempt-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_PROVIDER = "workbench-failed-attempt-recovery"
+_BLOCKED_SOURCE_REPAIR_MODE = "blocked_source_repair"
 _ROLLBACK_PROJECTION_ARTIFACTS_BYTES_LIMIT = 16 * 1024
 _ROLLBACK_PROJECTION_ATTRIBUTION_BYTES_LIMIT = 32 * 1024
 
@@ -600,6 +601,9 @@ class WorkbenchStore:
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
                 CREATE INDEX IF NOT EXISTS events_task_node_type_created_cursor_idx
                     ON events(task_id, node_id, event_type, created_at, cursor);
+                CREATE UNIQUE INDEX IF NOT EXISTS events_blocked_source_repair_request_id_idx
+                    ON events(json_extract(payload_json, '$.request_id'))
+                    WHERE event_type = 'node.blocked_source_repair_queued';
                 CREATE UNIQUE INDEX IF NOT EXISTS planning_requests_task_id_unique_idx
                     ON planning_requests(task_id);
                 CREATE INDEX IF NOT EXISTS planning_requests_state_idx
@@ -4475,6 +4479,167 @@ class WorkbenchStore:
         }
 
     @staticmethod
+    def _blocked_source_repair_authorization(
+        connection: sqlite3.Connection,
+        task_id: str,
+        node: sqlite3.Row,
+        *,
+        authorization_revision: int,
+        source_result_json: str,
+        observed_changed_paths: tuple[str, ...],
+        source_delta_sha256: str,
+    ) -> dict[str, Any]:
+        """Seal a blocked source-only delta for the existing retry lifecycle.
+
+        This intentionally does not derive ``changed_paths`` from the historic
+        result.  A blocked source repair preserves that result byte-for-byte
+        while the separately observed, scope-checked live delta supplies the
+        patch that the normal next worker attempt receives.
+        """
+
+        if (
+            isinstance(authorization_revision, bool)
+            or not isinstance(authorization_revision, int)
+            or authorization_revision <= 0
+        ):
+            raise StateConflictError("blocked source repair authorization revision is invalid")
+        if (
+            not isinstance(source_delta_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_delta_sha256) is None
+        ):
+            raise StateConflictError("blocked source repair source delta digest is invalid")
+        if node["state"] != "blocked" or node["recovery_json"] is not None:
+            raise StateConflictError("blocked source repair node is no longer an unbound block")
+        if not isinstance(node["result_json"], str) or node["result_json"] != source_result_json:
+            raise StateConflictError("blocked source repair must preserve the exact blocked result receipt")
+        try:
+            historical_result = json.loads(source_result_json)
+            spec = json.loads(str(node["spec_json"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StateConflictError("blocked source repair source receipt or specification is invalid") from error
+        if not isinstance(historical_result, dict) or historical_result.get("status") != "blocked":
+            raise StateConflictError("blocked source repair source result is not blocked")
+        if not isinstance(spec, dict) or spec.get("verifier") is True:
+            raise StateConflictError("blocked source repair is only supported for worker nodes")
+        artifacts = historical_result.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise StateConflictError("blocked source repair source artifacts are invalid")
+        dependency_input_ref = artifacts.get("dependency-input")
+        if dependency_input_ref is not None and (
+            not isinstance(dependency_input_ref, str) or not dependency_input_ref
+        ):
+            raise StateConflictError("blocked source repair dependency input ref is invalid")
+        if (
+            not observed_changed_paths
+            or tuple(observed_changed_paths) != tuple(sorted(set(observed_changed_paths)))
+            or not all(isinstance(path, str) and path for path in observed_changed_paths)
+        ):
+            raise StateConflictError("blocked source repair observed paths are not canonical")
+        _, generated_residue_paths = partition_recovery_paths(observed_changed_paths)
+        if generated_residue_paths:
+            raise StateConflictError(
+                "blocked source repair must retain ignored source residue instead of discarding it"
+            )
+
+        task = connection.execute(
+            "SELECT state, contract_json FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        if task["state"] != "blocked":
+            raise StateConflictError("blocked source repair task is no longer blocked")
+        try:
+            contract = json.loads(str(task["contract_json"]))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("blocked source repair task contract is invalid JSON") from error
+        if not isinstance(contract, dict):
+            raise StateConflictError("blocked source repair task contract is invalid")
+        if (
+            contract.get("external_write_permission") is not False
+            or contract.get("destructive_action_permission") is not False
+        ):
+            raise StateConflictError(
+                "blocked source repair requires a contract with no external or destructive permissions"
+            )
+        allowed_scope = contract.get("allowed_scope")
+        forbidden_scope = contract.get("forbidden_scope")
+        write_scopes = spec.get("write_scopes")
+        base_sha = contract.get("base_sha")
+        repository = contract.get("repository")
+        if not (
+            isinstance(allowed_scope, list)
+            and all(isinstance(scope, str) for scope in allowed_scope)
+            and isinstance(forbidden_scope, list)
+            and all(isinstance(scope, str) for scope in forbidden_scope)
+            and isinstance(write_scopes, list)
+            and all(isinstance(scope, str) for scope in write_scopes)
+            and isinstance(base_sha, str)
+            and base_sha
+            and isinstance(repository, str)
+            and repository
+        ):
+            raise StateConflictError("blocked source repair scopes or task binding are invalid")
+        for relative_path in observed_changed_paths:
+            try:
+                task_allowed = scope_allows(relative_path, allowed_scope, forbidden_scope)
+                node_allowed = scope_allows(relative_path, write_scopes, [])
+            except ValueError as error:
+                raise StateConflictError(
+                    f"blocked source repair observed path is invalid: {relative_path!r}"
+                ) from error
+            if not task_allowed:
+                raise StateConflictError(
+                    "blocked source repair observed path is outside task scope: " + relative_path
+                )
+            if not node_allowed:
+                raise StateConflictError(
+                    "blocked source repair observed path is outside node write scope: " + relative_path
+                )
+        allocation = connection.execute(
+            """
+            SELECT allocation_id, state, repository, base_sha, branch, current_path, attempt
+            FROM worktree_allocations
+            WHERE task_id = ? AND node_id = ? AND attempt = ?
+            """,
+            (task_id, node["node_id"], node["attempt"]),
+        ).fetchone()
+        expected_branch = WorktreeManager.branch_name(
+            task_id, str(node["node_id"]), int(node["attempt"])
+        )
+        if (
+            allocation is None
+            or allocation["state"] != "active"
+            or allocation["current_path"] != node["worktree"]
+            or allocation["repository"] != repository
+            or allocation["base_sha"] != base_sha
+            or allocation["branch"] != expected_branch
+            or int(allocation["attempt"]) != int(node["attempt"])
+        ):
+            raise StateConflictError("blocked source repair allocation no longer matches its source")
+        return {
+            "schema_version": 1,
+            "kind": _FAILED_ATTEMPT_RECOVERY_KIND,
+            "state": "capture_pending",
+            "authorization_revision": authorization_revision,
+            "source_allocation_id": str(allocation["allocation_id"]),
+            "source_result_json": source_result_json,
+            "mode": _BLOCKED_SOURCE_REPAIR_MODE,
+            "source_node_state": "blocked",
+            "source_task_state": "blocked",
+            "source": {
+                "attempt": int(node["attempt"]),
+                "worktree": str(allocation["current_path"]),
+                "branch": str(allocation["branch"]),
+                "base_sha": base_sha,
+                "changed_paths": list(observed_changed_paths),
+                "generated_residue_paths": [],
+                "source_only_ignored": True,
+                "source_only_extraction": True,
+                "source_delta_sha256": source_delta_sha256,
+            },
+        }
+
+    @staticmethod
     def _blocked_retry_candidate(
         connection: sqlite3.Connection,
         task_id: str,
@@ -4902,7 +5067,7 @@ class WorkbenchStore:
             expected_attempt=expected_attempt,
         )
         task = connection.execute(
-            "SELECT contract_json FROM tasks WHERE task_id = ?", (task_id,)
+            "SELECT contract_json, contract_hash FROM tasks WHERE task_id = ?", (task_id,)
         ).fetchone()
         node = connection.execute(
             "SELECT spec_json, result_json FROM nodes WHERE task_id = ? AND node_id = ?",
@@ -4978,6 +5143,7 @@ class WorkbenchStore:
             "candidate": candidate,
             "source_candidate": source_candidate,
             "contract_json": str(task["contract_json"]),
+            "contract_hash": str(task["contract_hash"]),
             "spec_json": str(node["spec_json"]),
             "historical_result_json": str(node["result_json"]),
             "dependency_input_ref": dependency_input_ref,
@@ -4999,7 +5165,7 @@ class WorkbenchStore:
         *,
         expected_revision: int,
         expected_attempt: int,
-        preserve_untracked: bool,
+        preserve_untracked: bool | None,
         expected_checkpoint_sha: str | None,
         expected_source_delta_sha256: str | None,
     ) -> tuple[dict[str, Any], Any]:
@@ -5023,11 +5189,11 @@ class WorkbenchStore:
             expected_checkpoint_sha=expected_checkpoint_sha,
             recovery_label="blocked",
         )
-        if delta.untracked_paths and not preserve_untracked:
+        if delta.untracked_paths and preserve_untracked is False:
             raise StateConflictError(
                 "dirty worktree contains untracked files; pass preserve_untracked=true to retain the exact verified paths"
             )
-        if preserve_untracked and not delta.untracked_paths:
+        if preserve_untracked is True and not delta.untracked_paths:
             raise StateConflictError(
                 "explicit untracked preservation requested but source has no untracked files"
             )
@@ -9087,11 +9253,12 @@ class WorkbenchStore:
         holds: set[str] = set()
         rows = connection.execute(
             "SELECT event_type, payload_json FROM events "
-            "WHERE event_type IN (?, ?, ?) ",
+            "WHERE event_type IN (?, ?, ?, ?) ",
             (
                 "node.indeterminate_local_recovery_queued",
                 "node.blocked_worktree_recovery_authorized",
                 "node.accepted_source_repair_authorized",
+                "node.blocked_source_repair_queued",
             ),
         ).fetchall()
         for row in rows:
@@ -9104,7 +9271,13 @@ class WorkbenchStore:
             if not isinstance(payload, dict):
                 raise StateConflictError("source-only recovery retention event is invalid")
             allocation_id = payload.get("allocation_id", payload.get("source_allocation_id"))
-            if payload.get("source_only_ignored") is True or row["event_type"] == "node.accepted_source_repair_authorized":
+            if (
+                payload.get("source_only_ignored") is True
+                or row["event_type"] in {
+                    "node.accepted_source_repair_authorized",
+                    "node.blocked_source_repair_queued",
+                }
+            ):
                 if not isinstance(allocation_id, str) or not allocation_id:
                     raise StateConflictError("source-only recovery retention event is invalid")
                 holds.add(allocation_id)
@@ -10000,6 +10173,19 @@ class WorkbenchStore:
             "source_result_json",
             "source",
         }
+        mode = authorization.get("mode")
+        if mode is None:
+            mode_fields: set[str] = set()
+        elif mode == _BLOCKED_SOURCE_REPAIR_MODE:
+            mode_fields = {"mode", "source_node_state", "source_task_state"}
+            if (
+                authorization.get("source_node_state") != "blocked"
+                or authorization.get("source_task_state") != "blocked"
+            ):
+                raise StateConflictError("blocked source repair source-state markers are invalid")
+        else:
+            raise StateConflictError("failed-attempt recovery mode is invalid")
+        base_fields |= mode_fields
         state = authorization.get("state")
         assigned_fields = base_fields | {
             "recovery",
@@ -10037,6 +10223,8 @@ class WorkbenchStore:
             raise StateConflictError(
                 "failed-attempt recovery source result is not failed or blocked"
             )
+        if mode == _BLOCKED_SOURCE_REPAIR_MODE and source_result.get("status") != "blocked":
+            raise StateConflictError("blocked source repair source result is not blocked")
         source = authorization["source"]
         source_fields = {
             "attempt",
@@ -10106,6 +10294,12 @@ class WorkbenchStore:
             raise StateConflictError(
                 "failed-attempt recovery source delta digest is invalid"
             )
+        if mode == _BLOCKED_SOURCE_REPAIR_MODE and (
+            source.get("source_only_ignored") is not True
+            or source_only_extraction is not True
+            or generated_residue_paths
+        ):
+            raise StateConflictError("blocked source repair source-only receipt is invalid")
         binding: dict[str, Any] = {
             "state": state,
             "authorization_revision": int(authorization["authorization_revision"]),
@@ -10113,6 +10307,12 @@ class WorkbenchStore:
             "source_result_json": authorization["source_result_json"],
             "source": dict(source),
         }
+        if mode == _BLOCKED_SOURCE_REPAIR_MODE:
+            binding.update({
+                "mode": mode,
+                "source_node_state": "blocked",
+                "source_task_state": "blocked",
+            })
         if state == "assigned":
             recovery = authorization["recovery"]
             if (
@@ -10932,6 +11132,18 @@ class WorkbenchStore:
                             "expected_changed_paths": selected_failed_attempt_recovery["source"]["changed_paths"],
                         },
                     } if selected_failed_attempt_recovery is not None else {}),
+                    **({
+                        "blocked_source_repair": {
+                            "source_attempt": selected_failed_attempt_recovery["source"]["attempt"],
+                            "source_allocation_id": selected_failed_attempt_recovery["source_allocation_id"],
+                            "source_node_state": selected_failed_attempt_recovery["source_node_state"],
+                            "source_task_state": selected_failed_attempt_recovery["source_task_state"],
+                        },
+                    } if (
+                        selected_failed_attempt_recovery is not None
+                        and selected_failed_attempt_recovery.get("mode")
+                        == _BLOCKED_SOURCE_REPAIR_MODE
+                    ) else {}),
                 },
                 created_at=timestamp,
             )
@@ -10991,6 +11203,18 @@ class WorkbenchStore:
                 **({
                     "failed_attempt_recovery": selected_failed_attempt_recovery,
                 } if selected_failed_attempt_recovery is not None else {}),
+                **({
+                    "blocked_source_repair": {
+                        "source_attempt": selected_failed_attempt_recovery["source"]["attempt"],
+                        "source_allocation_id": selected_failed_attempt_recovery["source_allocation_id"],
+                        "source_node_state": selected_failed_attempt_recovery["source_node_state"],
+                        "source_task_state": selected_failed_attempt_recovery["source_task_state"],
+                    },
+                } if (
+                    selected_failed_attempt_recovery is not None
+                    and selected_failed_attempt_recovery.get("mode")
+                    == _BLOCKED_SOURCE_REPAIR_MODE
+                ) else {}),
                 **({"accepted_source_repair": selected_accepted_source_repair}
                    if selected_accepted_source_repair is not None else {}),
             }
@@ -11394,6 +11618,9 @@ class WorkbenchStore:
             ):
                 if binding.get(field) != current.get(field):
                     raise StateConflictError("failed-attempt recovery binding changed before assignment")
+            for field in ("mode", "source_node_state", "source_task_state"):
+                if binding.get(field) != current.get(field):
+                    raise StateConflictError("failed-attempt recovery mode changed before assignment")
             try:
                 contract = json.loads(str(task["contract_json"]))
             except json.JSONDecodeError as error:
@@ -11469,6 +11696,15 @@ class WorkbenchStore:
                         "target_attempt": attempt,
                         "target_worktree": worktree,
                         "target_branch": expected_branch,
+                        **(
+                            {
+                                "mode": current["mode"],
+                                "source_node_state": current["source_node_state"],
+                                "source_task_state": current["source_task_state"],
+                            }
+                            if current.get("mode") == _BLOCKED_SOURCE_REPAIR_MODE
+                            else {}
+                        ),
                     }
                 )
             elif recovery_ref is not None or prepared_recovery is not None:
@@ -11552,6 +11788,15 @@ class WorkbenchStore:
                     "target_branch": expected_branch,
                     "recovery_ref": recovery_ref,
                     "recovered_changes": recovery is not None,
+                    **(
+                        {
+                            "mode": current["mode"],
+                            "source_node_state": current["source_node_state"],
+                            "source_task_state": current["source_task_state"],
+                        }
+                        if current.get("mode") == _BLOCKED_SOURCE_REPAIR_MODE
+                        else {}
+                    ),
                 },
                 created_at=timestamp,
             )
@@ -11749,6 +11994,17 @@ class WorkbenchStore:
                 "failed-attempt recovery must be rejected before a normal worker can settle"
             )
         source = recovery["source"]
+        mode = recovery.get("mode")
+        if mode is None:
+            source_node_state = "failed"
+            source_task_state = "needs_fix"
+        elif mode == _BLOCKED_SOURCE_REPAIR_MODE:
+            source_node_state = recovery.get("source_node_state")
+            source_task_state = recovery.get("source_task_state")
+            if source_node_state != "blocked" or source_task_state != "blocked":
+                raise StateConflictError("blocked source repair rollback state markers are invalid")
+        else:
+            raise StateConflictError("failed-attempt recovery rollback mode is invalid")
         allocation = connection.execute(
             """
             SELECT state, current_path, branch, base_sha FROM worktree_allocations
@@ -11769,7 +12025,7 @@ class WorkbenchStore:
         changed = connection.execute(
             """
             UPDATE nodes
-            SET state = 'failed', attempt = ?, worker_id = NULL, worktree = ?,
+            SET state = ?, attempt = ?, worker_id = NULL, worktree = ?,
                 effective_executor = NULL, effective_model = NULL,
                 started_at = NULL, settled_at = ?, result_json = ?, recovery_json = NULL,
                 coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
@@ -11777,6 +12033,7 @@ class WorkbenchStore:
               AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
             """,
             (
+                source_node_state,
                 source["attempt"],
                 source["worktree"],
                 timestamp,
@@ -11796,7 +12053,11 @@ class WorkbenchStore:
             (task_id,),
         ).fetchone()
         assert task is not None
-        blocker = f"failed-attempt recovery rejected: {result.summary}"
+        blocker = (
+            result.summary
+            if mode == _BLOCKED_SOURCE_REPAIR_MODE
+            else f"failed-attempt recovery rejected: {result.summary}"
+        )
         control_state_preserved = task["state"] in {"paused", "cancelled"}
         if control_state_preserved:
             revision = int(task["state_revision"])
@@ -11805,28 +12066,55 @@ class WorkbenchStore:
             connection.execute(
                 """
                 UPDATE tasks
-                SET state = 'needs_fix', state_revision = ?, updated_at = ?,
+                SET state = ?, state_revision = ?, updated_at = ?,
                     blocker = ?, verdict = NULL
                 WHERE task_id = ?
                 """,
-                (revision, timestamp, blocker, task_id),
+                (source_task_state, revision, timestamp, blocker, task_id),
             )
-        self._event(
-            connection,
-            "node.failed_attempt_recovery_rejected",
-            task_id,
-            node_id,
-            {
-                "attempt": int(row["attempt"]),
-                "source_attempt": source["attempt"],
-                "source_allocation_id": recovery["source_allocation_id"],
-                "source": source,
-                "rejection": result.to_dict(),
-                "task_revision": revision,
-                "control_state_preserved": control_state_preserved,
-            },
-            created_at=timestamp,
-        )
+        if mode == _BLOCKED_SOURCE_REPAIR_MODE:
+            self._event(
+                connection,
+                "node.blocked_worktree_recovery_rolled_back",
+                task_id,
+                node_id,
+                {
+                    "attempt": int(row["attempt"]),
+                    "source_attempt": source["attempt"],
+                    "source_allocation_id": recovery["source_allocation_id"],
+                    "recovery": {
+                        "source_attempt": source["attempt"],
+                        "source_worktree": source["worktree"],
+                        "source_branch": source["branch"],
+                        "base_sha": source["base_sha"],
+                        "changed_paths": source["changed_paths"],
+                    },
+                    "preparation_result": result.to_dict(),
+                    "task_revision": revision,
+                    "mode": mode,
+                    "source_node_state": source_node_state,
+                    "source_task_state": source_task_state,
+                    "control_state_preserved": control_state_preserved,
+                },
+                created_at=timestamp,
+            )
+        else:
+            self._event(
+                connection,
+                "node.failed_attempt_recovery_rejected",
+                task_id,
+                node_id,
+                {
+                    "attempt": int(row["attempt"]),
+                    "source_attempt": source["attempt"],
+                    "source_allocation_id": recovery["source_allocation_id"],
+                    "source": source,
+                    "rejection": result.to_dict(),
+                    "task_revision": revision,
+                    "control_state_preserved": control_state_preserved,
+                },
+                created_at=timestamp,
+            )
         if control_state_preserved:
             self._event(
                 connection,
@@ -11848,7 +12136,7 @@ class WorkbenchStore:
                 None,
                 {
                     "from": task["state"],
-                    "to": "needs_fix",
+                    "to": source_task_state,
                     "revision": revision,
                     "blocker": blocker,
                     "recovery_rolled_back": True,
@@ -12118,6 +12406,13 @@ class WorkbenchStore:
                     "source_allocation_id": failed_attempt_recovery["source_allocation_id"],
                     "recovery_ref": failed_attempt_recovery.get("recovery_ref"),
                 }
+                if failed_attempt_recovery.get("mode") == _BLOCKED_SOURCE_REPAIR_MODE:
+                    node_event["blocked_source_repair"] = {
+                        "source_attempt": failed_attempt_recovery["source"]["attempt"],
+                        "source_allocation_id": failed_attempt_recovery["source_allocation_id"],
+                        "source_node_state": failed_attempt_recovery["source_node_state"],
+                        "source_task_state": failed_attempt_recovery["source_task_state"],
+                    }
             if retry_recovery is not None:
                 node_event["failed_attempt_recovery"] = {
                     "source_attempt": retry_recovery["source"]["attempt"],

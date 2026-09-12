@@ -262,6 +262,7 @@ class Coordinator:
         from .node_recovery_readiness import ReadinessNodeActions
         from .node_recovery_local import LocalNodeActions
         from .node_recovery_repair import RepairNodeActions
+        from .node_recovery_source_repair import SourceRepairNodeActions
         from .node_recovery_store import NodeRecoveryStore
         from .node_recovery_deployment import observe_repair_delivery
 
@@ -280,6 +281,7 @@ class Coordinator:
                 "observe_readiness": readiness, "narrow_validation": journaled,
                 "source_only_recovery": journaled,
                 "materialize_dependencies": local, "resume_node": local,
+                "repair_source": SourceRepairNodeActions(self.store),
                 "request_repair": RepairNodeActions(self.config, NodeRecoveryStore(self.store), authority_service),
             },
         )
@@ -2253,6 +2255,9 @@ class Coordinator:
         binding = claimed.get("failed_attempt_recovery")
         if not isinstance(binding, dict):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery binding is missing")
+        recovery_mode = binding.get("mode")
+        if recovery_mode not in {None, "blocked_source_repair"}:
+            raise DirtyWorktreeRecoveryError("failed-attempt recovery mode is invalid")
         spec = claimed["spec"]
         contract = claimed["contract"]
         if spec.get("verifier"):
@@ -2297,6 +2302,12 @@ class Coordinator:
         elif source_delta_sha256 is not None:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt recovery source delta is invalid"
+            )
+        if recovery_mode == "blocked_source_repair" and (
+            source_only is not True or source_only_extraction is not True
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "blocked source repair must retain the source-only recovery binding"
             )
         if source_base != contract["base_sha"]:
             raise DirtyWorktreeRecoveryError(

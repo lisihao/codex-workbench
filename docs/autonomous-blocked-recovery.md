@@ -14,6 +14,7 @@ The existing Coordinator control pool consumes bounded event metadata and sweeps
 | `request_repair` | Existing asynchronous planning queue | Explicit repair repository/scopes; one stable repair request per failure; no publication authority |
 | `materialize_dependencies` | Existing offline materializer, cached template required, at most 60 seconds | Explicit task policy and current source/runtime binding; unknown effects are not replayed |
 | `resume_node` | Existing blocked-node retry CAS | Proven pre-execution dependency failure, fresh readiness and clean source with matching revision/attempt/allocation; never changes historical acceptance |
+| `repair_source` | Existing failed-attempt preparation followed by the ordinary worker executor | Explicit action grant, ready blocked non-verifier, fresh source/revision/attempt/policy binding and bounded repair count; never accepts the task |
 
 The fixed validation profiles currently cover the bounded DSH B IPC and pairing checks documented in [controlled validation](controlled-validation.md). This does not provide arbitrary acceptance commands, arbitrary Unix/Git grants or generic project compatibility. Existing readiness checks and those fixed profile plans do not yet constitute a general pre-dispatch capability proof for every project's acceptance surface.
 
@@ -40,6 +41,8 @@ This example only observes readiness. It cannot install dependencies, requeue a 
 ## Preservation and repair
 
 An environment-blocked node no longer prevents an independent legal node from being claimed. Dependency acceptance and read/write scope gates still apply. Pause and cancellation override recovery at claim and settlement; unknown effects retain their original evidence and require a decision. One bounded investigation may report missing durable progress for a running attempt, but it neither labels a live PID as progress nor declares a deadlock or kills the process.
+
+`repair_source` separates source preparation from business acceptance. The `blocked_source_repair` mode restores the retained source and dependencies before invoking the ordinary worker; it does not require the failing business checks to pass before the worker can repair them. The original blocked result remains unchanged. Preparation failure restores that blocked attempt and records separate rollback evidence. The existing final verifier remains mandatory, and the existing strict source-only recovery path still runs its acceptance checks. Repair dispatches are counted across attempts for the current task/node policy revision, so creating another attempt does not reset the repair limit. A repeated request ID reads its original receipt rather than queuing another attempt.
 
 The verifier now returns `repair_node_ids` (empty when the source owner is unknown). A failed verifier does not reset every worker. Only explicit, evidenced accepted owners enter `accepted-source-repair-v1`: their original successful result, patch, dependency input and allocation remain the source for a fresh attempt. Unrelated accepted ancestors remain accepted. Invalid owner lists, missing source evidence and uncovered accepted descendants are rejected without discarding implementation.
 

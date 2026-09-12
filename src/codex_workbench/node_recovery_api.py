@@ -9,7 +9,7 @@ from .store import WorkbenchStore
 
 INSTALLED_RECOVERY_ACTIONS = (
     "observe_readiness", "materialize_dependencies", "resume_node",
-    "narrow_validation", "source_only_recovery", "request_repair",
+    "narrow_validation", "source_only_recovery", "request_repair", "repair_source",
 )
 
 RECOVERY_TOOLS = [

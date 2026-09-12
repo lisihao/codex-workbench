@@ -19,6 +19,7 @@ Action = Literal[
     "source_only_recovery",
     "request_repair",
     "resume_node",
+    "repair_source",
 ]
 Category = Literal[
     "capacity",
@@ -42,6 +43,7 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "source_only_recovery",
         "request_repair",
         "resume_node",
+        "repair_source",
     }
 )
 VALIDATION_PROFILES: Final[frozenset[str]] = frozenset(
@@ -528,6 +530,19 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
             category=category, action=None, state="needs_action",
             reason_kind="readiness_not_authorized", owner="user",
             requires_authorization=True, next_wakeup_at=None,
+        )
+
+    if (
+        readiness_ready
+        and category == "validation_failure"
+        and node_state == "blocked"
+        and observation.get("node_is_verifier") is False
+        and observation.get("validation_succeeded") is not True
+        and "repair_source" in policy.allowed_actions
+    ):
+        return _ready_action(
+            policy, observation, category=category, action="repair_source",
+            reason_kind="blocked_source_repair_authorized",
         )
 
     if readiness_ready and category == "validation_failure":

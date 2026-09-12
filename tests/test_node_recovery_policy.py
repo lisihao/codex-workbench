@@ -31,6 +31,32 @@ def observation(category: str, **overrides: object) -> dict[str, object]:
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_authorized_blocked_worker_can_enter_source_repair_before_acceptance_passes(self) -> None:
+        policy = RecoveryPolicy(enabled=True, allowed_actions=("repair_source",))
+        failed_check = observation(
+            "validation_failure", readiness_ready=True, node_is_verifier=False,
+            implementation_ready=False, validation_succeeded=False,
+        )
+        decision = plan_recovery(policy, failed_check)
+        self.assertEqual((decision["state"], decision["action"]), ("ready", "repair_source"))
+        self.assertFalse(decision["requires_authorization"])
+
+        for change in (
+            {"readiness_ready": False},
+            {"node_is_verifier": True},
+            {"validation_succeeded": True},
+            {"node_state": "indeterminate"},
+            {"task_state": "paused"},
+            {"task_state": "cancelled"},
+            {"category": "unknown_effects"},
+            {"approval_denied": True},
+            {"action_attempts": policy.max_action_attempts},
+        ):
+            with self.subTest(change=change):
+                self.assertNotEqual(plan_recovery(policy, {**failed_check, **change})["action"], "repair_source")
+        disabled = RecoveryPolicy(enabled=True, allowed_actions=("observe_readiness",))
+        self.assertNotEqual(plan_recovery(disabled, failed_check)["action"], "repair_source")
+
     def test_policy_defaults_round_trip_and_strict_config(self) -> None:
         policy = RecoveryPolicy()
         self.assertEqual(policy.to_dict()["allowed_actions"], ["observe_readiness"])

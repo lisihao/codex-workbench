@@ -96,6 +96,8 @@ class NodeRecoveryReconciler:
                     datetime.fromisoformat(current["now"]) + timedelta(seconds=policy.backoff_seconds)
                 ).isoformat(),
             }
+        if decision["state"] == "suspended":
+            return decision
         if current.get("recovery_resumed") is True:
             return {
                 "category": current["category"], "state": "resolved", "action": None,
