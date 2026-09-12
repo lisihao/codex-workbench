@@ -859,6 +859,8 @@ def _preview(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "manifest_fingerprint": source["manifest_fingerprint"],
         "lockfile": source["lockfile"],
         "changed_importer_count": len(source["changed_importers"]),
+        "changed_importers": [item["importer"] for item in source["changed_importers"][:32]],
+        "changed_importers_truncated": len(source["changed_importers"]) > 32,
         "changed_importers_fingerprint": canonical_hash(source["changed_importers"]),
         "creates_attempt": False,
         "queues_task": False,

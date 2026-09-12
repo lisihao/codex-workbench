@@ -316,6 +316,8 @@ class LockfileHandoffTests(unittest.TestCase):
         arguments = self._arguments(contract, before, "handoff-success")
         preview = lockfile_handoff(self.config, self.store, arguments)
         self.assertEqual(preview["state"], "preview")
+        self.assertEqual(preview["changed_importers"], ["packages/a"])
+        self.assertFalse(preview["changed_importers_truncated"])
         self.assertNotIn("input_fingerprints", preview)
         original_result = self._worker(before)["result"]
         original_owner = next(node for node in before["nodes"] if node["node_id"] == "lock-owner")

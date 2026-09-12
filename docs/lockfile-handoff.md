@@ -4,6 +4,8 @@ This operation repairs a prerequisite of an existing blocked task. It does not c
 
 The task must already authorize `pnpm-lock.yaml`. A preview identifies the existing lockfile owner, the temporary handoff owner, the blocked node and attempt, accepted dependency inputs, and the manifest and lockfile fingerprints. Ambiguous ownership, active conflicting work, or changed inputs reject the operation.
 
+The preview lists up to 32 changed importer paths and reports the complete count and fingerprint. If `changed_importers_truncated` is true, the displayed list is incomplete; inspect the complete source plan before authorizing application.
+
 `workbench_handoff_lockfile` is available through the existing authenticated Authority service. `preview` and `status` are read-only. `apply` requires the preview fingerprint and a stable request ID matching the Authority journal request ID. After an uncertain transport response, query that journal receipt and the handoff status; do not invent a new ID to retry.
 
 Apply reserves temporary ownership and reconstructs a separate repair worktree from accepted inputs and the scope-checked existing source delta. Original worktrees and historical acceptance receipts are not modified. The importer editor supports the repository's generated pnpm lockfile format and adds missing supported workspace links only. Unsupported formats and third-party dependency changes are rejected rather than normalized or upgraded. The fixed offline frozen-lockfile check remains mandatory.
