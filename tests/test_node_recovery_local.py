@@ -34,6 +34,7 @@ from codex_workbench.node_recovery_readiness import ReadinessNodeActions
 from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
+from tests.process_probe_fixture import isolated_process_catalog
 
 
 class _FixtureMaterializer:
@@ -81,6 +82,7 @@ class _UncertainMaterializer(_FixtureMaterializer):
 
 class LocalNodeActionsTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.enterContext(isolated_process_catalog(()))
         self.temp = tempfile.TemporaryDirectory(prefix="node-recovery-local-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

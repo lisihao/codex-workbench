@@ -1,6 +1,6 @@
 # Task-scoped blocked recovery
 
-This candidate adds a recovery projection to the existing Workbench Authority and SQLite database. It is not a second scheduler, a chat automation, or an acceptance shortcut. Policies are disabled unless explicitly enabled for a task. The [ADR](autonomous-blocked-recovery-adr.md) records the source findings and intended completion criteria.
+Version 1.18.0 adds a recovery projection to the existing Workbench Authority and SQLite database. It is not a second scheduler, a chat automation, or an acceptance shortcut. Policies are disabled unless explicitly enabled for a task. The [ADR](autonomous-blocked-recovery-adr.md) records the source findings and intended completion criteria.
 
 ## Available behavior
 
@@ -64,4 +64,4 @@ A repair request fingerprint and a verified deployment fingerprint are separate 
 
 The focused fixtures exercise original-node continuation, independent-node dispatch, pause/cancellation, bounded repeated faults, lost-response/restart deduplication, accepted-source owner repair, actual metadata-only repair enqueue, controlled validation isolation and deployment receipt validation. Local-adapter fixtures use isolated Git/SQLite and a controlled materializer; they do not prove that an arbitrary production project's dependency cache is complete.
 
-The source candidate still requires its stable release gate, an identified version/commit and authorized runtime installation. No DSH task acceptance or production speedup follows from these fixtures. Ledger metrics distinguish episode/action counts and deduplicated user-action notices; model wakeups remain unknown unless actual provider evidence measures them. Workbench and DSH code, releases, deployments and acceptance remain separate.
+Runtime delivery requires an identified version/commit, authorized installation and separate activation evidence. No DSH task acceptance or production speedup follows from these fixtures. Ledger metrics distinguish episode/action counts and deduplicated user-action notices; model wakeups remain unknown unless actual provider evidence measures them. Workbench and DSH code, releases, deployments and acceptance remain separate.
