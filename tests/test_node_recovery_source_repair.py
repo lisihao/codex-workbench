@@ -37,13 +37,17 @@ class SourceRepairAdapterTests(unittest.TestCase):
 
     def test_execute_uses_frozen_preview_and_reports_only_requeue(self) -> None:
         plan = self.plan()
-        with patch(f"{_MODULE}.blocked_source_repair", return_value=self.receipt) as execute:
+        raw = {**self.receipt, "changed_paths": ["src/private.txt"], "untracked_paths": ["src/private.txt"]}
+        with patch(f"{_MODULE}.blocked_source_repair", return_value=raw) as execute:
             result = self.actions.execute(plan)
         self.assertFalse(execute.call_args.kwargs["dry_run"])
         self.assertEqual(execute.call_args.kwargs["expected_fingerprint"], self.preview["fingerprint"])
         self.assertEqual(execute.call_args.kwargs["request_id"], "repair-fixture")
         self.assertTrue(result["observation_patch"]["recovery_resumed"])
         self.assertNotIn("accepted", result)
+        self.assertNotIn("changed_paths", result["receipt"])
+        self.assertNotIn("untracked_paths", result["receipt"])
+        self.assertEqual(result["receipt"], self.receipt)
 
     def test_missing_receipt_never_replays_the_operation(self) -> None:
         plan = self.plan()

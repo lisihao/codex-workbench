@@ -111,7 +111,12 @@ class SourceRepairNodeActions:
             "ok": True,
             "known_effects": True,
             "stage_succeeded": True,
-            "receipt": receipt,
+            "receipt": {
+                key: receipt[key] for key in (
+                    "request_id", "request_fingerprint", "authorization_event_cursor",
+                    "revision", "next_attempt", "queued",
+                )
+            },
             "observation_patch": {
                 "recovery_resumed": True,
                 "last_action": _ACTION,

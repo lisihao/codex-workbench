@@ -33,6 +33,7 @@ class NodeRecoveryAPITests(unittest.TestCase):
 
     def test_advertised_source_repair_is_bound_to_existing_coordinator(self):
         coordinator = Coordinator(self.store, Path(self.temp.name), coordinator_epoch=1)
+        self.addCleanup(coordinator._pool.shutdown, wait=True)
         before = self.store.get_task("policy-task")
         coordinator.bind_authority_service(self.service)
         self.assertIsInstance(coordinator.node_recovery.adapters["repair_source"], SourceRepairNodeActions)
