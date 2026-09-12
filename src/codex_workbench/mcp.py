@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +14,8 @@ from .acceptance_amendment import ACCEPTANCE_AMENDMENT_TOOL, amend_task_acceptan
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
+from .node_recovery_api import RECOVERY_TOOLS, recovery_tool
+from .session_notifications_api import SESSION_NOTIFICATION_TOOLS, session_notification_tool
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .dirty_worktree_recovery import observed_indeterminate_recovery_paths
 from .governance import code_as_harness_health
@@ -20,6 +23,7 @@ from .planner import PlannerError
 from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryManager
 from .worktrees import WorktreeError
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
+from .task_observation import current_task_observations
 from .submission import enqueue_natural_language_request, planning_request_receipt
 from .sync import RepositorySynchronizer, RepositorySyncError
 
@@ -47,6 +51,8 @@ _LIST_TASKS_NODE_STATES = (
 
 TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
+    *RECOVERY_TOOLS,
+    *SESSION_NOTIFICATION_TOOLS,
     ACCEPTANCE_AMENDMENT_TOOL,
     {
         "name": "workbench_create_delivery_objective",
@@ -731,6 +737,7 @@ class WorkbenchMCPServer:
 
     def _list_task_summaries(self, limit: int, cursor: int) -> dict[str, Any]:
         with self.store.connection() as connection:
+            connection.execute("BEGIN")
             rows = connection.execute(
                 """
                 WITH page AS (
@@ -782,6 +789,9 @@ class WorkbenchMCPServer:
                 """,
                 (cursor, limit + 1),
             ).fetchall()
+            observations = current_task_observations(
+                connection, [str(row["task_id"]) for row in rows[:limit]],
+            )
 
         summaries: list[tuple[int, dict[str, Any]]] = []
         for row in rows[:limit]:
@@ -813,6 +823,7 @@ class WorkbenchMCPServer:
                         "contract_hash": contract_hash,
                         "created_at": created_at,
                         "updated_at": updated_at,
+                        "current_status": observations[str(row["task_id"])],
                         "node_counts": {
                             "total": int(row["node_total"]),
                             **{
@@ -861,6 +872,10 @@ class WorkbenchMCPServer:
         return str(row["task_id"])
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
+            return self._text(recovery_tool(self.store, name, arguments))
+        if name in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:
+            return self._text(session_notification_tool(self.store, name, arguments))
         if name == "workbench_amend_task_acceptance":
             return self._text(amend_task_acceptance(self.config, self.store, arguments))
         if name == "workbench_validate_blocked_node":
@@ -954,7 +969,17 @@ class WorkbenchMCPServer:
             )
         if name == "workbench_list_tasks":
             limit, cursor = self._list_tasks_arguments(arguments)
-            return self._text(self._list_task_summaries(limit, cursor))
+            try:
+                summary = self._list_task_summaries(limit, cursor)
+            except (sqlite3.Error, OSError) as error:
+                result = self._text({
+                    "state": "observation_unavailable",
+                    "error_type": type(error).__name__,
+                    "task_state_changed": False,
+                })
+                result["isError"] = True
+                return result
+            return self._text(summary)
         if name == "workbench_inspect_task":
             return self._text(self.store.get_task(self._inspect_task_id(arguments)))
         if name == "workbench_read_events":

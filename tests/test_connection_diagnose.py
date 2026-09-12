@@ -193,6 +193,53 @@ class ConnectionDiagnoseTests(unittest.TestCase):
         )
         self.assertFalse(result["ok"])
 
+    def test_status_only_connected_without_exit_evidence_is_not_a_child_fault(self) -> None:
+        state = {
+            "connection": {"state": "connected"},
+            "layers": {"authority_http": {"status": "ready", "http_status": 200}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory), state=state)
+            with mock.patch.object(diagnose.subprocess, "run") as run:
+                result = diagnose.diagnose(config_path, status_only=True)
+
+        run.assert_not_called()
+        self.assertEqual(
+            result["components"]["ssh_or_local_process"]["summary"],
+            "bridge_state_connected",
+        )
+        self.assertEqual(
+            result["components"]["mcp_child"]["summary"],
+            "child_exit_not_observed",
+        )
+        self.assertEqual(result["fault_key"], "mcp-child-not-observed")
+        self.assertEqual(result["recovery_steps"], [])
+        self.assertFalse(result["ok"])
+
+    def test_status_only_disconnected_without_exit_evidence_stays_unknown(self) -> None:
+        state = {
+            "connection": {
+                "state": "disconnected",
+                "error": {"layer": "child", "kind": "eof", "stderr_tail": []},
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory), state=state)
+            with mock.patch.object(diagnose.subprocess, "run") as run:
+                result = diagnose.diagnose(config_path, status_only=True)
+
+        run.assert_not_called()
+        self.assertEqual(
+            result["components"]["ssh_or_local_process"]["summary"],
+            "bridge_state_disconnected",
+        )
+        self.assertEqual(
+            result["components"]["mcp_child"]["summary"],
+            "child_exit_stderr_unknown",
+        )
+        self.assertEqual(result["fault_key"], "bridge-disconnected")
+        self.assertFalse(result["ok"])
+
     def test_status_only_uses_explicit_state_for_each_connection_layer(self) -> None:
         state = {
             "layers": {
@@ -242,6 +289,7 @@ class ConnectionDiagnoseTests(unittest.TestCase):
             "redacted_stderr_tail_count:1",
         )
         self.assertEqual(result["fault_key"], "mcp-child-exit-9")
+        self.assertFalse(result["ok"])
 
     def test_auth_or_hostkey_failure_is_not_retried_and_http_stays_unknown(self) -> None:
         response = subprocess.CompletedProcess(

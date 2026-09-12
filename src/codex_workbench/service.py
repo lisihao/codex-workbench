@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 from typing import Callable, Iterable
 
 from .artifacts import ArtifactStore
@@ -157,6 +158,7 @@ class _ExecutionAttributionContext:
     direct_artifact_refs: frozenset[str] = field(default_factory=frozenset)
     failure_origin: str | None = None
     failure_detail: str | None = None
+    harness_failure_ref: str | None = None
 
 
 class Coordinator:
@@ -250,6 +252,71 @@ class Coordinator:
         )
         self._next_quota_refresh = 0.0
         self._quota_unavailable_reported = False
+        self.node_recovery = None
+        self._node_recovery_fault: str | None = None
+        self._session_notification_fault: str | None = None
+
+    def bind_authority_service(self, authority_service) -> None:
+        """Share the running Authority journal with fixed recovery adapters."""
+        from .node_recovery import NodeRecoveryReconciler
+        from .node_recovery_actions import JournaledNodeActions
+        from .node_recovery_readiness import ReadinessNodeActions
+        from .node_recovery_local import LocalNodeActions
+        from .node_recovery_repair import RepairNodeActions
+        from .node_recovery_source_repair import SourceRepairNodeActions
+        from .node_recovery_store import NodeRecoveryStore
+        from .node_recovery_deployment import observe_repair_delivery
+
+        readiness = ReadinessNodeActions(
+            self.config, self.store, readiness_request_factory=self._readiness_request,
+        )
+        journaled = JournaledNodeActions(self.config, self.store, authority_service)
+        local = LocalNodeActions(
+            self.config, self.store, readiness_request_factory=self._readiness_request,
+            materializer=self.blocked_worktree_recovery.materializer,
+        )
+        self.node_recovery = NodeRecoveryReconciler(
+            self.store, coordinator_epoch=self.coordinator_epoch,
+            delivery_observer=lambda episode: observe_repair_delivery(self.store, self.config, episode),
+            adapters={
+                "observe_readiness": readiness, "narrow_validation": journaled,
+                "source_only_recovery": journaled,
+                "materialize_dependencies": local, "resume_node": local,
+                "repair_source": SourceRepairNodeActions(self.store),
+                "request_repair": RepairNodeActions(self.config, NodeRecoveryStore(self.store), authority_service),
+            },
+        )
+        self.node_recovery.recovery.recover_interrupted()
+
+    def _reconcile_authority_work(self) -> list[dict]:
+        """Use the existing bounded control pool without holding worker dispatch."""
+        from .session_notifications import project_notifications
+
+        if self.node_recovery is not None:
+            try:
+                self.node_recovery.reconcile_once()
+                self._node_recovery_fault = None
+            except Exception as error:
+                failure = f"{type(error).__name__}: {error}"[:512]
+                if failure != self._node_recovery_fault:
+                    self.store.record_system_event(
+                        "node_recovery.reconcile_failed",
+                        {"error": failure, "owner": "authority", "retry": "bounded-next-control-turn"},
+                    )
+                    self._node_recovery_fault = failure
+        result = self.delivery_lifecycle.reconcile_once()
+        try:
+            project_notifications(self.store, limit=200)
+            self._session_notification_fault = None
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"[:512]
+            if failure != self._session_notification_fault:
+                self.store.record_system_event(
+                    "session_notification.projection_failed",
+                    {"error": failure, "owner": "authority", "retry": "bounded-next-control-turn"},
+                )
+                self._session_notification_fault = failure
+        return result
 
     def recover(self) -> int:
         recovered_planning = self.store.recover_interrupted_planning_requests()
@@ -323,7 +390,7 @@ class Coordinator:
             # time, but it must never hold worker dispatch or a deployment
             # safe-point wakeup hostage.
             self._delivery_future = self._delivery_pool.submit(
-                self.delivery_lifecycle.reconcile_once,
+                self._reconcile_authority_work,
             )
         except Exception as error:
             self.store.record_system_event(
@@ -1462,22 +1529,14 @@ class Coordinator:
         *,
         verifier: bool,
         context: _ExecutionAttributionContext,
+        supplied: ExecutionAttribution | None = None,
     ) -> str:
         if result.status == "succeeded":
             return "unknown"
         if context.failure_origin is not None:
             return context.failure_origin
-        detail = result.summary.lower()
-        if "cancel" in detail:
-            return "cancel"
-        if "quota" in detail:
-            return "quota"
-        if any(token in detail for token in ("authentication", "auth", "logged in", "login")):
-            return "auth"
-        if any(token in detail for token in ("timed out", "timeout", "transport", "network")):
-            return "transport"
-        if "scope" in detail or "changed paths outside" in detail:
-            return "scope"
+        if supplied is not None:
+            return supplied.failure.origin
         if verifier and result.status == "failed":
             return "verification"
         # A worker-declared failure with a direct structured response is a
@@ -1490,6 +1549,42 @@ class Coordinator:
         ):
             return "model"
         return "unknown"
+
+    def _pre_execution_harness_failure_ref(
+        self,
+        claimed: dict,
+        error: Exception,
+        context: _ExecutionAttributionContext,
+    ) -> str | None:
+        """Persist bounded evidence for one internal pre-execution harness fault."""
+
+        if context.execute_started_at is not None or not isinstance(
+            error, (NameError, AttributeError, AssertionError, TypeError)
+        ):
+            return None
+        frames = traceback.extract_tb(error.__traceback__)
+        if not frames:
+            return None
+        deepest = Path(frames[-1].filename).expanduser().resolve(strict=False)
+        package_root = Path(__file__).resolve().parent
+        try:
+            relative_module = deepest.relative_to(package_root).as_posix()
+        except ValueError:
+            return None
+        evidence = {
+            "kind": "harness-failure",
+            "task_id": str(claimed["task_id"]),
+            "node_id": str(claimed["node_id"]),
+            "attempt": int(claimed["attempt"]),
+            "phase": "pre_execution",
+            "error_type": type(error).__name__,
+            "relative_module": relative_module,
+            "line": int(frames[-1].lineno),
+            "executor_started": False,
+        }
+        reference = self.artifacts.put_text(canonical_json(evidence), "harness-failure.json")
+        context.harness_failure_ref = reference
+        return reference
 
     def _attach_execution_attribution(
         self,
@@ -1617,15 +1712,33 @@ class Coordinator:
             verify=execution_phase if verifier else PhaseTiming(),
         )
 
-        failure_origin = self._failure_origin(result, verifier=verifier, context=context)
+        failure_origin = self._failure_origin(
+            result, verifier=verifier, context=context, supplied=supplied,
+        )
         failure_references: list[AttributionReference] = []
         if result.status != "succeeded":
-            if failure_origin == "environment" and readiness_reference is not None:
-                failure_references.append(readiness_reference)
+            if context.failure_origin is None and supplied is not None:
+                failure_references.extend(supplied.failure.references)
+            elif failure_origin == "environment":
+                if readiness_reference is not None:
+                    failure_references.append(readiness_reference)
+                materialization_reference = self._artifact_reference(
+                    "artifact", context.dependency_materialization_ref,
+                )
+                if materialization_reference is not None:
+                    failure_references.append(materialization_reference)
+                if dependency_reference is not None:
+                    failure_references.append(dependency_reference)
             elif failure_origin == "scope":
                 failure_references.append(scope_reference)
             elif failure_origin == "quota" and quota_reference is not None:
                 failure_references.append(quota_reference)
+            elif failure_origin == "tooling_bug" and context.harness_failure_ref is not None:
+                failure_reference = self._artifact_reference(
+                    "artifact", context.harness_failure_ref
+                )
+                if failure_reference is not None:
+                    failure_references.append(failure_reference)
             else:
                 structured_reference = self._artifact_reference(
                     "artifact", result.artifacts.get("structured-result")
@@ -1634,7 +1747,9 @@ class Coordinator:
                     failure_references.append(structured_reference)
                 elif claim_reference is not None:
                     failure_references.append(claim_reference)
-        failure_detail = context.failure_detail or result.summary
+        failure_detail = context.failure_detail or (
+            supplied.failure.detail if supplied is not None else result.summary
+        )
         observed_model = self._observed_model_identity(result, supplied)
         attribution = ExecutionAttribution(
             state=ExecutionStateReference(
@@ -1685,6 +1800,7 @@ class Coordinator:
         context = self._execution_attribution_context(claimed)
         request: ExecutionRequest | None = None
         failed_attempt_recovery = claimed.get("failed_attempt_recovery")
+        accepted_source_repair = claimed.get("accepted_source_repair")
         failed_attempt_assigned = False
         recovery_artifacts: dict[str, str] = {}
         try:
@@ -1695,7 +1811,27 @@ class Coordinator:
             input_receipt_ref: str | None = None
             prepare_started_monotonic = time.monotonic()
             context.prepare_started_at = now_iso()
-            if failed_attempt_recovery is not None:
+            if accepted_source_repair is not None:
+                from .accepted_source_repair import prepare_accepted_source_repair
+
+                prepared = prepare_accepted_source_repair(
+                    self.store, accepted_source_repair, self.worktrees,
+                )
+                worktree = prepared.worktree
+                dependency_input = prepared.dependency_input
+                prepared_ref = self.artifacts.put_text(
+                    canonical_json(prepared.receipt), "accepted-source-repair.json",
+                )
+                self.store.assign_worktree(
+                    claimed["task_id"], claimed["node_id"], str(worktree),
+                    attempt=claimed["attempt"], coordinator_epoch=claimed["coordinator_epoch"],
+                    lease_epoch=claimed["lease_epoch"], recovery_preflight=prepared.receipt,
+                )
+                recovery_artifacts["accepted-source-repair"] = prepared_ref
+                self._materialize_worktree_dependencies(
+                    worktree, context, timeout_seconds=int(contract["timeout_seconds"]),
+                )
+            elif failed_attempt_recovery is not None:
                 (
                     worktree,
                     dependency_input,
@@ -2042,13 +2178,28 @@ class Coordinator:
                     **governance_receipt_fields(claimed["contract"]),
                 )
         except Exception as error:
-            context.failure_detail = f"worker crashed: {type(error).__name__}: {error}"
-            if failed_attempt_recovery is not None and not failed_attempt_assigned:
+            harness_failure_ref = self._pre_execution_harness_failure_ref(
+                claimed, error, context
+            )
+            if harness_failure_ref is not None:
+                context.failure_origin = "tooling_bug"
+                context.failure_detail = "pre-execution Workbench harness failure"
+                result = NodeResult(
+                    status="blocked",
+                    summary="pre-execution Workbench harness failure",
+                    artifacts={"harness-failure": harness_failure_ref},
+                    result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                    verdict="blocked" if claimed["spec"].get("verifier") else None,
+                    **governance_receipt_fields(claimed["contract"]),
+                )
+            elif failed_attempt_recovery is not None and not failed_attempt_assigned:
+                context.failure_detail = f"worker crashed: {type(error).__name__}: {error}"
                 result = self._failed_attempt_recovery_failure(
                     claimed,
                     f"failed-attempt recovery crashed: {type(error).__name__}: {error}",
                 )
             else:
+                context.failure_detail = f"worker crashed: {type(error).__name__}: {error}"
                 result = NodeResult(
                     status="indeterminate",
                     summary=f"worker crashed: {type(error).__name__}: {error}",
@@ -2119,6 +2270,9 @@ class Coordinator:
         binding = claimed.get("failed_attempt_recovery")
         if not isinstance(binding, dict):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery binding is missing")
+        recovery_mode = binding.get("mode")
+        if recovery_mode not in {None, "blocked_source_repair"}:
+            raise DirtyWorktreeRecoveryError("failed-attempt recovery mode is invalid")
         spec = claimed["spec"]
         contract = claimed["contract"]
         if spec.get("verifier"):
@@ -2163,6 +2317,12 @@ class Coordinator:
         elif source_delta_sha256 is not None:
             raise DirtyWorktreeRecoveryError(
                 "failed-attempt recovery source delta is invalid"
+            )
+        if recovery_mode == "blocked_source_repair" and (
+            source_only is not True or source_only_extraction is not True
+        ):
+            raise DirtyWorktreeRecoveryError(
+                "blocked source repair must retain the source-only recovery binding"
             )
         if source_base != contract["base_sha"]:
             raise DirtyWorktreeRecoveryError(
@@ -2702,6 +2862,21 @@ class Coordinator:
                 claimed=claimed,
                 target=target,
                 branch=target_branch,
+            )
+            artifacts["recovery-preparation"] = self.artifacts.put_text(
+                canonical_json({
+                    "schema_version": 1,
+                    "kind": "recovery-preparation-failure",
+                    "task_id": claimed["task_id"],
+                    "node_id": claimed["node_id"],
+                    "source_attempt": recovery["source_attempt"],
+                    "recovery_attempt": target_attempt,
+                    "phase": "acceptance" if outcome.failure_code else "preparation",
+                    "code": outcome.failure_code or "preparation-failed",
+                    "executor_started": False,
+                    "evidence_refs": dict(artifacts),
+                }),
+                "recovery-preparation.json",
             )
             return NodeResult(
                 status=outcome.status,

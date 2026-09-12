@@ -1664,6 +1664,7 @@ class CodexExecutor(ProcessExecutor):
             checks=tuple(structured.get("checks", ())) if isinstance(structured, dict) else (),
             evidence=verifier_evidence,
             verdict=verifier_verdict,
+            repair_node_ids=tuple(structured.get("repair_node_ids", ())) if verifier and isinstance(structured, dict) else (),
             **metadata,
             **governance_receipt_fields(request.contract),
         )
@@ -1797,10 +1798,15 @@ class CodexExecutor(ProcessExecutor):
 
     @staticmethod
     def _verifier_schema(*, archify_required: bool = False) -> dict:
-        required = ["verdict", "summary", "checks", "evidence"]
+        required = ["verdict", "summary", "checks", "evidence", "repair_node_ids"]
         properties: dict[str, Any] = {
             "verdict": {"enum": ["accepted", "needs_fix", "blocked"]},
             "summary": {"type": "string"},
+            "repair_node_ids": {
+                "type": "array", "uniqueItems": True, "maxItems": 32,
+                "items": {"type": "string", "minLength": 1},
+                "description": "For needs_fix only: evidenced accepted worker owners whose source requires repair, including affected accepted descendants. Use an empty array when ownership is unknown or only the verification environment is unavailable.",
+            },
             "checks": {"type": "array", "minItems": 1, "items": {"type": "string"}},
             "evidence": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         }

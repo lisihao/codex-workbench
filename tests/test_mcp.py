@@ -4,6 +4,7 @@ import json
 import io
 from pathlib import Path
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -165,6 +166,10 @@ class MCPTests(unittest.TestCase):
             names,
             {
                 "workbench_validate_blocked_node",
+                "workbench_configure_node_recovery",
+                "workbench_get_node_recovery",
+                "workbench_read_session_notifications",
+                "workbench_ack_session_notification",
                 "workbench_amend_task_acceptance",
                 "workbench_request",
                 "workbench_get_request",
@@ -207,7 +212,22 @@ class MCPTests(unittest.TestCase):
         )
         self.assertEqual(swept["status"], "idle")
 
-    def test_list_tasks_has_deterministic_bounded_pagination(self) -> None:
+    def test_list_tasks_read_failure_is_observation_unavailable_without_task_changes(self) -> None:
+        self._create_list_task("mcp-observation-unavailable")
+        before = self.store.get_task("mcp-observation-unavailable")
+        with patch.object(
+            self.server, "_list_task_summaries",
+            side_effect=sqlite3.OperationalError("fixture read unavailable"),
+        ):
+            result = self.call("workbench_list_tasks", {"limit": 1})
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["state"], "observation_unavailable")
+        self.assertFalse(payload["task_state_changed"])
+        self.assertEqual(self.store.get_task("mcp-observation-unavailable"), before)
+
+    @patch("codex_workbench.task_observation.now_iso", return_value="2026-01-01T00:00:00+00:00")
+    def test_list_tasks_has_deterministic_bounded_pagination(self, _clock) -> None:
         for task_id in ("mcp-list-c", "mcp-list-a", "mcp-list-b"):
             self._create_list_task(task_id)
 
@@ -238,6 +258,7 @@ class MCPTests(unittest.TestCase):
                 "contract_hash",
                 "created_at",
                 "updated_at",
+                "current_status",
                 "node_counts",
             },
         )

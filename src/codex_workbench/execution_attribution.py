@@ -33,6 +33,7 @@ FailureOrigin = Literal[
     "verification",
     "scope",
     "cancel",
+    "tooling_bug",
     "unknown",
 ]
 ObservedIdentityStatus = Literal["attested", "unattested", "unknown"]
@@ -79,6 +80,7 @@ FAILURE_ORIGINS = frozenset(
         "transport",
         "model",
         "verification",
+        "tooling_bug",
         "scope",
         "cancel",
         "unknown",

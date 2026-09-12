@@ -267,6 +267,8 @@ codex mcp get codex-workbench
 
 连接恢复通过本地 MCP bridge 和同一 Authority 请求回执完成；断线不重建任务，也不重放已发出的写请求。客户端安装、分层诊断和受控回退见 [连接恢复](docs/connection-recovery.md)。升级时先更新 Authority，再更新 MacBook 客户端。
 
+任务级自动恢复的当前能力、显式配置、源码保留和部署等待见 [受阻任务恢复](docs/autonomous-blocked-recovery.md)。默认关闭；未安装的动作会明确拒绝，测试夹具不等于生产功能已启用。
+
 安装并信任 `wb` 插件后，在新会话或已有会话中输入：
 
 ```text

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import tempfile
 import uuid
 from typing import Any, Mapping
@@ -72,6 +73,21 @@ _TRANSACTION_FIELDS = frozenset({"schema_version", "managed_by", "state", "endpo
 _ENDPOINT_FIELDS = frozenset({"target", "stage", "backup", "had_target", "phase"})
 
 
+def _project_identity(source: Path | None = None) -> str:
+    """Load the canonical project-boundary text without importing Workbench."""
+
+    root = (source or Path(__file__).resolve().parents[1]).expanduser().resolve()
+    module = root / "src" / "codex_workbench" / "project_identity.py"
+    try:
+        values = runpy.run_path(str(module))
+    except OSError as error:
+        raise SystemExit(f"Workbench project identity source is unavailable: {module}") from error
+    identity = values.get("WORKBENCH_PROJECT_IDENTITY")
+    if not isinstance(identity, str) or not identity.strip() or "\x00" in identity:
+        raise SystemExit(f"Workbench project identity source is invalid: {module}")
+    return identity
+
+
 def _normalized_home(home: Path) -> Path:
     home = home.expanduser()
     return home if home.is_absolute() else Path.cwd() / home
@@ -81,6 +97,7 @@ def policy_block(agent: str) -> str:
     return "\n".join(
         (
             POLICY_START,
+            _project_identity(),
             "## Codex Workbench Code-as-Harness (managed)",
             f"Profile: `{PROFILE}`. Canonical skill: `{SKILL_NAME}`.",
             "- Define the acceptance boundary and affected-path scope before editing.",
