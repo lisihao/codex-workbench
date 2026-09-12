@@ -1802,6 +1802,7 @@ class Coordinator:
         request: ExecutionRequest | None = None
         failed_attempt_recovery = claimed.get("failed_attempt_recovery")
         accepted_source_repair = claimed.get("accepted_source_repair")
+        historical_accepted_source = claimed.get("historical_accepted_source")
         failed_attempt_assigned = False
         recovery_artifacts: dict[str, str] = {}
         try:
@@ -1821,25 +1822,60 @@ class Coordinator:
                     )
                 context.dependency_input_ref = input_receipt_ref
 
+            def validate_historical_dispatch() -> None:
+                """Do not start historical-source work after its claim or control state changed."""
+
+                if historical_accepted_source is None:
+                    return
+                from .historical_accepted_source import assert_historical_accepted_source_dispatch
+
+                try:
+                    assert_historical_accepted_source_dispatch(self.store, claimed)
+                except StateConflictError as error:
+                    raise DependencyInputError(
+                        f"historical accepted-source dispatch stopped: {error}"
+                    ) from error
+
             prepare_started_monotonic = time.monotonic()
             context.prepare_started_at = now_iso()
-            if accepted_source_repair is not None:
-                from .accepted_source_repair import prepare_accepted_source_repair
+            if historical_accepted_source is not None or accepted_source_repair is not None:
+                if historical_accepted_source is not None:
+                    from .historical_accepted_source import prepare_historical_accepted_source
 
-                prepared = prepare_accepted_source_repair(
-                    self.store, accepted_source_repair, self.worktrees,
-                )
+                    try:
+                        prepared = prepare_historical_accepted_source(
+                            self.store, historical_accepted_source, self.worktrees,
+                        )
+                    except StateConflictError as error:
+                        raise DependencyInputError(
+                            f"historical accepted-source preparation stopped: {error}"
+                        ) from error
+                    repair_artifact_kind = "historical-accepted-source"
+                else:
+                    from .accepted_source_repair import prepare_accepted_source_repair
+
+                    prepared = prepare_accepted_source_repair(
+                        self.store, accepted_source_repair, self.worktrees,
+                    )
+                    repair_artifact_kind = "accepted-source-repair"
                 worktree = prepared.worktree
                 dependency_input = prepared.dependency_input
                 prepared_ref = self.artifacts.put_text(
-                    canonical_json(prepared.receipt), "accepted-source-repair.json",
+                    canonical_json(prepared.receipt), repair_artifact_kind + ".json",
                 )
-                self.store.assign_worktree(
-                    claimed["task_id"], claimed["node_id"], str(worktree),
-                    attempt=claimed["attempt"], coordinator_epoch=claimed["coordinator_epoch"],
-                    lease_epoch=claimed["lease_epoch"], recovery_preflight=prepared.receipt,
-                )
-                recovery_artifacts["accepted-source-repair"] = prepared_ref
+                try:
+                    self.store.assign_worktree(
+                        claimed["task_id"], claimed["node_id"], str(worktree),
+                        attempt=claimed["attempt"], coordinator_epoch=claimed["coordinator_epoch"],
+                        lease_epoch=claimed["lease_epoch"], recovery_preflight=prepared.receipt,
+                    )
+                except StateConflictError as error:
+                    if historical_accepted_source is None:
+                        raise
+                    raise DependencyInputError(
+                        f"historical accepted-source assignment stopped: {error}"
+                    ) from error
+                recovery_artifacts[repair_artifact_kind] = prepared_ref
                 record_dependency_input()
                 self._materialize_worktree_dependencies(
                     worktree, context, timeout_seconds=int(contract["timeout_seconds"]),
@@ -1945,6 +1981,7 @@ class Coordinator:
                 except StateConflictError:
                     pass
                 return
+            validate_historical_dispatch()
             cache_spec = {
                 **effective_spec_with_dependency_input(spec, dependency_input),
                 "execution_readiness": self._readiness_fingerprint(readiness),
@@ -2037,6 +2074,7 @@ class Coordinator:
                 and context.quota_snapshot_id is None
             ):
                 decision = self._missing_quota_reference_decision(decision)
+            validate_historical_dispatch()
             execute_started_monotonic = time.monotonic()
             context.execute_started_at = now_iso()
             if decision is not None and decision.action != "claude":
