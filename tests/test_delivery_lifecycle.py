@@ -520,6 +520,12 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
         self.store.queue_task(blocker_task)
         blocker = self.store.claim_ready_node("quota-worker", self.epoch)
         self.assertEqual((blocker["task_id"], blocker["node_id"]), (blocker_task, "repair"))
+        # Scope release, not creation-time ordering against the blocker's
+        # newly-ready verifier, determines this fixture's expected claim.
+        self.store.set_task_priority(
+            candidate_task, 1,
+            expected_revision=self.store.get_task(candidate_task)["state_revision"],
+        )
         self.store.queue_task(candidate_task)
         self.assertIsNone(self.store.claim_ready_node("lifecycle-worker", self.epoch))
 
