@@ -50,9 +50,141 @@ _LIST_TASKS_NODE_STATES = (
 )
 
 
+_HISTORICAL_SOURCE_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "op": {"enum": ["preview", "apply", "status"]},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "node_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "accepted_event_cursor": {"type": "integer", "minimum": 1},
+    "expected_attempt": {"type": "integer", "minimum": 1},
+    "expected_revision": {"type": "integer", "minimum": 1},
+    "expected_contract_hash": {
+        "type": "string", "pattern": "^[0-9a-f]{64}$",
+    },
+    "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "expected_fingerprint": {
+        "type": "string", "pattern": "^[0-9a-f]{64}$",
+    },
+}
+
+
+_HISTORICAL_SOURCE_OPERATION_FIELDS = {
+    "status": frozenset({"op", "task_id", "request_id"}),
+    "preview": frozenset({
+        "op", "task_id", "node_id", "accepted_event_cursor", "expected_attempt",
+        "expected_revision", "expected_contract_hash", "request_id",
+    }),
+    "apply": frozenset({
+        "op", "task_id", "node_id", "accepted_event_cursor", "expected_attempt",
+        "expected_revision", "expected_contract_hash", "request_id", "expected_fingerprint",
+    }),
+}
+
+
+def _historical_source_schema_branch(operation: str) -> dict[str, Any]:
+    """Build one JSON Schema branch with an exact operation field set."""
+
+    fields = _HISTORICAL_SOURCE_OPERATION_FIELDS[operation]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": sorted(fields),
+        "properties": {
+            field: {"const": operation}
+            if field == "op"
+            else _HISTORICAL_SOURCE_FIELD_SCHEMAS[field]
+            for field in fields
+        },
+    }
+
+
+HISTORICAL_SOURCE_TOOL: dict[str, Any] = {
+    "name": "workbench_restore_accepted_source",
+    "description": (
+        "Preview, apply, or inspect restoration of one exact accepted source "
+        "event. Apply authorizes and queues one next attempt using the supplied "
+        "historical identity; it never creates a task or changes task-control permissions."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["op", "task_id", "request_id"],
+        "properties": _HISTORICAL_SOURCE_FIELD_SCHEMAS,
+        "oneOf": [
+            _historical_source_schema_branch("status"),
+            _historical_source_schema_branch("preview"),
+            _historical_source_schema_branch("apply"),
+        ],
+    },
+}
+
+
+def _historical_source_arguments(arguments: object) -> dict[str, Any]:
+    """Validate the exact per-operation historical-source request fields."""
+
+    if not isinstance(arguments, dict):
+        raise ValueError("historical source arguments must be an object")
+    op = arguments.get("op")
+    if not isinstance(op, str):
+        raise ValueError("historical source op is unsupported")
+    expected = _HISTORICAL_SOURCE_OPERATION_FIELDS.get(op)
+    if expected is None:
+        raise ValueError("historical source op is unsupported")
+    supplied = set(arguments)
+    if supplied != expected:
+        missing = sorted(expected - supplied)
+        unexpected = sorted(supplied - expected)
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unsupported " + ", ".join(unexpected))
+        raise ValueError("historical source operation requires exact fields: " + "; ".join(details))
+
+    normalized = dict(arguments)
+    for field in ("task_id", "request_id"):
+        value = normalized[field]
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 200
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+        ):
+            raise ValueError(f"{field} must be a non-empty string")
+    if op == "status":
+        return normalized
+    node_id = normalized["node_id"]
+    if not isinstance(node_id, str) or not node_id or node_id != node_id.strip() or len(node_id) > 200:
+        raise ValueError("node_id must be a non-empty string")
+    for field, minimum in (
+        ("accepted_event_cursor", 1),
+        ("expected_attempt", 1),
+        ("expected_revision", 1),
+    ):
+        value = normalized[field]
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{field} must be an integer >= {minimum}")
+    for field in ("expected_contract_hash", "expected_fingerprint"):
+        if field not in normalized:
+            continue
+        value = normalized[field]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return normalized
+
+
+def _invoke_historical_source(store: WorkbenchStore, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Call the domain adapter without importing it until the operation is used."""
+
+    from .historical_accepted_source import historical_accepted_source
+
+    return historical_accepted_source(store, arguments)
+
+
 TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
     LOCKFILE_HANDOFF_TOOL,
+    HISTORICAL_SOURCE_TOOL,
     *RECOVERY_TOOLS,
     *SESSION_NOTIFICATION_TOOLS,
     ACCEPTANCE_AMENDMENT_TOOL,
@@ -876,6 +1008,9 @@ class WorkbenchMCPServer:
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "workbench_handoff_lockfile":
             return self._text(lockfile_handoff(self.config, self.store, arguments))
+        if name == "workbench_restore_accepted_source":
+            validated = _historical_source_arguments(arguments)
+            return self._text(_invoke_historical_source(self.store, validated))
         if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
             return self._text(recovery_tool(self.store, name, arguments))
         if name in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:

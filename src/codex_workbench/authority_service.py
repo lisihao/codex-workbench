@@ -43,6 +43,7 @@ CREATE INDEX IF NOT EXISTS authority_requests_state_updated_idx
 # adapter never accepts a callable tool name from a client without this fence.
 MCP_TOOL_NAMES = frozenset({
     "workbench_handoff_lockfile",
+    "workbench_restore_accepted_source",
     "workbench_read_session_notifications",
     "workbench_ack_session_notification",
     "workbench_configure_node_recovery",
@@ -101,6 +102,9 @@ def is_read_only_tool(name: object, arguments: object) -> bool:
         return True
     if name == "workbench_handoff_lockfile":
         return arguments.get("op") in {"preview", "status"}
+    if name == "workbench_restore_accepted_source":
+        operation = arguments.get("op")
+        return isinstance(operation, str) and operation in {"preview", "status"}
     return name in {"workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance"} and arguments.get("dry_run") is True
 
 
@@ -481,6 +485,9 @@ class AuthorityService:
             bound_id = arguments.get("request_id") if operation == "apply" else arguments.get("operation_id")
             if request_id is None or bound_id != request_id or request["task_id"] is None:
                 raise ValueError("lockfile handoff mutation requires a matching journal identity and task_id")
+        if tool == "workbench_restore_accepted_source" and not is_read_only_tool(tool, arguments):
+            if request_id is None or arguments.get("request_id") != request_id or request["task_id"] is None:
+                raise ValueError("historical source mutation requires a matching journal identity and task_id")
         return request
 
     def _freeze_session_task_binding(

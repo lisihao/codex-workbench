@@ -10844,6 +10844,7 @@ class WorkbenchStore:
             selected_dirty_worktree_recovery: dict[str, Any] | None = None
             selected_failed_attempt_recovery: dict[str, Any] | None = None
             selected_accepted_source_repair: dict[str, Any] | None = None
+            selected_historical_accepted_source: dict[str, Any] | None = None
             selected_provider_readmission: dict[str, Any] | None = None
             handoff_admission: dict[str, bool] = {}
             for candidate in candidates:
@@ -10860,13 +10861,23 @@ class WorkbenchStore:
                     candidate["recovery_json"], next_attempt=candidate_attempt
                 )
                 from .accepted_source_repair import parse_accepted_source_repair_binding
+                from .historical_accepted_source import (
+                    parse_historical_accepted_source_binding,
+                )
 
                 accepted_source_repair = parse_accepted_source_repair_binding(
                     candidate["recovery_json"], next_attempt=candidate_attempt,
                 )
+                historical_accepted_source = parse_historical_accepted_source_binding(
+                    candidate["recovery_json"], next_attempt=candidate_attempt,
+                )
                 dirty_worktree_recovery = (
                     None
-                    if failed_attempt_recovery is not None or accepted_source_repair is not None
+                    if (
+                        failed_attempt_recovery is not None
+                        or accepted_source_repair is not None
+                        or historical_accepted_source is not None
+                    )
                     else self._current_dirty_worktree_recovery_binding(
                         candidate["recovery_json"],
                         next_attempt=candidate_attempt,
@@ -11026,6 +11037,7 @@ class WorkbenchStore:
                 selected_dirty_worktree_recovery = dirty_worktree_recovery
                 selected_failed_attempt_recovery = failed_attempt_recovery
                 selected_accepted_source_repair = accepted_source_repair
+                selected_historical_accepted_source = historical_accepted_source
                 selected_provider_readmission = provider_readmission
                 break
 
@@ -11124,6 +11136,11 @@ class WorkbenchStore:
                         "source_attempt": selected_accepted_source_repair["source"]["attempt"],
                         "source_allocation_id": selected_accepted_source_repair["source_allocation_id"],
                     }} if selected_accepted_source_repair is not None else {}),
+                    **({"historical_accepted_source": {
+                        "source_event_cursor": selected_historical_accepted_source["source_event_cursor"],
+                        "source_attempt": selected_historical_accepted_source["source"]["attempt"],
+                        "current_allocation_id": selected_historical_accepted_source["current"]["allocation_id"],
+                    }} if selected_historical_accepted_source is not None else {}),
                     **({"provider_readmission": selected_provider_readmission}
                        if selected_provider_readmission is not None else {}),
                     **({
@@ -11234,6 +11251,8 @@ class WorkbenchStore:
                 ) else {}),
                 **({"accepted_source_repair": selected_accepted_source_repair}
                    if selected_accepted_source_repair is not None else {}),
+                **({"historical_accepted_source": selected_historical_accepted_source}
+                   if selected_historical_accepted_source is not None else {}),
             }
 
     def _claim_repository_identities(self) -> dict[str, str]:
@@ -11422,6 +11441,9 @@ class WorkbenchStore:
         recovery_preflight: dict[str, Any] | None = None,
     ) -> None:
         from .accepted_source_repair import parse_accepted_source_repair_binding
+        from .historical_accepted_source import (
+            parse_historical_accepted_source_binding,
+        )
 
         with self.transaction() as connection:
             self._assert_active_coordinator(connection, coordinator_epoch)
@@ -11456,10 +11478,76 @@ class WorkbenchStore:
             recovery_binding = None
             consumed_recovery_json = None
             assigned_worktree = worktree
+            superseded_allocation_id: str | None = None
+            historical_binding = parse_historical_accepted_source_binding(
+                node["recovery_json"], next_attempt=attempt,
+            )
             accepted_binding = parse_accepted_source_repair_binding(
                 node["recovery_json"], next_attempt=attempt,
             )
-            if accepted_binding is not None:
+            if historical_binding is not None:
+                if task["state"] in {"paused", "cancelled"} or node["worktree"] is not None:
+                    raise StateConflictError(
+                        "historical accepted source assignment was paused, cancelled or already assigned"
+                    )
+                expected_preflight = {
+                    "schema_version": 1,
+                    "kind": "historical-accepted-source-v1",
+                    "state": "prepared",
+                    "binding_sha256": canonical_hash(historical_binding),
+                    "source_event_cursor": historical_binding["source_event_cursor"],
+                    "source_attempt": historical_binding["source"]["attempt"],
+                    "current_attempt": historical_binding["current_attempt"],
+                    "current_allocation_id": historical_binding["current"]["allocation_id"],
+                    "target_attempt": attempt,
+                    "target_worktree": worktree,
+                    "target_branch": branch,
+                    "patch_ref": historical_binding["source"]["patch_ref"],
+                    "patch_sha256": historical_binding["source"]["patch_sha256"],
+                }
+                if not isinstance(recovery_preflight, dict) or any(
+                    recovery_preflight.get(key) != value
+                    for key, value in expected_preflight.items()
+                ):
+                    raise StateConflictError(
+                        "historical accepted source target lacks matching prepared evidence"
+                    )
+                current_source = connection.execute(
+                    """
+                    SELECT state, repository, base_sha, branch, current_path, attempt, node_result_json
+                    FROM worktree_allocations WHERE allocation_id = ?
+                    """,
+                    (historical_binding["current"]["allocation_id"],),
+                ).fetchone()
+                if current_source is None or (
+                    current_source["state"] != "active"
+                    or current_source["repository"] != contract["repository"]
+                    or current_source["base_sha"] != contract["base_sha"]
+                    or current_source["branch"] != WorktreeManager.branch_name(
+                        task_id, node_id, historical_binding["current_attempt"]
+                    )
+                    or current_source["current_path"] != historical_binding["current"]["worktree"]
+                    or int(current_source["attempt"]) != historical_binding["current_attempt"]
+                    or current_source["node_result_json"] != historical_binding["current"]["result_json"]
+                ):
+                    raise StateConflictError(
+                        "historical accepted source current allocation changed before assignment"
+                    )
+                recovery_binding = historical_binding
+                superseded_allocation_id = historical_binding["current"]["allocation_id"]
+                consumed_recovery_json = canonical_json(
+                    {
+                        **historical_binding,
+                        "state": "assigned",
+                        "assignment": {
+                            "target_attempt": attempt,
+                            "target_worktree": worktree,
+                            "target_branch": branch,
+                            "assigned_at": timestamp,
+                        },
+                    }
+                )
+            elif accepted_binding is not None:
                 if task["state"] in {"paused", "cancelled"} or node["worktree"] is not None:
                     raise StateConflictError("accepted-source assignment was paused, cancelled or already assigned")
                 expected_preflight = {
@@ -11475,6 +11563,7 @@ class WorkbenchStore:
                 ):
                     raise StateConflictError("accepted-source target lacks matching prepared evidence")
                 recovery_binding = accepted_binding
+                superseded_allocation_id = accepted_binding["source_allocation_id"]
             elif node["recovery_json"] is not None:
                 if node["worktree"] is not None:
                     raise StateConflictError("dirty-worktree recovery target was already assigned")
@@ -11515,6 +11604,7 @@ class WorkbenchStore:
                     }
                 )
                 assigned_worktree = worktree
+                superseded_allocation_id = recovery_binding["source_allocation_id"]
             changed = connection.execute(
                 """
                 UPDATE nodes SET worktree = ?, recovery_json = ?, updated_at = ?
@@ -11534,14 +11624,14 @@ class WorkbenchStore:
             ).rowcount
             if changed != 1:
                 raise StateConflictError(f"node {node_id} lease is stale")
-            if recovery_binding is not None:
+            if superseded_allocation_id is not None:
                 superseded = connection.execute(
                     """
                     UPDATE worktree_allocations
                     SET state = 'superseded', updated_at = ?
                     WHERE allocation_id = ? AND state = 'active'
                     """,
-                    (timestamp, recovery_binding["source_allocation_id"]),
+                    (timestamp, superseded_allocation_id),
                 ).rowcount
                 if superseded != 1:
                     raise StateConflictError(
@@ -11582,7 +11672,24 @@ class WorkbenchStore:
                     "branch": branch,
                 },
             )
-            if accepted_binding is not None:
+            if historical_binding is not None:
+                self._event(
+                    connection,
+                    "node.historical_accepted_source_assigned",
+                    task_id,
+                    node_id,
+                    {
+                        "attempt": attempt,
+                        "source_event_cursor": historical_binding["source_event_cursor"],
+                        "source_attempt": historical_binding["source"]["attempt"],
+                        "current_allocation_id": historical_binding["current"]["allocation_id"],
+                        "target_worktree": assigned_worktree,
+                        "binding_sha256": canonical_hash(historical_binding),
+                        "prepared_receipt": recovery_preflight,
+                    },
+                    created_at=timestamp,
+                )
+            elif accepted_binding is not None:
                 self._event(connection, "node.accepted_source_repair_assigned", task_id, node_id, {
                     "attempt": attempt, "source_allocation_id": accepted_binding["source_allocation_id"],
                     "source_attempt": accepted_binding["source"]["attempt"],
@@ -11846,6 +11953,86 @@ class WorkbenchStore:
                 created_at=timestamp,
             )
 
+    @staticmethod
+    def _historical_accepted_source_for_settlement(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+        worktree: object,
+        contract_json: object,
+        raw: object,
+    ) -> dict[str, Any] | None:
+        """Validate one assigned historical-source target before settlement."""
+
+        from .historical_accepted_source import parse_historical_accepted_source_binding
+
+        binding = parse_historical_accepted_source_binding(
+            raw, next_attempt=attempt, allow_assigned=True
+        )
+        if binding is None:
+            return None
+        if binding["state"] != "assigned":
+            raise StateConflictError("historical accepted source target is not assigned")
+        assignment = binding.get("assignment")
+        if not isinstance(assignment, dict):
+            raise StateConflictError("historical accepted source assignment is missing")
+        if (
+            assignment.get("target_attempt") != attempt
+            or assignment.get("target_worktree") != worktree
+            or assignment.get("target_branch") != WorktreeManager.branch_name(
+                task_id, node_id, attempt
+            )
+        ):
+            raise StateConflictError("historical accepted source assignment is stale")
+        try:
+            contract = json.loads(str(contract_json))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("historical accepted source task contract is invalid") from error
+        if not isinstance(contract, dict) or (
+            contract.get("base_sha") != binding["current_base_sha"]
+            or contract.get("repository") is None
+        ):
+            raise StateConflictError("historical accepted source task contract changed")
+        target = connection.execute(
+            """
+            SELECT state, repository, base_sha, branch, current_path, attempt
+            FROM worktree_allocations
+            WHERE task_id = ? AND node_id = ? AND attempt = ?
+            """,
+            (task_id, node_id, attempt),
+        ).fetchone()
+        if target is None or (
+            target["state"] != "active"
+            or target["repository"] != contract["repository"]
+            or target["base_sha"] != binding["current_base_sha"]
+            or target["branch"] != assignment["target_branch"]
+            or target["current_path"] != assignment["target_worktree"]
+            or int(target["attempt"]) != attempt
+        ):
+            raise StateConflictError("historical accepted source target allocation changed")
+        current = connection.execute(
+            """
+            SELECT state, repository, base_sha, branch, current_path, attempt, node_result_json
+            FROM worktree_allocations WHERE allocation_id = ?
+            """,
+            (binding["current"]["allocation_id"],),
+        ).fetchone()
+        if current is None or (
+            current["state"] != "superseded"
+            or current["repository"] != contract["repository"]
+            or current["base_sha"] != binding["current_base_sha"]
+            or current["branch"] != WorktreeManager.branch_name(
+                task_id, node_id, binding["current_attempt"]
+            )
+            or current["current_path"] != binding["current"]["worktree"]
+            or int(current["attempt"]) != binding["current_attempt"]
+            or current["node_result_json"] != binding["current"]["result_json"]
+        ):
+            raise StateConflictError("historical accepted source current allocation changed")
+        return binding
+
     def _dirty_worktree_recovery_for_settlement(
         self,
         raw: object,
@@ -11868,6 +12055,12 @@ class WorkbenchStore:
         # structural/lease validation happens in ``settle_node`` before this
         # blocked-recovery-specific parser is reached.
         if stored.get("kind") == _FAILED_ATTEMPT_RECOVERY_KIND:
+            return None
+        # Historical accepted-source recovery has an assigned-target receipt
+        # and is validated by its own settlement fence before this legacy
+        # dirty-worktree parser. It must never be interpreted as a dirty
+        # source receipt merely because both use ``nodes.recovery_json``.
+        if stored.get("kind") == "historical-accepted-source-v1":
             return None
         state = stored.get("state")
         base_fields = {
@@ -12248,6 +12441,15 @@ class WorkbenchStore:
                 and failed_attempt_recovery["state"] == "capture_pending"
             ):
                 return signature
+            self._historical_accepted_source_for_settlement(
+                connection,
+                task_id=task_id,
+                node_id=node_id,
+                attempt=attempt,
+                worktree=row["worktree"],
+                contract_json=row["contract_json"],
+                raw=row["recovery_json"],
+            )
             spec = json.loads(row["spec_json"])
             self._validate_result_contract(
                 connection,
@@ -12324,6 +12526,15 @@ class WorkbenchStore:
                     timestamp=timestamp,
                 )
                 return
+            historical_accepted_source = self._historical_accepted_source_for_settlement(
+                connection,
+                task_id=task_id,
+                node_id=node_id,
+                attempt=attempt,
+                worktree=row["worktree"],
+                contract_json=row["contract_json"],
+                raw=row["recovery_json"],
+            )
             spec = json.loads(row["spec_json"])
             contract = json.loads(row["contract_json"])
             recovery = self._dirty_worktree_recovery_for_settlement(
@@ -12458,6 +12669,12 @@ class WorkbenchStore:
                         "source_node_state": failed_attempt_recovery["source_node_state"],
                         "source_task_state": failed_attempt_recovery["source_task_state"],
                     }
+            if historical_accepted_source is not None:
+                node_event["historical_accepted_source"] = {
+                    "source_event_cursor": historical_accepted_source["source_event_cursor"],
+                    "source_attempt": historical_accepted_source["source"]["attempt"],
+                    "current_allocation_id": historical_accepted_source["current"]["allocation_id"],
+                }
             if retry_recovery is not None:
                 node_event["failed_attempt_recovery"] = {
                     "source_attempt": retry_recovery["source"]["attempt"],

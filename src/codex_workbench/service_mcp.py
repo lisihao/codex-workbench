@@ -69,10 +69,13 @@ class AuthorityMCPAdapter:
                 else:
                     copied = dict(arguments)
                     read_only = tool.get("annotations", {}).get("readOnlyHint") is True
-                    if name == "workbench_handoff_lockfile":
+                    if name in {"workbench_handoff_lockfile", "workbench_restore_accepted_source"}:
                         read_only = is_read_only_tool(name, copied)
                         service_request_id = copied.get(
-                            "operation_id" if copied.get("op") in {"cancel", "reconcile"} else "request_id"
+                            "operation_id"
+                            if name == "workbench_handoff_lockfile"
+                            and copied.get("op") in {"cancel", "reconcile"}
+                            else "request_id"
                         )
                     else:
                         service_request_id = copied.pop("request_id", None)
