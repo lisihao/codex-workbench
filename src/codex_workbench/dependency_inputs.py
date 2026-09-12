@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -8,11 +8,36 @@ import subprocess
 from typing import Any
 
 from .artifacts import ArtifactStore
+from .lockfile_handoff_input import (
+    LockfileHandoff,
+    LockfileHandoffInputError,
+    apply_pending_lockfile_handoffs,
+    derive_lockfile_handoff_input_tree,
+    normalize_lockfile_handoffs,
+    recorded_handoff_identity,
+    require_all_handoffs_applied,
+    select_lockfile_handoffs_for_target,
+    validate_lockfile_handoff_manifests,
+)
 from .worktrees import WorktreeError, WorktreeManager
 
 
 class DependencyInputError(WorktreeError):
     """An accepted dependency cannot provide a reproducible worker input."""
+
+
+_DEPENDENCY_INPUT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "node_id",
+        "contract_base_sha",
+        "input_tree_sha",
+        "ancestors",
+    }
+)
+_DEPENDENCY_INPUT_SCHEMA_2_FIELDS = _DEPENDENCY_INPUT_FIELDS | {"lockfile_handoffs"}
 
 
 @dataclass(frozen=True)
@@ -27,6 +52,8 @@ def validate_dependency_input_lineage(
     task: Mapping[str, Any],
     node_id: str,
     dependency_input: DependencyInput,
+    *,
+    artifacts: ArtifactStore | None = None,
 ) -> None:
     """Require one loaded dependency input to match the current accepted closure.
 
@@ -97,6 +124,29 @@ def validate_dependency_input_lineage(
         raise DependencyInputError(
             "dependency input receipt ancestor lineage does not match accepted closure"
         )
+    handoffs = _receipt_lockfile_handoffs(receipt)
+    if not handoffs:
+        return
+    if artifacts is None:
+        raise DependencyInputError(
+            "lockfile dependency input validation requires an artifact store"
+        )
+    try:
+        selected = select_lockfile_handoffs_for_target(
+            artifacts,
+            task,
+            node_id,
+            ancestors=raw_ancestors,
+            ready_handoffs=handoffs,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile dependency input is invalid: {error}"
+        ) from error
+    if len(selected) != len(handoffs):
+        raise DependencyInputError(
+            "dependency input includes a lockfile handoff that does not apply to its target"
+        )
 
 
 def base_dependency_input(
@@ -154,18 +204,16 @@ def load_recorded_dependency_input(
         ) from error
     if not isinstance(payload, dict):
         raise DependencyInputError("recorded dependency input must be an object")
-    required = {
-        "schema_version",
-        "kind",
-        "task_id",
-        "node_id",
-        "contract_base_sha",
-        "input_tree_sha",
-        "ancestors",
-    }
+    schema_version = payload.get("schema_version")
+    if schema_version == 1:
+        required = _DEPENDENCY_INPUT_FIELDS
+    elif schema_version == 2:
+        required = _DEPENDENCY_INPUT_SCHEMA_2_FIELDS
+    else:
+        raise DependencyInputError("recorded dependency input schema is unsupported")
     if set(payload) != required:
         raise DependencyInputError("recorded dependency input has an invalid shape")
-    if payload["schema_version"] != 1 or payload["kind"] != "accepted-ancestor-patch-input":
+    if payload["kind"] != "accepted-ancestor-patch-input":
         raise DependencyInputError("recorded dependency input schema is unsupported")
     if payload["task_id"] != task_id or payload["node_id"] != node_id:
         raise DependencyInputError("recorded dependency input belongs to another node")
@@ -200,18 +248,35 @@ def load_recorded_dependency_input(
         normalized_ancestors.append(
             {"node_id": source_node_id, "attempt": attempt, "patch_ref": patch_ref}
         )
-    return DependencyInput(
-        input_tree_sha=input_tree_sha,
-        receipt={
-            "schema_version": 1,
-            "kind": "accepted-ancestor-patch-input",
-            "task_id": task_id,
-            "node_id": node_id,
-            "contract_base_sha": base_sha,
-            "input_tree_sha": input_tree_sha,
-            "ancestors": normalized_ancestors,
-        },
-    )
+    receipt: dict[str, Any] = {
+        "schema_version": schema_version,
+        "kind": "accepted-ancestor-patch-input",
+        "task_id": task_id,
+        "node_id": node_id,
+        "contract_base_sha": base_sha,
+        "input_tree_sha": input_tree_sha,
+        "ancestors": normalized_ancestors,
+    }
+    if schema_version == 2:
+        raw_handoffs = payload["lockfile_handoffs"]
+        try:
+            handoffs = normalize_lockfile_handoffs(
+                artifacts,
+                raw_handoffs,
+                task_id=task_id,
+            )
+        except LockfileHandoffInputError as error:
+            raise DependencyInputError(
+                f"recorded dependency input lockfile handoffs are invalid: {error}"
+            ) from error
+        if not handoffs:
+            raise DependencyInputError(
+                "recorded dependency input schema 2 requires a lockfile handoff"
+            )
+        receipt["lockfile_handoffs"] = [
+            dict(handoff.receipt) for handoff in handoffs
+        ]
+    return DependencyInput(input_tree_sha=input_tree_sha, receipt=receipt)
 
 
 def apply_recorded_dependency_input(
@@ -234,17 +299,66 @@ def apply_recorded_dependency_input(
         base_sha=base_sha,
     )
     _require_clean_worktree(worktree)
+    handoffs = _normalized_recorded_handoffs(artifacts, dependency_input)
+    applied_request_ids: set[str] = set()
+    applied_sources: list[dict[str, Any]] = []
+    try:
+        apply_pending_lockfile_handoffs(
+            worktree,
+            artifacts,
+            handoffs,
+            applied_sources,
+            applied_request_ids=applied_request_ids,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"cannot apply recorded lockfile handoff input: {error}"
+        ) from error
     for source in dependency_input.receipt["ancestors"]:
         patch_ref = source["patch_ref"]
         if patch_ref is None:
-            continue
+            applied_sources.append(source)
+        else:
+            try:
+                manager.apply_patch(worktree, artifacts.verify(patch_ref))
+            except (ValueError, WorktreeError) as error:
+                raise DependencyInputError(
+                    f"cannot apply recorded dependency {source['node_id']} patch"
+                ) from error
+            applied_sources.append(source)
         try:
-            manager.apply_patch(worktree, artifacts.verify(patch_ref))
-        except (ValueError, WorktreeError) as error:
+            apply_pending_lockfile_handoffs(
+                worktree,
+                artifacts,
+                handoffs,
+                applied_sources,
+                applied_request_ids=applied_request_ids,
+            )
+        except LockfileHandoffInputError as error:
             raise DependencyInputError(
-                f"cannot apply recorded dependency {source['node_id']} patch"
+                f"cannot apply recorded lockfile handoff input: {error}"
             ) from error
-    actual_tree = write_input_tree(worktree)
+    try:
+        require_all_handoffs_applied(
+            worktree,
+            artifacts,
+            handoffs,
+            applied_request_ids=applied_request_ids,
+        )
+        actual_tree = (
+            derive_lockfile_handoff_input_tree(
+                worktree,
+                write_input_tree(worktree),
+                artifacts,
+                handoffs,
+            )
+            if handoffs
+            else write_input_tree(worktree)
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"recorded dependency input lockfile handoff did not reproduce: {error}"
+        ) from error
     if actual_tree != dependency_input.input_tree_sha:
         raise DependencyInputError(
             "recorded dependency input did not reproduce its input tree"
@@ -258,6 +372,8 @@ def apply_accepted_ancestor_patches(
     worktree: Path,
     artifacts: ArtifactStore,
     manager: WorktreeManager,
+    *,
+    ready_lockfile_handoffs: object = (),
 ) -> DependencyInput | None:
     """Apply just ``node_id``'s accepted dependency closure to ``worktree``.
 
@@ -268,12 +384,37 @@ def apply_accepted_ancestor_patches(
     """
 
     ancestors = accepted_ancestor_nodes(task, node_id)
-    if not ancestors:
+    sources = [_source_receipt(ancestor) for ancestor in ancestors]
+    try:
+        handoffs = select_lockfile_handoffs_for_target(
+            artifacts,
+            task,
+            node_id,
+            ancestors=sources,
+            ready_handoffs=ready_lockfile_handoffs,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile handoff input is unavailable: {error}"
+        ) from error
+    if not ancestors and not handoffs:
         return None
     _require_clean_worktree(worktree)
-    sources: list[dict[str, Any]] = []
-    for ancestor in ancestors:
-        source = _source_receipt(ancestor)
+    applied_sources: list[dict[str, Any]] = []
+    applied_request_ids: set[str] = set()
+    try:
+        apply_pending_lockfile_handoffs(
+            worktree,
+            artifacts,
+            handoffs,
+            applied_sources,
+            applied_request_ids=applied_request_ids,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"cannot apply lockfile handoff input: {error}"
+        ) from error
+    for source in sources:
         patch_ref = source["patch_ref"]
         if patch_ref is not None:
             try:
@@ -288,8 +429,40 @@ def apply_accepted_ancestor_patches(
                 raise DependencyInputError(
                     f"cannot apply accepted dependency {source['node_id']} patch"
                 ) from error
-        sources.append(source)
-    input_tree_sha = write_input_tree(worktree)
+        applied_sources.append(source)
+        try:
+            apply_pending_lockfile_handoffs(
+                worktree,
+                artifacts,
+                handoffs,
+                applied_sources,
+                applied_request_ids=applied_request_ids,
+            )
+        except LockfileHandoffInputError as error:
+            raise DependencyInputError(
+                f"cannot apply lockfile handoff input: {error}"
+            ) from error
+    try:
+        require_all_handoffs_applied(
+            worktree,
+            artifacts,
+            handoffs,
+            applied_request_ids=applied_request_ids,
+        )
+        input_tree_sha = (
+            derive_lockfile_handoff_input_tree(
+                worktree,
+                write_input_tree(worktree),
+                artifacts,
+                handoffs,
+            )
+            if handoffs
+            else write_input_tree(worktree)
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile handoff input did not reproduce: {error}"
+        ) from error
     task_id = task.get("task_id")
     contract = task.get("contract")
     if not isinstance(task_id, str) or not isinstance(contract, Mapping):
@@ -297,18 +470,141 @@ def apply_accepted_ancestor_patches(
     base_sha = contract.get("base_sha")
     if not isinstance(base_sha, str) or not base_sha:
         raise DependencyInputError("dependency task snapshot lacks contract base")
-    return DependencyInput(
-        input_tree_sha=input_tree_sha,
-        receipt={
-            "schema_version": 1,
-            "kind": "accepted-ancestor-patch-input",
-            "task_id": task_id,
-            "node_id": node_id,
-            "contract_base_sha": base_sha,
-            "input_tree_sha": input_tree_sha,
-            "ancestors": sources,
-        },
-    )
+    receipt: dict[str, Any] = {
+        "schema_version": 2 if handoffs else 1,
+        "kind": "accepted-ancestor-patch-input",
+        "task_id": task_id,
+        "node_id": node_id,
+        "contract_base_sha": base_sha,
+        "input_tree_sha": input_tree_sha,
+        "ancestors": sources,
+    }
+    if handoffs:
+        receipt["lockfile_handoffs"] = [
+            dict(handoff.receipt) for handoff in handoffs
+        ]
+    return DependencyInput(input_tree_sha=input_tree_sha, receipt=receipt)
+
+
+def apply_ready_lockfile_handoffs_to_dependency_input(
+    task: Mapping[str, Any],
+    node_id: str,
+    worktree: Path,
+    artifacts: ArtifactStore,
+    dependency_input: DependencyInput,
+    *,
+    ready_lockfile_handoffs: object,
+    manifest_phase: str = "baseline",
+) -> DependencyInput:
+    """Derive a new input tree after replaying ready lockfile handoffs.
+
+    Callers restore the supplied dependency input before this function. The
+    function stages only the lockfile in a temporary index, so a dirty source
+    patch remains a worker delta rather than becoming part of the derived
+    baseline.
+    """
+
+    if not isinstance(dependency_input, DependencyInput):
+        raise DependencyInputError("dependency input is invalid")
+    receipt = dependency_input.receipt
+    if not isinstance(receipt, Mapping):
+        raise DependencyInputError("dependency input receipt is invalid")
+    raw_ancestors = receipt.get("ancestors")
+    if not isinstance(raw_ancestors, list):
+        raise DependencyInputError("dependency input receipt ancestors are invalid")
+    try:
+        existing = _normalized_recorded_handoffs(artifacts, dependency_input)
+        selected = select_lockfile_handoffs_for_target(
+            artifacts,
+            task,
+            node_id,
+            ancestors=raw_ancestors,
+            ready_handoffs=ready_lockfile_handoffs,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile handoff input is unavailable: {error}"
+        ) from error
+    if not selected:
+        return dependency_input
+    try:
+        validate_lockfile_handoff_manifests(
+            worktree,
+            selected,
+            manifest_phase=manifest_phase,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile handoff input is unavailable: {error}"
+        ) from error
+    existing_by_identity = {
+        recorded_handoff_identity(handoff): handoff for handoff in existing
+    }
+    additions: list[LockfileHandoff] = []
+    for selected_handoff in selected:
+        identity = recorded_handoff_identity(selected_handoff)
+        recorded = existing_by_identity.get(identity)
+        if recorded is not None:
+            if recorded.receipt != selected_handoff.receipt:
+                raise DependencyInputError(
+                    "recorded lockfile handoff drifted from the durable ready receipt"
+                )
+            continue
+        additions.append(selected_handoff)
+    if not additions:
+        return dependency_input
+    combined = (*existing, *additions)
+    try:
+        # Revalidate ordering and every artifact before changing the worktree.
+        normalized_combined = normalize_lockfile_handoffs(
+            artifacts,
+            [handoff.receipt for handoff in combined],
+            task_id=str(receipt.get("task_id", "")),
+            contract=task.get("contract") if isinstance(task.get("contract"), Mapping) else None,
+            contract_hash=(
+                task.get("contract_hash")
+                if isinstance(task.get("contract_hash"), str)
+                else None
+            ),
+        )
+        applied_request_ids: set[str] = set()
+        apply_pending_lockfile_handoffs(
+            worktree,
+            artifacts,
+            additions,
+            raw_ancestors,
+            applied_request_ids=applied_request_ids,
+            manifest_phase=manifest_phase,
+        )
+        require_all_handoffs_applied(
+            worktree,
+            artifacts,
+            additions,
+            applied_request_ids=applied_request_ids,
+        )
+        input_tree_sha = derive_lockfile_handoff_input_tree(
+            worktree,
+            dependency_input.input_tree_sha,
+            artifacts,
+            additions,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"cannot derive lockfile handoff input: {error}"
+        ) from error
+    derived = {
+        "schema_version": 2,
+        "kind": "accepted-ancestor-patch-input",
+        "task_id": receipt.get("task_id"),
+        "node_id": receipt.get("node_id"),
+        "contract_base_sha": receipt.get("contract_base_sha"),
+        "input_tree_sha": input_tree_sha,
+        "ancestors": [dict(source) for source in raw_ancestors],
+        "lockfile_handoffs": [
+            dict(handoff.receipt) for handoff in normalized_combined
+        ],
+    }
+    return DependencyInput(input_tree_sha=input_tree_sha, receipt=derived)
 
 
 def accepted_ancestor_nodes(task: Mapping[str, Any], node_id: str) -> tuple[Mapping[str, Any], ...]:
@@ -376,6 +672,43 @@ def changed_paths_since_input_tree(worktree: Path, input_tree_sha: str) -> set[s
     return changed
 
 
+def _receipt_lockfile_handoffs(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
+    schema_version = receipt.get("schema_version")
+    if schema_version == 1:
+        if set(receipt) != _DEPENDENCY_INPUT_FIELDS:
+            raise DependencyInputError("dependency input receipt has an invalid shape")
+        return []
+    if schema_version != 2 or set(receipt) != _DEPENDENCY_INPUT_SCHEMA_2_FIELDS:
+        raise DependencyInputError("dependency input receipt has an invalid shape")
+    handoffs = receipt.get("lockfile_handoffs")
+    if isinstance(handoffs, (str, bytes)) or not isinstance(handoffs, list) or not handoffs:
+        raise DependencyInputError("dependency input lockfile handoffs are invalid")
+    if not all(isinstance(handoff, dict) for handoff in handoffs):
+        raise DependencyInputError("dependency input lockfile handoff is invalid")
+    return handoffs
+
+
+def _normalized_recorded_handoffs(
+    artifacts: ArtifactStore,
+    dependency_input: DependencyInput,
+) -> tuple[LockfileHandoff, ...]:
+    receipt = dependency_input.receipt
+    if not isinstance(receipt, Mapping):
+        raise DependencyInputError("dependency input receipt is invalid")
+    handoffs = _receipt_lockfile_handoffs(receipt)
+    if not handoffs:
+        return ()
+    task_id = receipt.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise DependencyInputError("dependency input receipt has an invalid task id")
+    try:
+        return normalize_lockfile_handoffs(artifacts, handoffs, task_id=task_id)
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"dependency input lockfile handoffs are invalid: {error}"
+        ) from error
+
+
 def effective_spec_with_dependency_input(
     spec: Mapping[str, Any], dependency_input: DependencyInput | None
 ) -> dict[str, Any]:
@@ -390,13 +723,29 @@ def effective_spec_with_dependency_input(
     effective = dict(spec)
     if dependency_input is not None:
         receipt = dependency_input.receipt
-        effective["dependency_input"] = {
+        dependency_spec: dict[str, Any] = {
             "contract_base_sha": receipt["contract_base_sha"],
             "input_tree_sha": dependency_input.input_tree_sha,
             "ancestor_patch_refs": tuple(
                 source["patch_ref"] for source in receipt["ancestors"]
             ),
         }
+        handoffs = (
+            _receipt_lockfile_handoffs(receipt)
+            if receipt.get("schema_version") in {1, 2}
+            else []
+        )
+        if handoffs:
+            dependency_spec["lockfile_handoff_refs"] = tuple(
+                (
+                    handoff["request_id"],
+                    handoff["ready_event_cursor"],
+                    handoff["lockfile"]["artifact_ref"],
+                    handoff["lockfile"]["sha256"],
+                )
+                for handoff in handoffs
+            )
+        effective["dependency_input"] = dependency_spec
     return effective
 
 

@@ -15,6 +15,7 @@ from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
 from .node_recovery_api import RECOVERY_TOOLS, recovery_tool
+from .lockfile_handoff import TOOL as LOCKFILE_HANDOFF_TOOL, lockfile_handoff
 from .session_notifications_api import SESSION_NOTIFICATION_TOOLS, session_notification_tool
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .dirty_worktree_recovery import observed_indeterminate_recovery_paths
@@ -51,6 +52,7 @@ _LIST_TASKS_NODE_STATES = (
 
 TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
+    LOCKFILE_HANDOFF_TOOL,
     *RECOVERY_TOOLS,
     *SESSION_NOTIFICATION_TOOLS,
     ACCEPTANCE_AMENDMENT_TOOL,
@@ -872,6 +874,8 @@ class WorkbenchMCPServer:
         return str(row["task_id"])
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "workbench_handoff_lockfile":
+            return self._text(lockfile_handoff(self.config, self.store, arguments))
         if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
             return self._text(recovery_tool(self.store, name, arguments))
         if name in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:

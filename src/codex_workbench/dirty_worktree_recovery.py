@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterator, Mapping
 
 from .artifacts import ArtifactStore
 from .dependency_inputs import (
+    DependencyInput,
     DependencyInputError,
     apply_recorded_dependency_input,
     changed_paths_since_input_tree,
@@ -624,6 +625,7 @@ class RecoveryOutcome:
     exit_code: int | None = None
     prepared_recovery: dict[str, object] | None = None
     failure_code: str | None = None
+    prepared_dependency_input: DependencyInput | None = None
 
 
 def _bounded(text: str, *, limit: int = 1_000_000) -> str:
@@ -1000,11 +1002,12 @@ class PnpmOfflineMaterializer:
             "--offline",
             "--frozen-lockfile",
             "--ignore-scripts",
-            "--pm-on-fail=ignore",
             "--config.minimumReleaseAge=0",
             "--config.trustLockfile=true",
             "--reporter=append-only",
         )
+        if actual_semver[0] >= 11:
+            install_command += ("--pm-on-fail=ignore",)
         if self.store_dir is not None:
             store_dir = self.store_dir.resolve(strict=False)
             if not store_dir.is_dir():
@@ -1712,6 +1715,7 @@ class DirtyWorktreeRecovery:
         timeout_seconds: int,
         source_only: bool = False,
         expected_source_delta_sha256: str | None = None,
+        prepare_dependency_input: Callable[[Path], DependencyInput] | None = None,
     ) -> RecoveryOutcome:
         """Prepare a verified recovery target without ever executing in source.
 
@@ -1759,6 +1763,14 @@ class DirtyWorktreeRecovery:
                 target,
                 self._recovery_untracked_paths(recovery),
             )
+            prepared_dependency_input: DependencyInput | None = None
+            if prepare_dependency_input is not None:
+                prepared_dependency_input = prepare_dependency_input(target)
+                if not isinstance(prepared_dependency_input, DependencyInput):
+                    raise DirtyWorktreeRecoveryError(
+                        "recovery lockfile handoff preparation did not return a dependency input"
+                    )
+                comparison_tree = prepared_dependency_input.input_tree_sha
             if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "recovery target patch does not exactly match the captured source patch"
@@ -1855,6 +1867,7 @@ class DirtyWorktreeRecovery:
                 "target_worktree": str(target),
                 "target_branch": target_branch,
                 "target_patch_sha256": sha256(patch).hexdigest(),
+                "dependency_input_tree_sha": comparison_tree,
                 "preparation_log_ref": log_ref,
             }
             return RecoveryOutcome(
@@ -1868,6 +1881,7 @@ class DirtyWorktreeRecovery:
                 tuple(checks),
                 tuple(str(path) for path in recovery["changed_paths"]),
                 prepared_recovery=prepared_recovery,
+                prepared_dependency_input=prepared_dependency_input,
             )
         except DirtyWorktreeRecoveryError as error:
             return RecoveryOutcome(
@@ -1927,6 +1941,7 @@ class DirtyWorktreeRecovery:
         target_attempt: int,
         recovery: Mapping[str, object],
         source_only: bool = False,
+        prepare_dependency_input: Callable[[Path], DependencyInput] | None = None,
     ) -> RecoveryOutcome:
         """Restore a sealed failed attempt before its normal executor runs.
 
@@ -1955,6 +1970,14 @@ class DirtyWorktreeRecovery:
                 target,
                 self._recovery_untracked_paths(recovery),
             )
+            prepared_dependency_input: DependencyInput | None = None
+            if prepare_dependency_input is not None:
+                prepared_dependency_input = prepare_dependency_input(target)
+                if not isinstance(prepared_dependency_input, DependencyInput):
+                    raise DirtyWorktreeRecoveryError(
+                        "retry lockfile handoff preparation did not return a dependency input"
+                    )
+                comparison_tree = prepared_dependency_input.input_tree_sha
             if self._git_bytes(target, "diff", "--binary", comparison_tree) != patch:
                 raise DirtyWorktreeRecoveryError(
                     "retry target patch does not exactly match the captured failed attempt"
@@ -1978,7 +2001,9 @@ class DirtyWorktreeRecovery:
                     "target_worktree": str(target),
                     "target_branch": target_branch,
                     "target_patch_sha256": sha256(patch).hexdigest(),
+                    "dependency_input_tree_sha": comparison_tree,
                 },
+                prepared_dependency_input=prepared_dependency_input,
             )
         except DirtyWorktreeRecoveryError as error:
             return RecoveryOutcome(

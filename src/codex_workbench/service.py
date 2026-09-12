@@ -20,6 +20,7 @@ from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
     apply_accepted_ancestor_patches,
+    apply_ready_lockfile_handoffs_to_dependency_input,
     apply_recorded_dependency_input,
     base_dependency_input,
     changed_paths_since_input_tree,
@@ -1857,7 +1858,7 @@ class Coordinator:
                 )
                 if spec.get("verifier"):
                     dependency_input = self._compose_worker_patches(claimed["task_id"], worktree)
-                elif spec.get("depends_on"):
+                else:
                     dependency_input = self._prepare_dependency_input(
                         claimed["task_id"], claimed["node_id"], worktree
                     )
@@ -2393,6 +2394,7 @@ class Coordinator:
                 self.store.get_task(claimed["task_id"]),
                 claimed["node_id"],
                 dependency_input,
+                artifacts=self.artifacts,
             )
         else:
             if spec.get("depends_on"):
@@ -2495,6 +2497,22 @@ class Coordinator:
                     raise DirtyWorktreeRecoveryError(
                         "failed-attempt recovery input lineage changed before retry"
                     )
+                retry_dependency_input = (
+                    self._apply_ready_lockfile_handoffs_to_recovery_input(
+                        claimed,
+                        target,
+                        dependency_input,
+                    )
+                )
+                retry_dependency_ref = (
+                    dependency_ref
+                    if retry_dependency_input.input_tree_sha
+                    == dependency_input.input_tree_sha
+                    else self.artifacts.put_text(
+                        canonical_json(retry_dependency_input.receipt),
+                        "dependency-input.json",
+                    )
+                )
                 if source_only_extraction:
                     assert_source_delta_current("while its clean retry was being prepared")
                 elif tuple(
@@ -2530,8 +2548,8 @@ class Coordinator:
                 )
                 return (
                     target,
-                    dependency_input,
-                    dependency_ref,
+                    retry_dependency_input,
+                    retry_dependency_ref,
                     (
                         {"generated-residue": generated_residue_ref}
                         if generated_residue_ref is not None
@@ -2586,15 +2604,27 @@ class Coordinator:
                 target_attempt=target_attempt,
                 recovery=recovery,
                 source_only=source_only,
+                prepare_dependency_input=lambda prepared_target: (
+                    self._apply_ready_lockfile_handoffs_to_recovery_input(
+                        claimed,
+                        prepared_target,
+                        dependency_input,
+                        manifest_phase="prepared",
+                    )
+                ),
             )
             if outcome.status != "succeeded":
                 raise DirtyWorktreeRecoveryError(outcome.summary)
             prepared_recovery = outcome.prepared_recovery
+            retry_dependency_input = (
+                outcome.prepared_dependency_input or dependency_input
+            )
             expected_prepared = {
                 "target_attempt": target_attempt,
                 "target_worktree": str(target),
                 "target_branch": target_branch,
                 "target_patch_sha256": recovery["patch_sha256"],
+                "dependency_input_tree_sha": retry_dependency_input.input_tree_sha,
             }
             if not isinstance(prepared_recovery, dict) or any(
                 prepared_recovery.get(key) != value
@@ -2603,6 +2633,15 @@ class Coordinator:
                 raise DirtyWorktreeRecoveryError(
                     "failed-attempt recovery prepared target does not match the captured patch"
                 )
+            retry_dependency_ref = (
+                dependency_ref
+                if retry_dependency_input.input_tree_sha
+                == dependency_input.input_tree_sha
+                else self.artifacts.put_text(
+                    canonical_json(retry_dependency_input.receipt),
+                    "dependency-input.json",
+                )
+            )
             if source_only:
                 self._materialize_worktree_dependencies(
                     target,
@@ -2625,8 +2664,8 @@ class Coordinator:
             )
             return (
                 target,
-                dependency_input,
-                dependency_ref,
+                retry_dependency_input,
+                retry_dependency_ref,
                 {
                     "failed-attempt-recovery": recovery_ref,
                     "failed-attempt-recovery-snapshot": str(recovery["patch_ref"]),
@@ -2819,6 +2858,32 @@ class Coordinator:
             )
         source_worktree = str(recovery["source_worktree"])
         target_attempt = int(claimed["attempt"])
+        recorded_dependency_ref = recovery.get("dependency_input_ref")
+        if recorded_dependency_ref is not None and (
+            not isinstance(recorded_dependency_ref, str) or not recorded_dependency_ref
+        ):
+            raise WorktreeError(
+                "blocked-worktree recovery dependency input reference is invalid"
+            )
+        if recorded_dependency_ref is None and spec.get("depends_on"):
+            raise WorktreeError(
+                "blocked-worktree recovery dependent worker lacks its recorded dependency input"
+            )
+        recorded_dependency_input: DependencyInput | None = None
+        if isinstance(recorded_dependency_ref, str):
+            recorded_dependency_input = load_recorded_dependency_input(
+                self.artifacts,
+                recorded_dependency_ref,
+                task_id=claimed["task_id"],
+                node_id=claimed["node_id"],
+                base_sha=contract["base_sha"],
+            )
+            validate_dependency_input_lineage(
+                self.store.get_task(claimed["task_id"]),
+                claimed["node_id"],
+                recorded_dependency_input,
+                artifacts=self.artifacts,
+            )
         target = self.worktrees.prepare_clean(
             contract["repository"],
             contract["base_sha"],
@@ -2829,6 +2894,27 @@ class Coordinator:
         target_branch = self.worktrees.branch_name(
             claimed["task_id"], claimed["node_id"], target_attempt
         )
+        ready_lockfile_handoffs = self._ready_lockfile_handoffs(claimed["task_id"])
+
+        def prepare_dependency_input(prepared_target: Path) -> DependencyInput:
+            baseline = recorded_dependency_input
+            if baseline is None:
+                baseline = base_dependency_input(
+                    task_id=claimed["task_id"],
+                    node_id=claimed["node_id"],
+                    base_sha=contract["base_sha"],
+                    worktree=prepared_target,
+                )
+            return apply_ready_lockfile_handoffs_to_dependency_input(
+                self.store.get_task(claimed["task_id"]),
+                claimed["node_id"],
+                prepared_target,
+                self.artifacts,
+                baseline,
+                ready_lockfile_handoffs=ready_lockfile_handoffs,
+                manifest_phase="prepared",
+            )
+
         outcome = self.blocked_worktree_recovery.prepare(
             repository=contract["repository"],
             source_worktree=source_worktree,
@@ -2840,6 +2926,7 @@ class Coordinator:
             timeout_seconds=int(contract["timeout_seconds"]),
             source_only=source_only_extraction is not None,
             expected_source_delta_sha256=expected_source_delta_sha256,
+            prepare_dependency_input=prepare_dependency_input,
         )
         artifacts = {
             **outcome.artifacts,
@@ -2891,9 +2978,32 @@ class Coordinator:
                 **governance_receipt_fields(contract),
             )
 
+        prepared_dependency_input = outcome.prepared_dependency_input
+        if prepared_dependency_input is not None and (
+            not isinstance(outcome.prepared_recovery, dict)
+            or outcome.prepared_recovery.get("dependency_input_tree_sha")
+            != prepared_dependency_input.input_tree_sha
+        ):
+            raise WorktreeError(
+                "blocked-worktree recovery prepared input metadata does not match its tree"
+            )
+        dependency_input_ref: str | None = recorded_dependency_ref
+        if (
+            prepared_dependency_input is not None
+            and prepared_dependency_input.receipt.get("schema_version") == 2
+            and (
+                recorded_dependency_input is None
+                or prepared_dependency_input.input_tree_sha
+                != recorded_dependency_input.input_tree_sha
+            )
+        ):
+            dependency_input_ref = self.artifacts.put_text(
+                canonical_json(prepared_dependency_input.receipt),
+                "dependency-input.json",
+            )
         artifacts["patch"] = str(recovery["patch_ref"])
-        if isinstance(recovery.get("dependency_input_ref"), str):
-            artifacts["dependency-input"] = recovery["dependency_input_ref"]
+        if dependency_input_ref is not None:
+            artifacts["dependency-input"] = dependency_input_ref
         binding_ref = self.artifacts.put_text(
             canonical_json(
                 {
@@ -2944,15 +3054,18 @@ class Coordinator:
             spec=spec,
             worktree=target,
             input_tree_sha=(
-                recovery["input_tree_sha"]
+                prepared_dependency_input.input_tree_sha
+                if prepared_dependency_input is not None
+                else recovery["input_tree_sha"]
                 if isinstance(recovery.get("input_tree_sha"), str)
                 else None
             ),
-            input_receipt_ref=(
-                recovery["dependency_input_ref"]
-                if isinstance(recovery.get("dependency_input_ref"), str)
+            input_receipt=(
+                prepared_dependency_input.receipt
+                if prepared_dependency_input is not None
                 else None
             ),
+            input_receipt_ref=dependency_input_ref,
         )
         result = validate_worker_scope(self.worktrees, request, result)
         if result.status != "succeeded":
@@ -3155,6 +3268,7 @@ class Coordinator:
             worktree,
             self.artifacts,
             self.worktrees,
+            ready_lockfile_handoffs=self._ready_lockfile_handoffs(task_id),
         )
 
     def _compose_worker_patches(
@@ -3175,6 +3289,40 @@ class Coordinator:
             worktree,
             self.artifacts,
             self.worktrees,
+            ready_lockfile_handoffs=self._ready_lockfile_handoffs(task_id),
+        )
+
+    def _ready_lockfile_handoffs(self, task_id: str) -> list[dict]:
+        """Read only validated durable lockfile overlays for one task input."""
+
+        try:
+            from .lockfile_handoff import get_ready_lockfile_handoffs
+
+            return get_ready_lockfile_handoffs(self.store, task_id)
+        except (ValueError, StateConflictError) as error:
+            raise DependencyInputError(
+                f"ready lockfile handoffs are unavailable: {error}"
+            ) from error
+
+    def _apply_ready_lockfile_handoffs_to_recovery_input(
+        self,
+        claimed: dict,
+        worktree: Path,
+        dependency_input: DependencyInput,
+        *,
+        manifest_phase: str = "baseline",
+    ) -> DependencyInput:
+        """Derive the claimed retry input before its old worker patch replays."""
+
+        task_id = claimed["task_id"]
+        return apply_ready_lockfile_handoffs_to_dependency_input(
+            self.store.get_task(task_id),
+            claimed["node_id"],
+            worktree,
+            self.artifacts,
+            dependency_input,
+            ready_lockfile_handoffs=self._ready_lockfile_handoffs(task_id),
+            manifest_phase=manifest_phase,
         )
 
     @staticmethod

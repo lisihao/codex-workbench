@@ -209,6 +209,8 @@ Claude 没有被当作无限资源。Workbench 以被动方式读取兼容的本
 
 ## 快速开始
 
+当已授权任务因 workspace manifest 与 lockfile 不一致而卡在前置检查时，参见[一次性 lockfile 所有权交接](docs/lockfile-handoff.md)。该入口保留 frozen 检查、原任务和验收历史，不扩大 worker 写权限或开启自动恢复策略。
+
 > Workbench 当前面向熟悉 macOS、SSH、Git 与 Codex 的操作者。请先阅读完整的 [AI 安装与配置指南](docs/AI_INSTALL.md)，再让 AI 或人工执行安装步骤。
 
 ### 前提条件

@@ -166,6 +166,7 @@ class MCPTests(unittest.TestCase):
             names,
             {
                 "workbench_validate_blocked_node",
+                "workbench_handoff_lockfile",
                 "workbench_configure_node_recovery",
                 "workbench_get_node_recovery",
                 "workbench_read_session_notifications",

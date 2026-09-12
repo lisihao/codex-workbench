@@ -82,7 +82,9 @@ from .worktrees import (
 )
 
 
-SCHEMA_VERSION = 14
+# Older coordinators do not honor temporary lockfile ownership or schema-2
+# dependency inputs and must not admit work against this ledger.
+SCHEMA_VERSION = 15
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 _DELIVERY_LEASE_SECONDS = 60 * 60
@@ -600,6 +602,7 @@ class WorkbenchStore:
                 );
                 CREATE INDEX IF NOT EXISTS nodes_state_idx ON nodes(state, updated_at);
                 CREATE INDEX IF NOT EXISTS events_task_cursor_idx ON events(task_id, cursor);
+                CREATE INDEX IF NOT EXISTS events_type_cursor_idx ON events(event_type, cursor);
                 CREATE INDEX IF NOT EXISTS events_task_node_type_created_cursor_idx
                     ON events(task_id, node_id, event_type, created_at, cursor);
                 CREATE UNIQUE INDEX IF NOT EXISTS events_blocked_source_repair_request_id_idx
@@ -10842,6 +10845,7 @@ class WorkbenchStore:
             selected_failed_attempt_recovery: dict[str, Any] | None = None
             selected_accepted_source_repair: dict[str, Any] | None = None
             selected_provider_readmission: dict[str, Any] | None = None
+            handoff_admission: dict[str, bool] = {}
             for candidate in candidates:
                 provider_readmission = None
                 spec = json.loads(candidate["spec_json"])
@@ -10943,10 +10947,16 @@ class WorkbenchStore:
                 read_scopes = tuple(spec.get("read_scopes", []))
                 write_scopes = tuple(spec.get("write_scopes", []))
                 candidate_contract = json.loads(candidate["contract_json"])
+                from .lockfile_handoff import active_lockfile_handoff
+
                 repository = repository_identities.get(
                     str(candidate_contract["repository"])
                 )
                 if repository is None:
+                    continue
+                if repository not in handoff_admission:
+                    handoff_admission[repository] = bool(active_lockfile_handoff(connection, repository))
+                if handoff_admission[repository]:
                     continue
                 blocking_conflicts: list[dict[str, Any]] = []
                 for running in running_accesses:
@@ -11275,6 +11285,7 @@ class WorkbenchStore:
                 "dirty-worktree recovery patch artifact does not match the captured receipt"
             )
         comparison_tree = recovery["base_sha"]
+        dependency_input = None
         if recovery.get("schema_version") in {2, 3, 5, 6}:
             if recovery.get("source_task_id") != task_id or recovery.get("source_node_id") != node_id:
                 raise StateConflictError("dependency recovery receipt belongs to another node")
@@ -11304,6 +11315,33 @@ class WorkbenchStore:
             raise StateConflictError("dirty-worktree recovery target branch is invalid")
         if self._recovery_git_bytes(target, "ls-files", "--others", "--exclude-standard", "-z"):
             raise StateConflictError("dirty-worktree recovery target has unexpected untracked files")
+        from .dependency_inputs import base_dependency_input
+        from .lockfile_handoff import get_ready_lockfile_handoffs
+        from .lockfile_handoff_input import (
+            derive_lockfile_handoff_input_tree,
+            select_lockfile_handoffs_for_target,
+            validate_lockfile_handoff_manifests,
+        )
+
+        recorded_ids = (
+            {item["request_id"] for item in dependency_input.receipt.get("lockfile_handoffs", ())}
+            if dependency_input is not None else set()
+        )
+        ready = [item for item in get_ready_lockfile_handoffs(self, task_id) if item["request_id"] not in recorded_ids]
+        if ready:
+            original_input = dependency_input or base_dependency_input(
+                task_id=task_id, node_id=node_id, base_sha=str(contract["base_sha"]), worktree=target,
+            )
+            handoffs = select_lockfile_handoffs_for_target(
+                artifacts, self.get_task(task_id), node_id,
+                ancestors=original_input.receipt["ancestors"], ready_handoffs=ready,
+            )
+            validate_lockfile_handoff_manifests(target, handoffs, manifest_phase="prepared")
+            # Only a journal-authorized lockfile changes the comparison tree.
+            # The target already contains it; validation never edits source files.
+            comparison_tree = derive_lockfile_handoff_input_tree(
+                target, original_input.input_tree_sha, artifacts, handoffs,
+            )
         if self._recovery_git_bytes(target, "diff", "--binary", comparison_tree) != patch:
             raise StateConflictError(
                 "dirty-worktree recovery target does not match the captured source patch"
