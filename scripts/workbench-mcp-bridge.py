@@ -1133,12 +1133,14 @@ class MCPConnectionBridge:
     def _handle_tool_call(self, message: dict[str, object]) -> dict[str, object]:
         request_id = message.get("id")
         name, arguments = self._tool_call_parts(message)
-        handoff_read = (
-            name == "workbench_handoff_lockfile"
-            and name in self.tool_read_only
-            and arguments.get("op") in {"preview", "status"}
+        operation_read = (
+            name in self.tool_read_only
+            and (
+                (name == "workbench_handoff_lockfile" and arguments.get("op") in {"preview", "status"})
+                or (name == "workbench_responsibility" and arguments.get("op") in {"list", "inspect"})
+            )
         )
-        if self._is_read_only(name) or handoff_read:
+        if self._is_read_only(name) or operation_read:
             outgoing, resumed = self._prepare_event_read(message, name, arguments)
             response = self._forward_read_only(outgoing)
             if response is None:

@@ -42,6 +42,7 @@ CREATE INDEX IF NOT EXISTS authority_requests_state_updated_idx
 # These names deliberately mirror the current ``mcp.TOOLS`` catalog. The
 # adapter never accepts a callable tool name from a client without this fence.
 MCP_TOOL_NAMES = frozenset({
+    "workbench_responsibility",
     "workbench_handoff_lockfile",
     "workbench_read_session_notifications",
     "workbench_ack_session_notification",
@@ -101,6 +102,8 @@ def is_read_only_tool(name: object, arguments: object) -> bool:
         return True
     if name == "workbench_handoff_lockfile":
         return arguments.get("op") in {"preview", "status"}
+    if name == "workbench_responsibility":
+        return arguments.get("op") in {"list", "inspect"}
     return name in {"workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance"} and arguments.get("dry_run") is True
 
 
@@ -481,6 +484,9 @@ class AuthorityService:
             bound_id = arguments.get("request_id") if operation == "apply" else arguments.get("operation_id")
             if request_id is None or bound_id != request_id or request["task_id"] is None:
                 raise ValueError("lockfile handoff mutation requires a matching journal identity and task_id")
+        if tool == "workbench_responsibility" and not is_read_only_tool(tool, arguments):
+            if request_id is None or arguments.get("request_id") != request_id or request["task_id"] is None:
+                raise ValueError("responsibility mutation requires a matching journal identity and task_id")
         return request
 
     def _freeze_session_task_binding(

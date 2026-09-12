@@ -17,6 +17,12 @@ from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_nod
 from .node_recovery_api import RECOVERY_TOOLS, recovery_tool
 from .lockfile_handoff import TOOL as LOCKFILE_HANDOFF_TOOL, lockfile_handoff
 from .session_notifications_api import SESSION_NOTIFICATION_TOOLS, session_notification_tool
+from .responsibility_api import TOOL as RESPONSIBILITY_TOOL, responsibility_tool
+from .session_objectives import (
+    DEFAULT_SESSION_OBJECTIVE_LIMIT,
+    MAX_SESSION_OBJECTIVE_LIMIT,
+    list_session_objectives,
+)
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
 from .dirty_worktree_recovery import observed_indeterminate_recovery_paths
 from .governance import code_as_harness_health
@@ -53,6 +59,7 @@ _LIST_TASKS_NODE_STATES = (
 TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
     LOCKFILE_HANDOFF_TOOL,
+    RESPONSIBILITY_TOOL,
     *RECOVERY_TOOLS,
     *SESSION_NOTIFICATION_TOOLS,
     ACCEPTANCE_AMENDMENT_TOOL,
@@ -137,12 +144,25 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_get_session",
-        "description": "Read the durable WB binding and active task for one Codex thread.",
+        "description": "Read the durable WB binding and a bounded, read-only inventory of this Codex thread's unfinished task and delivery objectives. It never binds, backfills, or schedules work.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "required": ["source_thread_id"],
-            "properties": {"source_thread_id": {"type": "string"}},
+            "properties": {
+                "source_thread_id": {"type": "string"},
+                "objective_cursor": {
+                    "type": "string",
+                    "pattern": "^(?:active|[1-9][0-9]{0,18})$",
+                    "maxLength": 19,
+                },
+                "objective_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_SESSION_OBJECTIVE_LIMIT,
+                    "default": DEFAULT_SESSION_OBJECTIVE_LIMIT,
+                },
+            },
         },
     },
     {
@@ -874,6 +894,8 @@ class WorkbenchMCPServer:
         return str(row["task_id"])
 
     def _tool_result(self, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "workbench_responsibility":
+            return self._text(responsibility_tool(self.store, arguments))
         if name == "workbench_handoff_lockfile":
             return self._text(lockfile_handoff(self.config, self.store, arguments))
         if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
@@ -939,9 +961,27 @@ class WorkbenchMCPServer:
                 )
             )
         if name == "workbench_get_session":
-            binding = self.store.get_session_binding(arguments["source_thread_id"])
+            allowed = {"source_thread_id", "objective_cursor", "objective_limit"}
+            if set(arguments) - allowed or "source_thread_id" not in arguments:
+                raise ValueError("invalid workbench_get_session fields")
+            source_thread_id = arguments["source_thread_id"]
+            binding = self.store.get_session_binding(source_thread_id)
+            inventory = list_session_objectives(
+                self.store,
+                source_thread_id,
+                binding["active_task_id"],
+                limit=arguments.get("objective_limit"),
+                cursor=arguments.get("objective_cursor"),
+            )
             return self._text(
-                {key: value for key, value in binding.items() if key != "context_excerpt"}
+                {
+                    **{
+                        key: value
+                        for key, value in binding.items()
+                        if key != "context_excerpt"
+                    },
+                    **inventory,
+                }
             )
         if name == "workbench_continue_session":
             receipt = self.store.append_active_session_steering(

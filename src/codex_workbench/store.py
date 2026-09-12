@@ -1776,12 +1776,32 @@ class WorkbenchStore:
         normalized_identities = normalize_identities(identities)
         if receipt_state == "succeeded":
             normalized_failure = None
+            receipt_failure = None
         else:
             if failure is None:
                 raise ValueError("a non-succeeded delivery receipt requires a precise failure reason")
             normalized_failure = normalize_wait_reason(
                 failure, default_kind="verification-failure"
             )
+            receipt_failure = {
+                name: item
+                for name, item in normalized_failure.items()
+                if name not in {
+                    "wait_kind",
+                    "release_condition",
+                    "responsible_owner",
+                    "next_recheck_at",
+                }
+            }
+            if isinstance(failure, dict):
+                for name in (
+                    "wait_kind",
+                    "release_condition",
+                    "responsible_owner",
+                    "next_recheck_at",
+                ):
+                    if name in failure:
+                        receipt_failure[name] = normalized_failure[name]
         requested_wakeup = normalize_timestamp(next_wakeup_at, "next_wakeup_at")
         receipt_hash = canonical_hash(
             {
@@ -1792,7 +1812,7 @@ class WorkbenchStore:
                 "receipt": receipt_body,
                 "evidence_fingerprint": evidence_fingerprint,
                 "identities": normalized_identities,
-                "failure": normalized_failure,
+                "failure": receipt_failure,
                 "retry_eligible": retry_eligible,
                 "cost_delta": float(cost_delta),
                 "dispatch_id": dispatch_id,
@@ -1903,7 +1923,8 @@ class WorkbenchStore:
                 }
             receipt_document: dict[str, Any] = dict(receipt_body)
             if normalized_failure is not None:
-                receipt_document["failure"] = normalized_failure
+                assert receipt_failure is not None
+                receipt_document["failure"] = receipt_failure
             next_state: str
             next_stage = normalized_stage
             next_attempt = attempt
@@ -1964,8 +1985,13 @@ class WorkbenchStore:
                         int(budget["base_backoff_seconds"]) * (2**exponent),
                     )
                     wakeup = requested_wakeup or self._timestamp_after(timestamp, backoff)
+                    typed_failure = normalize_wait_reason(
+                        normalized_failure,
+                        responsible_owner=row["owner_id"],
+                        next_recheck_at=wakeup,
+                    )
                     wait_reason = {
-                        **normalized_failure,
+                        **typed_failure,
                         "retry_eligible": True,
                         "next_attempt": next_attempt,
                         "backoff_seconds": backoff,
@@ -1990,8 +2016,13 @@ class WorkbenchStore:
                         if normalized_failure["kind"] == "missing-essential-user-choice"
                         else "choose_recovery_or_stop"
                     )
+                    typed_failure = normalize_wait_reason(
+                        normalized_failure,
+                        responsible_owner=row["owner_id"],
+                        next_recheck_at=wakeup,
+                    )
                     wait_reason = {
-                        **normalized_failure,
+                        **typed_failure,
                         "retry_eligible": False,
                         "resolution": resolution,
                         "budget": budget,
@@ -2222,7 +2253,6 @@ class WorkbenchStore:
         The dispatch remains unsettled. A later owner must reconcile that same
         intent, while stage attempts and failure budgets remain unchanged.
         """
-        wait = normalize_wait_reason(reason)
         timestamp = now_iso()
         wakeup = normalize_timestamp(next_wakeup_at, "next_wakeup_at")
         if wakeup is None or self._timestamp_is_due(wakeup, timestamp):
@@ -2239,6 +2269,11 @@ class WorkbenchStore:
             )
             if int(row["state_revision"]) != expected_revision:
                 raise StateConflictError("delivery observation revision is stale")
+            wait = normalize_wait_reason(
+                reason,
+                responsible_owner=row["owner_id"],
+                next_recheck_at=wakeup,
+            )
             dispatch = connection.execute(
                 "SELECT * FROM delivery_stage_dispatches WHERE dispatch_id = ?", (dispatch_id,)
             ).fetchone()
@@ -2258,7 +2293,20 @@ class WorkbenchStore:
                 "kind": "delivery_objective.observation_waiting",
                 "stage": row["stage"], "dispatch_id": dispatch_id, "reason": wait,
             }
-            changed_observation = any(previous.get(key) != value for key, value in observation.items())
+            previous_reason = previous.get("reason")
+            if isinstance(previous_reason, dict):
+                previous_reason = {
+                    name: item for name, item in previous_reason.items() if name != "next_recheck_at"
+                }
+            comparable_wait = {
+                name: item for name, item in wait.items() if name != "next_recheck_at"
+            }
+            changed_observation = (
+                previous.get("kind") != observation["kind"]
+                or previous.get("stage") != observation["stage"]
+                or previous.get("dispatch_id") != observation["dispatch_id"]
+                or previous_reason != comparable_wait
+            )
             if changed_observation:
                 cursor = self._event(
                     connection, "delivery_objective.observation_waiting", str(row["task_id"]), None,
@@ -2340,12 +2388,16 @@ class WorkbenchStore:
                 "trigger": "worker_settlement_or_bounded_reconciliation",
                 "retry_after": next_wakeup_at,
             }
-            wait_reason = {
-                "kind": "active-workers-draining",
-                "detail": "deployment waits for all authority work to reach a safe point",
-                "blockers": actual_blockers,
-                "due_at": due_at,
-            }
+            wait_reason = normalize_wait_reason(
+                {
+                    "kind": "active-workers-draining",
+                    "detail": "deployment waits for all authority work to reach a safe point",
+                    "blockers": actual_blockers,
+                    "due_at": due_at,
+                },
+                responsible_owner=objective["owner_id"],
+                next_recheck_at=next_wakeup_at,
+            )
             revision = expected_revision + 1
             cursor = self._event(
                 connection,
@@ -2481,7 +2533,13 @@ class WorkbenchStore:
                             "attempt": int(objective["stage_attempt"]),
                         }
                     ),
-                    canonical_json({**wait_reason, "safe_point_ready": True}),
+                    canonical_json(
+                        {
+                            **wait_reason,
+                            "safe_point_ready": True,
+                            "next_recheck_at": timestamp,
+                        }
+                    ),
                     timestamp,
                     objective["objective_id"],
                     objective["state_revision"],

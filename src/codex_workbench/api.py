@@ -116,11 +116,14 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
             tool["annotations"] = {**tool.get("annotations", {}), "readOnlyHint": read_only}
             if not read_only:
                 schema = tool["inputSchema"]
+                owns_request_id = "request_id" in schema["properties"]
                 schema["properties"].setdefault("request_id", {
                     "type": "string", "minLength": 1, "maxLength": 200,
                     "description": "Stable mutation ID. After a lost receipt, query this ID; never resend with a new ID.",
                 })
-                schema["required"] = list(dict.fromkeys([*schema.get("required", []), "request_id"]))
+                schema["required"] = list(dict.fromkeys([
+                    *schema.get("required", []), *([] if owns_request_id else ["request_id"]),
+                ]))
         self.service_tools.append({
             "name": "workbench_get_service_request",
             "description": "Read the durable outcome of one Authority service request without replaying it.",
