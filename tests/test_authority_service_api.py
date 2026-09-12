@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.authority_service import AUTHORITY_REQUEST_JOURNAL_DDL
 from codex_workbench.config import WorkbenchConfig
+from codex_workbench.lockfile_handoff import TOOL as HANDOFF_TOOL
 from codex_workbench.model import NodeSpec, TaskContract
 from codex_workbench.store import WorkbenchStore
 
@@ -51,6 +52,12 @@ class AuthorityServiceAPITests(unittest.TestCase):
         status = self._request("/api/service/status")
         self.assertEqual(status["service_protocol"], "workbench-authority-service/v1")
         tools = self._request("/api/service/tools")["tools"]
+        for tool in tools:
+            required = tool["inputSchema"].get("required", [])
+            self.assertEqual(len(required), len(set(required)), tool["name"])
+        handoff = next(tool for tool in tools if tool["name"] == "workbench_handoff_lockfile")
+        self.assertEqual(handoff["inputSchema"]["properties"]["request_id"],
+                         HANDOFF_TOOL["inputSchema"]["properties"]["request_id"])
         control = next(tool for tool in tools if tool["name"] == "workbench_control_task")
         self.assertIn("request_id", control["inputSchema"]["required"])
         self.assertFalse(control["annotations"]["readOnlyHint"])

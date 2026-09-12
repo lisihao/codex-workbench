@@ -1133,7 +1133,12 @@ class MCPConnectionBridge:
     def _handle_tool_call(self, message: dict[str, object]) -> dict[str, object]:
         request_id = message.get("id")
         name, arguments = self._tool_call_parts(message)
-        if self._is_read_only(name):
+        handoff_read = (
+            name == "workbench_handoff_lockfile"
+            and name in self.tool_read_only
+            and arguments.get("op") in {"preview", "status"}
+        )
+        if self._is_read_only(name) or handoff_read:
             outgoing, resumed = self._prepare_event_read(message, name, arguments)
             response = self._forward_read_only(outgoing)
             if response is None:
@@ -1144,7 +1149,12 @@ class MCPConnectionBridge:
                     self.resume_events_after_reconnect = False
             return response
 
-        stable_request_id = self._valid_request_id(arguments.get("request_id"))
+        identity_field = (
+            "operation_id"
+            if name == "workbench_handoff_lockfile" and arguments.get("op") in {"cancel", "reconcile"}
+            else "request_id"
+        )
+        stable_request_id = self._valid_request_id(arguments.get(identity_field))
         if stable_request_id is None:
             return _tool_error(request_id, "stable_request_id_required")
         if self.state.has_write(stable_request_id):

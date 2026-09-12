@@ -16,6 +16,7 @@ class ServiceMCPTests(unittest.TestCase):
         self.client.tools.return_value = {"tools": [
             {"name": "workbench_list_tasks", "annotations": {"readOnlyHint": True}},
             {"name": "workbench_control_task", "annotations": {"readOnlyHint": False}},
+            {"name": "workbench_handoff_lockfile", "annotations": {"readOnlyHint": False}},
             {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
         ]}
         self.result = {"content": [{"type": "text", "text": "accepted request, not task acceptance"}]}
@@ -35,6 +36,25 @@ class ServiceMCPTests(unittest.TestCase):
         self.assertEqual(envelope["request_id"], "mutation-1")
         self.assertEqual(envelope["arguments"], {"task_id": "task", "action": "pause", "expected_revision": 7})
         self.assertFalse(self.client.dispatch.call_args.kwargs["read_only"])
+
+    def test_handoff_preserves_business_id_and_maps_operation_identity(self):
+        for op in ("preview", "status", "apply", "cancel", "reconcile"):
+            with self.subTest(op=op):
+                arguments = {"op": op, "task_id": "fixture", "request_id": "handoff-1"}
+                if op in {"cancel", "reconcile"}:
+                    arguments["operation_id"] = op + "-1"
+                self.assertEqual(self.call("workbench_handoff_lockfile", arguments), self.result)
+                envelope = self.client.dispatch.call_args.args[0]
+                self.assertEqual(envelope["arguments"], arguments)
+                self.assertEqual(envelope["request_id"], arguments.get("operation_id", "handoff-1"))
+                self.assertEqual(self.client.dispatch.call_args.kwargs["read_only"], op in {"preview", "status"})
+
+    def test_handoff_cancel_and_reconcile_require_distinct_operation_field(self):
+        for op in ("cancel", "reconcile"):
+            with self.subTest(op=op):
+                result = self.call("workbench_handoff_lockfile", {"op": op, "request_id": "handoff-1"})
+                self.assertTrue(result["isError"])
+        self.client.dispatch.assert_not_called()
 
     def test_mutation_requires_stable_id_but_read_does_not(self):
         result = self.call("workbench_control_task", {"task_id": "task", "action": "pause"})
