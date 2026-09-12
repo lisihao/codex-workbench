@@ -75,6 +75,7 @@ tools = [
     {"name": "workbench_read_events", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_write", "annotations": {"readOnlyHint": False}},
+    {"name": "workbench_handoff_lockfile", "annotations": {"readOnlyHint": False}},
 ]
 if mode == "upgrade" and launch >= 2:
     tools.append({"name": "new_read_tool", "annotations": {"readOnlyHint": True}})
@@ -151,7 +152,11 @@ for raw in sys.stdin:
         else:
             send(request_id, {"content": [{"type": "text", "text": json.dumps({"events": events, "cursor": cursor})}]})
         continue
-    if name == "workbench_write":
+    if name == "workbench_handoff_lockfile" and arguments.get("op") in {"preview", "status"}:
+        log(arguments["op"])
+        send(request_id, {"content": [{"type": "text", "text": arguments["op"] + "-ok"}]})
+        continue
+    if name in {"workbench_write", "workbench_handoff_lockfile"}:
         log("write")
         (root / "last-write-arguments").write_text(json.dumps(arguments, sort_keys=True))
         with (root / "effects").open("a") as stream:
@@ -163,6 +168,7 @@ for raw in sys.stdin:
     if name == "workbench_get_service_request":
         log("query")
         supplied = arguments.get("request_id")
+        (root / "last-query-id").write_text(str(supplied))
         if mode == "write-completed":
             payload = {
                 "request_id": supplied,
@@ -422,6 +428,43 @@ class MCPConnectionBridgeTests(unittest.TestCase):
         persisted = self.state_file.read_text()
         self.assertNotIn("stable-write", persisted)
         self.assertNotIn("persisted-result", persisted)
+
+    def test_handoff_preview_and_status_do_not_poison_apply_identity(self) -> None:
+        messages = self._initialize()
+        for number, op in enumerate(("preview", "status", "apply", "apply"), 3):
+            messages.append({"jsonrpc": "2.0", "id": number, "method": "tools/call",
+                             "params": {"name": "workbench_handoff_lockfile",
+                                        "arguments": {"op": op, "request_id": "handoff-1"}}})
+        output = self._run("write-completed", messages)
+        self.assertEqual(self._by_id(output, 3)["result"]["content"][0]["text"], "preview-ok")
+        self.assertEqual(self._by_id(output, 4)["result"]["content"][0]["text"], "status-ok")
+        for number in (5, 6):
+            self.assertEqual(self._by_id(output, number)["result"]["content"][0]["text"], "persisted-result")
+        self.assertEqual(self._log().count("write"), 1)
+        self.assertEqual((self.fixture / "last-query-id").read_text(), "handoff-1")
+
+    def test_handoff_cancel_reconcile_use_operation_id_for_lost_response(self) -> None:
+        messages = self._initialize()
+        for number, op in enumerate(("cancel", "cancel", "reconcile", "reconcile"), 3):
+            messages.append({"jsonrpc": "2.0", "id": number, "method": "tools/call",
+                             "params": {"name": "workbench_handoff_lockfile", "arguments": {
+                                 "op": op, "request_id": "handoff-1", "operation_id": op + "-1"}}})
+        output = self._run("write-completed", messages)
+        for number in range(3, 7):
+            self.assertEqual(self._by_id(output, number)["result"]["content"][0]["text"], "persisted-result")
+        self.assertEqual(self._log().count("write"), 2)
+        self.assertEqual((self.fixture / "last-query-id").read_text(), "reconcile-1")
+        self.assertEqual(json.loads((self.fixture / "last-write-arguments").read_text())["request_id"], "handoff-1")
+
+    def test_handoff_cancel_without_operation_id_never_reuses_original_handoff_id(self) -> None:
+        output = self._run("normal", [*self._initialize(), {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "workbench_handoff_lockfile",
+                       "arguments": {"op": "cancel", "request_id": "handoff-1"}},
+        }])
+        self.assertTrue(self._by_id(output, 3)["result"]["isError"])
+        self.assertNotIn("write", self._log())
+        self.assertNotIn("query", self._log())
 
     def test_unknown_write_status_is_indeterminate_and_never_replayed(self) -> None:
         messages = [

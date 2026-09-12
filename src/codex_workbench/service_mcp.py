@@ -5,6 +5,7 @@ import json
 import sys
 from typing import Any, TextIO
 
+from .authority_service import is_read_only_tool
 from .service_client import AuthorityHTTPClient, IndeterminateServiceRequest, ServiceTransportError
 
 
@@ -67,8 +68,14 @@ class AuthorityMCPAdapter:
                     result = _text(self.client.get_request(arguments.get("request_id")))
                 else:
                     copied = dict(arguments)
-                    service_request_id = copied.pop("request_id", None)
                     read_only = tool.get("annotations", {}).get("readOnlyHint") is True
+                    if name == "workbench_handoff_lockfile":
+                        read_only = is_read_only_tool(name, copied)
+                        service_request_id = copied.get(
+                            "operation_id" if copied.get("op") in {"cancel", "reconcile"} else "request_id"
+                        )
+                    else:
+                        service_request_id = copied.pop("request_id", None)
                     if not read_only and (not isinstance(service_request_id, str) or not service_request_id):
                         raise ValueError("mutation requires a stable request_id; refresh tools/list if absent")
                     envelope = {"tool": name, "arguments": copied}
