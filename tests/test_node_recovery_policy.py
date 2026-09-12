@@ -31,6 +31,25 @@ def observation(category: str, **overrides: object) -> dict[str, object]:
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_known_repeated_failure_uses_authorized_repair_without_relabeling_cause(self) -> None:
+        policy = RecoveryPolicy(
+            enabled=True, allowed_actions=("request_repair",),
+            repair_repository="/fixture/repository", repair_allowed_scopes=("src",),
+        )
+        repeated = observation("dependency", repeated_recovery_failure={"episode_id": "episode", "stage_key": "observe_readiness"})
+        decision = plan_recovery(policy, repeated)
+        self.assertEqual((decision["action"], decision["category"]), ("request_repair", "dependency"))
+        for change in (
+            {"task_state": "paused"}, {"task_state": "cancelled"},
+            {"category": "auth"}, {"category": "unknown_effects"},
+            {"approval_denied": True}, {"elapsed_seconds": policy.time_budget_seconds},
+            {"approval_pending": True},
+            {"action_attempts": policy.max_action_attempts},
+            {"repair_linked": True}, {"repair_requested": True},
+        ):
+            with self.subTest(change=change):
+                self.assertNotEqual(plan_recovery(policy, {**repeated, **change})["action"], "request_repair")
+
     def test_authorized_blocked_worker_can_enter_source_repair_before_acceptance_passes(self) -> None:
         policy = RecoveryPolicy(enabled=True, allowed_actions=("repair_source",))
         failed_check = observation(

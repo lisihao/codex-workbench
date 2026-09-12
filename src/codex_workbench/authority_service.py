@@ -42,6 +42,8 @@ CREATE INDEX IF NOT EXISTS authority_requests_state_updated_idx
 # These names deliberately mirror the current ``mcp.TOOLS`` catalog. The
 # adapter never accepts a callable tool name from a client without this fence.
 MCP_TOOL_NAMES = frozenset({
+    "workbench_read_session_notifications",
+    "workbench_ack_session_notification",
     "workbench_configure_node_recovery",
     "workbench_get_node_recovery",
     "workbench_amend_task_acceptance",
@@ -70,6 +72,7 @@ MCP_TOOL_NAMES = frozenset({
 
 
 READ_ONLY_TOOL_NAMES = frozenset({
+    "workbench_read_session_notifications",
     "workbench_get_node_recovery",
     "workbench_acceptance_report",
     "workbench_get_delivery_objective",
@@ -487,6 +490,10 @@ class AuthorityService:
             binding = self.store.get_session_binding(session_id)
         except KeyError as error:
             raise ValueError("session_id has no durable session binding") from error
+        if request["tool"] in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:
+            if has_explicit_task:
+                raise ValueError("session notification requests use their durable route, not an active task override")
+            return
         active_task_id = binding.get("active_task_id")
         if active_task_id is not None:
             active_task_id = self._required_string(active_task_id, "session active_task_id")

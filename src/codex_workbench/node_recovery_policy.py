@@ -446,6 +446,11 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
             requires_authorization=True,
             next_wakeup_at=None,
         )
+    if observation.get("approval_pending") is True:
+        return _result(
+            category=category, action=None, state="needs_action", reason_kind="approval_pending",
+            owner="user", requires_authorization=True, next_wakeup_at=None,
+        )
     if node_state == "indeterminate":
         return _result(
             category=category,
@@ -481,6 +486,20 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
     elapsed = observation.get("elapsed_seconds", 0)
     attempts_number = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
     elapsed_number = elapsed if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else 0
+    if (
+        elapsed_number < policy.time_budget_seconds
+        and observation.get("repeated_recovery_failure") is not None
+        and category in {"dependency", "environment", "network", "validation_failure", "tooling_bug"}
+        and observation.get("repair_linked") is not True
+        and observation.get("repair_requested") is not True
+        and "request_repair" in policy.allowed_actions
+        and policy.repair_repository and policy.repair_allowed_scopes
+        and attempts_number < policy.max_action_attempts
+    ):
+        return _ready_action(
+            policy, observation, category=category, action="request_repair",
+            reason_kind="repeated_recovery_failure",
+        )
     if attempts_number >= policy.max_action_attempts or elapsed_number >= policy.time_budget_seconds:
         return _result(
             category=category,

@@ -1,16 +1,17 @@
-"""One fixed, journaled repair-planning action for a verified tooling defect."""
+"""One fixed, journaled repair-planning action for bounded recovery defects."""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
-from typing import Any, Mapping, TypedDict
+from typing import Any, Mapping, NotRequired, TypedDict
 
 from .authority_service import AuthorityService
 from .config import WorkbenchConfig
-from .model import canonical_hash, canonical_json
+from .model import canonical_hash, canonical_json, now_iso
 from .node_recovery_store import NodeRecoveryStore
 from .store import StateConflictError
 
@@ -20,6 +21,10 @@ _TOOL = "workbench_request"
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _MAX_REFS = 32
 _MAX_TEXT = 500
+_REPEATED_REPAIR_CATEGORIES = frozenset({
+    "dependency", "environment", "network", "validation_failure", "tooling_bug",
+})
+_REPAIR_TRIGGER_FIELDS = frozenset({"episode_id", "stage_key"})
 
 
 class RepairActionPlan(TypedDict):
@@ -46,6 +51,7 @@ class RepairActionPlan(TypedDict):
     claude_allowed: bool
     arguments: dict[str, object]
     action_fingerprint: str
+    repair_trigger: NotRequired[dict[str, str]]
 
 
 class RepairActionReceipt(TypedDict):
@@ -59,7 +65,7 @@ class RepairActionReceipt(TypedDict):
 
 
 class RepairNodeActions:
-    """Create or read exactly one bounded repair planning request per failure."""
+    """Create or read one bounded repair planning request per eligible failure."""
 
     def __init__(
         self,
@@ -84,11 +90,15 @@ class RepairNodeActions:
             raise ValueError("RepairNodeActions supports only request_repair")
         request_id = _request_id(request_id)
         identity = _observation_identity(observation)
-        if identity["category"] != "tooling_bug" or not _explicit_tooling_evidence(observation):
-            raise StateConflictError("repair requires explicit tooling_bug evidence")
         parent = self._parent_binding(identity)
         policy_row = self.store.get_policy(identity["task_id"])
         policy = _authorized_policy(policy_row)
+        trigger = _repeated_repair_trigger(observation)
+        if trigger is None:
+            if identity["category"] != "tooling_bug" or not _explicit_tooling_evidence(observation):
+                raise StateConflictError("repair requires explicit tooling_bug evidence")
+        else:
+            self._validate_repeated_repair_trigger(trigger, identity, policy_row)
         repository, scopes, base_sha = _repair_repository(policy)
         refs = _evidence_refs(observation.get("evidence_refs"))
         stable = {
@@ -107,21 +117,6 @@ class RepairNodeActions:
                 "allowed_scopes": scopes,
             }
         )
-        arguments: dict[str, object] = {
-            "objective": _objective(identity, refs, scopes),
-            "repository": repository,
-            "allowed_scopes": scopes,
-            "task_id": repair_task_id,
-            "command_id": repair_request_id,
-            "base_sha": base_sha,
-            "task_type": "debugging",
-            "complexity": "low",
-            "claude_allowed": parent["claude_allowed"],
-            "timeout_seconds": 900,
-            "retry_limit": 1,
-            "external_write_permission": False,
-            "queue": True,
-        }
         plan: RepairActionPlan = {
             "action": _ACTION,
             "request_id": request_id,
@@ -142,9 +137,11 @@ class RepairNodeActions:
             "policy_revision": int(policy_row["policy_revision"]),
             "policy": _policy_binding(policy, repository=repository, scopes=scopes),
             "claude_allowed": parent["claude_allowed"],
-            "arguments": arguments,
+            "arguments": {},
             "action_fingerprint": "",
+            **({"repair_trigger": trigger} if trigger is not None else {}),
         }
+        plan["arguments"] = _arguments(plan)
         plan["action_fingerprint"] = canonical_hash({**plan, "action_fingerprint": ""})
         return plan
 
@@ -158,7 +155,26 @@ class RepairNodeActions:
         planning = self._planning_or_task_receipt(normalized)
         if planning is not None:
             return planning
-        self._assert_plan_current(normalized)
+        try:
+            self._assert_plan_current(normalized)
+        except (StateConflictError, ValueError):
+            return {
+                "action": _ACTION,
+                "request_id": normalized["request_id"],
+                "journal_status": "completed",
+                "known_effects": True,
+                "receipt": {
+                    "ok": False,
+                    "known_effects": True,
+                    "stage_succeeded": False,
+                    "reason_kind": "repair_admission_rejected",
+                    "observation_patch": {
+                        "repair_enqueue_rejected": True,
+                        "repair_requested": False,
+                        "repair_linked": False,
+                    },
+                },
+            }
         receipt = self.authority_service.dispatch(
             {
                 "request_id": normalized["request_id"],
@@ -184,6 +200,13 @@ class RepairNodeActions:
             raise StateConflictError("repair parent task is paused or cancelled")
         if task.get("state") != "blocked":
             raise StateConflictError("repair requires a blocked parent task")
+        with self.store.base_store.connection() as connection:
+            pending_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1",
+                (identity["task_id"],),
+            ).fetchone()
+        if pending_approval is not None:
+            raise StateConflictError("repair parent task has a pending approval")
         if task.get("state_revision") != identity["task_revision"]:
             raise StateConflictError("repair parent task revision changed after observation")
         nodes = task.get("nodes")
@@ -202,19 +225,117 @@ class RepairNodeActions:
             raise StateConflictError("repair parent contract is invalid")
         return {"claude_allowed": contract["claude_allowed"]}
 
+    def _validate_repeated_repair_trigger(
+        self,
+        trigger: Mapping[str, str],
+        identity: Mapping[str, Any],
+        policy_row: Mapping[str, Any],
+        *,
+        expected_policy_revision: int | None = None,
+    ) -> None:
+        """Verify a repeat trigger against the durable episode and action ledger."""
+
+        if identity["category"] not in _REPEATED_REPAIR_CATEGORIES:
+            raise StateConflictError("repeated repair category is not authorized")
+        policy = _authorized_policy(policy_row)
+        policy_revision = _policy_revision(policy_row)
+        if expected_policy_revision is not None and policy_revision != expected_policy_revision:
+            raise StateConflictError("repair policy revision changed after preparation")
+        try:
+            episode = self.store.get_episode(trigger["episode_id"])
+        except KeyError as error:
+            raise StateConflictError("repeated repair trigger episode is unavailable") from error
+        if (
+            episode.get("task_id") != identity["task_id"]
+            or episode.get("node_id") != identity["node_id"]
+            or episode.get("node_attempt") != identity["node_attempt"]
+            or episode.get("failure_fingerprint") != identity["failure_fingerprint"]
+            or episode.get("task_revision") != identity["task_revision"]
+        ):
+            raise StateConflictError("repeated repair trigger does not match the parent episode")
+        if (
+            episode.get("policy_revision") != policy_revision
+            or episode.get("policy") != policy_row.get("policy")
+        ):
+            raise StateConflictError("repeated repair trigger policy does not match the parent episode")
+        if episode.get("category") != identity["category"]:
+            raise StateConflictError("repeated repair trigger category does not match the parent episode")
+        if episode.get("state") in {"resolved", "suspended"}:
+            raise StateConflictError("repeated repair trigger episode is no longer actionable")
+        observed = episode.get("observation")
+        decision = episode.get("decision")
+        if not isinstance(observed, Mapping) or not isinstance(decision, Mapping):
+            raise StateConflictError("repeated repair trigger episode is invalid")
+        if (
+            observed.get("approval_denied") is True
+            or decision.get("requires_authorization") is True
+            or decision.get("reason_kind") in {"approval_denied", "authorization_required", "unknown_effects", "user_pause"}
+        ):
+            raise StateConflictError("repeated repair trigger requires user intervention")
+        deadline = _deadline(episode.get("time_budget_deadline_at"))
+        if deadline <= datetime.fromisoformat(now_iso()):
+            raise StateConflictError("repeated repair trigger time budget is exhausted")
+        stage_attempts = episode.get("stage_attempts")
+        if not isinstance(stage_attempts, Mapping):
+            raise StateConflictError("repeated repair trigger stage attempts are invalid")
+        attempts = stage_attempts.get(trigger["stage_key"])
+        if (
+            isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or attempts < _max_action_attempts(policy)
+        ):
+            raise StateConflictError("repeated repair trigger stage is not exhausted")
+        actions = episode.get("actions")
+        if not isinstance(actions, list):
+            raise StateConflictError("repeated repair trigger action ledger is invalid")
+        if any(
+            not isinstance(action, Mapping)
+            or (
+                action.get("state") != "completed"
+                and str(action.get("stage_key", "")).split(":", 1)[0] != _ACTION
+            )
+            for action in actions
+        ):
+            raise StateConflictError("repeated repair trigger has unresolved action effects")
+        relevant = [
+            action for action in actions
+            if isinstance(action, Mapping) and action.get("stage_key") == trigger["stage_key"]
+        ]
+        if len(relevant) < attempts:
+            raise StateConflictError("repeated repair trigger has incomplete stage action receipts")
+        for action in relevant:
+            receipt = action.get("receipt")
+            if (
+                action.get("state") != "completed"
+                or not isinstance(receipt, Mapping)
+                or receipt.get("known_effects") is not True
+                or receipt.get("stage_succeeded") is not False
+            ):
+                raise StateConflictError("repeated repair trigger stage effects are not known failed receipts")
+
     def _assert_plan_current(self, plan: RepairActionPlan) -> None:
-        self._parent_binding(
-            {
-                "task_id": plan["parent_task_id"],
-                "node_id": plan["parent_node_id"],
-                "node_attempt": plan["parent_node_attempt"],
-                "task_revision": plan["parent_task_revision"],
-            }
-        )
-        policy = _authorized_policy(self.store.get_policy(plan["parent_task_id"]))
+        identity = {
+            "task_id": plan["parent_task_id"],
+            "node_id": plan["parent_node_id"],
+            "node_attempt": plan["parent_node_attempt"],
+            "task_revision": plan["parent_task_revision"],
+            "failure_fingerprint": plan["failure_fingerprint"],
+            "category": plan["category"],
+        }
+        self._parent_binding(identity)
+        policy_row = self.store.get_policy(plan["parent_task_id"])
+        policy = _authorized_policy(policy_row)
+        trigger = _plan_repair_trigger(plan)
+        if trigger is not None:
+            self._validate_repeated_repair_trigger(
+                trigger,
+                identity,
+                policy_row,
+                expected_policy_revision=plan["policy_revision"],
+            )
         repository, scopes, base_sha = _repair_repository(policy)
         if (
-            int(self.store.get_policy(plan["parent_task_id"])["policy_revision"]) != plan["policy_revision"]
+            _policy_revision(policy_row) != plan["policy_revision"]
             or _policy_binding(policy, repository=repository, scopes=scopes) != plan["policy"]
             or (repository, scopes, base_sha) != (plan["repository"], plan["allowed_scopes"], plan["base_sha"])
         ):
@@ -289,18 +410,22 @@ class RepairNodeActions:
             "allowed_scopes", "evidence_refs", "policy_revision", "policy", "arguments",
             "claude_allowed", "action_fingerprint",
         }
+        trigger = _plan_repair_trigger(raw)
+        if trigger is not None:
+            required.add("repair_trigger")
         if set(raw) != required:
             raise ValueError("repair action plan has unsupported or missing fields")
-        if raw["action"] != _ACTION or raw["category"] != "tooling_bug":
-            raise ValueError("repair action plan is not tooling repair")
+        if raw["action"] != _ACTION:
+            raise ValueError("repair action plan is not request_repair")
         request_id = _request_id(raw["request_id"])
         identity = _identity_from_plan(raw)
+        category = _identifier(raw["category"], "repair action category")
         repair_task_id = _identifier(raw["repair_task_id"], "repair_task_id")
         repair_request_id = _identifier(raw["repair_request_id"], "repair_request_id")
         repair_fingerprint = _fingerprint(raw["repair_fingerprint"], "repair_fingerprint")
-        repository = _absolute_repository(raw["repository"])
+        repository = _plan_repository(raw["repository"])
         base_sha = _sha(raw["base_sha"], "base_sha")
-        scopes = _scopes(repository, raw["allowed_scopes"])
+        scopes = _plan_scopes(raw["allowed_scopes"])
         refs = _evidence_refs(raw["evidence_refs"])
         stable = {
             "parent_task_id": identity["parent_task_id"],
@@ -319,8 +444,7 @@ class RepairNodeActions:
             or repair_fingerprint != expected_deployment
         ):
             raise ValueError("repair action plan stable identity is invalid")
-        if type(raw["policy_revision"]) is not int or raw["policy_revision"] < 0:
-            raise ValueError("policy_revision must be a non-negative integer")
+        policy_revision = _policy_revision(raw)
         if not isinstance(raw["policy"], dict) or not isinstance(raw["arguments"], dict):
             raise ValueError("repair action plan policy and arguments must be objects")
         if not isinstance(raw["claude_allowed"], bool):
@@ -330,7 +454,7 @@ class RepairNodeActions:
             "action": _ACTION,
             "request_id": request_id,
             **identity,
-            "category": "tooling_bug",
+            "category": category,
             "stage_key": _identifier(raw["stage_key"], "stage_key"),
             "repair_task_id": repair_task_id,
             "repair_request_id": repair_request_id,
@@ -339,12 +463,18 @@ class RepairNodeActions:
             "base_sha": base_sha,
             "allowed_scopes": scopes,
             "evidence_refs": refs,
-            "policy_revision": raw["policy_revision"],
+            "policy_revision": policy_revision,
             "policy": dict(raw["policy"]),
             "claude_allowed": raw["claude_allowed"],
             "arguments": dict(raw["arguments"]),
             "action_fingerprint": fingerprint,
+            **({"repair_trigger": trigger} if trigger is not None else {}),
         }
+        if trigger is None:
+            if category != "tooling_bug":
+                raise ValueError("repair action plan is not tooling repair")
+        elif category not in _REPEATED_REPAIR_CATEGORIES:
+            raise ValueError("repair action plan repeated category is not authorized")
         if plan["stage_key"] != _ACTION:
             raise ValueError("repair action plan stage_key must be request_repair")
         expected_policy = {
@@ -388,6 +518,56 @@ def _observation_identity(observation: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "category": _identifier(observation.get("category"), "observation.category"),
     }
+
+
+def _repeated_repair_trigger(observation: Mapping[str, Any]) -> dict[str, str] | None:
+    if "repeated_recovery_failure" not in observation:
+        return None
+    return _repair_trigger(observation["repeated_recovery_failure"])
+
+
+def _plan_repair_trigger(plan: Mapping[str, Any]) -> dict[str, str] | None:
+    if "repair_trigger" not in plan:
+        return None
+    return _repair_trigger(plan["repair_trigger"])
+
+
+def _repair_trigger(raw: object) -> dict[str, str]:
+    if not isinstance(raw, Mapping) or set(raw) != _REPAIR_TRIGGER_FIELDS:
+        raise StateConflictError("repeated repair trigger is invalid")
+    trigger = {
+        "episode_id": _identifier(raw["episode_id"], "repeated repair episode_id"),
+        "stage_key": _identifier(raw["stage_key"], "repeated repair stage_key"),
+    }
+    if trigger["stage_key"].split(":", 1)[0] == _ACTION:
+        raise StateConflictError("repeated repair trigger must name an automatic recovery stage")
+    return trigger
+
+
+def _policy_revision(policy_row: Mapping[str, Any]) -> int:
+    value = policy_row.get("policy_revision")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise StateConflictError("repair policy revision is invalid")
+    return value
+
+
+def _max_action_attempts(policy: Mapping[str, object]) -> int:
+    value = policy.get("max_action_attempts")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3:
+        raise StateConflictError("repair policy action limit is invalid")
+    return value
+
+
+def _deadline(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise StateConflictError("repeated repair trigger deadline is invalid")
+    try:
+        deadline = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise StateConflictError("repeated repair trigger deadline is invalid") from error
+    if deadline.tzinfo is None:
+        raise StateConflictError("repeated repair trigger deadline is invalid")
+    return deadline
 
 
 def _explicit_tooling_evidence(observation: Mapping[str, Any]) -> bool:
@@ -457,6 +637,17 @@ def _absolute_repository(value: object) -> str:
     return str(repository)
 
 
+def _plan_repository(value: object) -> str:
+    """Validate an immutable plan path without consulting its current filesystem state."""
+
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("repair plan repository is invalid")
+    repository = Path(value)
+    if not repository.is_absolute() or repository == Path("/"):
+        raise ValueError("repair plan repository is invalid")
+    return value
+
+
 def _scopes(repository: str, value: object) -> list[str]:
     if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)) or not value:
         raise ValueError("repair_allowed_scopes must be a non-empty array")
@@ -484,6 +675,25 @@ def _scopes(repository: str, value: object) -> list[str]:
     return scopes
 
 
+def _plan_scopes(value: object) -> list[str]:
+    """Validate immutable owned scopes without checking current symlinks."""
+
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)) or not value:
+        raise ValueError("repair plan allowed scopes are invalid")
+    scopes: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw or "\\" in raw or "\x00" in raw:
+            raise ValueError("repair plan allowed scope is invalid")
+        parsed = PurePosixPath(raw)
+        if parsed.is_absolute() or raw in {".", ""} or ".." in parsed.parts or ".git" in parsed.parts:
+            raise ValueError("repair plan allowed scope is invalid")
+        normalized = str(parsed)
+        if normalized in scopes:
+            raise ValueError("repair plan allowed scopes are invalid")
+        scopes.append(normalized)
+    return scopes
+
+
 def _evidence_refs(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise StateConflictError("repair requires bounded evidence references")
@@ -503,6 +713,17 @@ def _evidence_refs(value: object) -> dict[str, str]:
 
 def _objective(identity: Mapping[str, Any], refs: Mapping[str, str], scopes: list[str]) -> str:
     evidence = ", ".join(f"{key}={value}" for key, value in sorted(refs.items()))
+    trigger = identity.get("repair_trigger")
+    if isinstance(trigger, Mapping):
+        return (
+            "Diagnose and repair one persistent Workbench recovery defect only. "
+            f"Parent task={identity['task_id']}; node={identity['node_id']}; "
+            f"attempt={identity['node_attempt']}; category={identity['category']}; "
+            f"repeated stage={trigger['stage_key']}. "
+            f"Owned paths={', '.join(scopes)}. Evidence refs={evidence}. "
+            "Fix only the evidenced recovery defect, run focused tests, preserve the parent objective, "
+            "and do not deploy, publish, or broaden scopes."
+        )
     return (
         "Repair one persistent Workbench tooling defect only. "
         f"Parent task={identity['task_id']}; node={identity['node_id']}; "
@@ -520,6 +741,8 @@ def _arguments(plan: RepairActionPlan) -> dict[str, object]:
                 "task_id": plan["parent_task_id"],
                 "node_id": plan["parent_node_id"],
                 "node_attempt": plan["parent_node_attempt"],
+                "category": plan["category"],
+                **({"repair_trigger": plan["repair_trigger"]} if "repair_trigger" in plan else {}),
             },
             plan["evidence_refs"],
             plan["allowed_scopes"],

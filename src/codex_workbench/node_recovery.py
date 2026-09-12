@@ -33,6 +33,7 @@ _PROGRESS_FIELDS = frozenset({
     "repair_deployed_verified", "repair_task_id", "repair_request_id", "repair_fingerprint",
     "recovery_resumed", "last_action", "last_action_at",
     "retry_due_at",
+    "repair_enqueue_rejected",
 })
 _EVENT_TYPES = frozenset({
     "node.blocked", "node.failed", "node.accepted", "node.started",
@@ -120,6 +121,10 @@ class NodeRecoveryReconciler:
 
     def _refresh_node(self, task_id: str, node_id: str, cursor: int) -> dict:
         observed = self.observer(self.store, task_id, node_id, source_event_cursor=cursor)
+        with self.store.connection() as connection:
+            observed["approval_pending"] = connection.execute(
+                "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1", (task_id,),
+            ).fetchone() is not None
         observed["attempt"] = observed["node_attempt"]
         policy = RecoveryPolicy.from_dict(self.recovery.get_policy(task_id)["policy"])
         if observed.get("observation_available") is False:
@@ -135,7 +140,8 @@ class NodeRecoveryReconciler:
                 # A fresh poll is not a lost write receipt. Only the exact
                 # adapter receipt may settle the old intent after restart.
                 return prior
-            if prior.get("repair") and not prior["repair"].get("deployed_at") and self.delivery_observer is not None:
+            if (prior.get("repair") and not prior["repair"].get("deployed_at")
+                    and not self._repair_enqueue_rejected(prior) and self.delivery_observer is not None):
                 delivery = self.delivery_observer(prior)
                 if delivery["state"] == "verified":
                     prior = self.recovery.mark_repair_deployed(
@@ -160,6 +166,9 @@ class NodeRecoveryReconciler:
                 if key in prior["observation"]:
                     observed[key] = prior["observation"][key]
             observed["source_event_cursor"] = max(cursor, prior["source_event_cursor"])
+            trigger = self._repeated_failure_trigger(prior, policy)
+            if trigger is not None:
+                observed["repeated_recovery_failure"] = trigger
         profiles = policy.validation_profiles
         validated = observed.get("validated_profiles", [])
         remaining = [profile for profile in profiles if profile not in validated]
@@ -167,9 +176,44 @@ class NodeRecoveryReconciler:
             observed["validation_profile"] = remaining[0]
         observed["validation_succeeded"] = bool(profiles) and not remaining
         if prior is not None and prior.get("repair"):
-            observed["repair_linked"] = True
+            observed["repair_linked"] = not self._repair_enqueue_rejected(prior)
             observed["repair_deployed"] = bool(prior["repair"].get("deployed_at"))
         return self.recovery.record_episode(observed, self._decision(observed, prior, policy))
+
+    @staticmethod
+    def _repeated_failure_trigger(episode: dict, policy: RecoveryPolicy) -> dict | None:
+        """Identify an exhausted known-failure stage without reclassifying its cause."""
+        if (episode.get("repair") and not NodeRecoveryReconciler._repair_enqueue_rejected(episode)) or "request_repair" not in policy.allowed_actions:
+            return None
+        for stage, count in episode.get("stage_attempts", {}).items():
+            if stage == "request_repair" or count < policy.max_action_attempts:
+                continue
+            actions = [item for item in episode.get("actions", []) if item.get("stage_key") == stage]
+            if len(actions) < count:
+                continue
+            if all(
+                item.get("state") == "completed"
+                and item.get("receipt", {}).get("known_effects") is True
+                and item.get("receipt", {}).get("stage_succeeded") is False
+                for item in actions
+            ):
+                return {"episode_id": episode["episode_id"], "stage_key": stage}
+        return None
+
+    @staticmethod
+    def _repair_enqueue_rejected(episode: dict) -> bool:
+        """Distinguish a reserved repair identity from a rejected pre-dispatch action."""
+        actions = [item for item in episode.get("actions", []) if item.get("stage_key") == "request_repair"]
+        if not actions:
+            return False
+        latest = actions[-1]
+        receipt = latest.get("receipt") or {}
+        return (
+            latest.get("state") == "completed"
+            and receipt.get("known_effects") is True
+            and receipt.get("stage_succeeded") is False
+            and receipt.get("reason_kind") == "repair_admission_rejected"
+        )
 
     def _refresh_task(self, task_id: str, cursor: int) -> None:
         policy = self.recovery.get_policy(task_id)["policy"]
@@ -313,6 +357,8 @@ class NodeRecoveryReconciler:
     def _receipt_progress(episode: dict, plan: dict, receipt: dict) -> tuple[dict, dict]:
         """Apply identical check-reuse facts for direct and reconciled receipts."""
         observed = {**episode["observation"], **receipt.get("observation_patch", {})}
+        if plan["action"] == "request_repair" and receipt.get("stage_succeeded") is True:
+            observed["repair_enqueue_rejected"] = False
         if plan["action"] == "narrow_validation" and receipt.get("ok") is True:
             prior = episode["observation"]
             preview = plan.get("fresh_preview", {})

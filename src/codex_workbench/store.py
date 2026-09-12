@@ -328,6 +328,7 @@ class WorkbenchStore:
     def initialize(self) -> None:
         from .authority_service import AUTHORITY_REQUEST_JOURNAL_DDL
         from .node_recovery_store import NODE_RECOVERY_SCHEMA_SQL
+        from .session_notifications import SCHEMA_SQL as SESSION_NOTIFICATION_SCHEMA_SQL
 
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._init_lock, self.connection() as connection:
@@ -630,6 +631,7 @@ class WorkbenchStore:
                 """
             schema_sql += AUTHORITY_REQUEST_JOURNAL_DDL
             schema_sql += NODE_RECOVERY_SCHEMA_SQL
+            schema_sql += SESSION_NOTIFICATION_SCHEMA_SQL
             schema_sql += MATERIAL_EVENT_INDEX_SQL + ";"
             # Read-only version fencing precedes every DDL statement. An
             # unknown newer database must remain untouched by an older binary.
@@ -8836,6 +8838,8 @@ class WorkbenchStore:
             "delivery_objective.authorization_denied",
             "node_recovery.needs_action",
             "node_recovery.reconcile_failed",
+            "node.blocked_source_repair_queued",
+            "session_notification.projection_failed",
         }
         with self.connection() as connection:
             rows = connection.execute(
@@ -9044,6 +9048,8 @@ class WorkbenchStore:
             return self._context_receipt(receipt)
 
     def bind_task_to_session(self, source_thread_id: str, task_id: str) -> None:
+        from .session_notifications import register_task_session
+
         timestamp = now_iso()
         with self.transaction() as connection:
             changed = connection.execute(
@@ -9056,6 +9062,7 @@ class WorkbenchStore:
             ).rowcount
             if changed != 1:
                 raise KeyError(source_thread_id)
+            register_task_session(connection, task_id, source_thread_id)
             self._event(
                 connection,
                 "context.task_bound",

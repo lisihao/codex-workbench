@@ -440,6 +440,38 @@ class NodeRecoveryLoopTests(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0]["payload"]["reason_kind"], "budget_exhausted")
 
+    def test_only_exhausted_known_failed_stage_can_trigger_repair(self):
+        policy = RecoveryPolicy(
+            enabled=True, allowed_actions=("request_repair",),
+            repair_repository=self.temp.name, repair_allowed_scopes=("src",), max_action_attempts=1,
+        )
+        episode = {
+            "episode_id": "fixture-episode", "stage_attempts": {"observe_readiness": 1},
+            "actions": [{"stage_key": "observe_readiness", "state": "completed",
+                         "receipt": {"known_effects": True, "stage_succeeded": False}}],
+        }
+        self.assertEqual(self.loop._repeated_failure_trigger(episode, policy), {
+            "episode_id": "fixture-episode", "stage_key": "observe_readiness",
+        })
+        for replacement in (
+            {"state": "unknown", "receipt": {"known_effects": False}},
+            {"state": "completed", "receipt": {"known_effects": True, "stage_succeeded": True}},
+        ):
+            invalid = {**episode, "actions": [{**episode["actions"][0], **replacement}]}
+            self.assertIsNone(self.loop._repeated_failure_trigger(invalid, policy))
+        self.assertIsNone(self.loop._repeated_failure_trigger({**episode, "repair": {"repair_task_id": "existing"}}, policy))
+        self.assertIsNone(self.loop._repeated_failure_trigger({**episode, "actions": []}, policy))
+
+    def test_reserved_repair_link_does_not_mask_a_known_admission_rejection(self):
+        episode = {"repair": {"repair_task_id": "reserved"}, "actions": [{
+            "stage_key": "request_repair", "state": "completed",
+            "receipt": {"known_effects": True, "stage_succeeded": False,
+                        "reason_kind": "repair_admission_rejected"},
+        }]}
+        self.assertTrue(self.loop._repair_enqueue_rejected(episode))
+        episode["actions"].append({"stage_key": "request_repair", "state": "unknown", "receipt": {}})
+        self.assertFalse(self.loop._repair_enqueue_rejected(episode))
+
     def test_restart_reuses_passed_validation_receipt_instead_of_running_it_again(self):
         self.category = "validation_failure"
         self.policy = RecoveryPolicy(

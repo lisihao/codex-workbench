@@ -38,6 +38,14 @@ Use `workbench_configure_node_recovery` through the same authenticated Authority
 
 This example only observes readiness. It cannot install dependencies, requeue a clean node or publish a repair. Add a fixed validation profile only when the task owns its required paths. Repair planning additionally requires explicit `repair_repository` and `repair_allowed_scopes`; it inherits the parent's Claude policy and retains the existing native-auth/quota gates. No API-key fallback is added.
 
+An exhausted stage with only known failed action receipts may enter the authorized `request_repair` stage once for its existing failure identity. The repair adapter verifies the durable episode, policy revision and action ledger before planning. It retains the observed failure category: repeated environment failure is not proof of a tooling bug. Unknown receipts, a pending repair, expired time budget, pause, cancellation or missing repair scope cannot trigger another repair request.
+
+## Session notifications
+
+The Authority control turn projects selected failure and recovery events into a durable session outbox without waking a model. Task-to-session routes survive a later change of the session's active task. Events without a route remain available for late binding; repeated projection and restart do not create a second notification. Notifications contain fixed event metadata rather than diagnostic bodies or source paths.
+
+`workbench_read_session_notifications` reads pending entries for one originating session. `workbench_ack_session_notification` records a session-bound acknowledgement through the existing Authority request journal. Reading does not acknowledge, and an acknowledgement does not prove that Codex displayed a message. This candidate does not yet provide a verified daemon-to-Codex conversation push adapter. Durable outbox acceptance and actual host delivery must be reported separately.
+
 ## Preservation and repair
 
 An environment-blocked node no longer prevents an independent legal node from being claimed. Dependency acceptance and read/write scope gates still apply. Pause and cancellation override recovery at claim and settlement; unknown effects retain their original evidence and require a decision. One bounded investigation may report missing durable progress for a running attempt, but it neither labels a live PID as progress nor declares a deadlock or kills the process.

@@ -254,6 +254,7 @@ class Coordinator:
         self._quota_unavailable_reported = False
         self.node_recovery = None
         self._node_recovery_fault: str | None = None
+        self._session_notification_fault: str | None = None
 
     def bind_authority_service(self, authority_service) -> None:
         """Share the running Authority journal with fixed recovery adapters."""
@@ -289,6 +290,8 @@ class Coordinator:
 
     def _reconcile_authority_work(self) -> list[dict]:
         """Use the existing bounded control pool without holding worker dispatch."""
+        from .session_notifications import project_notifications
+
         if self.node_recovery is not None:
             try:
                 self.node_recovery.reconcile_once()
@@ -301,7 +304,19 @@ class Coordinator:
                         {"error": failure, "owner": "authority", "retry": "bounded-next-control-turn"},
                     )
                     self._node_recovery_fault = failure
-        return self.delivery_lifecycle.reconcile_once()
+        result = self.delivery_lifecycle.reconcile_once()
+        try:
+            project_notifications(self.store, limit=200)
+            self._session_notification_fault = None
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"[:512]
+            if failure != self._session_notification_fault:
+                self.store.record_system_event(
+                    "session_notification.projection_failed",
+                    {"error": failure, "owner": "authority", "retry": "bounded-next-control-turn"},
+                )
+                self._session_notification_fault = failure
+        return result
 
     def recover(self) -> int:
         recovered_planning = self.store.recover_interrupted_planning_requests()

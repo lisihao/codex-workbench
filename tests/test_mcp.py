@@ -168,6 +168,8 @@ class MCPTests(unittest.TestCase):
                 "workbench_validate_blocked_node",
                 "workbench_configure_node_recovery",
                 "workbench_get_node_recovery",
+                "workbench_read_session_notifications",
+                "workbench_ack_session_notification",
                 "workbench_amend_task_acceptance",
                 "workbench_request",
                 "workbench_get_request",
