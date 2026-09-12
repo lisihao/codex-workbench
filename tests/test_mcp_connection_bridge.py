@@ -76,6 +76,7 @@ tools = [
     {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_write", "annotations": {"readOnlyHint": False}},
     {"name": "workbench_handoff_lockfile", "annotations": {"readOnlyHint": False}},
+    {"name": "workbench_responsibility", "annotations": {"readOnlyHint": False}},
 ]
 if mode == "upgrade" and launch >= 2:
     tools.append({"name": "new_read_tool", "annotations": {"readOnlyHint": True}})
@@ -156,7 +157,11 @@ for raw in sys.stdin:
         log(arguments["op"])
         send(request_id, {"content": [{"type": "text", "text": arguments["op"] + "-ok"}]})
         continue
-    if name in {"workbench_write", "workbench_handoff_lockfile"}:
+    if name == "workbench_responsibility" and arguments.get("op") == "inspect":
+        log("inspect")
+        send(request_id, {"content": [{"type": "text", "text": "inspect-ok"}]})
+        continue
+    if name in {"workbench_write", "workbench_handoff_lockfile", "workbench_responsibility"}:
         log("write")
         (root / "last-write-arguments").write_text(json.dumps(arguments, sort_keys=True))
         with (root / "effects").open("a") as stream:
@@ -465,6 +470,21 @@ class MCPConnectionBridgeTests(unittest.TestCase):
         self.assertTrue(self._by_id(output, 3)["result"]["isError"])
         self.assertNotIn("write", self._log())
         self.assertNotIn("query", self._log())
+
+    def test_responsibility_read_and_lost_mutation_receipt_use_one_identity(self) -> None:
+        messages = self._initialize()
+        for number, args in enumerate((
+            {"op": "inspect"},
+            {"op": "open", "request_id": "responsibility-1"},
+            {"op": "open", "request_id": "responsibility-1"},
+        ), 3):
+            messages.append({"jsonrpc": "2.0", "id": number, "method": "tools/call",
+                             "params": {"name": "workbench_responsibility", "arguments": args}})
+        output = self._run("write-completed", messages)
+        self.assertEqual(self._by_id(output, 3)["result"]["content"][0]["text"], "inspect-ok")
+        self.assertEqual(self._by_id(output, 5)["result"]["content"][0]["text"], "persisted-result")
+        self.assertEqual(self._log().count("write"), 1)
+        self.assertEqual((self.fixture / "last-query-id").read_text(), "responsibility-1")
 
     def test_unknown_write_status_is_indeterminate_and_never_replayed(self) -> None:
         messages = [

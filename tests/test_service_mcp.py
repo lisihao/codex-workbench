@@ -17,6 +17,7 @@ class ServiceMCPTests(unittest.TestCase):
             {"name": "workbench_list_tasks", "annotations": {"readOnlyHint": True}},
             {"name": "workbench_control_task", "annotations": {"readOnlyHint": False}},
             {"name": "workbench_handoff_lockfile", "annotations": {"readOnlyHint": False}},
+            {"name": "workbench_responsibility", "annotations": {"readOnlyHint": False}},
             {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
         ]}
         self.result = {"content": [{"type": "text", "text": "accepted request, not task acceptance"}]}
@@ -55,6 +56,16 @@ class ServiceMCPTests(unittest.TestCase):
                 result = self.call("workbench_handoff_lockfile", {"op": op, "request_id": "handoff-1"})
                 self.assertTrue(result["isError"])
         self.client.dispatch.assert_not_called()
+
+    def test_responsibility_inspect_is_read_only_and_mutation_preserves_one_id(self):
+        self.assertEqual(self.call("workbench_responsibility", {"op": "inspect", "task_id": "task", "goal_id": "goal"}), self.result)
+        self.assertTrue(self.client.dispatch.call_args.kwargs["read_only"])
+        args = {"op": "open", "task_id": "task", "goal_id": "goal", "request_id": "open-1"}
+        self.assertEqual(self.call("workbench_responsibility", args), self.result)
+        envelope = self.client.dispatch.call_args.args[0]
+        self.assertEqual(envelope["request_id"], "open-1")
+        self.assertEqual(envelope["arguments"], args)
+        self.assertFalse(self.client.dispatch.call_args.kwargs["read_only"])
 
     def test_mutation_requires_stable_id_but_read_does_not(self):
         result = self.call("workbench_control_task", {"task_id": "task", "action": "pause"})

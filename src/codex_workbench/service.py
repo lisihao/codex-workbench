@@ -256,6 +256,7 @@ class Coordinator:
         self.node_recovery = None
         self._node_recovery_fault: str | None = None
         self._session_notification_fault: str | None = None
+        self._responsibility_fault: str | None = None
 
     def bind_authority_service(self, authority_service) -> None:
         """Share the running Authority journal with fixed recovery adapters."""
@@ -306,6 +307,21 @@ class Coordinator:
                     )
                     self._node_recovery_fault = failure
         result = self.delivery_lifecycle.reconcile_once()
+        try:
+            from .responsibility import ResponsibilityLedger
+
+            ResponsibilityLedger(self.store).reconcile_terminal(
+                coordinator_epoch=self.coordinator_epoch, limit=100,
+            )
+            self._responsibility_fault = None
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"[:512]
+            if failure != self._responsibility_fault:
+                self.store.record_system_event(
+                    "responsibility.reconcile_failed",
+                    {"error": failure, "owner": "authority", "retry": "bounded-next-control-turn"},
+                )
+                self._responsibility_fault = failure
         try:
             project_notifications(self.store, limit=200)
             self._session_notification_fault = None

@@ -24,6 +24,11 @@ _MAX_TIMESTAMP_CHARS = 40
 _UNROUTED_SOURCE_THREAD = None
 
 NOTIFICATION_EVENT_TYPES = (
+    "responsibility.handoff_proposed",
+    "responsibility.handoff_claimed",
+    "responsibility.deferred",
+    "responsibility.fulfilled",
+    "responsibility.cancelled",
     "node.blocked",
     "node.failed",
     "node.blocked_worktree_recovery_rolled_back",

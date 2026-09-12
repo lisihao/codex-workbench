@@ -2,6 +2,12 @@
 
 Status: implementation authorized; preparation-failure recovery is the first delivery slice. Later slices are not implemented or deployed by this plan. Workbench is independent of the applications it develops. Production migration, new takeover authority and deployment remain separately authorized operations.
 
+## First continuation candidate
+
+The v1.20.0 candidate implements event-journal responsibility proposals/claims/typed deferral, authoritative terminal projection, read-only session objective inventory and typed waits for the existing delivery observation/receipt/deployment-safe-point paths. Owners are `responsibility.py` plus `responsibility_api.py`, `session_objectives.py` plus the existing get-session handler, and `delivery_lifecycle.py` with its existing store methods. The existing Authority control turn reconciles terminal responsibilities and projects their existing-route notifications; no new executor or scheduler is created. MCP, HTTP journaling and the bridge preserve one mutation identity. These are source and fixture milestones, not installed-runtime acceptance.
+
+P2 explicit scoped/superseded steering, complete recovery/supervisor fault coverage and measured unattended-time/rework/user-nudge reports remain separate work. Existing recovery budgets and journal reconciliation are reused rather than replaced. Current-host catalogue verification remains a deployment acceptance item even when a fresh fixture connection passes.
+
 ## Delivery order and ownership
 
 | Slice | Implementation owner and files | Dependencies | Observable acceptance |

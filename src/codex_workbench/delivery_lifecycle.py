@@ -53,6 +53,23 @@ DELIVERY_FAILURE_KINDS = frozenset(
 MANUAL_DECISION_FAILURE_KINDS = frozenset(
     {"unknown-effects", "permission-denied", "missing-essential-user-choice"}
 )
+DELIVERY_WAIT_KINDS = frozenset(
+    {"resource", "dependency", "environment", "indeterminate", "approval", "user_pause"}
+)
+_WAIT_REASON_METADATA = {
+    "missing-artifact-input": ("dependency", "required_artifact_input_is_available"),
+    "invalid-planning-scopes": ("dependency", "planning_scopes_are_valid"),
+    "stale-base-ref": ("dependency", "authoritative_base_ref_is_current"),
+    "execution-environment": ("environment", "execution_environment_is_available"),
+    "provider-unavailable-quota": ("resource", "provider_capacity_is_available"),
+    "result-envelope-rejected": ("environment", "result_envelope_is_accepted"),
+    "verification-failure": ("environment", "verification_failure_is_repaired"),
+    "unknown-effects": ("indeterminate", "authoritative_reconciliation_is_complete"),
+    "permission-denied": ("approval", "scope_limited_authorization_is_granted"),
+    "missing-essential-user-choice": ("approval", "essential_user_choice_is_provided"),
+    "active-workers-draining": ("resource", "active_workers_reach_safe_point"),
+}
+_WAIT_CONTEXT_UNSET = object()
 # A deployment receipt is not enough to establish what actually ran.  Keep
 # the host toolchain identities alongside the source/build/deploy/runtime
 # chain so a live check cannot accidentally bless a process from a different
@@ -244,24 +261,70 @@ def merge_identities(existing: object, incoming: object | None) -> dict[str, Any
     return current
 
 
-def normalize_wait_reason(value: object, *, default_kind: str | None = None) -> dict[str, Any]:
+def normalize_wait_reason(
+    value: object,
+    *,
+    default_kind: str | None = None,
+    responsible_owner: object = _WAIT_CONTEXT_UNSET,
+    next_recheck_at: object = _WAIT_CONTEXT_UNSET,
+) -> dict[str, Any]:
+    """Normalize a durable delivery wait without inventing missing ownership."""
+
     if isinstance(value, str):
         detail = _nonempty_text(value, "wait_reason")
         kind = default_kind or "execution-environment"
-        return {"kind": kind, "detail": detail}
-    if not isinstance(value, dict):
+        normalized: dict[str, Any] = {"kind": kind, "detail": detail}
+    elif not isinstance(value, dict):
         raise ValueError("wait_reason must be a string or object")
-    normalized = dict(value)
-    kind = normalized.get("kind", default_kind)
-    if kind not in DELIVERY_FAILURE_KINDS:
-        raise ValueError("wait_reason.kind must be a recognized delivery failure kind")
-    normalized["kind"] = str(kind)
+    else:
+        normalized = dict(value)
+    kind = _nonempty_text(normalized.get("kind", default_kind), "wait_reason.kind")
+    if kind not in _WAIT_REASON_METADATA:
+        raise ValueError("wait_reason.kind must be a recognized delivery wait reason kind")
+    wait_kind, default_release_condition = _WAIT_REASON_METADATA[kind]
+    declared_wait_kind = _nonempty_text(
+        normalized.get("wait_kind", wait_kind), "wait_reason.wait_kind"
+    )
+    if declared_wait_kind not in DELIVERY_WAIT_KINDS:
+        raise ValueError("wait_reason.wait_kind must be a recognized delivery wait kind")
+    if declared_wait_kind != wait_kind:
+        raise ValueError("wait_reason.wait_kind must match the delivery failure kind")
+    normalized["kind"] = kind
+    normalized["wait_kind"] = wait_kind
     normalized["detail"] = _nonempty_text(
         normalized.get("detail", normalized.get("reason")), "wait_reason.detail"
+    )
+    normalized["release_condition"] = _nonempty_text(
+        normalized.get("release_condition", default_release_condition),
+        "wait_reason.release_condition",
     )
     resolution = normalized.get("resolution")
     if resolution is not None:
         normalized["resolution"] = _nonempty_text(resolution, "wait_reason.resolution")
+    has_declared_owner = "responsible_owner" in normalized
+    declared_owner = normalized.get("responsible_owner")
+    if declared_owner is not None:
+        declared_owner = _nonempty_text(declared_owner, "wait_reason.responsible_owner")
+    if responsible_owner is not _WAIT_CONTEXT_UNSET:
+        actual_owner = responsible_owner
+        if actual_owner is not None:
+            actual_owner = _nonempty_text(actual_owner, "wait_reason.responsible_owner")
+        if has_declared_owner and declared_owner != actual_owner:
+            raise ValueError("wait_reason.responsible_owner must match the current delivery claim")
+        normalized["responsible_owner"] = actual_owner
+    elif has_declared_owner:
+        normalized["responsible_owner"] = declared_owner
+    has_declared_recheck = "next_recheck_at" in normalized
+    declared_recheck = normalize_timestamp(
+        normalized.get("next_recheck_at"), "wait_reason.next_recheck_at"
+    )
+    if next_recheck_at is not _WAIT_CONTEXT_UNSET:
+        actual_recheck = normalize_timestamp(next_recheck_at, "wait_reason.next_recheck_at")
+        if has_declared_recheck and declared_recheck != actual_recheck:
+            raise ValueError("wait_reason.next_recheck_at must match the objective wakeup")
+        normalized["next_recheck_at"] = actual_recheck
+    elif has_declared_recheck:
+        normalized["next_recheck_at"] = declared_recheck
     return _json_safe(normalized, "wait_reason")
 
 

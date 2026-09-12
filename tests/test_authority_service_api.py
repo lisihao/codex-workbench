@@ -56,6 +56,11 @@ class AuthorityServiceAPITests(unittest.TestCase):
             required = tool["inputSchema"].get("required", [])
             self.assertEqual(len(required), len(set(required)), tool["name"])
         handoff = next(tool for tool in tools if tool["name"] == "workbench_handoff_lockfile")
+        responsibility = next(tool for tool in tools if tool["name"] == "workbench_responsibility")
+        self.assertNotIn("request_id", responsibility["inputSchema"]["required"])
+        open_schema = next(item for item in responsibility["inputSchema"]["oneOf"]
+                           if item["properties"]["op"]["const"] == "open")
+        self.assertIn("request_id", open_schema["required"])
         self.assertEqual(handoff["inputSchema"]["properties"]["request_id"],
                          HANDOFF_TOOL["inputSchema"]["properties"]["request_id"])
         control = next(tool for tool in tools if tool["name"] == "workbench_control_task")
