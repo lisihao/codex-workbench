@@ -4,6 +4,8 @@ This operation repairs a prerequisite of an existing blocked task. It does not c
 
 The task must already authorize `pnpm-lock.yaml`. A preview identifies the existing lockfile owner, the temporary handoff owner, the blocked node and attempt, accepted dependency inputs, and the manifest and lockfile fingerprints. Ambiguous ownership, active conflicting work, or changed inputs reject the operation.
 
+Historical package-preparation failures may lack a dependency-input receipt. Recovery then requires the blocked result's content-verified pnpm materialization failure report and reconstructs accepted ancestor patches from the fixed task snapshot in a private Git index. The reconstructed tree must exactly match the source's staged tree; missing evidence, corrupt patches, changed ancestors or staged worker edits reject recovery. The live index, worker files and historical task result are not rewritten. Normal preparation now preserves its completed input receipt even if the subsequent package installation fails.
+
 The preview lists up to 32 changed importer paths and reports the complete count and fingerprint. If `changed_importers_truncated` is true, the displayed list is incomplete; inspect the complete source plan before authorizing application.
 
 `workbench_handoff_lockfile` is available through the existing authenticated Authority service. `preview` and `status` are read-only. `apply` requires the preview fingerprint and a stable request ID matching the Authority journal request ID. After an uncertain transport response, query that journal receipt and the handoff status; do not invent a new ID to retry.

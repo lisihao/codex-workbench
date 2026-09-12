@@ -311,6 +311,62 @@ class LockfileHandoffTests(unittest.TestCase):
         self.assertEqual(response["state"], "completed")
         return response["result"]  # type: ignore[return-value]
 
+    def _legacy_preparation_failure(self, task_id: str):
+        contract, task, source = self._blocked_fixture(task_id)
+        result = dict(self._worker(task)["result"])
+        result["artifacts"] = {"dependency-materialization": self.store.artifacts.put_text(
+            canonical_json({"schema_version": 1, "kind": "pnpm-offline-materialization",
+                            "status": "blocked", "reason": "frozen lockfile outdated"}),
+            "dependency-materialization.json",
+        )}
+        with self.store.connection() as connection:
+            connection.execute("UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                               (canonical_json(result), task_id))
+        return contract, self.store.get_task(task_id), source
+
+    def test_preparation_failure_reconstructs_input_without_changing_historical_source(self) -> None:
+        contract, before, source = self._legacy_preparation_failure("legacy-preparation")
+        args = self._arguments(contract, before, "legacy-handoff")
+        index = Path(self._git(source, "rev-parse", "--git-path", "index"))
+        index_before = index.read_bytes()
+        manifest_before = (source / "packages/a/package.json").read_bytes()
+        preview = lockfile_handoff(self.config, self.store, args)
+        self.assertEqual(preview["state"], "preview")
+        self.assertEqual(self.store.get_task(contract.task_id), before)
+        with patch("codex_workbench.lockfile_handoff._pnpm_materializer", return_value=_FixtureMaterializer()):
+            applied = self._apply(args, preview)
+        self.assertEqual(applied["state"], "ready", applied)
+        self.assertEqual(index.read_bytes(), index_before)
+        self.assertEqual((source / "packages/a/package.json").read_bytes(), manifest_before)
+        self.assertEqual(self._worker(self.store.get_task(contract.task_id))["result"], self._worker(before)["result"])
+
+    def test_preparation_reconstruction_rejects_staged_worker_edits(self) -> None:
+        contract, before, source = self._legacy_preparation_failure("legacy-staged")
+        self._git(source, "add", "packages/a/package.json")
+        with self.assertRaisesRegex(LockfileHandoffError, "staged source does not match"):
+            lockfile_handoff(self.config, self.store, self._arguments(contract, before, "staged-reject"))
+        self.assertEqual(self.store.get_task(contract.task_id), before)
+
+    def test_preparation_reconstruction_rejects_corrupt_accepted_patch(self) -> None:
+        contract, before, source = self._legacy_preparation_failure("legacy-corrupt")
+        ancestor = next(node for node in before["nodes"] if node["node_id"] == "upstream")
+        artifact = self.store.artifacts.verify(ancestor["result"]["artifacts"]["patch"])
+        artifact.write_bytes(b"corrupt fixture patch")
+        with self.assertRaisesRegex(LockfileHandoffError, "hash mismatch"):
+            lockfile_handoff(self.config, self.store, self._arguments(contract, before, "corrupt-reject"))
+        self.assertEqual(self.store.get_task(contract.task_id), before)
+
+    def test_preparation_reconstruction_rejects_missing_failure_evidence(self) -> None:
+        contract, before, source = self._legacy_preparation_failure("legacy-missing")
+        with self.store.connection() as connection:
+            result = dict(self._worker(before)["result"])
+            result["artifacts"] = {}
+            connection.execute("UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                               (canonical_json(result), contract.task_id))
+        task = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(LockfileHandoffError, "failure evidence"):
+            lockfile_handoff(self.config, self.store, self._arguments(contract, task, "missing-reject"))
+
     def test_success_keeps_task_blocked_and_returns_replayable_ready_overlay(self) -> None:
         contract, before, source = self._blocked_fixture()
         arguments = self._arguments(contract, before, "handoff-success")
