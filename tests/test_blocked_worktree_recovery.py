@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import socket
 import shutil
@@ -1351,6 +1352,211 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual([timeout for _command, timeout in calls], [360, 360, 360])
         self.assertIn("--pm-on-fail=ignore", calls[1][0])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
+
+    def test_offline_materializer_keeps_complete_install_when_template_publication_times_out(self) -> None:
+        worktree = self.root / "publication-timeout"
+        template_root = self.root / "templates"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(tuple(args))
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            if args[0] == "/bin/cp":
+                raise subprocess.TimeoutExpired(
+                    args,
+                    kwargs["timeout"],
+                    output="template copy still running\n" * 500,
+                    stderr="cross-device copy fixture\n",
+                )
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            linker = cwd / "node_modules"
+            (linker / ".bin").mkdir(parents=True)
+            (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "offline frozen install ok\n", "")
+
+        receipt = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            template_dir=template_root,
+            runner=runner,
+        ).materialize(worktree, timeout_seconds=120)
+
+        template = receipt["template"]
+        assert isinstance(template, dict)
+        self.assertEqual(template["state"], "publication_failed")
+        self.assertEqual(
+            (worktree / "node_modules" / PnpmOfflineMaterializer.TEMPLATE_MARKER_FILENAME)
+            .read_text(encoding="utf-8")
+            .strip(),
+            template["key"],
+        )
+        self.assertEqual(
+            template["warning"],
+            "pnpm linker template publication failed after complete local frozen install",
+        )
+        self.assertIn("offline pnpm materialization timed out after", template["diagnostic"])
+        self.assertIn("pnpm template clone", template["diagnostic"])
+        self.assertIn("captured output: stdout=", template["diagnostic"])
+        self.assertLess(len(template["diagnostic"].encode("utf-8")), 4_200)
+        commands = receipt["commands"]
+        assert isinstance(commands, list)
+        self.assertEqual([command["exit_code"] for command in commands], [0, 0])
+        self.assertIn("install", commands[1]["command"])
+        self.assertEqual(receipt["budget_seconds"], {"configured": 120, "effective": 120})
+        timing = receipt["timing_seconds"]
+        assert isinstance(timing, dict)
+        self.assertEqual(
+            set(timing),
+            {"version", "signature", "lock_wait", "install", "publication", "total"},
+        )
+        self.assertTrue(all(isinstance(value, float) and value >= 0 for value in timing.values()))
+        self.assertEqual(sum(command[0] == "/bin/cp" for command in calls), 1)
+
+    def test_offline_materializer_install_timeout_remains_fatal(self) -> None:
+        worktree = self.root / "install-timeout"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            raise subprocess.TimeoutExpired(
+                args,
+                kwargs["timeout"],
+                output="frozen install still running\n",
+                stderr="fixture install timeout\n",
+            )
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            template_dir=self.root / "templates",
+            runner=runner,
+        )
+        with self.assertRaisesRegex(
+            DirtyWorktreeRecoveryError,
+            r"offline pnpm materialization timed out after \d+s; recovery stopped without retrying indefinitely",
+        ) as raised:
+            materializer.materialize(worktree, timeout_seconds=120)
+
+        diagnostic = str(raised.exception)
+        self.assertIn("frozen offline pnpm install", diagnostic)
+        self.assertIn("captured output: stdout=frozen install still running", diagnostic)
+        self.assertFalse((worktree / "node_modules").exists())
+
+    def test_offline_materializer_signature_prunes_excluded_trees_without_changing_key(self) -> None:
+        worktree = self.root / "signature-pruning"
+        package = worktree / "packages" / "fixture"
+        package.mkdir(parents=True)
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0", "name": "root"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+        (package / "package.json").write_text(
+            json.dumps({"name": "fixture"}), encoding="utf-8"
+        )
+        materializer = PnpmOfflineMaterializer(binary=sys.executable)
+        baseline = materializer._template_signature(worktree, "pnpm@11.25.0", "11.25.0")
+        excluded_manifests = (
+            worktree / ".git" / "objects" / "fixture" / "package.json",
+            worktree / "node_modules" / ".pnpm" / "fixture" / "package.json",
+            package / "node_modules" / "fixture" / "package.json",
+        )
+        for manifest in excluded_manifests:
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"name": "excluded"}), encoding="utf-8")
+
+        walked: list[Path] = []
+        actual_walk = os.walk
+
+        def tracking_walk(path: Path):
+            for current, directories, filenames in actual_walk(path):
+                walked.append(Path(current).relative_to(worktree))
+                yield current, directories, filenames
+
+        with patch(
+            "codex_workbench.dirty_worktree_recovery.os.walk",
+            side_effect=tracking_walk,
+        ):
+            observed = materializer._template_signature(worktree, "pnpm@11.25.0", "11.25.0")
+
+        self.assertEqual(observed, baseline)
+        self.assertFalse(
+            any(".git" in relative.parts or "node_modules" in relative.parts for relative in walked)
+        )
+        (package / "package.json").write_text(
+            json.dumps({"name": "fixture", "version": "2.0.0"}), encoding="utf-8"
+        )
+        self.assertNotEqual(
+            materializer._template_signature(worktree, "pnpm@11.25.0", "11.25.0")["key"],
+            baseline["key"],
+        )
+
+    def test_offline_materializer_reuses_complete_available_linker_tree_without_install(self) -> None:
+        worktree = self.root / "available-linker-reuse"
+        template_root = self.root / "templates"
+        package = worktree / "packages" / "fixture"
+        package.mkdir(parents=True)
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+        installs = 0
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal installs
+            if args[0] == "/bin/cp":
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            installs += 1
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            linker = cwd / "node_modules"
+            (linker / ".bin").mkdir(parents=True)
+            (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            (package / "node_modules").mkdir()
+            return subprocess.CompletedProcess(args, 0, "offline frozen install ok\n", "")
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            template_dir=template_root,
+            runner=runner,
+        )
+        materializer.materialize(worktree, timeout_seconds=120)
+        with patch.object(
+            materializer,
+            "_linker_tree_is_complete",
+            wraps=materializer._linker_tree_is_complete,
+        ) as complete:
+            receipt = materializer.materialize(worktree, timeout_seconds=120)
+
+        self.assertEqual(installs, 1)
+        self.assertEqual(receipt["template"]["state"], "reuse")
+        self.assertEqual(
+            complete.call_args.args[1],
+            (Path("node_modules"), Path("packages/fixture/node_modules")),
+        )
+        commands = receipt["commands"]
+        assert isinstance(commands, list)
+        self.assertFalse(any("install" in command["command"] for command in commands))
 
     def test_offline_materializer_reuses_isolated_template_for_matching_inputs(self) -> None:
         store = self.root / "template-store"

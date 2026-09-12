@@ -68,6 +68,7 @@ _RECOVERY_EVIDENCE_MAX_LAUNCHER_BYTES = 1_048_576
 _RECOVERY_ERROR_PATH_LIMIT = 8
 _RECOVERY_ERROR_PATH_CHARS = 80
 _RECOVERY_ERROR_SUMMARY_CHARS = 768
+_MATERIALIZATION_DIAGNOSTIC_OUTPUT_BYTES = 4_096
 
 
 @dataclass(frozen=True)
@@ -947,6 +948,27 @@ class PnpmOfflineMaterializer:
         effective_timeout = min(timeout_seconds, maximum_seconds)
         if effective_timeout <= 0:
             raise DirtyWorktreeRecoveryError("pnpm recovery timeout must be positive")
+        started = time.monotonic()
+        phase_seconds: dict[str, float] = {
+            "version": 0.0,
+            "signature": 0.0,
+            "lock_wait": 0.0,
+            "install": 0.0,
+            "publication": 0.0,
+        }
+
+        def timing_receipt() -> dict[str, object]:
+            return {
+                "budget_seconds": {
+                    "configured": timeout_seconds,
+                    "effective": effective_timeout,
+                },
+                "timing_seconds": {
+                    **phase_seconds,
+                    "total": self._elapsed_seconds(started),
+                },
+            }
+
         environment = os.environ.copy()
         environment.update({
             "CI": "true",
@@ -959,16 +981,19 @@ class PnpmOfflineMaterializer:
             "npm_config_minimum_release_age": "0",
             "npm_config_trust_lockfile": "true",
         })
-        deadline = time.monotonic() + effective_timeout
+        deadline = started + effective_timeout
         # pnpm consults workspace configuration even for --version. Probe the
         # Workbench-managed binary in a neutral directory so a broken target
         # workspace cannot consume the whole recovery lease before install.
+        version_started = time.monotonic()
         version = self._run(
             (binary, "--version"),
             Path(tempfile.gettempdir()),
             environment,
             self._remaining_seconds(deadline),
+            stage="pnpm version probe",
         )
+        phase_seconds["version"] = self._elapsed_seconds(version_started)
         if version.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
                 f"pnpm version probe failed: {version.stderr.strip() or version.stdout.strip()}"
@@ -987,9 +1012,11 @@ class PnpmOfflineMaterializer:
                 f"pnpm {actual_version} is unsupported for offline recovery; pnpm 11 must be at least "
                 f"{minimum}. Configure {self.BINARY_ENVIRONMENT_VARIABLE} to the Workbench-managed runtime."
             )
+        signature_started = time.monotonic()
         template_signature = self._template_signature(
             worktree, declared, actual_version
         )
+        phase_seconds["signature"] = self._elapsed_seconds(signature_started)
         template_directory = (
             cache_root / template_signature["key"]
             if cache_root is not None
@@ -1024,9 +1051,12 @@ class PnpmOfflineMaterializer:
         # linker. The same lock also protects cache publication so no recovery
         # can observe a partially copied template.
         template_publish: CommandOutcome | None = None
+        template_publication_error: str | None = None
         with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
-            if not require_cached_template and self._has_template_marker(
-                worktree / "node_modules", template_signature["key"]
+            phase_seconds["lock_wait"] = lock_wait_seconds
+            available_linker_paths = self._linker_paths(worktree)
+            if not require_cached_template and self._linker_tree_is_complete(
+                worktree, available_linker_paths, template_signature["key"]
             ):
                 return {
                     "schema_version": 1,
@@ -1045,6 +1075,7 @@ class PnpmOfflineMaterializer:
                         "key": template_signature["key"],
                         "path": str(worktree / "node_modules"),
                     },
+                    **timing_receipt(),
                     "commands": [version.to_dict(), {
                         "command": ["pnpm-worktree", "reuse", str(worktree)],
                         "exit_code": 0,
@@ -1076,6 +1107,7 @@ class PnpmOfflineMaterializer:
                             "path": str(template_directory),
                             "replaced_interrupted_node_modules": replaced_interrupted_node_modules,
                         },
+                        **timing_receipt(),
                         "commands": [version.to_dict(), clone.to_dict()],
                     }
             if require_cached_template:
@@ -1083,12 +1115,15 @@ class PnpmOfflineMaterializer:
                     "source-only recovery requires a cached verified pnpm linker template"
                 )
             self._discard_incomplete_node_modules(worktree)
+            install_started = time.monotonic()
             install = self._run(
                 install_command,
                 worktree,
                 environment,
                 self._remaining_seconds(deadline),
+                stage="frozen offline pnpm install",
             )
+            phase_seconds["install"] = self._elapsed_seconds(install_started)
             if install.exit_code != 0:
                 raise DirtyWorktreeRecoveryError(
                     "offline pnpm materialization failed: "
@@ -1096,11 +1131,43 @@ class PnpmOfflineMaterializer:
                 )
             if template_directory is not None:
                 self._write_template_marker(worktree / "node_modules", template_signature["key"])
-                template_publish = self._publish_template(
-                    template_directory, template_signature, worktree, deadline
-                )
+                if not self._has_template_marker(
+                    worktree / "node_modules", template_signature["key"]
+                ):
+                    raise DirtyWorktreeRecoveryError(
+                        "offline pnpm materialization did not retain a complete linker marker"
+                    )
+                publication_started = time.monotonic()
+                try:
+                    template_publish = self._publish_template(
+                        template_directory, template_signature, worktree, deadline
+                    )
+                except (DirtyWorktreeRecoveryError, OSError) as error:
+                    template_publication_error = _bounded(
+                        str(error) or type(error).__name__,
+                        limit=_MATERIALIZATION_DIAGNOSTIC_OUTPUT_BYTES,
+                    )
+                finally:
+                    phase_seconds["publication"] = self._elapsed_seconds(publication_started)
             elif self._node_modules_is_complete(worktree / "node_modules"):
                 self._write_template_marker(worktree / "node_modules", template_signature["key"])
+        if template_publication_error is not None and template_directory is not None:
+            template = {
+                "state": "publication_failed",
+                "key": template_signature["key"],
+                "path": str(template_directory),
+                "warning": "pnpm linker template publication failed after complete local frozen install",
+                "diagnostic": template_publication_error,
+            }
+        elif template_publish is not None and template_directory is not None:
+            template = {
+                "state": "seeded",
+                "key": template_signature["key"],
+                "path": str(template_directory),
+                "clone": template_publish.to_dict(),
+            }
+        else:
+            template = {"state": "disabled" if cache_root is None else "not-created"}
         return {
             "schema_version": 1,
             "kind": "pnpm-offline-materialization",
@@ -1113,17 +1180,8 @@ class PnpmOfflineMaterializer:
                 "path": str(lock_path),
                 "wait_seconds": lock_wait_seconds,
             },
-            "template": (
-                {
-                    "state": "seeded",
-                    "key": template_signature["key"],
-                    "path": str(template_directory),
-                    "clone": template_publish.to_dict(),
-                }
-                if template_publish is not None
-                and template_directory is not None
-                else {"state": "disabled" if cache_root is None else "not-created"}
-            ),
+            "template": template,
+            **timing_receipt(),
             "commands": [version.to_dict(), install.to_dict()],
         }
 
@@ -1138,10 +1196,12 @@ class PnpmOfflineMaterializer:
         self, worktree: Path, package_manager: str, pnpm_version: str
     ) -> dict[str, str]:
         input_paths = {Path("pnpm-lock.yaml"), Path("pnpm-workspace.yaml"), Path(".npmrc")}
-        for manifest in worktree.rglob("package.json"):
-            relative = manifest.relative_to(worktree)
-            if "node_modules" not in relative.parts and ".git" not in relative.parts:
-                input_paths.add(relative)
+        for current, directories, filenames in os.walk(worktree):
+            directories[:] = [
+                name for name in directories if name not in {".git", "node_modules"}
+            ]
+            if "package.json" in filenames:
+                input_paths.add(Path(current).relative_to(worktree) / "package.json")
         digest = sha256()
         for relative in sorted(input_paths, key=str):
             path = worktree / relative
@@ -1407,6 +1467,7 @@ class PnpmOfflineMaterializer:
             source.parent,
             os.environ.copy(),
             self._remaining_seconds(deadline),
+            stage="pnpm template clone",
         )
         if outcome.exit_code != 0:
             raise DirtyWorktreeRecoveryError(
@@ -1423,6 +1484,12 @@ class PnpmOfflineMaterializer:
                 "offline pnpm materialization exhausted its bounded recovery window"
             )
         return max(1, math.ceil(remaining))
+
+    @staticmethod
+    def _elapsed_seconds(started: float) -> float:
+        """Return a non-negative materialization phase duration rounded for receipts."""
+
+        return round(max(0.0, time.monotonic() - started), 3)
 
     @contextmanager
     def _shared_store_lock(self, deadline: float) -> Iterator[tuple[Path, float]]:
@@ -1465,6 +1532,8 @@ class PnpmOfflineMaterializer:
         cwd: Path,
         environment: Mapping[str, str],
         timeout_seconds: int,
+        *,
+        stage: str,
     ) -> CommandOutcome:
         try:
             completed = self.runner(
@@ -1477,9 +1546,26 @@ class PnpmOfflineMaterializer:
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
+            captured: list[str] = []
+            for name, value in (("stdout", error.output), ("stderr", error.stderr)):
+                if isinstance(value, bytes):
+                    text = value.decode(errors="replace")
+                elif isinstance(value, str):
+                    text = value
+                else:
+                    text = ""
+                if text:
+                    captured.append(
+                        name
+                        + "="
+                        + _bounded(text, limit=_MATERIALIZATION_DIAGNOSTIC_OUTPUT_BYTES)
+                    )
+            detail = f" during {stage} ({shlex.join(command)})"
+            if captured:
+                detail += "; captured output: " + "; ".join(captured)
             raise DirtyWorktreeRecoveryError(
                 "offline pnpm materialization timed out after "
-                f"{timeout_seconds}s; recovery stopped without retrying indefinitely"
+                f"{timeout_seconds}s; recovery stopped without retrying indefinitely{detail}"
             ) from error
         except OSError as error:
             raise DirtyWorktreeRecoveryError(f"cannot run {' '.join(command)}: {error}") from error
