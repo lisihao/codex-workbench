@@ -100,6 +100,7 @@ _ARCHIFY_COMMANDS = frozenset({"deliver", "compare", "visual-check", "validate",
 _DIRTY_WORKTREE_RECOVERY_PROVIDER = "workbench-dirty-worktree-recovery"
 _FAILED_ATTEMPT_RECOVERY_PROVIDER = "workbench-failed-attempt-recovery"
 _PLANNING_FUTURE_PREFIX = "planning/"
+_PROVIDER_BUDGET_EXHAUSTED_REASON = "provider execution budget exhausted before Codex fallback"
 
 
 @dataclass(frozen=True)
@@ -2029,6 +2030,13 @@ class Coordinator:
                 decision = self._missing_quota_reference_decision(decision)
             execute_started_monotonic = time.monotonic()
             context.execute_started_at = now_iso()
+            if spec["executor"] in {"claude", "codex"}:
+                request = replace(
+                    request,
+                    provider_deadline_monotonic=(
+                        execute_started_monotonic + float(contract["timeout_seconds"])
+                    ),
+                )
             if decision is not None and decision.action != "claude":
                 fallback_kind = (
                     "claude-capacity-overflow"
@@ -2066,6 +2074,7 @@ class Coordinator:
                             decision.zone if decision is not None else "unknown",
                             fallback_kind=f"claude-executor-{result.status}",
                             attribution_context=context,
+                            source_result=result,
                         )
                     else:
                         self._ensure_selected_candidate(
@@ -3059,7 +3068,18 @@ class Coordinator:
         *,
         fallback_kind: str,
         attribution_context: _ExecutionAttributionContext | None = None,
+        source_result: NodeResult | None = None,
     ) -> tuple[ExecutionRequest, NodeResult]:
+        if self._provider_execution_budget_exhausted(request):
+            if source_result is not None:
+                return request, self._with_provider_budget_exhausted_fallback(source_result)
+            return request, NodeResult(
+                status="failed",
+                summary=_PROVIDER_BUDGET_EXHAUSTED_REASON,
+                result_kind="verifier" if request.spec.get("verifier") else "worker",
+                checks=(f"FAILED: {_PROVIDER_BUDGET_EXHAUSTED_REASON}",),
+                **governance_receipt_fields(request.contract),
+            )
         contract = TaskContract.from_dict(request.contract)
         node_strategy = strategy_for_node(contract, request.spec)
         fallback_model = codex_fallback_model(
@@ -3112,6 +3132,7 @@ class Coordinator:
             input_tree_sha=request.input_tree_sha,
             input_receipt=request.input_receipt,
             input_receipt_ref=request.input_receipt_ref,
+            provider_deadline_monotonic=request.provider_deadline_monotonic,
         )
         if attribution_context is not None:
             if isinstance(route_cursor, int) and route_cursor > 0:
@@ -3144,6 +3165,25 @@ class Coordinator:
                     self._latest_quota()
                 )
         return routed_request, self._executor("codex").execute(routed_request)
+
+    @staticmethod
+    def _provider_execution_budget_exhausted(request: ExecutionRequest) -> bool:
+        """Return whether this coordinated provider phase has no remaining time."""
+
+        deadline = request.provider_deadline_monotonic
+        return deadline is not None and time.monotonic() >= deadline
+
+    @staticmethod
+    def _with_provider_budget_exhausted_fallback(result: NodeResult) -> NodeResult:
+        """Preserve a completed first-provider receipt when fallback cannot start."""
+
+        if _PROVIDER_BUDGET_EXHAUSTED_REASON in result.summary:
+            return result
+        return replace(
+            result,
+            summary=f"{result.summary}; {_PROVIDER_BUDGET_EXHAUSTED_REASON}",
+            checks=tuple(dict.fromkeys((*result.checks, f"FAILED: {_PROVIDER_BUDGET_EXHAUSTED_REASON}"))),
+        )
 
     def _prepare_dependency_input(
         self, task_id: str, node_id: str, worktree: Path

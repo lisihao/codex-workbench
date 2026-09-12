@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Mapping, Protocol
 
 from .archify import (
@@ -53,10 +54,45 @@ class ExecutionRequest:
     input_tree_sha: str | None = None
     input_receipt: dict[str, Any] | None = None
     input_receipt_ref: str | None = None
+    # The coordinator owns this monotonic deadline for one provider execution
+    # phase, including a Claude-to-Codex fallback. Direct executor callers do
+    # not set it and retain their historic per-provider timeout.
+    provider_deadline_monotonic: float | None = None
 
 
 class Executor(Protocol):
     def execute(self, request: ExecutionRequest) -> NodeResult: ...
+
+
+def _provider_execution_timeout(request: ExecutionRequest) -> int | float | None:
+    """Return the remaining provider budget, or ``None`` before a spawn is allowed."""
+
+    configured_timeout = int(request.contract["timeout_seconds"])
+    deadline = request.provider_deadline_monotonic
+    if deadline is None:
+        return configured_timeout
+    remaining = min(float(configured_timeout), deadline - time.monotonic())
+    return remaining if remaining > 0 else None
+
+
+def _provider_budget_exhausted_result(
+    request: ExecutionRequest,
+    *,
+    provider: str,
+) -> NodeResult:
+    """Return a known failure when no provider turn was started before its deadline."""
+
+    verifier = bool(request.spec.get("verifier"))
+    reason = f"{provider} provider execution budget exhausted before spawn"
+    return NodeResult(
+        status="failed",
+        summary=reason,
+        result_kind="verifier" if verifier else "worker",
+        verdict="needs_fix" if verifier else None,
+        checks=(f"FAILED: {reason}",),
+        **_execution_receipt_metadata(request, provider=provider.lower()),
+        **governance_receipt_fields(request.contract),
+    )
 
 
 def _archify_context(request: ExecutionRequest) -> tuple[str | None, bool, str]:
@@ -355,7 +391,7 @@ class ProcessExecutor:
         command: list[str],
         *,
         cwd: Path,
-        timeout: int,
+        timeout: int | float,
         input_text: str | None = None,
         environment: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
@@ -1515,7 +1551,7 @@ class CodexExecutor(ProcessExecutor):
         super().__init__(artifacts)
         self.binary = binary
 
-    def qualification(self) -> tuple[bool, str]:
+    def qualification(self, *, timeout_seconds: float = 15) -> tuple[bool, str]:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary or not Path(binary).exists():
             return False, "Codex CLI is not installed"
@@ -1527,7 +1563,7 @@ class CodexExecutor(ProcessExecutor):
                 [binary, "login", "status"],
                 text=True,
                 capture_output=True,
-                timeout=15,
+                timeout=timeout_seconds,
                 env=codex_subscription_environment(),
                 check=False,
             )
@@ -1541,8 +1577,15 @@ class CodexExecutor(ProcessExecutor):
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
         metadata = _execution_receipt_metadata(request, provider="codex")
-        qualified, reason = self.qualification()
         verifier = bool(request.spec.get("verifier"))
+        timeout = _provider_execution_timeout(request)
+        if timeout is None:
+            return _provider_budget_exhausted_result(request, provider="Codex")
+        qualified, reason = (
+            self.qualification(timeout_seconds=min(15.0, float(timeout)))
+            if request.provider_deadline_monotonic is not None
+            else self.qualification()
+        )
         if not qualified:
             return NodeResult(
                 status="blocked", summary=reason,
@@ -1570,10 +1613,13 @@ class CodexExecutor(ProcessExecutor):
             schema_path.write_text(json.dumps(schema))
             command = self._command(self.binary, request, schema_path, output_path)
             try:
+                timeout = _provider_execution_timeout(request)
+                if timeout is None:
+                    return _provider_budget_exhausted_result(request, provider="Codex")
                 result, artifacts = self._run(
                     command,
                     cwd=request.worktree,
-                    timeout=int(request.contract["timeout_seconds"]),
+                    timeout=timeout,
                     input_text=prompt,
                     environment=codex_subscription_environment(
                         pnpm_shim_directory=temporary_directory / "bin"
@@ -1856,7 +1902,7 @@ class ClaudeExecutor(ProcessExecutor):
         self.binary = binary
         self.quota_ttl_seconds = quota_ttl_seconds
 
-    def authentication(self) -> tuple[bool, str]:
+    def authentication(self, *, timeout_seconds: float = 15) -> tuple[bool, str]:
         binary = shutil.which(self.binary) if "/" not in self.binary else self.binary
         if not binary or not Path(binary).exists():
             return False, "Claude Code CLI is not installed"
@@ -1865,7 +1911,7 @@ class ClaudeExecutor(ProcessExecutor):
                 [binary, "auth", "status", "--json"],
                 text=True,
                 capture_output=True,
-                timeout=15,
+                timeout=timeout_seconds,
                 env=subscription_environment(),
                 check=False,
             )
@@ -1876,7 +1922,12 @@ class ClaudeExecutor(ProcessExecutor):
             return False, "Claude must attest native-subscription authentication"
         return True, "native-subscription"
 
-    def qualification(self, model: str) -> tuple[bool, str]:
+    def qualification(
+        self,
+        model: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[bool, str]:
         if self.quota is None:
             return False, "Claude quota is unknown"
         decision = self.quota.dispatch_decision(
@@ -1885,7 +1936,11 @@ class ClaudeExecutor(ProcessExecutor):
         )
         if decision.action != "claude":
             return False, decision.reason
-        return self.authentication()
+        return (
+            self.authentication(timeout_seconds=timeout_seconds)
+            if timeout_seconds is not None
+            else self.authentication()
+        )
 
     def execute(self, request: ExecutionRequest) -> NodeResult:
         assert request.worktree is not None
@@ -1899,7 +1954,17 @@ class ClaudeExecutor(ProcessExecutor):
                 **governance_receipt_fields(request.contract),
             )
         archify_role, archify_required, _ = _archify_context(request)
-        qualified, reason = self.qualification(request.spec["model"])
+        timeout = _provider_execution_timeout(request)
+        if timeout is None:
+            return _provider_budget_exhausted_result(request, provider="Claude")
+        qualified, reason = (
+            self.qualification(
+                request.spec["model"],
+                timeout_seconds=min(15.0, float(timeout)),
+            )
+            if request.provider_deadline_monotonic is not None
+            else self.qualification(request.spec["model"])
+        )
         if not qualified:
             return NodeResult(
                 status="blocked",
@@ -1919,10 +1984,13 @@ class ClaudeExecutor(ProcessExecutor):
             permission_mode=permission_mode,
         )
         try:
+            timeout = _provider_execution_timeout(request)
+            if timeout is None:
+                return _provider_budget_exhausted_result(request, provider="Claude")
             result, artifacts = self._run(
                 command,
                 cwd=request.worktree,
-                timeout=int(request.contract["timeout_seconds"]),
+                timeout=timeout,
                 environment=subscription_environment(),
             )
         except subprocess.TimeoutExpired:
