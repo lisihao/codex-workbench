@@ -115,7 +115,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 14)
+        self.assertEqual(self.store.health()["schema_version"], 15)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -164,7 +164,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 14)
+        self.assertEqual(migrated.health()["schema_version"], 15)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -241,7 +241,7 @@ class StoreTests(unittest.TestCase):
         )
 
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 14)
+        self.assertEqual(migrated.health()["schema_version"], 15)
         with migrated.connection() as connection:
             columns = {
                 row["name"]
@@ -278,12 +278,12 @@ class StoreTests(unittest.TestCase):
             connection.executescript(
                 """
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO metadata(key, value) VALUES('schema_version', '15');
+                INSERT INTO metadata(key, value) VALUES('schema_version', '16');
                 """
             )
 
         unknown = WorkbenchStore(path)
-        with self.assertRaisesRegex(RuntimeError, "unsupported schema version 15; expected 14"):
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema version 16; expected 15"):
             unknown.initialize()
 
         with sqlite3.connect(path) as connection:

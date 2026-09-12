@@ -23,6 +23,7 @@ from typing import Any, TypedDict
 from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
+    apply_ready_lockfile_handoffs_to_dependency_input,
     apply_recorded_dependency_input,
     base_dependency_input,
     load_recorded_dependency_input,
@@ -243,7 +244,12 @@ def build_accepted_repair_bindings(
                     node_id=node_id,
                     base_sha=base_sha,
                 )
-                validate_dependency_input_lineage(snapshot, node_id, dependency_input)
+                validate_dependency_input_lineage(
+                    snapshot,
+                    node_id,
+                    dependency_input,
+                    artifacts=store.artifacts,
+                )
             except (DependencyInputError, ValueError) as error:
                 raise AcceptedSourceRepairError(
                     f"accepted-source repair owner {node_id} dependency input is invalid: {error}"
@@ -484,8 +490,14 @@ def prepare_accepted_source_repair(
         if sha256(patch).hexdigest() != source["patch_sha256"]:
             raise AcceptedSourceRepairError(
                 "accepted-source repair patch artifact hash does not match its binding"
-            )
+        )
         manager.apply_patch(target, store.artifacts.verify(source["patch_ref"]))
+        dependency_input = _apply_ready_lockfile_handoffs(
+            store,
+            parsed,
+            target,
+            dependency_input,
+        )
         restored_patch = manager.diff_patch(target, dependency_input.input_tree_sha)
         if restored_patch != patch:
             raise AcceptedSourceRepairError(
@@ -765,7 +777,7 @@ def _validate_frozen_dependency_receipt(
     node_id: str,
     base_sha: str,
 ) -> None:
-    required = {
+    base_required = {
         "schema_version",
         "kind",
         "task_id",
@@ -774,13 +786,20 @@ def _validate_frozen_dependency_receipt(
         "input_tree_sha",
         "ancestors",
     }
-    if set(receipt) != required:
+    schema_version = receipt.get("schema_version")
+    required = (
+        base_required
+        if schema_version == 1
+        else base_required | {"lockfile_handoffs"}
+        if schema_version == 2
+        else set()
+    )
+    if not required or set(receipt) != required:
         raise AcceptedSourceRepairError(
             "accepted-source repair dependency input receipt has an invalid shape"
         )
     if (
-        receipt["schema_version"] != 1
-        or receipt["kind"] != "accepted-ancestor-patch-input"
+        receipt["kind"] != "accepted-ancestor-patch-input"
         or receipt["task_id"] != task_id
         or receipt["node_id"] != node_id
         or receipt["contract_base_sha"] != base_sha
@@ -802,6 +821,17 @@ def _validate_frozen_dependency_receipt(
         _positive_int(ancestor["attempt"], "accepted-source dependency ancestor attempt")
         if ancestor["patch_ref"] is not None:
             _text(ancestor["patch_ref"], "accepted-source dependency ancestor patch")
+    if schema_version == 2:
+        handoffs = receipt["lockfile_handoffs"]
+        if (
+            isinstance(handoffs, (str, bytes))
+            or not isinstance(handoffs, list)
+            or not handoffs
+            or not all(isinstance(handoff, Mapping) for handoff in handoffs)
+        ):
+            raise AcceptedSourceRepairError(
+                "accepted-source repair dependency input lockfile handoffs are invalid"
+            )
 
 
 def _preparation_snapshot(
@@ -967,6 +997,36 @@ def _restore_dependency_input(
             "accepted-source repair dependency input artifact drifted from its binding"
         )
     return dependency_input
+
+
+def _apply_ready_lockfile_handoffs(
+    store: WorkbenchStore,
+    binding: AcceptedSourceRepairBinding,
+    target: Path,
+    dependency_input: DependencyInput,
+) -> DependencyInput:
+    """Derive the claimed repair input before replaying its source patch."""
+
+    try:
+        from .lockfile_handoff import get_ready_lockfile_handoffs
+
+        task = store.get_task(binding["task_id"])
+        return apply_ready_lockfile_handoffs_to_dependency_input(
+            task,
+            binding["node_id"],
+            target,
+            store.artifacts,
+            dependency_input,
+            ready_lockfile_handoffs=get_ready_lockfile_handoffs(
+                store,
+                binding["task_id"],
+            ),
+            manifest_phase="prepared",
+        )
+    except (DependencyInputError, StateConflictError, ValueError) as error:
+        raise AcceptedSourceRepairError(
+            f"accepted-source repair cannot apply ready lockfile handoff: {error}"
+        ) from error
 
 
 def _git_text(worktree: Path, *arguments: str) -> str:

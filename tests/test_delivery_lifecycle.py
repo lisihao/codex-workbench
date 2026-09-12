@@ -174,7 +174,7 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
             }.issubset(tables)
         )
         self.assertEqual(marker["value"], "1")
-        self.assertEqual(self.store.health()["schema_version"], 14)
+        self.assertEqual(self.store.health()["schema_version"], 15)
 
     def _accept_task(self, task_id: str) -> dict:
         self.store.queue_task(task_id)
@@ -202,7 +202,7 @@ class DeliveryLifecyclePersistenceTests(unittest.TestCase):
         )
         self.assertEqual(objective["stage"], "plan")
         self.assertEqual(objective["state"], "active")
-        self.assertEqual(self.store.health()["schema_version"], 14)
+        self.assertEqual(self.store.health()["schema_version"], 15)
         objective = self._claim_objective(objective)
         duplicate_claim = self.store.claim_delivery_objective(
             objective["objective_id"],
