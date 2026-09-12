@@ -1810,6 +1810,17 @@ class Coordinator:
             worktree: Path | None = None
             dependency_input: DependencyInput | None = None
             input_receipt_ref: str | None = None
+
+            def record_dependency_input() -> None:
+                """Persist a completed input before later preparation can block."""
+
+                nonlocal input_receipt_ref
+                if input_receipt_ref is None and dependency_input is not None:
+                    input_receipt_ref = self.artifacts.put_text(
+                        canonical_json(dependency_input.receipt), "dependency-input.json"
+                    )
+                context.dependency_input_ref = input_receipt_ref
+
             prepare_started_monotonic = time.monotonic()
             context.prepare_started_at = now_iso()
             if accepted_source_repair is not None:
@@ -1829,6 +1840,7 @@ class Coordinator:
                     lease_epoch=claimed["lease_epoch"], recovery_preflight=prepared.receipt,
                 )
                 recovery_artifacts["accepted-source-repair"] = prepared_ref
+                record_dependency_input()
                 self._materialize_worktree_dependencies(
                     worktree, context, timeout_seconds=int(contract["timeout_seconds"]),
                 )
@@ -1862,16 +1874,13 @@ class Coordinator:
                     dependency_input = self._prepare_dependency_input(
                         claimed["task_id"], claimed["node_id"], worktree
                     )
+                record_dependency_input()
                 self._materialize_worktree_dependencies(
                     worktree,
                     context,
                     timeout_seconds=int(contract["timeout_seconds"]),
                 )
-            if input_receipt_ref is None and dependency_input is not None:
-                input_receipt_ref = self.artifacts.put_text(
-                    canonical_json(dependency_input.receipt), "dependency-input.json"
-                )
-            context.dependency_input_ref = input_receipt_ref
+            record_dependency_input()
             request = ExecutionRequest(
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],

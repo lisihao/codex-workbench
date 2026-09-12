@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 from typing import Any
 
 from .artifacts import ArtifactStore
@@ -363,6 +365,49 @@ def apply_recorded_dependency_input(
         raise DependencyInputError(
             "recorded dependency input did not reproduce its input tree"
         )
+    return dependency_input
+
+
+def reconstruct_prepared_dependency_input(
+    task: Mapping[str, Any], node_id: str, worktree: Path, artifacts: ArtifactStore,
+) -> DependencyInput:
+    """Reproduce accepted patches in a private index and require the staged input to match.
+
+    This recovers a completed preparation whose receipt was not saved before
+    package installation failed. It never stages worker edits or changes the
+    live index, files, branch, or task record. A differing staged tree is not
+    evidence of the historical input and is rejected.
+    """
+
+    sources = [_source_receipt(node) for node in accepted_ancestor_nodes(task, node_id)]
+    base_sha = task["contract"]["base_sha"]
+    with tempfile.TemporaryDirectory(prefix="workbench-prepared-input-") as temporary:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+
+        def git(*args: str, data: bytes | None = None) -> bytes:
+            result = subprocess.run(
+                ["git", "-C", str(worktree), *args], input=data,
+                capture_output=True, env=environment, timeout=60,
+            )
+            if result.returncode:
+                raise DependencyInputError("accepted preparation could not be reproduced in a private index")
+            return result.stdout
+
+        git("read-tree", base_sha)
+        for source in sources:
+            if source["patch_ref"] is not None:
+                patch = artifacts.verify(source["patch_ref"]).read_bytes()
+                if patch.strip():
+                    git("apply", "--cached", "--binary", "-", data=patch)
+        tree = git("write-tree").decode("ascii").strip()
+    if _git_bytes(worktree, "diff", "--cached", "--name-only", tree, "--"):
+        raise DependencyInputError("staged source does not match reconstructed accepted input")
+    dependency_input = DependencyInput(tree, {
+        "schema_version": 1, "kind": "accepted-ancestor-patch-input",
+        "task_id": task["task_id"], "node_id": node_id,
+        "contract_base_sha": base_sha, "input_tree_sha": tree, "ancestors": sources,
+    })
+    validate_dependency_input_lineage(task, node_id, dependency_input, artifacts=artifacts)
     return dependency_input
 
 

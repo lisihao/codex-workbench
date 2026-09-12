@@ -31,6 +31,7 @@ from .dependency_inputs import (
     apply_recorded_dependency_input,
     base_dependency_input,
     load_recorded_dependency_input,
+    reconstruct_prepared_dependency_input,
     validate_dependency_input_lineage,
 )
 from .dirty_worktree_recovery import (
@@ -692,8 +693,19 @@ def _dependency_input(
             )
             return dependency_input
         if durable["blocked_depends_on"]:
-            raise LockfileHandoffError(
-                "blocked dependent node lacks its recorded dependency-input artifact"
+            historical = _json_object(durable["blocked_result_json"], "blocked node result")
+            failure_ref = historical["artifacts"].get("dependency-materialization")
+            if not isinstance(failure_ref, str):
+                raise LockfileHandoffError(
+                    "blocked dependent node lacks recorded input or dependency preparation failure evidence"
+                )
+            failure = json.loads(store.artifacts.verify(failure_ref).read_text(encoding="utf-8"))
+            if not isinstance(failure, dict) or (
+                failure.get("schema_version"), failure.get("kind"), failure.get("status")
+            ) != (1, "pnpm-offline-materialization", "blocked"):
+                raise LockfileHandoffError("dependency preparation failure evidence is invalid")
+            return reconstruct_prepared_dependency_input(
+                durable["task_snapshot"], durable["blocked_node_id"], source, store.artifacts,
             )
         return base_dependency_input(
             task_id=durable["task_id"],
@@ -1065,6 +1077,10 @@ def _restore_input_and_delta(
     """Rebuild only accepted input plus the scope-checked source delta."""
 
     ref = lineage.get("ref")
+    if ref is None and dependency_input.receipt["ancestors"]:
+        ref = store.artifacts.put_text(
+            canonical_json(dependency_input.receipt), "dependency-input.json",
+        )
     if ref is not None:
         restored = apply_recorded_dependency_input(
             store.artifacts,
