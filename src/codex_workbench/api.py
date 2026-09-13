@@ -17,6 +17,7 @@ import uuid
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
+from .connection_evidence import authority_observation, unknown_connection_evidence
 from .acceptance import build_acceptance_report
 from .ai_frontier import WorkbenchAIFrontier
 from .artifacts import ArtifactStore
@@ -107,7 +108,18 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
                 "params": {"name": name, "arguments": arguments},
             })
             assert response is not None
-            return response["result"]
+            result = response["result"]
+            if name == "workbench_harness_health" and not result.get("isError"):
+                payload = json.loads(result["content"][0]["text"])
+                evidence = unknown_connection_evidence()
+                evidence["authority"] = authority_observation({
+                    "version": __version__, "service_instance": self.service_instance,
+                    "service_protocol": "workbench-authority-service/v1",
+                    "tools_sha256": self.service_tools_sha256,
+                })
+                payload["connection_evidence"] = evidence
+                result = {**result, "content": [{"type": "text", "text": json.dumps(payload)}]}
+            return result
 
         self.authority_service = AuthorityService(store, invoke_tool, self.service_instance)
         self.service_tools = deepcopy(TOOLS)

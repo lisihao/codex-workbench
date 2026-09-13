@@ -278,6 +278,30 @@ class ConnectionServiceEndToEndTests(unittest.TestCase):
         ancestor = self._ancestor(after_task)
         self.assertEqual((ancestor["state"], ancestor["attempt"]), ("accepted", 1))
 
+    def test_compatible_service_change_keeps_bridge_and_adapter_process(self) -> None:
+        from unittest.mock import patch
+
+        def health(label):
+            with patch("codex_workbench.mcp.code_as_harness_health", return_value={"fixture_business_revision": label}):
+                return self._mcp_text(self._call_tool(60, "workbench_harness_health", {}))
+
+        before_task = self.store.get_task(self.task_id)
+        before = health("before-fix")
+        child = self.bridge.transport.process
+        self._restart_server()
+        after = health("after-fix")
+        self.assertEqual(after["fixture_business_revision"], "after-fix")
+        self.assertIs(self.bridge.transport.process, child)
+        self.assertIsNone(child.poll())
+        old = before["connection_evidence"]
+        new = after["connection_evidence"]
+        for layer in ("adapter", "bridge"):
+            self.assertEqual(old[layer]["instance_id"], new[layer]["instance_id"])
+            self.assertEqual(old[layer]["pid"], new[layer]["pid"])
+        self.assertNotEqual(old["authority"]["instance_id"], new["authority"]["instance_id"])
+        self.assertEqual(new["host_catalog"]["ui_tool_availability"], "unknown")
+        self.assertEqual(self.store.get_task(self.task_id), before_task)
+
     def test_cut_mcp_child_after_persisted_write_queries_same_receipt_once(self) -> None:
         assert self.server is not None
         request_id = "connection-cut-priority"

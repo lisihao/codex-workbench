@@ -30,6 +30,10 @@ Authority shutdown stops accepting new service mutations and waits for admitted 
 
 ## Bounded diagnosis and fallback
 
+`workbench_harness_health` adds `connection_evidence` using `workbench-connection-evidence/v1`. The Authority reports its responding service instance, loaded package version, protocol and capability digest. A supporting adapter adds its own process instance, PID and loaded version; a supporting bridge adds its process instance, PID, implementation protocol and source digest captured once at import. The bridge does not read or hash its installed source on every call. An installed release receipt remains separate evidence, and a legacy component is unknown rather than inferred from another component's version.
+
+Host evidence records receipt of the existing health tool call and, separately, the last tools/list request made by that host. Internal reconnection catalog fetches are not host refreshes. UI catalog availability remains unknown: neither a health call nor list_changed proves that the host exposes every current tool. Missing restart, recovery-duration, duplicate-effect, orphan-process and data-loss measurements remain null. Diagnostics do not clear or rewrite write identities, authorize operations, or turn a failed health response into success. See the staged [connection lifecycle repair plan](connection-lifecycle-plan.md).
+
 Use the installed Python interpreter to run `libexec/workbench-connection-diagnose.py --config <client-root>/mcp-bridge.json`. `--status-only` reads local state without a remote probe. The normal diagnostic probes only the recognized transport's `service status` endpoint; authentication or host-key failures do not trigger login retries. Missing child exit/stderr evidence is reported as unknown, not guessed from a running tunnel process.
 
 The diagnostic separates configured transport, SSH/local child, Authority HTTP, and MCP child. A 3-second snapshot timeout is not sufficient evidence of a dead Authority: the task snapshot can be much slower than the lightweight service status endpoint. Workbench MCP and Codex's separate remote AppServer channel are different connections.
