@@ -938,7 +938,23 @@ def _source_records_handoff(
         except LockfileHandoffInputError:
             continue
         if candidate == identity:
-            return canonical_json(dict(raw)) == canonical_json(handoff.receipt)
+            if canonical_json(dict(raw)) == canonical_json(handoff.receipt):
+                return True
+            before = {
+                key: value
+                for key, value in raw.items()
+                if key not in {"contract_hash", "task_revision"}
+            }
+            after = {
+                key: value
+                for key, value in handoff.receipt.items()
+                if key not in {"contract_hash", "task_revision"}
+            }
+            return (
+                canonical_json(before) == canonical_json(after)
+                and isinstance(raw.get("task_revision"), int)
+                and int(handoff.receipt["task_revision"]) >= int(raw["task_revision"])
+            )
     return False
 
 

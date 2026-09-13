@@ -1233,32 +1233,33 @@ def _apply(
             ).rowcount
             if e_changed != 1:
                 raise StateConflictError("integration scope amendment E compare-and-set failed")
+        event_payload = {
+            "profile_id": SCOPE_PROFILE_ID,
+            "reason": arguments["reason"],
+            "preview_fingerprint": preflight["fingerprint"],
+            "attempt": arguments["expected_attempt"],
+            "revision": revision,
+            "old_contract": plan["old_contract"],
+            "old_contract_hash": plan["old_contract_hash"],
+            "new_contract": plan["new_contract"],
+            "new_contract_hash": plan["new_contract_hash"],
+            "d_scope_change": {
+                "old_spec": plan["old_d_spec"],
+                "new_spec": plan["new_d_spec"],
+            },
+            "e_scope_change": {
+                "old_spec": plan["old_e_spec"],
+                "new_spec": plan["new_e_spec"],
+            },
+            "additions": plan["additions"],
+            "source": preflight["source"],
+        }
         event_cursor = store._event(
             connection,
             _EVENT_TYPE,
             str(arguments["task_id"]),
             "D",
-            {
-                "profile_id": SCOPE_PROFILE_ID,
-                "reason": arguments["reason"],
-                "preview_fingerprint": preflight["fingerprint"],
-                "attempt": arguments["expected_attempt"],
-                "revision": revision,
-                "old_contract": plan["old_contract"],
-                "old_contract_hash": plan["old_contract_hash"],
-                "new_contract": plan["new_contract"],
-                "new_contract_hash": plan["new_contract_hash"],
-                "d_scope_change": {
-                    "old_spec": plan["old_d_spec"],
-                    "new_spec": plan["new_d_spec"],
-                },
-                "e_scope_change": {
-                    "old_spec": plan["old_e_spec"],
-                    "new_spec": plan["new_e_spec"],
-                },
-                "additions": plan["additions"],
-                "source": preflight["source"],
-            },
+            event_payload,
             created_at=timestamp,
         )
     return _response(

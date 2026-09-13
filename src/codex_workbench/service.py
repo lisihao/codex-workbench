@@ -26,6 +26,7 @@ from .dependency_inputs import (
     changed_paths_since_input_tree,
     effective_spec_with_dependency_input,
     load_recorded_dependency_input,
+    rebind_recorded_lockfile_handoffs,
     validate_dependency_input_lineage,
 )
 from .delivery_lifecycle import DeliveryLifecycleReconciler
@@ -2430,13 +2431,29 @@ class Coordinator:
                 raise DirtyWorktreeRecoveryError(
                     "failed-attempt recovery dependency input reference is invalid"
                 )
-            dependency_input = load_recorded_dependency_input(
+            loaded_dependency_input = load_recorded_dependency_input(
                 self.artifacts,
                 dependency_ref,
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],
                 base_sha=source_base,
             )
+            dependency_input = rebind_recorded_lockfile_handoffs(
+                self.store.get_task(claimed["task_id"]),
+                claimed["node_id"],
+                self.artifacts,
+                loaded_dependency_input,
+                ready_lockfile_handoffs=self._ready_lockfile_handoffs(
+                    claimed["task_id"]
+                ),
+            )
+            if canonical_json(dependency_input.receipt) != canonical_json(
+                loaded_dependency_input.receipt
+            ):
+                dependency_ref = self.artifacts.put_text(
+                    canonical_json(dependency_input.receipt),
+                    "rebound-dependency-input.json",
+                )
             validate_dependency_input_lineage(
                 self.store.get_task(claimed["task_id"]),
                 claimed["node_id"],
@@ -2916,14 +2933,23 @@ class Coordinator:
             raise WorktreeError(
                 "blocked-worktree recovery dependent worker lacks its recorded dependency input"
             )
+        loaded_recorded_dependency_input: DependencyInput | None = None
         recorded_dependency_input: DependencyInput | None = None
+        ready_lockfile_handoffs = self._ready_lockfile_handoffs(claimed["task_id"])
         if isinstance(recorded_dependency_ref, str):
-            recorded_dependency_input = load_recorded_dependency_input(
+            loaded_recorded_dependency_input = load_recorded_dependency_input(
                 self.artifacts,
                 recorded_dependency_ref,
                 task_id=claimed["task_id"],
                 node_id=claimed["node_id"],
                 base_sha=contract["base_sha"],
+            )
+            recorded_dependency_input = rebind_recorded_lockfile_handoffs(
+                self.store.get_task(claimed["task_id"]),
+                claimed["node_id"],
+                self.artifacts,
+                loaded_recorded_dependency_input,
+                ready_lockfile_handoffs=ready_lockfile_handoffs,
             )
             validate_dependency_input_lineage(
                 self.store.get_task(claimed["task_id"]),
@@ -2941,8 +2967,6 @@ class Coordinator:
         target_branch = self.worktrees.branch_name(
             claimed["task_id"], claimed["node_id"], target_attempt
         )
-        ready_lockfile_handoffs = self._ready_lockfile_handoffs(claimed["task_id"])
-
         def prepare_dependency_input(prepared_target: Path) -> DependencyInput:
             baseline = recorded_dependency_input
             if baseline is None:
@@ -3039,9 +3063,11 @@ class Coordinator:
             prepared_dependency_input is not None
             and prepared_dependency_input.receipt.get("schema_version") == 2
             and (
-                recorded_dependency_input is None
+                loaded_recorded_dependency_input is None
                 or prepared_dependency_input.input_tree_sha
-                != recorded_dependency_input.input_tree_sha
+                != loaded_recorded_dependency_input.input_tree_sha
+                or canonical_json(prepared_dependency_input.receipt)
+                != canonical_json(loaded_recorded_dependency_input.receipt)
             )
         ):
             dependency_input_ref = self.artifacts.put_text(

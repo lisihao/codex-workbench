@@ -278,30 +278,122 @@ def get_ready_lockfile_handoffs(
         raise TypeError("store must be a WorkbenchStore")
     normalized_task_id = _text(task_id, "task_id")
     with store.connection() as connection:
-        rows = connection.execute(
-            "SELECT cursor, payload_json FROM events WHERE task_id = ? "
-            "AND event_type IN (?, ?, ?, ?, ?) ORDER BY cursor",
-            (normalized_task_id, *_EVENT_TYPES),
-        ).fetchall()
-        latest: dict[str, tuple[int, dict[str, Any]]] = {}
-        ready: list[tuple[int, dict[str, Any]]] = []
-        for row in rows:
-            payload = _event_payload(row)
-            request_id = _text(payload.get("request_id"), "request_id", maximum=_MAX_REQUEST_ID)
-            cursor = int(row["cursor"])
-            latest[request_id] = (cursor, payload)
-            if payload.get("state") == "ready":
-                ready.append((cursor, payload))
-    projected: list[dict[str, Any]] = []
-    for cursor, payload in ready:
+        return _ready_lockfile_handoffs_from_connection(
+            store,
+            connection,
+            normalized_task_id,
+            verify_artifacts=True,
+        )
+
+
+def _ready_lockfile_handoffs_from_connection(
+    store: WorkbenchStore,
+    connection: Any,
+    task_id: str,
+    *,
+    verify_artifacts: bool,
+) -> list[dict[str, Any]]:
+    """Project the latest ready inputs, including audited contract rebindings."""
+
+    event_types = (*_EVENT_TYPES, "task.blocked_integration_scope_amended")
+    placeholders = ", ".join("?" for _ in event_types)
+    rows = connection.execute(
+        "SELECT cursor, event_type, node_id, payload_json FROM events WHERE task_id = ? "
+        f"AND event_type IN ({placeholders}) ORDER BY cursor",
+        (task_id, *event_types),
+    ).fetchall()
+    latest: dict[str, tuple[int, dict[str, Any] | None]] = {}
+    for row in rows:
+        payload = _event_payload(row)
+        if row["event_type"] == "task.blocked_integration_scope_amended":
+            for request_id, (ready_cursor, projection) in tuple(latest.items()):
+                if projection is None or projection.get("blocked_node_id") != row["node_id"]:
+                    continue
+                latest[request_id] = (
+                    ready_cursor,
+                    _scope_amendment_projection(projection, payload),
+                )
+            continue
         request_id = _text(payload.get("request_id"), "request_id", maximum=_MAX_REQUEST_ID)
-        current = latest.get(request_id)
-        if current is None or current[0] != cursor or current[1].get("state") != "ready":
+        cursor = int(row["cursor"])
+        if payload.get("state") != "ready":
+            latest[request_id] = (cursor, None)
             continue
         receipt = _ready_receipt(payload, cursor)
-        _verify_ready_artifacts(store, receipt)
-        projected.append(_overlay_projection(receipt))
-    return projected
+        if verify_artifacts:
+            _verify_ready_artifacts(store, receipt)
+        latest[request_id] = (cursor, _overlay_projection(receipt))
+    projected = [value for _, value in latest.values() if value is not None]
+    return sorted(projected, key=lambda receipt: int(receipt["ready_event_cursor"]))
+
+
+def _scope_amendment_projection(
+    previous: Mapping[str, Any],
+    amendment: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive a ready overlay from one validated fixed scope amendment."""
+
+    old_contract_hash = _digest(
+        amendment.get("old_contract_hash"),
+        "scope amendment old_contract_hash",
+    )
+    new_contract_hash = _digest(
+        amendment.get("new_contract_hash"),
+        "scope amendment new_contract_hash",
+    )
+    revision = _positive_int(amendment.get("revision"), "scope amendment revision")
+    if previous.get("contract_hash") != old_contract_hash:
+        return dict(previous)
+    _validate_scope_amendment_contract_change(
+        amendment,
+        old_contract_hash=old_contract_hash,
+        new_contract_hash=new_contract_hash,
+        task_revision=revision,
+    )
+    rebound = dict(previous)
+    rebound["contract_hash"] = new_contract_hash
+    rebound["task_revision"] = revision
+    return rebound
+
+
+def _validate_scope_amendment_contract_change(
+    payload: Mapping[str, Any],
+    *,
+    old_contract_hash: str,
+    new_contract_hash: str,
+    task_revision: int,
+) -> None:
+    """Require the referenced D amendment to be a monotonic scope-only change."""
+
+    if (
+        payload.get("profile_id") != "dsh-task-template-integration-v1"
+        or payload.get("old_contract_hash") != old_contract_hash
+        or payload.get("new_contract_hash") != new_contract_hash
+        or payload.get("revision") != task_revision
+    ):
+        raise LockfileHandoffError("lockfile handoff contract rebinding amendment disagrees")
+    old_contract = payload.get("old_contract")
+    new_contract = payload.get("new_contract")
+    if not isinstance(old_contract, Mapping) or not isinstance(new_contract, Mapping):
+        raise LockfileHandoffError("lockfile handoff contract rebinding contracts are invalid")
+    if canonical_hash(dict(old_contract)) != old_contract_hash:
+        raise LockfileHandoffError("lockfile handoff contract rebinding old contract is invalid")
+    if canonical_hash(dict(new_contract)) != new_contract_hash:
+        raise LockfileHandoffError("lockfile handoff contract rebinding new contract is invalid")
+    old_other = {key: value for key, value in old_contract.items() if key != "allowed_scope"}
+    new_other = {key: value for key, value in new_contract.items() if key != "allowed_scope"}
+    if canonical_json(old_other) != canonical_json(new_other):
+        raise LockfileHandoffError("lockfile handoff contract rebinding changed a non-scope field")
+    old_scope = old_contract.get("allowed_scope")
+    new_scope = new_contract.get("allowed_scope")
+    if (
+        not isinstance(old_scope, list)
+        or not isinstance(new_scope, list)
+        or any(not isinstance(value, str) or not value for value in (*old_scope, *new_scope))
+        or new_scope[: len(old_scope)] != old_scope
+        or len(new_scope) <= len(old_scope)
+    ):
+        raise LockfileHandoffError("lockfile handoff contract rebinding scope is not monotonic")
 
 
 def _arguments(raw: object) -> dict[str, Any]:
