@@ -10,6 +10,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from .authority_service import is_read_only_tool
+
 
 class ServiceTransportError(RuntimeError):
     """The configured Authority HTTP endpoint did not return a valid receipt."""
@@ -103,6 +105,9 @@ class AuthorityHTTPClient:
         return self._request("GET", "/api/service/requests/" + quote(request_id, safe=""), retry_read=True)
 
     def dispatch(self, envelope: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
+        read_only = read_only is True and is_read_only_tool(
+            envelope.get("tool"), envelope.get("arguments", {})
+        )
         request_id = envelope.get("request_id")
         if not read_only and (not isinstance(request_id, str) or not request_id):
             raise ValueError("mutation requires a stable request_id")

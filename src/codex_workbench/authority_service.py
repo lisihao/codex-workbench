@@ -7,6 +7,8 @@ import json
 import threading
 from typing import Any
 
+from . import __version__
+from .connection_evidence import AUTHORITY_SERVICE_PROTOCOL
 from .model import canonical_hash, canonical_json, now_iso
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 
@@ -159,6 +161,7 @@ class AuthorityService:
             })
             if not self._reserve(request, fingerprint, actor):
                 return self.get_request(request_id)
+            self._record_action_started(request_id)
 
             try:
                 result = self.invoke_callable(request["tool"], request["arguments"])
@@ -231,7 +234,7 @@ class AuthorityService:
         with self.store.transaction() as connection:
             rows = connection.execute(
                 """
-                SELECT request_id, tool, task_id, session_id
+                SELECT request_id, tool, task_id, session_id, instance_id
                 FROM authority_requests
                 WHERE state = 'executing'
                 ORDER BY created_at, request_id
@@ -253,7 +256,13 @@ class AuthorityService:
                     "authority_request.unknown",
                     row["task_id"],
                     None,
-                    self._event_payload(row, "unknown"),
+                    self._event_payload(
+                        row,
+                        "unknown",
+                        phase="outcome_unknown",
+                        origin_authority=self._origin_authority(row),
+                        settled_by_authority=self._current_authority(),
+                    ),
                     created_at=timestamp,
                 )
                 recovered += 1
@@ -310,10 +319,44 @@ class AuthorityService:
                 "authority_request.executing",
                 request["task_id"],
                 None,
-                self._event_payload(request, "executing"),
+                self._event_payload(
+                    request,
+                    "executing",
+                    phase="admitted",
+                    origin_authority=self._current_authority(),
+                ),
                 created_at=timestamp,
             )
         return True
+
+    def _record_action_started(self, request_id: str) -> None:
+        """Record the one action boundary owned by this executing request."""
+
+        timestamp = now_iso()
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT request_id, tool, task_id, session_id, state, instance_id
+                FROM authority_requests
+                WHERE request_id = ? AND state = 'executing' AND instance_id = ?
+                """,
+                (request_id, self.instance_id),
+            ).fetchone()
+            if row is None:
+                raise StateConflictError("authority request action start ownership check failed")
+            WorkbenchStore._event(
+                connection,
+                "authority_request.action_started",
+                row["task_id"],
+                None,
+                self._event_payload(
+                    row,
+                    "executing",
+                    phase="action_started",
+                    origin_authority=self._origin_authority(row),
+                ),
+                created_at=timestamp,
+            )
 
     def _settle_completed(self, request_id: str, result_json: str) -> dict[str, Any]:
         timestamp = now_iso()
@@ -337,7 +380,13 @@ class AuthorityService:
                     "authority_request.completed",
                     row["task_id"],
                     None,
-                    self._event_payload(row, "completed"),
+                    self._event_payload(
+                        row,
+                        "completed",
+                        phase="result_recorded",
+                        origin_authority=self._origin_authority(row),
+                        settled_by_authority=self._current_authority(),
+                    ),
                     created_at=timestamp,
                 )
                 row = connection.execute(
@@ -369,7 +418,13 @@ class AuthorityService:
                     "authority_request.unknown",
                     row["task_id"],
                     None,
-                    self._event_payload(row, "unknown"),
+                    self._event_payload(
+                        row,
+                        "unknown",
+                        phase="outcome_unknown",
+                        origin_authority=self._origin_authority(row),
+                        settled_by_authority=self._current_authority(),
+                    ),
                     created_at=timestamp,
                 )
                 row = connection.execute(
@@ -400,15 +455,49 @@ class AuthorityService:
         return receipt
 
     @staticmethod
-    def _event_payload(row: Mapping[str, Any], state: str) -> dict[str, Any]:
+    def _event_payload(
+        row: Mapping[str, Any],
+        state: str,
+        *,
+        phase: str,
+        origin_authority: Mapping[str, str | None],
+        settled_by_authority: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Build an audit payload that never carries arguments or tool output."""
 
-        return {
+        payload: dict[str, Any] = {
             "request_id": str(row["request_id"]),
             "tool": str(row["tool"]),
             "task_id": row["task_id"],
             "session_id": row["session_id"],
             "state": state,
+            "phase": phase,
+            "origin_authority": dict(origin_authority),
+            "external_effects": "unknown",
+        }
+        if settled_by_authority is not None:
+            payload["settled_by_authority"] = dict(settled_by_authority)
+        return payload
+
+    def _current_authority(self) -> dict[str, str]:
+        """Return this loaded service identity for an event it records."""
+
+        return {
+            "instance_id": self.instance_id,
+            "version": __version__,
+            "protocol": AUTHORITY_SERVICE_PROTOCOL,
+        }
+
+    def _origin_authority(self, row: Mapping[str, Any]) -> dict[str, str | None]:
+        """Return only the origin identity this service can directly observe."""
+
+        instance_id = str(row["instance_id"])
+        if instance_id == self.instance_id:
+            return self._current_authority()
+        return {
+            "instance_id": instance_id,
+            "version": None,
+            "protocol": None,
         }
 
     @staticmethod

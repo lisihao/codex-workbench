@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -71,6 +72,21 @@ class AuthorityServiceAPITests(unittest.TestCase):
         self.assertEqual(self._request("/api/service/requests", envelope), first)
         self.assertEqual(self._request("/api/service/requests/queue-1"), first)
         self.assertEqual(self.store.get_task("fixture"), after)
+
+    def test_health_observes_only_responding_authority_without_creating_journal(self):
+        before = self.store.get_task("fixture")
+        with patch("codex_workbench.mcp.code_as_harness_health", return_value={"ok": True}):
+            receipt = self._request("/api/service/requests", {
+                "request_id": "health-read", "tool": "workbench_harness_health", "arguments": {},
+            })
+        evidence = json.loads(receipt["result"]["content"][0]["text"])["connection_evidence"]
+        self.assertEqual(evidence["authority"]["instance_id"], self.server.service_instance)
+        self.assertEqual(evidence["authority"]["capabilities_sha256"], self.server.service_tools_sha256)
+        for layer in ("host_catalog", "bridge", "adapter"):
+            self.assertEqual(evidence[layer], {"status": "unknown"})
+        self.assertEqual(self.store.get_task("fixture"), before)
+        with self.assertRaises(KeyError):
+            self.server.authority_service.get_request("health-read")
 
     def test_no_auth_cannot_read_private_receipts_or_mutate(self):
         before = self.store.get_task("fixture")

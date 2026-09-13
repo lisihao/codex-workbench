@@ -42,6 +42,9 @@ MAX_STDERR_TAIL_LINES = 16
 MAX_STDERR_LINE_BYTES = 4096
 MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
 _RESPONSE_TOO_LARGE = "response_too_large"
+CONNECTION_EVIDENCE_VERSION = "workbench-connection-evidence/v1"
+# Captured once during import, not from a possibly replaced script per request.
+SOURCE_SHA256_AT_IMPORT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class ConfigError(ValueError):
@@ -696,6 +699,16 @@ class MCPConnectionBridge:
     """
 
     _INTRINSIC_READ_ONLY_TOOLS = {"workbench_get_service_request"}
+    # A catalog cannot make an unknown operation eligible for read retries.
+    # Authority still classifies and authorizes every forwarded operation.
+    _READ_ONLY_TOOL_CEILING = frozenset({
+        "workbench_read_session_notifications", "workbench_get_node_recovery",
+        "workbench_acceptance_report", "workbench_get_delivery_objective",
+        "workbench_get_request", "workbench_get_session", "workbench_harness_health",
+        "workbench_inspect_task", "workbench_list_approvals", "workbench_list_tasks",
+        "workbench_read_artifact", "workbench_read_events", "workbench_worktree_status",
+        "workbench_get_service_request",
+    })
 
     def __init__(
         self,
@@ -724,6 +737,8 @@ class MCPConnectionBridge:
         self.resume_events_after_reconnect = False
         self._notification_keys: set[str] = set()
         self._counter = 0
+        self._instance_id = uuid.uuid4().hex
+        self._host_catalog_digest: str | None = None
 
     def close(self) -> None:
         if self.transport is not None:
@@ -790,7 +805,8 @@ class MCPConnectionBridge:
             annotations = tool.get("annotations")
             if isinstance(name, str):
                 values[name] = (
-                    isinstance(annotations, Mapping)
+                    name in MCPConnectionBridge._READ_ONLY_TOOL_CEILING
+                    and isinstance(annotations, Mapping)
                     and annotations.get("readOnlyHint") is True
                 )
         return values
@@ -848,6 +864,47 @@ class MCPConnectionBridge:
             # The host's actual list request—not this bridge's internal
             # directory check—is the only confirmation that it has refreshed.
             self.catalog_refresh_required = False
+            self._host_catalog_digest = digest
+
+    def _health_connection_evidence(self, response: dict[str, object]) -> dict[str, object]:
+        """Report the responding bridge and observed host interaction only."""
+
+        result = response.get("result")
+        if not isinstance(result, Mapping) or result.get("isError"):
+            return response
+        try:
+            payload = json.loads(result["content"][0]["text"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            return _tool_error(response.get("id"), "invalid_connection_evidence")
+        if not isinstance(payload, dict):
+            return _tool_error(response.get("id"), "invalid_connection_evidence")
+        evidence = payload.get("connection_evidence")
+        if evidence is None:
+            evidence = {
+                "schema_version": CONNECTION_EVIDENCE_VERSION,
+                **{name: {"status": "unknown"} for name in ("host_catalog", "bridge", "adapter", "authority")},
+                "measurements": {name: None for name in (
+                    "restart_requests", "recovery_duration_ms", "duplicate_effects", "orphan_processes", "data_loss"
+                )},
+            }
+        if not isinstance(evidence, dict) or evidence.get("schema_version") != CONNECTION_EVIDENCE_VERSION:
+            return _tool_error(response.get("id"), "unsupported_connection_evidence")
+        evidence["bridge"] = {
+            "status": "observed", "instance_id": self._instance_id, "pid": os.getpid(),
+            "implementation_version": CONNECTION_EVIDENCE_VERSION,
+            "source_sha256_at_import": SOURCE_SHA256_AT_IMPORT,
+            "observation": "responding_bridge_process", "installed_version": None,
+        }
+        evidence["host_catalog"] = {
+            "status": "observed", "observation": "health_tool_call_received",
+            "observed_tool": "workbench_harness_health",
+            "last_host_list_sha256": self._host_catalog_digest,
+            "connected_catalog_sha256": self.tools_digest,
+            "refresh_required": self.catalog_refresh_required,
+            "ui_tool_availability": "unknown",
+        }
+        payload["connection_evidence"] = evidence
+        return {**response, "result": {**result, "content": [{"type": "text", "text": json.dumps(payload)}]}}
 
     def _on_child_notification(self, message: dict[str, object]) -> None:
         if message.get("method") == "notifications/tools/list_changed":
@@ -1205,7 +1262,9 @@ class MCPConnectionBridge:
                     self._record_transport_failure(error)
             return None
         if method == "tools/call":
-            return self._handle_tool_call(message)
+            response = self._handle_tool_call(message)
+            name, _ = self._tool_call_parts(message)
+            return self._health_connection_evidence(response) if name == "workbench_harness_health" else response
         if method in {"tools/list", "ping"}:
             response = self._forward_read_only(message)
             if response is None:
