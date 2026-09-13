@@ -12,6 +12,8 @@ Read requests have bounded retries. Reconnection repeats MCP initialize and tool
 
 The mixed control, blocked-node validation and acceptance-amendment tools use read-only transport only for the Boolean `dry_run: true`. This includes correcting an invalid preview under the same request ID. See [task control recovery](task-control-recovery.md) for existing sent-record preservation and the distinction between a missing preview receipt and an unknown mutation.
 
+The Authority classifies business operations. The adapter uses that shared classifier, while the HTTP client intersects a caller's read-only hint with the classifier before enabling retries. The standalone bridge also requires a recognized local read-tool ceiling and the catalog annotation; a catalog cannot silently promote an unknown operation to read-only. Mixed preview operations retain their explicit Boolean/operation checks. New unsupported tools may require a compatible client update; this is a permission ceiling, not permission for the client to authorize server-side effects.
+
 Event continuation uses the Authority cursor. A reconnect continues after the last observed cursor and does not duplicate returned events. A caller's explicit historical `after` is preserved. Events without an authoritative cursor are not silently discarded. Session continuation freezes the active task ID and compares it inside the steering transaction, so a concurrent session rebind cannot redirect the message to a different task.
 
 ## Installation and private state
@@ -45,5 +47,7 @@ No fallback authorizes arbitrary shell work on a task, a new worker attempt, mod
 ## Evidence coverage
 
 `tests/test_connection_service_e2e.py` exercises the real bridge, CLI MCP child, loopback HTTP Authority and fixture SQLite ledger. It covers reconnecting after an Authority restart, losing a response after a mutation committed while reconnecting without a second POST, and rejecting a session-rebind race. Accepted ancestors, attempt numbers and code artifacts remain unchanged. Unit fixtures cover bounded transport failures, catalog changes, cursor continuation, idempotent receipts, installer rollback and diagnostic redaction. These keyless tests are implementation evidence, not a claim that a deployed host connection has been upgraded.
+
+The compatible-service-change fixture additionally holds the bridge and adapter process instances and PIDs constant while recreating the Authority and reading a changed business result through the existing health tool. It verifies a changed Authority instance and unchanged durable task. This is an isolated compatibility demonstration, not a measurement of the user's Codex UI, a production restart count, or a guarantee for changed tool schemas and incompatible upgrades.
 
 `tests/test_handoff_service_mcp.py` runs lockfile handoff operations through that same bridge, CLI MCP child and HTTP Authority path. Its isolated Git/SQLite fixture checks read-only preview/status, a single overlay materialization across repeated apply requests, and separate cancel/reconcile receipts. The package-manager materializer is a deterministic fixture; this test covers MCP delivery and idempotency, not a deployed pnpm installation or a production DSH handoff.

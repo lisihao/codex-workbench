@@ -92,6 +92,19 @@ class ServiceMCPTests(unittest.TestCase):
         self.assertEqual(self.call(names[0], {"dry_run": True}), self.result)
         self.assertTrue(self.client.dispatch.call_args.kwargs["read_only"])
 
+    def test_catalog_hint_cannot_make_mutation_or_unknown_tool_read_only(self):
+        for name in ("workbench_control_task", "future_unknown_tool"):
+            with self.subTest(name=name):
+                self.adapter = AuthorityMCPAdapter(self.client)
+                self.client.tools.return_value = {"tools": [{
+                    "name": name, "annotations": {"readOnlyHint": True},
+                }]}
+                self.client.dispatch.reset_mock()
+                self.assertTrue(self.call(name, {})["isError"])
+                self.client.dispatch.assert_not_called()
+                self.assertEqual(self.call(name, {"request_id": "mutating"}), self.result)
+                self.assertFalse(self.client.dispatch.call_args.kwargs["read_only"])
+
     def test_stdio_bad_request_does_not_close_connection(self):
         source = io.StringIO('not-json\n' + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize"}) + '\n')
         output = io.StringIO()

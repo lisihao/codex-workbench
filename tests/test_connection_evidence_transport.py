@@ -97,3 +97,18 @@ class ConnectionEvidenceTransportTests(unittest.TestCase):
         })
         self.assertTrue(response["result"]["isError"])
         self.assertFalse((Path(self.temp.name) / "state.json").exists())
+
+    def test_catalog_cannot_expand_bridge_read_retry_ceiling(self):
+        permissions = bridge.MCPConnectionBridge._catalog_read_only([
+            {"name": name, "annotations": {"readOnlyHint": True}}
+            for name in ("future_unknown_tool", "workbench_control_task", "workbench_list_tasks")
+        ])
+        self.assertFalse(permissions["future_unknown_tool"])
+        self.assertFalse(permissions["workbench_control_task"])
+        self.assertTrue(permissions["workbench_list_tasks"])
+
+    def test_bridge_ceiling_matches_supported_authority_read_tools(self):
+        from codex_workbench.authority_service import READ_ONLY_TOOL_NAMES
+
+        self.assertEqual(bridge.MCPConnectionBridge._READ_ONLY_TOOL_CEILING,
+                         READ_ONLY_TOOL_NAMES | {"workbench_get_service_request"})

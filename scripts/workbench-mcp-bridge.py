@@ -699,6 +699,16 @@ class MCPConnectionBridge:
     """
 
     _INTRINSIC_READ_ONLY_TOOLS = {"workbench_get_service_request"}
+    # A catalog cannot make an unknown operation eligible for read retries.
+    # Authority still classifies and authorizes every forwarded operation.
+    _READ_ONLY_TOOL_CEILING = frozenset({
+        "workbench_read_session_notifications", "workbench_get_node_recovery",
+        "workbench_acceptance_report", "workbench_get_delivery_objective",
+        "workbench_get_request", "workbench_get_session", "workbench_harness_health",
+        "workbench_inspect_task", "workbench_list_approvals", "workbench_list_tasks",
+        "workbench_read_artifact", "workbench_read_events", "workbench_worktree_status",
+        "workbench_get_service_request",
+    })
 
     def __init__(
         self,
@@ -795,7 +805,8 @@ class MCPConnectionBridge:
             annotations = tool.get("annotations")
             if isinstance(name, str):
                 values[name] = (
-                    isinstance(annotations, Mapping)
+                    name in MCPConnectionBridge._READ_ONLY_TOOL_CEILING
+                    and isinstance(annotations, Mapping)
                     and annotations.get("readOnlyHint") is True
                 )
         return values

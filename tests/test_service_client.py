@@ -96,6 +96,17 @@ class ServiceClientTests(unittest.TestCase):
         self.assertEqual(self.reads, 0)
         self.assertNotIn("wrong-token", str(caught.exception))
 
+    def test_readonly_hint_does_not_replay_a_mutation_after_lost_response(self):
+        receipt = self.client.dispatch(self.envelope, read_only=True)
+        self.assertEqual(receipt["result"], self.result)
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(self.reads, 1)
+
+    def test_unknown_readonly_hint_still_requires_write_identity(self):
+        with self.assertRaises(ValueError):
+            self.client.dispatch({"tool": "future_unknown_tool", "arguments": {}}, read_only=True)
+        self.assertEqual(self.posts, 0)
+
     def test_nonlocal_token_destinations_are_rejected(self):
         for url in ("http://example.invalid", "http://user:password@127.0.0.1", "file:///tmp/control"):
             with self.subTest(url=url), self.assertRaises(ValueError):

@@ -101,10 +101,8 @@ class AuthorityMCPAdapter:
                     result = _text(self.client.get_request(arguments.get("request_id")))
                 else:
                     copied = dict(arguments)
-                    read_only = (
-                        tool.get("annotations", {}).get("readOnlyHint") is True
-                        or is_read_only_tool(name, copied)
-                    )
+                    # Catalog hints cannot expand this adapter's retry ceiling.
+                    read_only = is_read_only_tool(name, copied)
                     if name in {"workbench_handoff_lockfile", "workbench_restore_accepted_source"}:
                         read_only = is_read_only_tool(name, copied)
                         service_request_id = copied.get(

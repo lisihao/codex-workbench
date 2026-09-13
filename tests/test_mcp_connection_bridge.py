@@ -71,7 +71,7 @@ if mode == "exit255":
 
 version = "2.0.0" if mode == "upgrade" and launch >= 2 else "1.0.0"
 tools = [
-    {"name": "workbench_read", "annotations": {"readOnlyHint": True}},
+    {"name": "workbench_list_tasks", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_read_events", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_write", "annotations": {"readOnlyHint": False}},
@@ -110,7 +110,7 @@ for raw in sys.stdin:
     params = request.get("params") or {}
     name = params.get("name")
     arguments = params.get("arguments") or {}
-    if name == "workbench_read":
+    if name == "workbench_list_tasks":
         log("read")
         if mode == "large":
             send(request_id, {"content": [{"type": "text", "text": "x" * (8 * 1024 * 1024)}]})
@@ -254,7 +254,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "workbench_read", "arguments": {}},
+                "params": {"name": "workbench_list_tasks", "arguments": {}},
             },
             {"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
         ]
@@ -285,7 +285,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "tools/call",
-                    "params": {"name": "workbench_read", "arguments": {}},
+                    "params": {"name": "workbench_list_tasks", "arguments": {}},
                 },
             ],
             request_timeout_seconds=5.0,
@@ -304,7 +304,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "tools/call",
-                    "params": {"name": "workbench_read", "arguments": {}},
+                    "params": {"name": "workbench_list_tasks", "arguments": {}},
                 },
             ],
         )
@@ -323,7 +323,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "tools/call",
-                    "params": {"name": "workbench_read", "arguments": {"payload": payload}},
+                    "params": {"name": "workbench_list_tasks", "arguments": {"payload": payload}},
                 },
             ],
             request_timeout_seconds=5.0,
@@ -343,7 +343,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 3,
                     "method": "tools/call",
-                    "params": {"name": "workbench_read", "arguments": {}},
+                    "params": {"name": "workbench_list_tasks", "arguments": {}},
                 },
             ],
             request_timeout_seconds=5.0,
@@ -372,7 +372,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "workbench_read", "arguments": {}},
+                "params": {"name": "workbench_list_tasks", "arguments": {}},
             },
             {
                 "jsonrpc": "2.0",
@@ -545,7 +545,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "workbench_read", "arguments": {}},
+                "params": {"name": "workbench_list_tasks", "arguments": {}},
             },
             {
                 "jsonrpc": "2.0",
@@ -591,7 +591,7 @@ class MCPConnectionBridgeTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "workbench_read", "arguments": {}},
+                "params": {"name": "workbench_list_tasks", "arguments": {}},
             },
             {
                 "jsonrpc": "2.0",
