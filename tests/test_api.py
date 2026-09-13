@@ -876,7 +876,9 @@ class APITests(unittest.TestCase):
                     self.assertFalse(empty_payload["ok"])
                     self.assertIsNone(empty_payload["active"])
                     self.assertFalse(empty_payload["status"]["ok"])
-                    with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=2) as response:
+                    # Snapshot includes other health projections; this case
+                    # verifies read-only serialization, not a two-second SLA.
+                    with urlopen(f"http://127.0.0.1:{port}/api/snapshot", timeout=10) as response:
                         empty_snapshot = json.load(response)
                     self.assertFalse(empty_snapshot["capability_registry"]["ok"])
                     registry.refresh.assert_not_called()

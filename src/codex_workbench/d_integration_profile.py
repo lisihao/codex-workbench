@@ -72,6 +72,6 @@ TASK_ACCESS_ADDITIONS = tuple(dict.fromkeys((*TASK_SCOPE_ADDITIONS, *NODE_READ_A
 
 REQUIRED_PACKAGE_MARKERS = {
     "packages/prompt/task-template/package.json": "@deepseek-ai/dsh-task-template",
-    "packages/client/ui-task-template/package.json": "@deepseek-ai/dsh-ui-task-template",
+    "packages/client/ui-task-template/package.json": "@deepseek-ai/dsh-client-ui-task-template",
     "packages/prompt/task-template-rpc/package.json": "@deepseek-ai/dsh-task-template-rpc",
 }
