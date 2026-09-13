@@ -133,6 +133,7 @@ def collect_node_observation(
 
     rollback_event_cursor: int | None = None
     rollback_provenance: dict[str, Any] | None = None
+    source_artifact_payloads: dict[str, dict[str, Any]] = {}
     preparation_attempt: int | None = None
     typed_failure_code: str | None = None
     preparation_phase: str | None = None
@@ -142,7 +143,9 @@ def collect_node_observation(
         rollback_event_cursor = int(rollback["rollback_event_cursor"])
         rollback_provenance = dict(rollback["rollback_provenance"])
         preparation_attempt = int(rollback_provenance["preparation_attempt"])
-        source_artifacts = _result_artifact_refs(source_result)
+        source_artifacts, source_artifact_payloads = _result_artifacts(
+            store, source_result
+        )
         raw_preparation = rollback["preparation_result"]
         if raw_preparation is None:
             result: dict[str, Any] = {}
@@ -163,6 +166,7 @@ def collect_node_observation(
     artifacts, artifact_payloads = _result_artifacts(store, result)
     if not rollback_preparation:
         source_artifacts = artifacts
+        source_artifact_payloads = artifact_payloads
 
     attribution, attribution_present, attribution_current = _current_attribution(
         result.get("execution_attribution"), task_id, node_id, attribution_attempt
@@ -173,6 +177,10 @@ def collect_node_observation(
         effective_cursor = max(effective_cursor, attribution.state.event_cursor)
 
     readiness = _readiness_report(artifact_payloads.get("execution-readiness"))
+    if readiness is None and rollback_preparation:
+        readiness = _readiness_report(
+            source_artifact_payloads.get("execution-readiness")
+        )
     materialization = _materialization_report(artifact_payloads.get("dependency-materialization"))
     validation_profile, validation_succeeded = _validation_facts(artifact_payloads)
 
