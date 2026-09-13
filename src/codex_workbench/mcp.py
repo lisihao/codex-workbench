@@ -12,6 +12,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .acceptance_amendment import ACCEPTANCE_AMENDMENT_TOOL, amend_task_acceptance
 from .artifacts import ArtifactStore
+from .blocked_source_repair import blocked_source_repair, blocked_source_repair_receipt
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
 from .d_integration_profile import SCOPE_PROFILE_ID
@@ -120,6 +121,108 @@ HISTORICAL_SOURCE_TOOL: dict[str, Any] = {
 }
 
 
+_BLOCKED_SOURCE_REPAIR_FIELDS = {
+    "status": frozenset({"op", "task_id", "request_id"}),
+    "preview": frozenset({
+        "op", "task_id", "node_id", "expected_attempt", "expected_revision",
+        "expected_contract_hash", "request_id", "reason",
+    }),
+    "apply": frozenset({
+        "op", "task_id", "node_id", "expected_attempt", "expected_revision",
+        "expected_contract_hash", "request_id", "reason", "expected_fingerprint",
+    }),
+}
+
+
+def _blocked_source_repair_schema(operation: str) -> dict[str, Any]:
+    fields = _BLOCKED_SOURCE_REPAIR_FIELDS[operation]
+    properties: dict[str, Any] = {
+        "op": {"const": operation},
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "node_id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "expected_attempt": {"type": "integer", "minimum": 1},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "expected_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+        "expected_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    }
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": sorted(fields),
+        "properties": {field: properties[field] for field in fields},
+    }
+
+
+BLOCKED_SOURCE_REPAIR_TOOL: dict[str, Any] = {
+    "name": "workbench_repair_blocked_source",
+    "description": (
+        "Preview, apply, or inspect the existing policy-authorized blocked-source repair. "
+        "Apply preserves the blocked result and queues one fenced next worker attempt; it never accepts a node or skips its verifier."
+    ),
+    "inputSchema": {
+        "type": "object", "additionalProperties": False,
+        "required": ["op", "task_id", "request_id"],
+        "properties": {
+            **_blocked_source_repair_schema("apply")["properties"],
+            "op": {"enum": ["status", "preview", "apply"]},
+        },
+        "oneOf": [_blocked_source_repair_schema(op) for op in ("status", "preview", "apply")],
+    },
+}
+
+
+def _blocked_source_repair_arguments(arguments: object) -> dict[str, Any]:
+    """Validate the exact public operation around the existing domain adapter."""
+
+    if not isinstance(arguments, dict):
+        raise ValueError("blocked source repair arguments must be an object")
+    op = arguments.get("op")
+    expected = _BLOCKED_SOURCE_REPAIR_FIELDS.get(op) if isinstance(op, str) else None
+    if expected is None or set(arguments) != expected:
+        raise ValueError("blocked source repair operation requires its exact fields")
+    normalized = dict(arguments)
+    for field, maximum in (("task_id", 200), ("request_id", 200)):
+        value = normalized[field]
+        if not isinstance(value, str) or not value or value != value.strip() or len(value) > maximum:
+            raise ValueError(f"{field} must be a non-empty bounded string")
+    if op == "status":
+        return normalized
+    for field, maximum in (("node_id", 200), ("reason", 500)):
+        value = normalized[field]
+        if not isinstance(value, str) or not value or value != value.strip() or len(value) > maximum:
+            raise ValueError(f"{field} must be a non-empty bounded string")
+    for field in ("expected_attempt", "expected_revision"):
+        value = normalized[field]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{field} must be a positive integer")
+    for field in ("expected_contract_hash", "expected_fingerprint"):
+        if field in normalized and (
+            not isinstance(normalized[field], str)
+            or re.fullmatch(r"[0-9a-f]{64}", normalized[field]) is None
+        ):
+            raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return normalized
+
+
+def _invoke_blocked_source_repair(store: WorkbenchStore, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Invoke the existing receipt-fenced repair without adding another scheduler."""
+
+    if arguments["op"] == "status":
+        receipt = blocked_source_repair_receipt(store, arguments["request_id"])
+        if receipt is not None and receipt.get("task_id") != arguments["task_id"]:
+            raise StateConflictError("blocked source repair receipt belongs to another task")
+        return {"ok": True, "status": "not_found" if receipt is None else "queued", "receipt": receipt}
+    values = {key: value for key, value in arguments.items() if key != "op"}
+    expected_fingerprint = values.pop("expected_fingerprint", None)
+    return blocked_source_repair(
+        store,
+        **values,
+        dry_run=arguments["op"] == "preview",
+        expected_fingerprint=expected_fingerprint,
+    )
+
+
 def _historical_source_arguments(arguments: object) -> dict[str, Any]:
     """Validate the exact per-operation historical-source request fields."""
 
@@ -187,6 +290,7 @@ TOOLS: list[dict[str, Any]] = [
     VALIDATION_TOOL,
     LOCKFILE_HANDOFF_TOOL,
     HISTORICAL_SOURCE_TOOL,
+    BLOCKED_SOURCE_REPAIR_TOOL,
     *RECOVERY_TOOLS,
     *SESSION_NOTIFICATION_TOOLS,
     ACCEPTANCE_AMENDMENT_TOOL,
@@ -1017,6 +1121,9 @@ class WorkbenchMCPServer:
         if name == "workbench_restore_accepted_source":
             validated = _historical_source_arguments(arguments)
             return self._text(_invoke_historical_source(self.store, validated))
+        if name == "workbench_repair_blocked_source":
+            validated = _blocked_source_repair_arguments(arguments)
+            return self._text(_invoke_blocked_source_repair(self.store, validated))
         if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
             return self._text(recovery_tool(self.store, name, arguments))
         if name in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:

@@ -67,6 +67,28 @@ class SourceRepairAdapterTests(unittest.TestCase):
         self.assertFalse(result["stage_succeeded"])
         self.assertEqual(result["reason_kind"], "source_repair_rejected")
 
+    def test_controlled_repair_requires_current_source_to_match_the_verified_delta(self) -> None:
+        observation = {
+            **self.observation,
+            "category": "unknown",
+            "controlled_source_repair_ready": True,
+            "controlled_source_repair": {"source_delta_after": "d" * 64},
+        }
+        with patch(
+            f"{_MODULE}.blocked_source_repair",
+            return_value={**self.preview, "source_delta_sha256": "e" * 64},
+        ) as prepare:
+            with self.assertRaisesRegex(ValueError, "no longer matches current source"):
+                self.actions.prepare(observation, "repair_source", "repair-fixture")
+        prepare.assert_called_once()
+
+        with patch(
+            f"{_MODULE}.blocked_source_repair",
+            return_value={**self.preview, "source_delta_sha256": "d" * 64},
+        ):
+            plan = self.actions.prepare(observation, "repair_source", "repair-fixture")
+        self.assertEqual(plan["action"], "repair_source")
+
     def test_lost_response_is_reconciled_with_same_request(self) -> None:
         plan = self.plan()
         with patch(f"{_MODULE}.blocked_source_repair") as execute, patch(

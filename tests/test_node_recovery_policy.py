@@ -76,6 +76,34 @@ class RecoveryPolicyTests(unittest.TestCase):
         disabled = RecoveryPolicy(enabled=True, allowed_actions=("observe_readiness",))
         self.assertNotEqual(plan_recovery(disabled, failed_check)["action"], "repair_source")
 
+    def test_verified_controlled_source_write_opens_one_bounded_repair_stage_after_elapsed_budget(self) -> None:
+        policy = RecoveryPolicy(
+            enabled=True,
+            allowed_actions=("repair_source",),
+            max_action_attempts=2,
+            time_budget_seconds=10,
+        )
+        repaired = observation(
+            "unknown",
+            elapsed_seconds=100,
+            readiness_ready=True,
+            node_is_verifier=False,
+            controlled_source_repair_ready=True,
+        )
+        decision = plan_recovery(policy, repaired)
+        self.assertEqual((decision["state"], decision["action"]), ("ready", "repair_source"))
+        self.assertEqual(decision["reason_kind"], "controlled_source_write_verified")
+        for change in (
+            {"task_state": "paused"},
+            {"task_state": "cancelled"},
+            {"node_state": "indeterminate"},
+            {"node_is_verifier": True},
+            {"readiness_ready": False},
+            {"action_attempts": policy.max_action_attempts},
+        ):
+            with self.subTest(change=change):
+                self.assertNotEqual(plan_recovery(policy, {**repaired, **change})["action"], "repair_source")
+
     def test_policy_defaults_round_trip_and_strict_config(self) -> None:
         policy = RecoveryPolicy()
         self.assertEqual(policy.to_dict()["allowed_actions"], ["observe_readiness"])

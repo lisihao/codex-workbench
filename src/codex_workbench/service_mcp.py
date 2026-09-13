@@ -72,7 +72,11 @@ class AuthorityMCPAdapter:
                         tool.get("annotations", {}).get("readOnlyHint") is True
                         or is_read_only_tool(name, copied)
                     )
-                    if name in {"workbench_handoff_lockfile", "workbench_restore_accepted_source"}:
+                    if name in {
+                        "workbench_handoff_lockfile",
+                        "workbench_restore_accepted_source",
+                        "workbench_repair_blocked_source",
+                    }:
                         read_only = is_read_only_tool(name, copied)
                         service_request_id = copied.get(
                             "operation_id"

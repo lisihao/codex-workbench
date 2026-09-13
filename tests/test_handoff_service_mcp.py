@@ -59,7 +59,10 @@ class HandoffServiceMCPTests(unittest.TestCase):
                 ],
                 "state_file": str(self.config.state_root / "handoff-mcp-bridge-state.json"),
                 "connect_timeout_seconds": 2,
-                "request_timeout_seconds": 3,
+                # Full-suite Git/source observation can exceed the bridge's
+                # tiny unit-test timeout; keep teardown from deleting the
+                # fixture while the real Authority request is still active.
+                "request_timeout_seconds": 15,
                 "max_reconnect_attempts": 3,
                 "initial_backoff_seconds": 0.001,
                 "max_backoff_seconds": 0.004,

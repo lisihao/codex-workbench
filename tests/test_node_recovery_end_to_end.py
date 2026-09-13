@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench.authority_service import AuthorityService
+from codex_workbench.blocked_source_repair import blocked_source_repair
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.execution_attribution import (
     ExecutionAttribution,
@@ -16,7 +17,7 @@ from codex_workbench.execution_attribution import (
     FailureAttribution,
     RequestedModelIdentity,
 )
-from codex_workbench.model import NodeResult, NodeSpec, TaskContract
+from codex_workbench.model import NodeResult, NodeSpec, TaskContract, canonical_json
 from codex_workbench.node_recovery_observation import collect_node_observation
 from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.service import Coordinator
@@ -454,6 +455,104 @@ class NodeRecoveryEndToEndTests(_FailedAttemptRecoveryFixture, unittest.TestCase
                 )
                 task = self.store.get_task(contract.task_id)
                 self.assertEqual(self._node(task, "worker")["state"], "blocked")
+
+    def test_expired_episode_reopens_once_from_new_controlled_write_without_user_message(self) -> None:
+        contract, _source, _dependency_ref, blocked = self._blocked_validation_task(
+            task_id="e2e-controlled-write-after-expiry"
+        )
+        worker = self._node(blocked, "worker")
+        result = dict(worker["result"])
+        result.pop("execution_attribution")
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET result_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                (canonical_json(result), contract.task_id),
+            )
+        blocked = self.store.get_task(contract.task_id)
+        worker = self._node(blocked, "worker")
+        self._configure_repair_policy(contract.task_id, int(blocked["state_revision"]))
+        coordinator = self._coordinator()
+        assert coordinator.node_recovery is not None
+        loop = coordinator.node_recovery
+        initial = loop._refresh_node(contract.task_id, "worker", 0)
+        self.assertEqual(initial["decision"]["reason_kind"], "unknown_evidence")
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                ("2020-01-01T00:00:00+00:00", initial["episode_id"]),
+            )
+
+        arguments = {
+            "task_id": contract.task_id,
+            "node_id": "worker",
+            "expected_revision": int(blocked["state_revision"]),
+            "expected_attempt": int(worker["attempt"]),
+            "expected_contract_hash": blocked["contract_hash"],
+            "request_id": "controlled-write-repair-preview",
+            "reason": "fixture source continuation",
+        }
+        source_preview = blocked_source_repair(self.store, **arguments, dry_run=True)
+        audit = {
+            "task_id": contract.task_id,
+            "node_id": "worker",
+            "expected_revision": int(blocked["state_revision"]),
+            "expected_attempt": int(worker["attempt"]),
+            "check_id": "dsh-d-pairing-write-v1",
+            "ok": True,
+            "historical_result_unchanged": True,
+            "source_delta_after": source_preview["source_delta_sha256"],
+            "execution": {"ok": True},
+        }
+        audit_ref = self.artifacts.put_text(canonical_json(audit), "validation.json")
+        business = {
+            **audit,
+            "status": "passed",
+            "audit_ref": audit_ref,
+            "task_state_changed": False,
+            "creates_attempt": False,
+            "accepts_task": False,
+            "recovery_requires_fresh_preview": True,
+        }
+        business.pop("execution")
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO authority_requests(
+                    request_id, request_fingerprint, tool, task_id, session_id, actor,
+                    state, instance_id, result_json, created_at, updated_at, settled_at
+                ) VALUES(?, ?, 'workbench_validate_blocked_node', ?, NULL, 'fixture',
+                    'completed', 'fixture-instance', ?, ?, ?, ?)
+                """,
+                (
+                    "controlled-write-after-expiry",
+                    "f" * 64,
+                    contract.task_id,
+                    canonical_json({"content": [{"type": "text", "text": canonical_json(business)}]}),
+                    "2026-09-13T00:00:00+00:00",
+                    "2026-09-13T00:00:01+00:00",
+                    "2026-09-13T00:00:01+00:00",
+                ),
+            )
+
+        # No steering, policy rewrite, or user turn occurs between evidence
+        # publication and the normal recovery sweep.
+        completed = loop.reconcile_once()
+        self.assertEqual(len(completed), 1)
+        current = self.store.get_task(contract.task_id)
+        self.assertEqual((current["state"], self._node(current, "worker")["state"]), ("queued", "pending"))
+        queued = [
+            event for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.blocked_source_repair_queued"
+        ]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(loop.reconcile_once(), [])
+        self.assertEqual(
+            len([
+                event for event in self.store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "node.blocked_source_repair_queued"
+            ]),
+            1,
+        )
 
 
 if __name__ == "__main__":

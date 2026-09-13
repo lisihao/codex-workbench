@@ -26,7 +26,10 @@ class SourceRepairNodeActions:
             observation.get("observation_available") is not True
             or observation.get("node_state") != "blocked"
             or observation.get("node_is_verifier") is not False
-            or observation.get("category") != "validation_failure"
+            or (
+                observation.get("category") != "validation_failure"
+                and observation.get("controlled_source_repair_ready") is not True
+            )
             or observation.get("readiness_ready") is not True
             or observation.get("validation_succeeded") is True
         ):
@@ -41,6 +44,13 @@ class SourceRepairNodeActions:
             "reason": _REASON,
         }
         preview = blocked_source_repair(self.store, **arguments, dry_run=True)
+        controlled_repair = observation.get("controlled_source_repair")
+        if observation.get("controlled_source_repair_ready") is True:
+            if (
+                not isinstance(controlled_repair, Mapping)
+                or preview.get("source_delta_sha256") != controlled_repair.get("source_delta_after")
+            ):
+                raise ValueError("controlled source repair evidence no longer matches current source")
         binding = {
             "arguments": arguments,
             "fingerprint": preview["fingerprint"],

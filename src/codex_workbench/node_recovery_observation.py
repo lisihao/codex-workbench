@@ -1,9 +1,10 @@
 """Read-only Authority evidence projection for blocked-node recovery.
 
-The projection consumes only the current task snapshot and immutable
-content-addressed receipts already attached to the current node result.  It
-does not execute a command, inspect a worktree, enumerate ignored files, or
-infer an owner from free-form result text.
+The projection consumes the current task snapshot, immutable content-addressed
+receipts attached to the current node result, and completed controlled-write
+receipts from the same Authority journal. It does not execute a command,
+inspect a worktree, enumerate ignored files, or infer an owner from free-form
+result text.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sqlite3
 from typing import Any
 
 from .dependency_inputs import DependencyInputError, accepted_ancestor_nodes
@@ -35,6 +37,10 @@ _VALIDATION_PROFILES = frozenset(
         "dsh-b-pairing-write-v1",
     }
 )
+_SOURCE_REPAIR_WRITE_PROFILES = frozenset({
+    "dsh-b-pairing-write-v1",
+    "dsh-d-pairing-write-v1",
+})
 _READINESS_DEPENDENCY_CODES = frozenset(
     {
         "missing-dependency",
@@ -183,6 +189,13 @@ def collect_node_observation(
         )
     materialization = _materialization_report(artifact_payloads.get("dependency-materialization"))
     validation_profile, validation_succeeded = _validation_facts(artifact_payloads)
+    controlled_repair = _latest_controlled_repair_evidence(
+        store,
+        task_id=task_id,
+        node_id=node_id,
+        task_revision=task_revision,
+        node_attempt=node_attempt,
+    )
 
     readiness_failure = _first_readiness_failure(readiness)
     readiness_codes = _readiness_failure_codes(readiness)
@@ -251,6 +264,8 @@ def collect_node_observation(
             source_patch = artifact_set.get(key)
             if source_patch is not None and source_patch not in source_refs:
                 source_refs.append(source_patch)
+    if controlled_repair is not None:
+        artifacts["controlled-repair"] = controlled_repair["audit_ref"]
 
     verification_wait = bool(
         bool(node.get("verifier"))
@@ -269,6 +284,7 @@ def collect_node_observation(
         or accepted_ancestors
         or source_refs
         or dependency_refs
+        or controlled_repair is not None
     )
     progress_detail = {
         "authoritative": material_progress,
@@ -281,6 +297,7 @@ def collect_node_observation(
             attribution_current=attribution_current,
             accepted_ancestors=accepted_ancestors,
             rollback_event_cursor=rollback_event_cursor,
+            controlled_repair=controlled_repair,
         ),
     }
 
@@ -342,6 +359,8 @@ def collect_node_observation(
         "validation_profile": validation_profile,
         "validation_succeeded": validation_succeeded,
         "readiness_ready": readiness_ready if readiness is not None else None,
+        "controlled_source_repair_ready": controlled_repair is not None,
+        **({"controlled_source_repair": controlled_repair} if controlled_repair is not None else {}),
         "source_event_cursor": effective_cursor,
         "material_progress": material_progress,
         "authoritative_material_progress": progress_detail,
@@ -509,6 +528,89 @@ def _read_json_artifact(store: Any, ref: str) -> dict[str, Any] | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _latest_controlled_repair_evidence(
+    store: Any,
+    *,
+    task_id: str,
+    node_id: str,
+    task_revision: int,
+    node_attempt: int,
+) -> dict[str, str] | None:
+    """Return the latest content-verified controlled source-write for this blocked attempt."""
+
+    connection_factory = getattr(store, "connection", None)
+    if not callable(connection_factory):
+        return None
+    try:
+        with connection_factory() as connection:
+            rows = connection.execute(
+                """
+                SELECT request_id, result_json, settled_at
+                FROM authority_requests
+                WHERE task_id = ? AND tool = 'workbench_validate_blocked_node'
+                  AND state = 'completed' AND result_json IS NOT NULL
+                ORDER BY settled_at DESC, request_id DESC
+                LIMIT 32
+                """,
+                (task_id,),
+            ).fetchall()
+    except (OSError, sqlite3.Error, TypeError):
+        return None
+    for row in rows:
+        try:
+            outer = json.loads(str(row["result_json"]))
+            content = outer["content"]
+            result = json.loads(content[0]["text"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(result, Mapping):
+            continue
+        audit_ref = result.get("audit_ref")
+        check_id = result.get("check_id")
+        source_delta_after = result.get("source_delta_after")
+        if (
+            result.get("task_id") != task_id
+            or result.get("node_id") != node_id
+            or result.get("expected_revision") != task_revision
+            or result.get("expected_attempt") != node_attempt
+            or result.get("ok") is not True
+            or result.get("status") != "passed"
+            or result.get("task_state_changed") is not False
+            or result.get("historical_result_unchanged") is not True
+            or result.get("creates_attempt") is not False
+            or result.get("accepts_task") is not False
+            or result.get("recovery_requires_fresh_preview") is not True
+            or check_id not in _SOURCE_REPAIR_WRITE_PROFILES
+            or not _valid_ref(audit_ref)
+            or not isinstance(source_delta_after, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_delta_after) is None
+        ):
+            continue
+        audit = _read_json_artifact(store, audit_ref)
+        if (
+            audit is None
+            or audit.get("task_id") != task_id
+            or audit.get("node_id") != node_id
+            or audit.get("expected_revision") != task_revision
+            or audit.get("expected_attempt") != node_attempt
+            or audit.get("check_id") != check_id
+            or audit.get("ok") is not True
+            or audit.get("historical_result_unchanged") is not True
+            or audit.get("source_delta_after") != source_delta_after
+            or not isinstance(audit.get("execution"), Mapping)
+            or audit["execution"].get("ok") is not True
+        ):
+            continue
+        return {
+            "request_id": str(row["request_id"]),
+            "audit_ref": audit_ref,
+            "check_id": check_id,
+            "source_delta_after": source_delta_after,
+            "settled_at": str(row["settled_at"]),
+        }
+    return None
 
 
 def _recovery_preparation_facts(
@@ -775,6 +877,7 @@ def _progress_sources(
     attribution_current: bool,
     accepted_ancestors: Sequence[Mapping[str, Any]],
     rollback_event_cursor: int | None = None,
+    controlled_repair: Mapping[str, str] | None = None,
 ) -> list[str]:
     sources: list[str] = []
     if source_event_cursor > 0:
@@ -791,6 +894,8 @@ def _progress_sources(
         sources.append("validation-result")
     if accepted_ancestors:
         sources.append("accepted-ancestors")
+    if controlled_repair is not None:
+        sources.append("controlled-repair-audit")
     return sources
 
 
