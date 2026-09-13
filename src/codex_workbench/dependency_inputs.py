@@ -21,6 +21,7 @@ from .lockfile_handoff_input import (
     select_lockfile_handoffs_for_target,
     validate_lockfile_handoff_manifests,
 )
+from .model import canonical_json
 from .worktrees import WorktreeError, WorktreeManager
 
 
@@ -582,23 +583,30 @@ def apply_ready_lockfile_handoffs_to_dependency_input(
         raise DependencyInputError(
             f"lockfile handoff input is unavailable: {error}"
         ) from error
-    existing_by_identity = {
+    combined_by_identity = {
         recorded_handoff_identity(handoff): handoff for handoff in existing
     }
     additions: list[LockfileHandoff] = []
+    rebound = False
     for selected_handoff in selected:
         identity = recorded_handoff_identity(selected_handoff)
-        recorded = existing_by_identity.get(identity)
+        recorded = combined_by_identity.get(identity)
         if recorded is not None:
             if recorded.receipt != selected_handoff.receipt:
-                raise DependencyInputError(
-                    "recorded lockfile handoff drifted from the durable ready receipt"
-                )
+                if not _same_handoff_after_contract_rebinding(recorded, selected_handoff):
+                    raise DependencyInputError(
+                        "recorded lockfile handoff drifted from the durable ready receipt"
+                    )
+                combined_by_identity[identity] = selected_handoff
+                rebound = True
             continue
         additions.append(selected_handoff)
-    if not additions:
+    if not additions and not rebound:
         return dependency_input
-    combined = (*existing, *additions)
+    combined = tuple(
+        combined_by_identity[recorded_handoff_identity(handoff)]
+        for handoff in existing
+    ) + tuple(additions)
     try:
         # Revalidate ordering and every artifact before changing the worktree.
         normalized_combined = normalize_lockfile_handoffs(
@@ -612,27 +620,29 @@ def apply_ready_lockfile_handoffs_to_dependency_input(
                 else None
             ),
         )
-        applied_request_ids: set[str] = set()
-        apply_pending_lockfile_handoffs(
-            worktree,
-            artifacts,
-            additions,
-            raw_ancestors,
-            applied_request_ids=applied_request_ids,
-            manifest_phase=manifest_phase,
-        )
-        require_all_handoffs_applied(
-            worktree,
-            artifacts,
-            additions,
-            applied_request_ids=applied_request_ids,
-        )
-        input_tree_sha = derive_lockfile_handoff_input_tree(
-            worktree,
-            dependency_input.input_tree_sha,
-            artifacts,
-            additions,
-        )
+        input_tree_sha = dependency_input.input_tree_sha
+        if additions:
+            applied_request_ids: set[str] = set()
+            apply_pending_lockfile_handoffs(
+                worktree,
+                artifacts,
+                additions,
+                raw_ancestors,
+                applied_request_ids=applied_request_ids,
+                manifest_phase=manifest_phase,
+            )
+            require_all_handoffs_applied(
+                worktree,
+                artifacts,
+                additions,
+                applied_request_ids=applied_request_ids,
+            )
+            input_tree_sha = derive_lockfile_handoff_input_tree(
+                worktree,
+                dependency_input.input_tree_sha,
+                artifacts,
+                additions,
+            )
     except LockfileHandoffInputError as error:
         raise DependencyInputError(
             f"cannot derive lockfile handoff input: {error}"
@@ -650,6 +660,114 @@ def apply_ready_lockfile_handoffs_to_dependency_input(
         ],
     }
     return DependencyInput(input_tree_sha=input_tree_sha, receipt=derived)
+
+
+def rebind_recorded_lockfile_handoffs(
+    task: Mapping[str, Any],
+    node_id: str,
+    artifacts: ArtifactStore,
+    dependency_input: DependencyInput,
+    *,
+    ready_lockfile_handoffs: object,
+) -> DependencyInput:
+    """Upgrade only stale contract bindings in a recorded dependency input.
+
+    The durable ready list has already validated the scope-amendment rebinding.
+    This function never reads or writes a worktree and never changes the input
+    tree; every lockfile, manifest, source, and ancestor field must be identical.
+    """
+
+    if not isinstance(dependency_input, DependencyInput):
+        raise DependencyInputError("dependency input is invalid")
+    receipt = dependency_input.receipt
+    if not isinstance(receipt, Mapping):
+        raise DependencyInputError("dependency input receipt is invalid")
+    raw_ancestors = receipt.get("ancestors")
+    if not isinstance(raw_ancestors, list):
+        raise DependencyInputError("dependency input receipt ancestors are invalid")
+    try:
+        recorded = _normalized_recorded_handoffs(artifacts, dependency_input)
+        selected = select_lockfile_handoffs_for_target(
+            artifacts,
+            task,
+            node_id,
+            ancestors=raw_ancestors,
+            ready_handoffs=ready_lockfile_handoffs,
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"lockfile handoff input is unavailable: {error}"
+        ) from error
+    if not recorded:
+        return dependency_input
+    selected_by_identity = {
+        recorded_handoff_identity(handoff): handoff for handoff in selected
+    }
+    rebound: list[LockfileHandoff] = []
+    changed = False
+    for existing in recorded:
+        current = selected_by_identity.get(recorded_handoff_identity(existing))
+        if current is None:
+            raise DependencyInputError(
+                "recorded lockfile handoff is absent from the durable ready journal"
+            )
+        if existing.receipt == current.receipt:
+            rebound.append(existing)
+            continue
+        if not _same_handoff_after_contract_rebinding(existing, current):
+            raise DependencyInputError(
+                "recorded lockfile handoff drifted from the durable ready receipt"
+            )
+        rebound.append(current)
+        changed = True
+    if not changed:
+        return dependency_input
+    try:
+        normalized = normalize_lockfile_handoffs(
+            artifacts,
+            [handoff.receipt for handoff in rebound],
+            task_id=str(receipt.get("task_id", "")),
+            contract=task.get("contract") if isinstance(task.get("contract"), Mapping) else None,
+            contract_hash=(
+                task.get("contract_hash")
+                if isinstance(task.get("contract_hash"), str)
+                else None
+            ),
+        )
+    except LockfileHandoffInputError as error:
+        raise DependencyInputError(
+            f"cannot rebind recorded lockfile handoff input: {error}"
+        ) from error
+    derived = dict(receipt)
+    derived["lockfile_handoffs"] = [dict(handoff.receipt) for handoff in normalized]
+    return DependencyInput(
+        input_tree_sha=dependency_input.input_tree_sha,
+        receipt=derived,
+    )
+
+
+def _same_handoff_after_contract_rebinding(
+    recorded: LockfileHandoff,
+    current: LockfileHandoff,
+) -> bool:
+    """Return whether two receipts differ only in their contract binding."""
+
+    if recorded_handoff_identity(recorded) != recorded_handoff_identity(current):
+        return False
+    before = {
+        key: value
+        for key, value in recorded.receipt.items()
+        if key not in {"contract_hash", "task_revision"}
+    }
+    after = {
+        key: value
+        for key, value in current.receipt.items()
+        if key not in {"contract_hash", "task_revision"}
+    }
+    return (
+        canonical_json(before) == canonical_json(after)
+        and int(current.receipt["task_revision"]) >= int(recorded.receipt["task_revision"])
+    )
 
 
 def accepted_ancestor_nodes(task: Mapping[str, Any], node_id: str) -> tuple[Mapping[str, Any], ...]:

@@ -18,10 +18,13 @@ from codex_workbench.authority import authority_machine_id
 from codex_workbench.authority_service import AuthorityService
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import (
+    DependencyInput,
     apply_recorded_dependency_input,
     load_recorded_dependency_input,
+    rebind_recorded_lockfile_handoffs,
 )
 from codex_workbench.lockfile_handoff import (
+    LockfileHandoffError,
     TOOL_NAME,
     get_ready_lockfile_handoffs,
     lockfile_handoff,
@@ -32,7 +35,14 @@ from codex_workbench.lockfile_handoff_input import (
     normalize_lockfile_handoffs,
 )
 from codex_workbench.mcp import WorkbenchMCPServer
-from codex_workbench.model import NodeResult, NodeSpec, TaskContract, canonical_json
+from codex_workbench.model import (
+    NodeResult,
+    NodeSpec,
+    TaskContract,
+    canonical_hash,
+    canonical_json,
+    now_iso,
+)
 from codex_workbench.service import Coordinator
 from codex_workbench.store import WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
@@ -407,6 +417,57 @@ class LockfileHandoffInputTests(unittest.TestCase):
         self.assertEqual(result["state"], "ready")
         return result
 
+    def _amend_contract_with_rebound_handoffs(
+        self,
+        task_id: str,
+        *,
+        node_id: str,
+    ) -> dict[str, object]:
+        """Apply the contract-only part of the fixed D scope amendment."""
+
+        before = self.store.get_task(task_id)
+        old_contract = dict(before["contract"])
+        new_contract = {
+            **old_contract,
+            "allowed_scope": [*old_contract["allowed_scope"], "docs/generated.md"],
+        }
+        new_contract_hash = canonical_hash(new_contract)
+        revision = int(before["state_revision"]) + 1
+        payload = {
+            "profile_id": "dsh-task-template-integration-v1",
+            "revision": revision,
+            "old_contract": old_contract,
+            "old_contract_hash": before["contract_hash"],
+            "new_contract": new_contract,
+            "new_contract_hash": new_contract_hash,
+        }
+        timestamp = now_iso()
+        with self.store.transaction() as connection:
+            changed = connection.execute(
+                "UPDATE tasks SET contract_json = ?, contract_hash = ?, "
+                "state_revision = ?, updated_at = ? WHERE task_id = ? "
+                "AND state_revision = ? AND contract_hash = ?",
+                (
+                    canonical_json(new_contract),
+                    new_contract_hash,
+                    revision,
+                    timestamp,
+                    task_id,
+                    before["state_revision"],
+                    before["contract_hash"],
+                ),
+            ).rowcount
+            self.assertEqual(changed, 1)
+            self.store._event(
+                connection,
+                "task.blocked_integration_scope_amended",
+                task_id,
+                node_id,
+                payload,
+                created_at=timestamp,
+            )
+        return self.store.get_task(task_id)
+
     def _resume_via_control_task(
         self,
         contract: TaskContract,
@@ -642,6 +703,120 @@ class LockfileHandoffInputTests(unittest.TestCase):
             2,
         )
         self.assertIn("worker", worktrees)
+
+    def test_scope_contract_rebinding_preserves_overlay_and_allows_resume(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-contract-rebind",
+            with_upstream=False,
+        )
+        self._apply_ready_handoff(contract, blocked, "handoff-contract-rebind-ready")
+        ready_before = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        self.assertEqual(len(ready_before), 1)
+
+        amended = self._amend_contract_with_rebound_handoffs(
+            contract.task_id,
+            node_id="worker",
+        )
+        ready_after = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        self.assertEqual(len(ready_after), 1)
+        self.assertEqual(ready_after[0]["contract_hash"], amended["contract_hash"])
+        self.assertEqual(ready_after[0]["task_revision"], amended["state_revision"])
+        self.assertEqual(
+            {
+                key: value
+                for key, value in ready_after[0].items()
+                if key not in {"contract_hash", "task_revision"}
+            },
+            {
+                key: value
+                for key, value in ready_before[0].items()
+                if key not in {"contract_hash", "task_revision"}
+            },
+        )
+
+        self._resume_via_control_task(contract, amended)
+        worktrees = self._run_scheduler_to_terminal(contract.task_id)
+        task = self.store.get_task(contract.task_id)
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((task["state"], worker["state"], worker["attempt"]),
+                         ("accepted", "accepted", 2))
+        self.assertIn("worker", worktrees)
+
+    def test_recorded_overlay_rebind_changes_no_content_identity(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-recorded-contract-rebind",
+            with_upstream=False,
+        )
+        self._apply_ready_handoff(contract, blocked, "handoff-recorded-rebind-ready")
+        ready_before = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        self._amend_contract_with_rebound_handoffs(
+            contract.task_id,
+            node_id="worker",
+        )
+        ready_after = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE nodes SET attempt = 2 WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            )
+        amended = self.store.get_task(contract.task_id)
+        tree = self._git(self.repository, "rev-parse", f"{self.base_sha}^{{tree}}")
+        recorded = DependencyInput(
+            input_tree_sha=tree,
+            receipt={
+                "schema_version": 2,
+                "kind": "accepted-ancestor-patch-input",
+                "task_id": contract.task_id,
+                "node_id": "worker",
+                "contract_base_sha": self.base_sha,
+                "input_tree_sha": tree,
+                "ancestors": [],
+                "lockfile_handoffs": ready_before,
+            },
+        )
+        rebound = rebind_recorded_lockfile_handoffs(
+            amended,
+            "worker",
+            self.store.artifacts,
+            recorded,
+            ready_lockfile_handoffs=ready_after,
+        )
+        self.assertEqual(rebound.input_tree_sha, recorded.input_tree_sha)
+        self.assertEqual(
+            rebound.receipt["lockfile_handoffs"],
+            ready_after,
+        )
+        self.assertEqual(
+            rebound.receipt["lockfile_handoffs"][0]["lockfile"],
+            recorded.receipt["lockfile_handoffs"][0]["lockfile"],
+        )
+
+    def test_contract_rebinding_event_tampering_is_rejected(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-contract-rebind-tamper",
+            with_upstream=False,
+        )
+        self._apply_ready_handoff(contract, blocked, "handoff-contract-rebind-tamper-ready")
+        self._amend_contract_with_rebound_handoffs(
+            contract.task_id,
+            node_id="worker",
+        )
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT cursor, payload_json FROM events WHERE task_id = ? "
+                "AND event_type = 'task.blocked_integration_scope_amended'",
+                (contract.task_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            payload = json.loads(str(row["payload_json"]))
+            payload["new_contract"]["objective"] = "tampered"
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                (canonical_json(payload), row["cursor"]),
+            )
+        with self.assertRaisesRegex(LockfileHandoffError, "new contract is invalid"):
+            get_ready_lockfile_handoffs(self.store, contract.task_id)
 
     def test_manifest_drift_and_bad_artifact_ref_are_rejected_before_overlay_write(self) -> None:
         contract, blocked, _source = self._blocked_task(
