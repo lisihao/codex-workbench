@@ -30,6 +30,11 @@ class DIntegrationScopeTests(unittest.TestCase):
     """Exercise the fixed A/B/C/D/E amendment against a retained Git worktree."""
 
     def setUp(self) -> None:
+        # This fixture owns no executor process. Host /proc access is tested in
+        # test_recovery_processes, not a prerequisite for these Git/SQLite cases.
+        self.enterContext(patch(
+            "codex_workbench.recovery_processes.source_process_ids", return_value=(),
+        ))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -48,6 +53,16 @@ class DIntegrationScopeTests(unittest.TestCase):
         self.epoch = self.store.activate_coordinator("d-integration-scope", "fixture-machine")
         self.worktrees = WorktreeManager(self.state_root / "worktrees")
         self._create_blocked_lane()
+
+    def test_unobservable_source_processes_still_reject_preview(self) -> None:
+        from codex_workbench.recovery_processes import RecoveryProcessError
+
+        before = self.store.get_task(self.contract.task_id)
+        with patch("codex_workbench.recovery_processes.source_process_ids",
+                   side_effect=RecoveryProcessError("source process inspection was incomplete")):
+            with self.assertRaisesRegex(scope.IntegrationScopeAmendmentError, "cannot prove.*idle"):
+                self._preview()
+        self.assertEqual(self.store.get_task(self.contract.task_id), before)
 
     def _initialize_repository(self) -> None:
         self.repository.mkdir()
