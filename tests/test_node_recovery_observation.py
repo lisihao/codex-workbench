@@ -336,16 +336,23 @@ class NodeRecoveryObservationTests(unittest.TestCase):
         self.assertEqual(observation["evidence_refs"]["execution-readiness"], oversized_ref)
 
     def test_rollback_preparation_uses_a2_attribution_and_preserves_source_refs(self) -> None:
-        source_dependency = self._store(_task(None)).artifacts.put_text("source dependency", "dependency-input.json")
         store = self._store(
             _task(
                 {
                     "status": "blocked",
-                    "artifacts": {"dependency-input": source_dependency},
+                    "artifacts": {},
                     "execution_attribution": _attribution("task-1", "work", 1, "auth"),
                 }
             )
         )
+        source_dependency = store.artifacts.put_text(
+            "source dependency", "dependency-input.json"
+        )
+        source_readiness = self._readiness_ref(store, ready=True)
+        store.task["nodes"][0]["result"]["artifacts"] = {  # type: ignore[index]
+            "dependency-input": source_dependency,
+            "execution-readiness": source_readiness,
+        }
         recovery_ref = store.artifacts.put_text("recovery evidence", "recovery.log")
         preparation_ref = self._recovery_preparation_ref(
             store,
@@ -370,8 +377,13 @@ class NodeRecoveryObservationTests(unittest.TestCase):
         self.assertEqual(observation["failure_code"], "acceptance-command-failed")
         self.assertEqual(observation["preparation_phase"], "acceptance")
         self.assertTrue(observation["executor_not_started"])
+        self.assertTrue(observation["readiness_ready"])
         self.assertEqual(observation["rollback_event_cursor"], 41)
         self.assertEqual(observation["source_evidence_refs"]["dependency-input"], source_dependency)
+        self.assertEqual(
+            observation["source_evidence_refs"]["execution-readiness"],
+            source_readiness,
+        )
         self.assertIn(source_dependency, observation["dependency_refs"])
         assert store.rollback is not None
         store.rollback["rollback_event_cursor"] = 42
