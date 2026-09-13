@@ -35,6 +35,10 @@ LEGACY_COMPATIBLE_SKILL_TEXT = (
 )
 CANONICAL_SKILL_ROOT_RELATIVE_PATH = Path("skills") / SKILL_NAME
 CANONICAL_SKILL_RELATIVE_PATH = CANONICAL_SKILL_ROOT_RELATIVE_PATH / "SKILL.md"
+CANONICAL_PROJECT_IDENTITY_RELATIVE_PATH = Path("src") / "codex_workbench" / "project_identity.py"
+CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH = (
+    Path("src") / "codex_workbench" / "authorization_policy.py"
+)
 CANONICAL_SKILL_FILES = (
     Path("SKILL.md"),
     Path("references/aegis-integration.md"),
@@ -77,7 +81,7 @@ def _project_identity(source: Path | None = None) -> str:
     """Load the canonical project-boundary text without importing Workbench."""
 
     root = (source or Path(__file__).resolve().parents[1]).expanduser().resolve()
-    module = root / "src" / "codex_workbench" / "project_identity.py"
+    module = root / CANONICAL_PROJECT_IDENTITY_RELATIVE_PATH
     try:
         values = runpy.run_path(str(module))
     except OSError as error:
@@ -88,23 +92,52 @@ def _project_identity(source: Path | None = None) -> str:
     return identity
 
 
+def _continuous_authorization_rules(source: Path | None = None) -> tuple[str, ...]:
+    """Load the dependency-free canonical rule text used by both managed agents."""
+
+    root = (source or Path(__file__).resolve().parents[1]).expanduser().resolve()
+    module = root / CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH
+    try:
+        values = runpy.run_path(str(module))
+    except (OSError, SyntaxError) as error:
+        raise SystemExit(f"Workbench authorization policy source is unavailable: {module}") from error
+    rules = values.get("WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES")
+    if (
+        not isinstance(rules, tuple)
+        or not rules
+        or not all(
+            isinstance(rule, str)
+            and rule.strip() == rule
+            and "\x00" not in rule
+            and "\n" not in rule
+            and "\r" not in rule
+            for rule in rules
+        )
+        or len(set(rules)) != len(rules)
+    ):
+        raise SystemExit(f"Workbench authorization policy source is invalid: {module}")
+    return rules
+
+
 def _normalized_home(home: Path) -> Path:
     home = home.expanduser()
     return home if home.is_absolute() else Path.cwd() / home
 
 
-def policy_block(agent: str) -> str:
+def policy_block(agent: str, *, source: Path | None = None) -> str:
+    """Project checked-in canonical identity and authorization rules for one agent."""
+
     return "\n".join(
         (
             POLICY_START,
-            _project_identity(),
+            _project_identity(source),
             "## Codex Workbench Code-as-Harness (managed)",
             f"Profile: `{PROFILE}`. Canonical skill: `{SKILL_NAME}`.",
             "- Define the acceptance boundary and affected-path scope before editing.",
             "- Maximize useful safe parallelism; independent work may run together, conflicting writes may not.",
             "- Reuse passing evidence only for the same complete Evidence fingerprint; do not repeat an L3 full gate for that fingerprint.",
             "- Treat a later user message as steering for the active objective. Preserve it unless an explicit pause, cancel, or replacement is requested.",
-            "- Continue authorized implementation through running, affected checks, and fixes; ask only for a material missing decision, new permission, or real external blocker.",
+            *(f"- {rule}" for rule in _continuous_authorization_rules(source)),
             "- Read only task-relevant skill workflows. Reuse applicable check results in reports instead of rerunning them for a new message.",
             "- Confirm repeated friction with evidence, then prefer a code-level harness fix over a reminder-only rule.",
             f"- Target agent: `{agent}`.",
@@ -196,9 +229,7 @@ def canonical_skill(source: Path) -> Path:
     frontmatter = _skill_frontmatter(text)
     metadata = frontmatter.get("metadata") if frontmatter else None
     body = _visible_text(_skill_body(text))
-    required = (
-        *REQUIRED_SKILL_TEXT,
-    )
+    required = (*REQUIRED_SKILL_TEXT, *_continuous_authorization_rules(source))
     if (
         frontmatter is None
         or frontmatter.get("name") != SKILL_NAME
@@ -326,7 +357,9 @@ def preflight_code_as_harness(
                 for relative in CANONICAL_SKILL_FILES
             },
             "policy": home / target["policy"],
-            "policy_content": updated_policy(home / target["policy"], policy_block(agent)),
+            "policy_content": updated_policy(
+                home / target["policy"], policy_block(agent, source=source)
+            ),
         }
     for target in prepared.values():
         assert_skill_installable(target["skill"], adopt_compatible=adopt_compatible)

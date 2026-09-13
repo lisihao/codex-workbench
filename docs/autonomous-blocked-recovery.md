@@ -2,6 +2,14 @@
 
 Version 1.18.0 adds a recovery projection to the existing Workbench Authority and SQLite database. It is not a second scheduler, a chat automation, or an acceptance shortcut. Policies are disabled unless explicitly enabled for a task. The [ADR](autonomous-blocked-recovery-adr.md) records the source findings and intended completion criteria.
 
+## Continuous authorization boundary
+
+The dependency-free [canonical authorization policy](../src/codex_workbench/authorization_policy.py) is projected into both managed Code-as-Harness agent rules and the Workbench governance directive. It guides continuation within an already-authorized objective; it does not create a recovery action, platform approval, durable receipt, or acceptance result.
+
+Authority handlers still evaluate the current task state, explicit scopes, permissions, approvals, and effect evidence before execution. An unknown external effect is reconciled rather than replayed, and an explicit pause or cancellation remains controlling durable state.
+
+An optional `continuation_authorization` adds executable evidence for the two fixed preview-backed actions, `narrow_validation` and `source_only_recovery`. It is disabled when absent. Configuration captures the current task objective digest, repository and task/node scopes, external/destructive permission flags, policy action/profile scope, attempts and revision from Authority SQLite. A later attempt or task revision may reuse that authorization only when the configured flags permit it and every captured scope and permission fact still matches; the action still needs a new native preview and a new revision/attempt-fenced intent. Other recovery actions continue to use their existing adapters and guards and are reported as outside this continuation mechanism.
+
 ## Available behavior
 
 The existing Coordinator control pool consumes bounded event metadata and sweeps enabled policies at a low frequency. A task/node/attempt/failure fingerprint identifies an episode. Each action has an intent, original request ID, current revision and attempt, Authority epoch, lease, stage-local budget, next wakeup and receipt. Unknown writes are reconciled from their original receipts, never replayed. A lost successful validation receipt retains the same check-reuse facts as a direct receipt.
@@ -37,6 +45,20 @@ Use `workbench_configure_node_recovery` through the same authenticated Authority
 ```
 
 This example only observes readiness. It cannot install dependencies, requeue a clean node or publish a repair. Add a fixed validation profile only when the task owns its required paths. Repair planning additionally requires explicit `repair_repository` and `repair_allowed_scopes`; it inherits the parent's Claude policy and retains the existing native-auth/quota gates. No API-key fallback is added.
+
+To opt one task into same-task continuation for the preview-backed actions, include the following policy member. `same_task_only` must be true; there is no cross-task mode.
+
+```json
+{
+  "continuation_authorization": {
+    "same_task_only": true,
+    "allow_across_attempts": true,
+    "allow_across_revisions": true
+  }
+}
+```
+
+The capture requires both `external_write_permission` and `destructive_action_permission` to be false. A changed objective, repository, allowed/forbidden scope, node read/write scope, policy action/profile scope or permission flag blocks continuation. Pending approval, pause/cancellation, missing observation, stale native preview and unknown effects also block a new effect; unknown effects can only reconcile the original request. This mechanism does not grant GitHub publication, deployment, child-task delivery or arbitrary source writes. A backup is operational evidence, not a risk classification. Because the strict policy JSON gains a new member after opt-in, do not downgrade that live database to a pre-feature runtime; restore the verified compatible backup or first remove the field with the current runtime through the normal policy API.
 
 An exhausted stage with only known failed action receipts may enter the authorized `request_repair` stage once for its existing failure identity. The repair adapter verifies the durable episode, policy revision and action ledger before planning. It retains the observed failure category: repeated environment failure is not proof of a tooling bug. Unknown receipts, a pending repair, expired time budget, pause, cancellation or missing repair scope cannot trigger another repair request.
 

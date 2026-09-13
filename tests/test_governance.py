@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
+from codex_workbench.authorization_policy import WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES
 from codex_workbench.executors import ClaudeExecutor, CodexExecutor, ExecutionRequest
-from codex_workbench.governance import governance_directive
+from codex_workbench.governance import governance_directive, governance_status
 from codex_workbench.model import TaskContract
 from codex_workbench.planner import CodexPlanner
 
@@ -65,12 +66,20 @@ class GovernancePromptWiringTests(unittest.TestCase):
         self.assertEqual(claude_command.count(policy), 1)
         self.assertNotIn(policy, claude_command[-1])
         for prompt in (codex_prompt, planner_prompt, claude_system_prompt):
-            self.assertIn("Already-authorized work continues through implementation", prompt)
-            self.assertIn("Ask only when a material decision is missing", prompt)
+            for rule in WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES:
+                self.assertIn(rule, prompt)
             self.assertIn("Use skills only when task-relevant", prompt)
             self.assertIn("Do not rerun valid unchanged evidence merely to report status", prompt)
 
         self.assertIn("Stay inside the declared scope", policy)
+        for rule in WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES:
+            self.assertEqual(policy.count(rule), 1)
         self.assertIn("The final node must be exactly one Codex verifier", planner_prompt)
         self.assertIn("run acceptance commands", planner_prompt)
 
+    def test_continuous_authorization_is_a_declared_governance_capability(self) -> None:
+        status = governance_status()
+        self.assertIn("canonical-continuous-authorization-policy", status["capabilities"])
+        policy = governance_directive(make_contract().to_dict())
+        self.assertIn("reconcile the original effect or receipt", policy)
+        self.assertIn("Do not bypass platform review", policy)

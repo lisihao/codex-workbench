@@ -509,6 +509,68 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(codex_policy.read_text(), first_codex_policy)
             self.assertEqual(claude_policy.read_text(), first_claude_policy)
 
+    def test_harness_installer_projects_canonical_continuous_authorization_to_both_agents(self) -> None:
+        from codex_workbench.authorization_policy import WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES
+
+        module = self._harness_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        self.assertEqual(module._continuous_authorization_rules(), WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES)
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            installed = module.install_code_as_harness(source, Path(directory))
+            for paths in installed.values():
+                policy = Path(paths["policy"]).read_text(encoding="utf-8")
+                skill = Path(paths["skill"]).read_text(encoding="utf-8")
+                for rule in WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES:
+                    self.assertIn(f"- {rule}", policy)
+                    self.assertIn(rule, skill)
+
+    def test_harness_installer_rejects_a_skill_missing_a_canonical_authorization_rule(self) -> None:
+        from codex_workbench.authorization_policy import WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES
+
+        module = self._harness_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            candidate = Path(directory) / "candidate"
+            skill_root = candidate / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH
+            shutil.copytree(source / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH, skill_root)
+            policy_source = candidate / module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH
+            policy_source.parent.mkdir(parents=True)
+            shutil.copy2(source / module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH, policy_source)
+            skill = candidate / module.CANONICAL_SKILL_RELATIVE_PATH
+            skill.write_text(
+                skill.read_text(encoding="utf-8").replace(
+                    WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES[0], "", 1
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "Canonical Code-as-Harness skill is invalid"):
+                module.canonical_skill(candidate)
+
+    def test_harness_policy_block_reads_authorization_rules_from_the_selected_source(self) -> None:
+        module = self._harness_installer_module()
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            candidate = Path(directory) / "candidate"
+            for relative in (
+                module.CANONICAL_PROJECT_IDENTITY_RELATIVE_PATH,
+                module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH,
+            ):
+                target = candidate / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source / relative, target)
+            policy_source = candidate / module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH
+            policy_source.write_text(
+                policy_source.read_text(encoding="utf-8").replace(
+                    "Do not pause for routine confirmation or status reports.",
+                    "Fixture source rule remains canonical for this projection.",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            block = module.policy_block("codex", source=candidate)
+            self.assertIn("Fixture source rule remains canonical for this projection.", block)
+            self.assertNotIn("Do not pause for routine confirmation or status reports.", block)
+
     def test_harness_installer_explicitly_adopts_the_recognized_legacy_skill(self) -> None:
         module = self._harness_installer_module()
         source = Path(__file__).resolve().parents[1]
@@ -702,6 +764,13 @@ class InstallerTests(unittest.TestCase):
             updated_source = root / "updated-source"
             updated_root = updated_source / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH
             shutil.copytree(source / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH, updated_root)
+            for relative in (
+                module.CANONICAL_PROJECT_IDENTITY_RELATIVE_PATH,
+                module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH,
+            ):
+                target = updated_source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source / relative, target)
             updated_skill = updated_source / module.CANONICAL_SKILL_RELATIVE_PATH
             updated_skill.write_text(
                 (source / module.CANONICAL_SKILL_RELATIVE_PATH).read_text(encoding="utf-8")
@@ -742,6 +811,13 @@ class InstallerTests(unittest.TestCase):
             updated_source = root / "updated-source"
             updated_root = updated_source / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH
             shutil.copytree(source / module.CANONICAL_SKILL_ROOT_RELATIVE_PATH, updated_root)
+            for relative in (
+                module.CANONICAL_PROJECT_IDENTITY_RELATIVE_PATH,
+                module.CANONICAL_AUTHORIZATION_POLICY_RELATIVE_PATH,
+            ):
+                target = updated_source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source / relative, target)
             updated_skill = updated_source / module.CANONICAL_SKILL_RELATIVE_PATH
             updated_skill.write_text(
                 (source / module.CANONICAL_SKILL_RELATIVE_PATH).read_text(encoding="utf-8")
