@@ -65,6 +65,7 @@ _NOTE_WRITE_PROGRAM = r"""
 "use strict";
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW;
 
@@ -104,12 +105,30 @@ function readExisting(target) {
   }
 }
 
-function writeExact(target, expected) {
+function currentTarget(target, expectedSha256) {
   requireDirectoryChain(target);
   const existing = readExisting(target);
+  const actualSha256 = existing === null ? null : crypto.createHash("sha256").update(existing).digest("hex");
+  if (actualSha256 !== expectedSha256) fail("target changed after preview");
+  return existing;
+}
+
+function writeExact(target, expected, expectedSha256) {
+  const existing = currentTarget(target, expectedSha256);
+  if (existing !== null && existing.equals(expected)) return "unchanged";
   if (existing !== null) {
-    if (!existing.equals(expected)) fail("existing target has different bytes");
-    return "unchanged";
+    const descriptor = fs.openSync(target, fs.constants.O_WRONLY | O_NOFOLLOW);
+    try {
+      if (!fs.fstatSync(descriptor).isFile()) fail("existing target is not a regular file");
+      fs.ftruncateSync(descriptor, 0);
+      fs.writeFileSync(descriptor, expected);
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    const written = readExisting(target);
+    if (written === null || !written.equals(expected)) fail("updated target bytes changed");
+    return "updated";
   }
   const descriptor = fs.openSync(
     target,
@@ -129,12 +148,14 @@ function writeExact(target, expected) {
 }
 
 function decodeTarget(value) {
-  if (!value || typeof value.path !== "string" || typeof value.contents_base64 !== "string") {
+  if (!value || typeof value.path !== "string" || typeof value.contents_base64 !== "string"
+      || !(value.expected_sha256 === null
+        || (typeof value.expected_sha256 === "string" && /^[0-9a-f]{64}$/.test(value.expected_sha256)))) {
     fail("input target is invalid");
   }
   const contents = Buffer.from(value.contents_base64, "base64");
   if (contents.toString("base64") !== value.contents_base64) fail("input contents are not canonical base64");
-  return { path: value.path, contents };
+  return { path: value.path, contents, expectedSha256: value.expected_sha256 };
 }
 
 if (typeof O_NOFOLLOW !== "number") fail("O_NOFOLLOW is unavailable");
@@ -145,7 +166,11 @@ if (!document || Object.keys(document).length !== 1 || !Array.isArray(document.t
 }
 const targets = document.targets.map(decodeTarget);
 if (new Set(targets.map((target) => target.path)).size !== targets.length) fail("input targets are not distinct");
-const results = targets.map((target) => ({ path: target.path, result: writeExact(target.path, target.contents) }));
+targets.forEach((target) => currentTarget(target.path, target.expectedSha256));
+const results = targets.map((target) => ({
+  path: target.path,
+  result: writeExact(target.path, target.contents, target.expectedSha256),
+}));
 process.stdout.write(JSON.stringify({ ok: true, results }) + "\n");
 """.lstrip()
 _NOTE_WRITE_PROGRAM_SHA256 = sha256(_NOTE_WRITE_PROGRAM.encode()).hexdigest()
@@ -893,7 +918,7 @@ def _d_pairing_bindings(
 
 
 def _d_agent_note_binding(worktree: Path, request: AgentNoteMetadata) -> DAgentNoteBinding:
-    """Bind creation-only Agent Note leaves before the private writer is prepared."""
+    """Bind absent or explicitly hash-matched Agent Note leaves before writing."""
 
     try:
         english_relative, chinese_relative = note_paths(request.anchor)
@@ -901,20 +926,29 @@ def _d_agent_note_binding(worktree: Path, request: AgentNoteMetadata) -> DAgentN
         raise ControlledValidationError(str(error)) from error
     english_path, english_exists, english = _safe_creation_leaf(worktree, english_relative)
     chinese_path, chinese_exists, chinese = _safe_creation_leaf(worktree, chinese_relative)
-    if english is not None and english != request.english:
-        raise ControlledValidationError("D Agent Note English target already has different bytes")
-    if chinese is not None and chinese != request.chinese:
-        raise ControlledValidationError("D Agent Note Chinese target already has different bytes")
+    english_sha256 = sha256(english).hexdigest() if english is not None else None
+    chinese_sha256 = sha256(chinese).hexdigest() if chinese is not None else None
+    if request.expected_english_sha256 is None:
+        if english is not None and english != request.english:
+            raise ControlledValidationError("D Agent Note English target already has different bytes")
+        if chinese is not None and chinese != request.chinese:
+            raise ControlledValidationError("D Agent Note Chinese target already has different bytes")
+    else:
+        if english_sha256 != request.expected_english_sha256:
+            raise ControlledValidationError("D Agent Note English target does not match expected current SHA-256")
+        if chinese_sha256 != request.expected_chinese_sha256:
+            raise ControlledValidationError("D Agent Note Chinese target does not match expected current SHA-256")
     private_input = _note_private_input_bytes(
-        english_path, chinese_path, request.english, request.chinese
+        english_path, chinese_path, request.english, request.chinese,
+        english_sha256, chinese_sha256,
     )
     return DAgentNoteBinding(
         anchor=english_relative,
         translated_path=chinese_relative,
         english_exists=english_exists,
         chinese_exists=chinese_exists,
-        english_sha256=sha256(english).hexdigest() if english is not None else None,
-        chinese_sha256=sha256(chinese).hexdigest() if chinese is not None else None,
+        english_sha256=english_sha256,
+        chinese_sha256=chinese_sha256,
         intended_english_sha256=sha256(request.english).hexdigest(),
         intended_chinese_sha256=sha256(request.chinese).hexdigest(),
         private_input_sha256=sha256(private_input).hexdigest(),
@@ -992,6 +1026,8 @@ def _note_private_input_bytes(
     chinese_path: Path,
     english: bytes,
     chinese: bytes,
+    expected_english_sha256: str | None,
+    expected_chinese_sha256: str | None,
 ) -> bytes:
     """Serialize only the two exact note writes for the private sandbox input."""
 
@@ -1001,10 +1037,12 @@ def _note_private_input_bytes(
                 {
                     "path": str(english_path),
                     "contents_base64": base64.b64encode(english).decode("ascii"),
+                    "expected_sha256": expected_english_sha256,
                 },
                 {
                     "path": str(chinese_path),
                     "contents_base64": base64.b64encode(chinese).decode("ascii"),
+                    "expected_sha256": expected_chinese_sha256,
                 },
             ],
         },
@@ -1407,7 +1445,8 @@ def _metadata_input_checks(
     ):
         raise ControlledValidationError("D Agent Note writer did not leave the exact planned bytes")
     private_input = _note_private_input_bytes(
-        english_path, chinese_path, metadata.request.english, metadata.request.chinese
+        english_path, chinese_path, metadata.request.english, metadata.request.chinese,
+        note.english_sha256, note.chinese_sha256,
     )
     if sha256(private_input).hexdigest() != note.private_input_sha256:
         raise ControlledValidationError("D Agent Note private input changed after preview")
@@ -1457,7 +1496,8 @@ def _prepare_private_metadata_input(plan: ValidationPlan, scratch: Path) -> None
     english_path, _english_exists, _english = _safe_creation_leaf(plan.worktree, note.anchor)
     chinese_path, _chinese_exists, _chinese = _safe_creation_leaf(plan.worktree, note.translated_path)
     private_input = _note_private_input_bytes(
-        english_path, chinese_path, metadata.request.english, metadata.request.chinese
+        english_path, chinese_path, metadata.request.english, metadata.request.chinese,
+        note.english_sha256, note.chinese_sha256,
     )
     if sha256(private_input).hexdigest() != note.private_input_sha256:
         raise ControlledValidationError("D Agent Note private input is not bound to this plan")

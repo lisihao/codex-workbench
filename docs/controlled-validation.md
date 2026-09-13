@@ -12,13 +12,15 @@ D 集成修复另外使用 `dsh-d-pairing-write-v1` 和 `dsh-d-agent-note-write-
 
 `dsh-d-pairing-write-v1` 必须显式传入 `pair_anchors`，每次 1–32 个英文 Markdown 路径，限于获准的 `docs/`、`packages/` 或 `.agents/notes/implemented/`。对应英文和中文文件必须已存在；配对 sidecar 可以缺失，预览把缺失状态也纳入指纹，但不会提前创建文件。只允许精确选中的 sidecar 和由其源字节决定的 Git 快照权限，不接受通配符、`--all`、符号链接逃逸或技能/AGENTS/归档路径。运行需要 `confirm_pairing_write: true`。
 
-`dsh-d-agent-note-write-v1` 接收 `note_anchor`、`note_english` 和 `note_chinese`，运行另需 `confirm_note_write: true`。路径限于实现记录的六种项目类别及日期命名，父目录必须已存在。固定写入程序把正文当作数据，只创建指定英文和中文文件；已存在且内容不同的文件拒绝覆盖。该操作不开放 Git 写权限，不运行模型，不生成翻译内容，也不表示文档格式或翻译质量通过。创建之后单独预览并执行该对文件的 pairing 检查，再按项目规则验收。
+`dsh-d-agent-note-write-v1` 接收 `note_anchor`、`note_english` 和 `note_chinese`，运行另需 `confirm_note_write: true`。路径限于实现记录的六种项目类别及日期命名，父目录必须已存在。默认模式只创建指定英文和中文文件；已存在且内容不同的文件拒绝覆盖。修订刚由同一入口创建但尚未验收的双语 Note 时，必须同时传入 `note_expected_english_sha256` 与 `note_expected_chinese_sha256`；预览把两侧当前字节及预期摘要纳入指纹，执行前再次核对，两侧缺失、单边摘要或任一摘要不符均拒绝，固定写入程序只替换原两个叶子。该操作不开放 Git 写权限，不运行模型，不生成翻译内容，也不表示文档格式或翻译质量通过。写入之后单独预览并执行该对文件的 pairing 检查，再按项目规则验收。
 
 验证计划使用 Authority 固定 Node 直接执行工作树已安装的 `vitest/vitest.mjs`，或通过已安装 `tsx/dist/esm/index.mjs` 的 ESM hook 执行 `scripts/verify-translation-pairing.ts`。不经过 `pnpm exec`／`pnpm run`：pnpm 本身会在只读工作目录尝试创建 `_tmp_*`，使业务检查尚未启动便失败。入口解析后的绝对路径与 SHA-256 纳入计划指纹，运行前重新校验；缺失或漂移时拒绝，不安装依赖、不回落到 PATH 或 pnpm。
 
 IPC 命令固定使用 `--no-cache --configLoader=runner`，避免 Vitest results cache 和 Vite bundle 配置临时文件写入 `node_modules/.vite`、`.vite-temp` 或源码旁边。已核对目标的 Vitest 4.1.8/Vite 8.0.16 实现支持这些选项；不额外开放 `node_modules` 写权限。每条命令的 JSON report 留在私有临时目录，并要求精确测试标题实际通过，退出 0 但未命中或被跳过也视为失败。
 
 先用 `dry_run: true` 预览。预览无任务、事件、artifact 或源码写入，返回当前完整绑定的 `fingerprint`、source delta、固定命令和权限计划。运行使用相同字段、`dry_run: false`、预览的 `expected_fingerprint`，并令 `validation_id` 等于稳定的 Authority `request_id`。pairing-write 另外要求 `confirm_pairing_write: true`。源码、分配、revision、attempt、依赖输入或执行计划变化时拒绝运行，必须重新预览。
+
+同一任务的预览和运行串行执行 source observation；并发调用在有界等待后返回明确的 busy 错误，不会启动第二组 Git 或进程扫描。macOS idle observation 在固定总预算内重试一次 `lsof` 超时，失败信息包含尝试次数和完整耗时；探针失败仍然拒绝验证。成功响应中的 `source_observation_duration_ms` 是本次等待与观察的墙钟时间，不是任务进度或性能承诺。
 
 运行回执复用 Authority 请求 journal，保留命令、隔离环境、退出码、超时、权限和日志 artifact 引用，并返回 `audit_ref`。响应丢失后通过 `workbench_get_service_request` 查询同一 ID，禁止自动换 ID 重跑。执行期间同一任务的恢复 CAS 被挡住；结束后历史 worker result、revision、attempt 和已接受祖先不被这个工具修改。pairing-write 改变当前源码摘要，因此后续 source-only 恢复必须重新预览，不能沿用写入前摘要。
 

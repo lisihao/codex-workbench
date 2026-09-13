@@ -1,6 +1,7 @@
 """Execute D metadata profiles in isolated native sandboxes without a model."""
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
@@ -74,6 +75,31 @@ class DMetadataRuntimeTests(unittest.TestCase):
         self.assertTrue(receipt["ok"])
         self.assertEqual({item["result"] for item in receipt["results"]}, {"created"})
         self.assertNotIn("English fixture.", json.dumps(plan.to_dict()))
+
+    def test_real_note_writer_updates_only_hash_matched_reviewed_leaves(self) -> None:
+        anchor = ".agents/notes/implemented/feature/2026-09-13-update.md"
+        english_path = self.worktree / anchor
+        chinese_path = self.worktree / (anchor.removesuffix(".md") + ".zh.md")
+        old_english = b"# Old English\n"
+        old_chinese = "# 旧中文\n".encode()
+        english_path.write_bytes(old_english)
+        chinese_path.write_bytes(old_chinese)
+        request = AgentNoteMetadata(
+            anchor,
+            b"# New English\n",
+            "# 新中文\n".encode(),
+            sha256(old_english).hexdigest(),
+            sha256(old_chinese).hexdigest(),
+        )
+        plan = plan_validation(self.worktree, NOTE_WRITE_ID, self.runtime, metadata=request)
+        result = self._execute(plan)
+        self.assertEqual(english_path.read_bytes(), request.english)
+        self.assertEqual(chinese_path.read_bytes(), request.chinese)
+        stdout = self.artifacts.verify(result["commands"][0]["stdout_ref"]).read_text()
+        self.assertEqual(
+            {item["result"] for item in json.loads(stdout)["results"]},
+            {"updated"},
+        )
 
     @unittest.skipUnless(_real_launcher_dependencies_available(), "requires installed DSH pairing/tsx sources")
     def test_real_pairing_creates_only_selected_missing_doc_and_note_sidecars(self) -> None:
