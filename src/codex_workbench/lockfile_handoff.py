@@ -298,7 +298,7 @@ def _ready_lockfile_handoffs_from_connection(
     event_types = (*_EVENT_TYPES, "task.blocked_integration_scope_amended")
     placeholders = ", ".join("?" for _ in event_types)
     rows = connection.execute(
-        "SELECT cursor, event_type, node_id, payload_json FROM events WHERE task_id = ? "
+        "SELECT cursor, event_type, payload_json FROM events WHERE task_id = ? "
         f"AND event_type IN ({placeholders}) ORDER BY cursor",
         (task_id, *event_types),
     ).fetchall()
@@ -307,7 +307,7 @@ def _ready_lockfile_handoffs_from_connection(
         payload = _event_payload(row)
         if row["event_type"] == "task.blocked_integration_scope_amended":
             for request_id, (ready_cursor, projection) in tuple(latest.items()):
-                if projection is None or projection.get("blocked_node_id") != row["node_id"]:
+                if projection is None:
                     continue
                 latest[request_id] = (
                     ready_cursor,

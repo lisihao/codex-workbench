@@ -704,7 +704,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
         )
         self.assertIn("worker", worktrees)
 
-    def test_scope_contract_rebinding_preserves_overlay_and_allows_resume(self) -> None:
+    def test_descendant_scope_event_rebinds_ancestor_overlay_and_allows_resume(self) -> None:
         contract, blocked, _source = self._blocked_task(
             task_id="handoff-contract-rebind",
             with_upstream=False,
@@ -715,7 +715,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
 
         amended = self._amend_contract_with_rebound_handoffs(
             contract.task_id,
-            node_id="worker",
+            node_id="D",
         )
         ready_after = get_ready_lockfile_handoffs(self.store, contract.task_id)
         self.assertEqual(len(ready_after), 1)
@@ -751,7 +751,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
         ready_before = get_ready_lockfile_handoffs(self.store, contract.task_id)
         self._amend_contract_with_rebound_handoffs(
             contract.task_id,
-            node_id="worker",
+            node_id="D",
         )
         ready_after = get_ready_lockfile_handoffs(self.store, contract.task_id)
         with self.store.transaction() as connection:
@@ -799,7 +799,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
         self._apply_ready_handoff(contract, blocked, "handoff-contract-rebind-tamper-ready")
         self._amend_contract_with_rebound_handoffs(
             contract.task_id,
-            node_id="worker",
+            node_id="D",
         )
         with self.store.transaction() as connection:
             row = connection.execute(
