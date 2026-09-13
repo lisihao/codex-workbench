@@ -383,6 +383,13 @@ class JournaledNodeActions:
 
     def _current_binding(self, identity: Mapping[str, Any]) -> dict[str, Any]:
         task = self.store.base_store.get_task(identity["task_id"])
+        with self.store.base_store.connection() as connection:
+            pending_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1",
+                (identity["task_id"],),
+            ).fetchone()
+        if pending_approval is not None:
+            raise StateConflictError("recovery task has a pending approval")
         if task.get("state") in {"paused", "cancelled"}:
             raise StateConflictError("recovery task is paused or cancelled")
         if task.get("state") != "blocked":

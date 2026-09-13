@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 import time
 from typing import Any, Callable, Mapping, Protocol
 
+from .continuation_authorization import (
+    ContinuationAuthorizationError,
+    action_authorization,
+    decision_authorization,
+)
 from .model import canonical_hash, now_iso
 from .node_recovery_observation import collect_node_observation
 from .node_recovery_policy import RecoveryPolicy, plan_recovery
@@ -46,6 +51,7 @@ _REPAIR_DELIVERY_EVENT_TYPES = frozenset({
     "delivery_objective.retry_scheduled",
     "delivery_objective.decision_required",
 })
+_CONTINUATION_PREVIEW_ACTIONS = frozenset({"narrow_validation", "source_only_recovery"})
 
 
 def _elapsed(start: str, end: str) -> float:
@@ -76,7 +82,88 @@ class NodeRecoveryReconciler:
         self._next_sweep = 0.0
         self._task_cursor: str | None = None
 
-    def _decision(self, observation: dict, episode: dict | None, policy: RecoveryPolicy) -> dict:
+    def _decision(
+        self,
+        observation: dict,
+        episode: dict | None,
+        policy: RecoveryPolicy,
+        *,
+        policy_revision: int | None = None,
+        continuation_capture: Mapping[str, Any] | None = None,
+    ) -> dict:
+        """Attach current continuation evidence without changing legacy policy decisions."""
+
+        decision = self._base_decision(observation, episode, policy)
+        if policy.continuation_authorization is None:
+            return decision
+        action = decision.get("action")
+        if action not in _CONTINUATION_PREVIEW_ACTIONS:
+            return {
+                **decision,
+                "continuation_authorization": {
+                    "applicable": False,
+                    "reason_kind": "not_applicable_existing_action_guard",
+                    "action": action,
+                },
+            }
+        task_id = observation.get("task_id")
+        node_id = observation.get("node_id")
+        if not isinstance(task_id, str) or not isinstance(node_id, str):
+            return self._continuation_blocked(decision, "identity_unavailable")
+        if policy_revision is None:
+            if episode is not None and type(episode.get("policy_revision")) is int:
+                policy_revision = episode["policy_revision"]
+            else:
+                policy_revision = self.recovery.get_policy(task_id)["policy_revision"]
+        if continuation_capture is None and episode is not None:
+            candidate = episode.get("continuation_capture")
+            continuation_capture = candidate if isinstance(candidate, Mapping) else None
+        if continuation_capture is None:
+            return self._continuation_blocked(decision, "capture_unavailable")
+        try:
+            task = self.store.get_task(task_id)
+            context = decision_authorization(
+                policy.to_dict(),
+                continuation_capture,
+                policy_revision=policy_revision,
+                task=task,
+                node_id=node_id,
+                action=action,
+                approval_pending=observation.get("approval_pending") is True,
+                approval_denied=observation.get("approval_denied") is True,
+                observation_available=observation.get("observation_available") is not False,
+            )
+        except (ContinuationAuthorizationError, KeyError, ValueError):
+            return self._continuation_blocked(decision, "current_binding_invalid")
+        if context["authorized"] is not True:
+            return self._continuation_blocked(decision, str(context["reason_kind"]), context)
+        return {**decision, "continuation_authorization": context}
+
+    @staticmethod
+    def _continuation_blocked(
+        decision: Mapping[str, Any],
+        reason_kind: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Convert an opt-in continuation failure into an explicit user decision."""
+
+        record = {
+            "authorized": False,
+            "reason_kind": reason_kind,
+            **({"evidence": dict(context)} if context is not None else {}),
+        }
+        return {
+            **decision,
+            "state": "needs_action",
+            "action": None,
+            "owner": "user",
+            "reason_kind": "continuation_" + reason_kind,
+            "requires_authorization": True,
+            "next_wakeup_at": None,
+            "continuation_authorization": record,
+        }
+
+    def _base_decision(self, observation: dict, episode: dict | None, policy: RecoveryPolicy) -> dict:
         current = dict(observation)
         current["now"] = now_iso()
         current["elapsed_seconds"] = _elapsed(episode["created_at"], current["now"]) if episode else 0
@@ -125,10 +212,18 @@ class NodeRecoveryReconciler:
             observed["approval_pending"] = connection.execute(
                 "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1", (task_id,),
             ).fetchone() is not None
+            observed["approval_denied"] = False
         observed["attempt"] = observed["node_attempt"]
-        policy = RecoveryPolicy.from_dict(self.recovery.get_policy(task_id)["policy"])
+        policy_row = self.recovery.get_policy(task_id)
+        policy = RecoveryPolicy.from_dict(policy_row["policy"])
         if observed.get("observation_available") is False:
-            return self._decision(observed, None, policy)
+            return self._decision(
+                observed,
+                None,
+                policy,
+                policy_revision=policy_row["policy_revision"],
+                continuation_capture=policy_row.get("continuation_capture"),
+            )
         prior = None
         for item in self.recovery.list_summary(task_id=task_id, limit=100):
             if (item["node_id"] == node_id and item["node_attempt"] == observed["node_attempt"]
@@ -178,7 +273,16 @@ class NodeRecoveryReconciler:
         if prior is not None and prior.get("repair"):
             observed["repair_linked"] = not self._repair_enqueue_rejected(prior)
             observed["repair_deployed"] = bool(prior["repair"].get("deployed_at"))
-        return self.recovery.record_episode(observed, self._decision(observed, prior, policy))
+        return self.recovery.record_episode(
+            observed,
+            self._decision(
+                observed,
+                prior,
+                policy,
+                policy_revision=policy_row["policy_revision"],
+                continuation_capture=policy_row.get("continuation_capture"),
+            ),
+        )
 
     @staticmethod
     def _repeated_failure_trigger(episode: dict, policy: RecoveryPolicy) -> dict | None:
@@ -337,7 +441,7 @@ class NodeRecoveryReconciler:
                 adapter = self.adapters.get(plan.get("action"))
                 if adapter is None:
                     continue
-                receipt = self._receipt_payload(adapter.reconcile(plan))
+                receipt = self._receipt_payload(adapter.reconcile(self._adapter_plan(plan)))
                 if receipt is None or receipt.get("known_effects") is not True:
                     continue
                 observed, receipt = self._receipt_progress(episode, plan, receipt)
@@ -387,6 +491,23 @@ class NodeRecoveryReconciler:
             **{key: value for key, value in observed.items() if key in _PROGRESS_FIELDS},
         }}
 
+    @staticmethod
+    def _adapter_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+        """Remove durable continuation evidence before calling a fixed adapter."""
+
+        result = dict(plan)
+        result.pop("continuation_authorization", None)
+        return result
+
+    def _approval_pending(self, task_id: str) -> bool:
+        """Read only a current unresolved approval; historical decisions do not linger."""
+
+        with self.store.connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1",
+                (task_id,),
+            ).fetchone() is not None
+
     def reconcile_once(self) -> list[dict[str, Any]]:
         """Consume bounded observations, then execute at most one due action."""
         if self.store.delivery_admission_gate() is not None:
@@ -415,19 +536,43 @@ class NodeRecoveryReconciler:
         adapter = self.adapters.get(action)
         preparation_error: Exception | None = None
         plan: dict
+        adapter_plan: dict
         try:
             if adapter is None:
                 raise ValueError("the authorized action has no installed adapter")
             options = {"validation_profile": episode["observation"].get("validation_profile")} if action == "narrow_validation" else {}
-            plan = adapter.prepare(episode["observation"], action, request_id, **options)
-            plan = {**plan, "stage_key": stage}
-        except (OSError, ValueError, StateConflictError) as error:
+            adapter_plan = {**adapter.prepare(episode["observation"], action, request_id, **options), "stage_key": stage}
+            plan = adapter_plan
+            policy = RecoveryPolicy.from_dict(episode["policy"])
+            if (
+                policy.continuation_authorization is not None
+                and action in _CONTINUATION_PREVIEW_ACTIONS
+            ):
+                capture = episode.get("continuation_capture")
+                if not isinstance(capture, Mapping):
+                    raise StateConflictError("continuation authorization capture is unavailable")
+                context = action_authorization(
+                    policy.to_dict(),
+                    capture,
+                    policy_revision=episode["policy_revision"],
+                    task=self.store.get_task(episode["task_id"]),
+                    node_id=episode["node_id"],
+                    action_plan=adapter_plan,
+                    approval_pending=self._approval_pending(episode["task_id"]),
+                    approval_denied=False,
+                    observation_available=episode["observation"].get("observation_available") is not False,
+                )
+                if context["authorized"] is not True:
+                    raise StateConflictError("continuation authorization is not current: " + str(context["reason_kind"]))
+                plan = {**adapter_plan, "continuation_authorization": context}
+        except (ContinuationAuthorizationError, OSError, ValueError, StateConflictError) as error:
             preparation_error = error
             plan = {
                 "action": action, "request_id": request_id, "stage_key": stage,
                 "task_revision": episode["task_revision"], "node_attempt": episode["node_attempt"],
                 "preparation_error": type(error).__name__,
             }
+            adapter_plan = plan
         fingerprint = canonical_hash(plan)
         intended = self.recovery.begin_action(
             episode["episode_id"], request_id, fingerprint, plan,
@@ -450,7 +595,7 @@ class NodeRecoveryReconciler:
             if intended["action"]["state"] == "completed":
                 receipt = intended["action"].get("receipt")
             elif adapter is not None:
-                receipt = adapter.reconcile(plan)
+                receipt = adapter.reconcile(adapter_plan)
         elif preparation_error is not None:
             receipt = {
                 "ok": False, "known_effects": True, "stage_succeeded": False,
@@ -459,11 +604,11 @@ class NodeRecoveryReconciler:
             }
         elif adapter is not None:
             try:
-                receipt = adapter.execute(plan)
+                receipt = adapter.execute(adapter_plan)
             except Exception:
                 # An exception after admission is not proof that no effect
                 # occurred. The adapter may only query the original receipt.
-                receipt = adapter.reconcile(plan)
+                receipt = adapter.reconcile(adapter_plan)
         if receipt is None:
             receipt = {
                 "ok": False, "known_effects": False, "stage_succeeded": False,

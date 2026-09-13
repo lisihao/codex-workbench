@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final, Literal, Mapping
 
+from .continuation_authorization import parse_continuation_authorization
+
 
 Action = Literal[
     "observe_readiness",
@@ -79,6 +81,7 @@ _POLICY_FIELDS: Final[frozenset[str]] = frozenset(
         "max_backoff_seconds",
         "repair_repository",
         "repair_allowed_scopes",
+        "continuation_authorization",
     }
 )
 
@@ -165,6 +168,7 @@ class RecoveryPolicy:
     max_backoff_seconds: int = 300
     repair_repository: str | None = None
     repair_allowed_scopes: tuple[str, ...] = ()
+    continuation_authorization: Mapping[str, bool] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -172,6 +176,7 @@ class RecoveryPolicy:
         actions = _read_tuple(self.allowed_actions, "allowed_actions")
         profiles = _read_tuple(self.validation_profiles, "validation_profiles")
         scopes = _read_tuple(self.repair_allowed_scopes, "repair_allowed_scopes")
+        continuation = parse_continuation_authorization(self.continuation_authorization)
         unsupported_actions = set(actions) - ALLOWED_ACTIONS
         if unsupported_actions:
             raise ValueError(f"unsupported allowed action(s): {sorted(unsupported_actions)!r}")
@@ -195,6 +200,7 @@ class RecoveryPolicy:
         object.__setattr__(self, "validation_profiles", profiles)
         object.__setattr__(self, "repair_allowed_scopes", scopes)
         object.__setattr__(self, "repair_repository", repository)
+        object.__setattr__(self, "continuation_authorization", continuation)
 
     @classmethod
     def from_dict(cls, raw: object) -> "RecoveryPolicy":
@@ -216,12 +222,13 @@ class RecoveryPolicy:
             max_backoff_seconds=raw.get("max_backoff_seconds", 300),
             repair_repository=raw.get("repair_repository"),
             repair_allowed_scopes=raw.get("repair_allowed_scopes", ()),
+            continuation_authorization=raw.get("continuation_authorization"),
         )
 
     def to_dict(self) -> dict[str, object]:
         """Return the canonical JSON-safe policy mapping."""
 
-        return {
+        result: dict[str, object] = {
             "enabled": self.enabled,
             "allowed_actions": list(self.allowed_actions),
             "validation_profiles": list(self.validation_profiles),
@@ -232,6 +239,9 @@ class RecoveryPolicy:
             "repair_repository": self.repair_repository,
             "repair_allowed_scopes": list(self.repair_allowed_scopes),
         }
+        if self.continuation_authorization is not None:
+            result["continuation_authorization"] = dict(self.continuation_authorization)
+        return result
 
 
 def _text(value: object) -> str | None:

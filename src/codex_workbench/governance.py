@@ -19,6 +19,7 @@ from .archify import (
     verify_skill_projection,
     verify_vendor,
 )
+from .authorization_policy import WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES
 from .project_identity import WORKBENCH_PROJECT_IDENTITY
 
 
@@ -33,11 +34,13 @@ CODE_AS_HARNESS_SKILL_REQUIRED_TEXT = (
     "Fill all safe independent work slots",
     "A matching L3 fingerprint has one full gate",
     "A later user message continues the active objective",
+    *WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES,
 )
 CODE_AS_HARNESS_POLICY_REQUIRED_TEXT = (
     "Maximize useful safe parallelism",
     "Evidence fingerprint",
     "later user message as steering for the active objective",
+    *WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES,
 )
 DEFAULT_VERIFICATION_TIER = "L2"
 VerificationTier = Literal["L0", "L1", "L2", "L3"]
@@ -47,6 +50,7 @@ CODE_AS_HARNESS_CAPABILITIES = (
     "declared-impact-scope",
     "evidence-fingerprint-reuse",
     "append-without-objective-cancellation",
+    "canonical-continuous-authorization-policy",
 )
 
 _SKILL_PATHS = {
@@ -107,10 +111,8 @@ def governance_directive(contract: Mapping[str, Any]) -> str:
         "Run a check only when its failure would change the next action. Reuse passing verification evidence only "
         "when its source, configuration, relevant dependency closure, runtime, scopes, steering, governance profile, "
         "and tier have the same Evidence fingerprint. For L3, do not repeat the full gate for that same fingerprint. "
-        "Already-authorized work continues through implementation, role-appropriate required command execution, "
-        "affected checks, and fixes exposed by those checks. Ask only when a material decision is missing, a new "
-        "permission outside the declared contract is needed, or a real blocker prevents progress; do not pause for "
-        "routine confirmation or status reports. Use skills only when task-relevant; do not unconditionally "
+        f"{' '.join(WORKBENCH_CONTINUOUS_AUTHORIZATION_RULES)} "
+        "Use skills only when task-relevant; do not unconditionally "
         "brainstorm or add an extra review outside the declared verifier. Do not rerun valid unchanged evidence merely "
         "to report status or because the current message restates the objective. "
         "A later user message is appended steering for the active objective; preserve its objective and scope unless "

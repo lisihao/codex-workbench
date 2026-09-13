@@ -14,6 +14,13 @@ import re
 import sqlite3
 from typing import Any, Mapping
 
+from .continuation_authorization import (
+    ContinuationAuthorizationError,
+    action_authorization,
+    attach_capture,
+    capture_authorization,
+    split_stored_policy,
+)
 from .model import canonical_hash, canonical_json, now_iso
 from .node_recovery_policy import RecoveryPolicy
 from .store import StateConflictError, WorkbenchStore
@@ -178,6 +185,7 @@ class NodeRecoveryStore:
                 return {
                     "task_id": task_id,
                     "policy": RecoveryPolicy().to_dict(),
+                    "continuation_capture": None,
                     "policy_revision": 0,
                     "configured_task_revision": None,
                     "actor": None,
@@ -210,14 +218,29 @@ class NodeRecoveryStore:
             existing = connection.execute(
                 "SELECT * FROM node_recovery_policies WHERE task_id = ?", (task_id,)
             ).fetchone()
-            document = normalized.to_dict()
-            if existing is not None and (
-                json.loads(str(existing["policy_json"])) == document
-                and str(existing["actor"]) == actor
-                and int(existing["configured_task_revision"]) == expected_task_revision
-            ):
-                return self._policy_row(existing)
+            if existing is not None:
+                try:
+                    existing_policy, _config, _capture = split_stored_policy(
+                        json.loads(str(existing["policy_json"]))
+                    )
+                except (ContinuationAuthorizationError, json.JSONDecodeError) as error:
+                    raise StateConflictError("recovery policy row is invalid") from error
+                if (
+                    existing_policy == normalized.to_dict()
+                    and str(existing["actor"]) == actor
+                    and int(existing["configured_task_revision"]) == expected_task_revision
+                ):
+                    return self._policy_row(existing)
             revision = 1 if existing is None else int(existing["policy_revision"]) + 1
+            try:
+                capture = capture_authorization(
+                    normalized.to_dict(),
+                    policy_revision=revision,
+                    task=self._continuation_task_snapshot(connection, task_id),
+                )
+                document = attach_capture(normalized.to_dict(), capture)
+            except ContinuationAuthorizationError as error:
+                raise ValueError("recovery continuation authorization is invalid: " + str(error)) from error
             if existing is None:
                 connection.execute(
                     """
@@ -249,6 +272,7 @@ class NodeRecoveryStore:
                 {
                     "policy_revision": revision,
                     "enabled": normalized.enabled,
+                    "continuation_authorization": capture is not None,
                     "actor": actor,
                     "configured_task_revision": expected_task_revision,
                 },
@@ -283,7 +307,9 @@ class NodeRecoveryStore:
                 raise StateConflictError("recovery observation task revision is stale")
             if int(node["attempt"]) != observed["attempt"]:
                 raise StateConflictError("recovery observation node attempt is stale")
-            policy, policy_revision = self._policy_for_task(connection, observed["task_id"])
+            policy, policy_revision, policy_document = self._policy_for_task(
+                connection, observed["task_id"]
+            )
             episode_id = _episode_id(
                 observed["task_id"], observed["node_id"], observed["attempt"], observed["failure_fingerprint"]
             )
@@ -305,6 +331,7 @@ class NodeRecoveryStore:
                     planned=planned,
                     policy=policy,
                     policy_revision=policy_revision,
+                    policy_document=policy_document,
                     timestamp=timestamp,
                 )
 
@@ -351,7 +378,7 @@ class NodeRecoveryStore:
                     observed["failure_fingerprint"],
                     observed["task_revision"],
                     policy_revision,
-                    canonical_json(policy.to_dict()),
+                    canonical_json(policy_document),
                     observed["origin"],
                     planned["category"],
                     observed["phase"],
@@ -499,7 +526,9 @@ class NodeRecoveryStore:
                 return None
             if int(task["state_revision"]) != int(row["task_revision"]):
                 raise StateConflictError("recovery task revision changed")
-            policy, policy_revision = self._policy_for_task(connection, str(row["task_id"]))
+            policy, policy_revision, _policy_document = self._policy_for_task(
+                connection, str(row["task_id"])
+            )
             if not policy.enabled or policy_revision != int(row["policy_revision"]):
                 return None
             if row["state"] not in {"ready", "waiting"}:
@@ -587,7 +616,9 @@ class NodeRecoveryStore:
                 connection, row, owner_id=owner_id, coordinator_epoch=coordinator_epoch,
                 lease_epoch=lease_epoch, timestamp=timestamp,
             )
-            policy, policy_revision = self._policy_for_task(connection, str(row["task_id"]))
+            policy, policy_revision, _policy_document = self._policy_for_task(
+                connection, str(row["task_id"])
+            )
             if not policy.enabled or policy_revision != int(row["policy_revision"]):
                 raise StateConflictError("recovery policy changed while the episode was leased")
             expires_at = _after(timestamp, lease_seconds)
@@ -660,13 +691,21 @@ class NodeRecoveryStore:
             if self._user_fence(task, node):
                 self._suspend_for_user_fence(connection, row, timestamp)
                 raise StateConflictError("user pause or cancellation prevents recovery action")
+            pending_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE task_id = ? AND decision IS NULL LIMIT 1",
+                (row["task_id"],),
+            ).fetchone()
+            if pending_approval is not None:
+                raise StateConflictError("pending approval prevents recovery action")
             if int(task["state_revision"]) != int(row["task_revision"]):
                 raise StateConflictError("recovery task revision changed")
             self._assert_episode_lease(
                 connection, row, owner_id=owner_id, coordinator_epoch=coordinator_epoch,
                 lease_epoch=lease_epoch, timestamp=timestamp,
             )
-            policy, policy_revision = self._policy_for_task(connection, str(row["task_id"]))
+            policy, policy_revision, policy_document = self._policy_for_task(
+                connection, str(row["task_id"])
+            )
             if not policy.enabled or policy_revision != int(row["policy_revision"]):
                 raise StateConflictError("recovery policy changed while the episode was leased")
             action = row["action"]
@@ -674,6 +713,45 @@ class NodeRecoveryStore:
                 raise StateConflictError("recovery episode has no currently authorized action")
             if stage_key != row["current_stage_key"]:
                 raise StateConflictError("recovery action stage does not match the planned stage")
+            continuation_context: dict[str, Any] | None = None
+            raw_continuation = input_document.get("continuation_authorization")
+            if policy.continuation_authorization is not None and action in {
+                "narrow_validation", "source_only_recovery"
+            }:
+                if not isinstance(raw_continuation, Mapping):
+                    raise StateConflictError("continuation authorization is absent from the action intent")
+                try:
+                    public_policy, _config, capture = split_stored_policy(policy_document)
+                    if capture is None:
+                        raise ContinuationAuthorizationError("continuation authorization capture is absent")
+                    stored_observation = json.loads(str(row["observation_json"]))
+                    if not isinstance(stored_observation, Mapping):
+                        raise ContinuationAuthorizationError("recovery observation is invalid")
+                    adapter_input = {
+                        key: value for key, value in input_document.items()
+                        if key != "continuation_authorization"
+                    }
+                    expected_continuation = action_authorization(
+                        public_policy,
+                        capture,
+                        policy_revision=policy_revision,
+                        task=self._continuation_task_snapshot(connection, str(row["task_id"])),
+                        node_id=row["node_id"],
+                        action_plan=adapter_input,
+                        approval_pending=False,
+                        approval_denied=False,
+                        observation_available=stored_observation.get("observation_available") is not False,
+                    )
+                except (ContinuationAuthorizationError, json.JSONDecodeError) as error:
+                    raise StateConflictError("continuation authorization is invalid") from error
+                if (
+                    expected_continuation.get("authorized") is not True
+                    or canonical_json(raw_continuation) != canonical_json(expected_continuation)
+                ):
+                    raise StateConflictError("continuation authorization changed before action intent")
+                continuation_context = expected_continuation
+            elif raw_continuation is not None:
+                raise StateConflictError("continuation authorization is not applicable to this action")
             stage_attempts = _stage_attempts(row["stage_attempts_json"])
             if stage_attempts.get(stage_key, 0) >= policy.max_action_attempts or _due(
                 str(row["time_budget_deadline_at"]), timestamp
@@ -755,7 +833,7 @@ class NodeRecoveryStore:
                 """
                 UPDATE node_recovery_episodes
                 SET phase = 'action_intent', state_revision = ?,
-                    last_material_progress_at = ?, last_progress_json = ?, updated_at = ?
+                    last_material_progress_at = ?, last_progress_json = ?, decision_json = ?, updated_at = ?
                 WHERE episode_id = ? AND state_revision = ? AND lease_epoch = ?
                 """,
                 (
@@ -769,6 +847,15 @@ class NodeRecoveryStore:
                             "action_key": action_key,
                             "action": action,
                             "stage_key": stage_key,
+                        }
+                    ),
+                    canonical_json(
+                        {
+                            **json.loads(str(row["decision_json"])),
+                            **(
+                                {"continuation_authorization": continuation_context}
+                                if continuation_context is not None else {}
+                            ),
                         }
                     ),
                     timestamp,
@@ -891,7 +978,7 @@ class NodeRecoveryStore:
                 planned = _suspended_decision("user_pause")
             elif receipt_state == "unknown":
                 planned = _unknown_effects_decision()
-            policy = RecoveryPolicy.from_dict(json.loads(str(row["policy_json"])))
+            policy = self._policy_from_document(json.loads(str(row["policy_json"])))
             stage_attempts = _stage_attempts(row["stage_attempts_json"])
             action_stage_key = str(action["stage_key"])
             if effect_dispatched:
@@ -910,6 +997,7 @@ class NodeRecoveryStore:
             if next_stage_key == action_stage_key and stage_attempts.get(action_stage_key, 0) >= policy.max_action_attempts:
                 planned = _budget_exhausted_decision()
                 next_stage_key = action_stage_key
+            planned = self._preserve_action_continuation(planned, action)
             if next_stage_key is None:
                 next_stage_key = action_stage_key
             current_attempts = stage_attempts.get(next_stage_key, 0)
@@ -1021,7 +1109,9 @@ class NodeRecoveryStore:
                     """,
                     (canonical_json(receipt), timestamp, timestamp, action["action_id"]),
                 )
-                planned = _unknown_effects_decision()
+                planned = self._preserve_action_continuation(
+                    _unknown_effects_decision(), action
+                )
                 revision = int(episode["state_revision"]) + 1
                 cursor = self.base_store._event(
                     connection,
@@ -1170,7 +1260,7 @@ class NodeRecoveryStore:
             node = self._node_row(connection, str(row["task_id"]), str(row["node_id"]))
             if self._user_fence(task, node):
                 planned = _suspended_decision("user_pause")
-            policy = RecoveryPolicy.from_dict(json.loads(str(row["policy_json"])))
+            policy = self._policy_from_document(json.loads(str(row["policy_json"])))
             stage_attempts = _stage_attempts(row["stage_attempts_json"])
             action_stage_key = str(action["stage_key"])
             if effect_dispatched:
@@ -1185,6 +1275,7 @@ class NodeRecoveryStore:
             if next_stage_key == action_stage_key and stage_attempts.get(action_stage_key, 0) >= policy.max_action_attempts:
                 planned = _budget_exhausted_decision()
                 next_stage_key = action_stage_key
+            planned = self._preserve_action_continuation(planned, action)
             if next_stage_key is None:
                 next_stage_key = action_stage_key
             current_attempts = stage_attempts.get(next_stage_key, 0)
@@ -1437,7 +1528,7 @@ class NodeRecoveryStore:
             if paused:
                 planned = _suspended_decision("user_pause")
             else:
-                policy = RecoveryPolicy.from_dict(json.loads(str(episode["policy_json"])))
+                policy = self._policy_from_document(json.loads(str(episode["policy_json"])))
                 planned = _repair_deployed_wait_decision(policy.backoff_seconds, timestamp)
             observed = json.loads(str(episode["observation_json"]))
             for key in ("validated_source_delta", "validated_install_manifest", "validated_runtime_fingerprint", "validation_audit_ref",
@@ -1610,6 +1701,52 @@ class NodeRecoveryStore:
         return row
 
     @staticmethod
+    def _continuation_task_snapshot(
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Read current scope and permission facts for an Authority capture."""
+
+        task = connection.execute(
+            "SELECT task_id, state, state_revision, contract_json, contract_hash "
+            "FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        try:
+            contract = json.loads(str(task["contract_json"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StateConflictError("continuation task contract is invalid") from error
+        if not isinstance(contract, dict):
+            raise StateConflictError("continuation task contract is invalid")
+        nodes: list[dict[str, Any]] = []
+        for row in connection.execute(
+            "SELECT node_id, state, attempt, spec_json FROM nodes WHERE task_id = ? ORDER BY node_id",
+            (task_id,),
+        ).fetchall():
+            try:
+                spec = json.loads(str(row["spec_json"]))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError("continuation node specification is invalid") from error
+            if not isinstance(spec, dict):
+                raise StateConflictError("continuation node specification is invalid")
+            nodes.append({
+                "node_id": str(row["node_id"]),
+                "state": str(row["state"]),
+                "attempt": int(row["attempt"]),
+                "spec": spec,
+            })
+        return {
+            "task_id": str(task["task_id"]),
+            "state": str(task["state"]),
+            "state_revision": int(task["state_revision"]),
+            "contract_hash": str(task["contract_hash"]),
+            "contract": contract,
+            "nodes": nodes,
+        }
+
+    @staticmethod
     def _episode_or_key_error(connection: sqlite3.Connection, episode_id: str) -> sqlite3.Row:
         row = connection.execute(
             "SELECT * FROM node_recovery_episodes WHERE episode_id = ?", (episode_id,)
@@ -1622,26 +1759,42 @@ class NodeRecoveryStore:
         self,
         connection: sqlite3.Connection,
         task_id: str,
-    ) -> tuple[RecoveryPolicy, int]:
+    ) -> tuple[RecoveryPolicy, int, dict[str, Any]]:
         row = connection.execute(
             "SELECT * FROM node_recovery_policies WHERE task_id = ?", (task_id,)
         ).fetchone()
         if row is None:
-            return RecoveryPolicy(), 0
+            policy = RecoveryPolicy()
+            return policy, 0, policy.to_dict()
         try:
-            return RecoveryPolicy.from_dict(json.loads(str(row["policy_json"]))), int(row["policy_revision"])
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            document = json.loads(str(row["policy_json"]))
+            public, _config, _capture = split_stored_policy(document)
+            return RecoveryPolicy.from_dict(public), int(row["policy_revision"]), dict(document)
+        except (ContinuationAuthorizationError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StateConflictError("recovery policy row is invalid") from error
+
+    @staticmethod
+    def _policy_from_document(raw: object) -> RecoveryPolicy:
+        """Parse stored policy configuration while retaining its private capture."""
+
+        try:
+            public, _config, _capture = split_stored_policy(raw)
+            return RecoveryPolicy.from_dict(public)
+        except (ContinuationAuthorizationError, TypeError, ValueError) as error:
             raise StateConflictError("recovery policy row is invalid") from error
 
     @staticmethod
     def _policy_row(row: sqlite3.Row) -> dict[str, Any]:
         try:
-            policy = RecoveryPolicy.from_dict(json.loads(str(row["policy_json"]))).to_dict()
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            document = json.loads(str(row["policy_json"]))
+            public, _config, capture = split_stored_policy(document)
+            policy = RecoveryPolicy.from_dict(public).to_dict()
+        except (ContinuationAuthorizationError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise StateConflictError("recovery policy row is invalid") from error
         return {
             "task_id": str(row["task_id"]),
             "policy": policy,
+            "continuation_capture": capture,
             "policy_revision": int(row["policy_revision"]),
             "configured_task_revision": int(row["configured_task_revision"]),
             "actor": str(row["actor"]),
@@ -1660,10 +1813,12 @@ class NodeRecoveryStore:
             observation = json.loads(str(row["observation_json"]))
             decision = json.loads(str(row["decision_json"]))
             evidence_refs = json.loads(str(row["evidence_refs_json"]))
-            policy = RecoveryPolicy.from_dict(json.loads(str(row["policy_json"]))).to_dict()
+            policy_document = json.loads(str(row["policy_json"]))
+            public_policy, _config, capture = split_stored_policy(policy_document)
+            policy = RecoveryPolicy.from_dict(public_policy).to_dict()
             progress = json.loads(str(row["last_progress_json"]))
             stage_attempts = _stage_attempts(row["stage_attempts_json"])
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (ContinuationAuthorizationError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise StateConflictError("recovery episode row is invalid") from error
         result: dict[str, Any] = {
             "episode_id": str(row["episode_id"]),
@@ -1674,6 +1829,7 @@ class NodeRecoveryStore:
             "task_revision": int(row["task_revision"]),
             "policy_revision": int(row["policy_revision"]),
             "policy": policy,
+            "continuation_capture": capture,
             "origin": str(row["origin"]),
             "category": str(row["category"]),
             "phase": str(row["phase"]),
@@ -1777,6 +1933,30 @@ class NodeRecoveryStore:
         }
 
     @staticmethod
+    def _preserve_action_continuation(
+        planned: dict[str, Any],
+        action: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """Keep an already-CASed action authorization visible after settlement."""
+
+        try:
+            action_input = json.loads(str(action["action_input_json"]))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("recovery action input is invalid") from error
+        continuation = action_input.get("continuation_authorization") if isinstance(action_input, Mapping) else None
+        if continuation is None:
+            return planned
+        if not isinstance(continuation, Mapping):
+            raise StateConflictError("recovery action continuation authorization is invalid")
+        document = {
+            **planned["document"],
+            "continuation_authorization": dict(continuation),
+        }
+        if planned["stage_key"] is not None:
+            document["stage_key"] = planned["stage_key"]
+        return _decision(document)
+
+    @staticmethod
     def _repair_row(row: sqlite3.Row) -> dict[str, Any]:
         try:
             refs = (
@@ -1807,6 +1987,7 @@ class NodeRecoveryStore:
         planned: dict[str, Any],
         policy: RecoveryPolicy,
         policy_revision: int,
+        policy_document: Mapping[str, object],
         timestamp: str,
     ) -> dict[str, Any]:
         try:
@@ -1886,7 +2067,7 @@ class NodeRecoveryStore:
             WHERE episode_id = ? AND state_revision = ?
             """,
             (
-                observed["task_revision"], policy_revision, canonical_json(policy.to_dict()),
+                observed["task_revision"], policy_revision, canonical_json(policy_document),
                 observed["origin"], planned["category"], observed["phase"],
                 canonical_json(merged_observation), canonical_json(planned["document"]),
                 canonical_json(merged_refs), merged_cursor,
