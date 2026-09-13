@@ -78,6 +78,20 @@ class ServiceMCPTests(unittest.TestCase):
         self.assertEqual(json.loads(result["content"][0]["text"])["state"], "unknown")
         self.client.dispatch.assert_not_called()
 
+    def test_mixed_dry_runs_match_authority_classification(self):
+        names = ("workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance")
+        self.client.tools.return_value = {"tools": [
+            {"name": name, "annotations": {"readOnlyHint": False}} for name in names
+        ]}
+        for name in names:
+            for dry_run in (True, False, "true", 1, None):
+                with self.subTest(name=name, dry_run=dry_run):
+                    arguments = {"dry_run": dry_run, "request_id": "same-id"}
+                    self.assertEqual(self.call(name, arguments), self.result)
+                    self.assertEqual(self.client.dispatch.call_args.kwargs["read_only"], dry_run is True)
+        self.assertEqual(self.call(names[0], {"dry_run": True}), self.result)
+        self.assertTrue(self.client.dispatch.call_args.kwargs["read_only"])
+
     def test_stdio_bad_request_does_not_close_connection(self):
         source = io.StringIO('not-json\n' + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize"}) + '\n')
         output = io.StringIO()
