@@ -162,7 +162,11 @@ class AuthorityServiceTests(unittest.TestCase):
         events = self.store.read_events(task_id="task-a")
         self.assertEqual(
             [event["event_type"] for event in events],
-            ["authority_request.executing", "authority_request.completed"],
+            [
+                "authority_request.executing",
+                "authority_request.action_started",
+                "authority_request.completed",
+            ],
         )
         self.assertNotIn("arguments", events[0]["payload"])
         self.assertNotIn("result", events[1]["payload"])
