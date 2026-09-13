@@ -140,7 +140,7 @@ _MAX_DOCUMENT_BYTES = 16 * 1024
 _MAX_EVIDENCE_REFS = 64
 _TEXT_LIMIT = 512
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
-_FORBIDDEN_DOCUMENT_KEYS = frozenset(
+RECOVERY_DOCUMENT_FORBIDDEN_KEYS = frozenset(
     {
         "changed_paths",
         "ignored_paths",
@@ -2328,7 +2328,7 @@ def _bounded_document(value: Mapping[str, object], label: str) -> dict[str, Any]
             result: dict[str, Any] = {}
             for key, child in item.items():
                 name = _text(key, f"{label} key")
-                if name.lower() in _FORBIDDEN_DOCUMENT_KEYS:
+                if name.lower() in RECOVERY_DOCUMENT_FORBIDDEN_KEYS:
                     raise ValueError(f"{label} may not persist {name}")
                 result[name] = visit(child, path + "." + name, depth + 1)
             return result
