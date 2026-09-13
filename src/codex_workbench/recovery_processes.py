@@ -6,10 +6,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 class RecoveryProcessError(ValueError):
     """The source cannot be shown idle for a local source-only extraction."""
+
+
+_DARWIN_LSOF_ATTEMPTS = 2
+_DARWIN_LSOF_TIMEOUT_SECONDS = 5
 
 
 def _inside_source(cwd: str, source: Path) -> bool:
@@ -30,15 +35,35 @@ def source_process_ids(worktree: Path) -> tuple[int, ...]:
         raise RecoveryProcessError("recovery source must be a directory")
     found: set[int] = set()
     if sys.platform == "darwin":
-        try:
-            result = subprocess.run(
-                ["/usr/sbin/lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-F0pn"],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RecoveryProcessError("cannot inspect source process activity") from error
+        command = [
+            "/usr/sbin/lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-F0pn"
+        ]
+        started = time.monotonic()
+        result: subprocess.CompletedProcess[bytes] | None = None
+        for attempt in range(1, _DARWIN_LSOF_ATTEMPTS + 1):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    timeout=_DARWIN_LSOF_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                break
+            except subprocess.TimeoutExpired as error:
+                if attempt == _DARWIN_LSOF_ATTEMPTS:
+                    duration = time.monotonic() - started
+                    raise RecoveryProcessError(
+                        "cannot inspect source process activity: lsof timed out after "
+                        f"{attempt} attempts in {duration:.3f}s"
+                    ) from error
+            except OSError as error:
+                duration = time.monotonic() - started
+                reason = f"errno {error.errno}" if error.errno is not None else type(error).__name__
+                raise RecoveryProcessError(
+                    "cannot inspect source process activity: lsof failed with "
+                    f"{reason} after {duration:.3f}s"
+                ) from error
+        assert result is not None
         if result.returncode not in (0, 1) or result.stderr.strip():
             raise RecoveryProcessError("source process inspection was incomplete")
         pid: int | None = None

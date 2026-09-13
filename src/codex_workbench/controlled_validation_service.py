@@ -10,6 +10,8 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import threading
+import time
 from typing import Any
 
 from .config import WorkbenchConfig
@@ -41,6 +43,11 @@ PAIRING_ANCHORS = (
     "packages/physical-operator/tool-physical-operator/README.md",
 )
 PAIRING_SIDECARS = tuple(path.removesuffix(".md") + ".i18n.yaml" for path in PAIRING_ANCHORS)
+_SOURCE_OBSERVATION_LOCK_COUNT = 64
+_SOURCE_OBSERVATION_WAIT_SECONDS = 5.0
+_SOURCE_OBSERVATION_LOCKS = tuple(
+    threading.Lock() for _ in range(_SOURCE_OBSERVATION_LOCK_COUNT)
+)
 
 VALIDATION_TOOL = {
     "name": TOOL_NAME,
@@ -251,8 +258,39 @@ def _require_journal_reservation(store: WorkbenchStore, arguments: dict[str, Any
 def validate_blocked_node(
     config: WorkbenchConfig, store: WorkbenchStore, raw_arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """Preview a current allocation or run the exact preview without task CAS."""
+    """Serialize one task's source observation before preview or execution."""
+
     arguments = _arguments(raw_arguments)
+    lock_index = int.from_bytes(
+        sha256(arguments["task_id"].encode("utf-8")).digest()[:8], "big"
+    ) % _SOURCE_OBSERVATION_LOCK_COUNT
+    lock = _SOURCE_OBSERVATION_LOCKS[lock_index]
+    started = time.monotonic()
+    if not lock.acquire(timeout=_SOURCE_OBSERVATION_WAIT_SECONDS):
+        waited_ms = max(0, int((time.monotonic() - started) * 1_000))
+        raise StateConflictError(
+            "validation source observation is already active for this task; "
+            f"waited {waited_ms}ms without starting another Git or process scan"
+        )
+    try:
+        result = _validate_blocked_node_serialized(config, store, arguments)
+    finally:
+        lock.release()
+    return {
+        **result,
+        "source_observation_duration_ms": max(
+            0, int((time.monotonic() - started) * 1_000)
+        ),
+    }
+
+
+def _validate_blocked_node_serialized(
+    config: WorkbenchConfig,
+    store: WorkbenchStore,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Preview or run the exact allocation while its observer lock is held."""
+
     metadata = metadata_request_from_arguments(arguments["check_id"], arguments)
     if not arguments["dry_run"]:
         _require_journal_reservation(store, arguments)

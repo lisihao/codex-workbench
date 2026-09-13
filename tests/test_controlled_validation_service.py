@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from codex_workbench.api import WorkbenchHTTPServer
 from codex_workbench.authority_service import AuthorityService
 from codex_workbench import controlled_validation_service as validation
 from codex_workbench.mcp import WorkbenchMCPServer
+from codex_workbench.service_client import AuthorityHTTPClient
 from codex_workbench.store import StateConflictError
 from tests import test_blocked_worktree_recovery as recovery_fixtures
 
@@ -80,6 +83,69 @@ class ControlledValidationServiceTests(unittest.TestCase):
             self.assertEqual(tuple(connection.iterdump()), before_database)
         self.assertEqual(tuple(sorted(self.store.artifacts.root.rglob("*"))), before_artifacts)
         self.assertEqual((self.source / "src/value.txt").read_bytes(), before_source)
+
+    def test_http_preview_serializes_same_task_source_observation(self) -> None:
+        config = self.fixture.config
+        server = WorkbenchHTTPServer(
+            type(config)(config.state_root, host="127.0.0.1", port=0),
+            self.store,
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server_thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = AuthorityHTTPClient(
+            f"http://127.0.0.1:{server.server_port}",
+            config.token(),
+            timeout_seconds=2,
+            read_attempts=1,
+        )
+        envelope = {
+            "tool": validation.TOOL_NAME,
+            "task_id": self.task_id,
+            "arguments": self.arguments,
+        }
+        entered = threading.Event()
+        release = threading.Event()
+        original_delta = validation._delta
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def blocked_first_delta(*args):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                current = calls
+            if current == 1:
+                entered.set()
+                self.assertTrue(release.wait(timeout=2))
+            return original_delta(*args)
+
+        first: dict[str, object] = {}
+
+        def request_first() -> None:
+            first.update(client.dispatch(envelope, read_only=True))
+
+        with patch.object(
+            validation, "_SOURCE_OBSERVATION_WAIT_SECONDS", 0.05
+        ), patch.object(validation, "_delta", side_effect=blocked_first_delta):
+            requester = threading.Thread(target=request_first)
+            requester.start()
+            self.assertTrue(entered.wait(timeout=2))
+            second = client.dispatch(envelope, read_only=True)
+            release.set()
+            requester.join(timeout=2)
+
+        self.assertFalse(requester.is_alive())
+        self.assertEqual(first["state"], "completed")
+        self.assertFalse(first["result"].get("isError", False))  # type: ignore[union-attr]
+        self.assertTrue(second["result"]["isError"])
+        self.assertIn(
+            "source observation is already active",
+            second["result"]["content"][0]["text"],
+        )
+        self.assertEqual(calls, 2)
 
     def test_run_is_audited_and_idempotent_without_changing_ancestor_or_attempt(self) -> None:
         arguments = self._run_arguments()

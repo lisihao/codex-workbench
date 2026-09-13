@@ -61,6 +61,33 @@ class RecoveryProcessesTests(unittest.TestCase):
                     with self.assertRaises(RecoveryProcessError):
                         source_process_ids(Path(directory))
 
+    def test_darwin_probe_retries_one_timeout_within_a_bounded_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve()
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with patch(
+                "codex_workbench.recovery_processes.sys.platform", "darwin"
+            ), patch(
+                "codex_workbench.recovery_processes.subprocess.run",
+                side_effect=[subprocess.TimeoutExpired("lsof", 5), completed],
+            ) as run:
+                self.assertEqual(source_process_ids(source), ())
+            self.assertEqual(run.call_count, 2)
+
+    def test_darwin_probe_reports_exhausted_timeout_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "codex_workbench.recovery_processes.sys.platform", "darwin"
+            ), patch(
+                "codex_workbench.recovery_processes.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("lsof", 5),
+            ) as run, self.assertRaisesRegex(
+                RecoveryProcessError,
+                r"lsof timed out after 2 attempts in [0-9.]+s",
+            ):
+                source_process_ids(Path(directory))
+            self.assertEqual(run.call_count, 2)
+
     def test_unreadable_linux_process_refuses_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory).resolve()
