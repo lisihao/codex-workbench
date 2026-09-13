@@ -19,6 +19,7 @@ from .dependency_inputs import DependencyInputError, accepted_ancestor_nodes
 from .execution_attribution import ExecutionAttribution
 from .model import canonical_json
 from .node_recovery_policy import classify_failure
+from .node_recovery_store import RECOVERY_DOCUMENT_FORBIDDEN_KEYS
 
 
 _ARTIFACT_BYTES_LIMIT = 256 * 1024
@@ -456,6 +457,8 @@ def _result_artifact_refs(result: Mapping[str, Any]) -> dict[str, str]:
         if index >= _MAX_ARTIFACT_REFS:
             break
         if not isinstance(raw_key, str) or not raw_key or not _valid_ref(raw_ref):
+            continue
+        if raw_key.lower() in RECOVERY_DOCUMENT_FORBIDDEN_KEYS:
             continue
         key = raw_key if raw_key in _KNOWN_ARTIFACT_KEYS else raw_key[:128]
         refs[key] = raw_ref

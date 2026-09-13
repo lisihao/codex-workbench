@@ -19,6 +19,7 @@ from codex_workbench.node_recovery_observation import (
     _ARTIFACT_BYTES_LIMIT,
     collect_node_observation,
 )
+from codex_workbench.node_recovery_store import _observation
 from codex_workbench.model import canonical_json
 from tests import test_acceptance_amendment as _acceptance_amendment
 
@@ -382,6 +383,30 @@ class NodeRecoveryObservationTests(unittest.TestCase):
 
         self.assertEqual(repeated["rollback_event_cursor"], 42)
         self.assertEqual(repeated["failure_fingerprint"], observation["failure_fingerprint"])
+
+    def test_rollback_omits_diagnostic_stream_refs_before_episode_persistence(self) -> None:
+        store = self._store(_task(None))
+        patch_ref = store.artifacts.put_text("source patch", "patch")
+        stdout_ref = store.artifacts.put_text("fixture output", "stdout.log")
+        stderr_ref = store.artifacts.put_text("fixture error", "stderr.log")
+        store.task["nodes"][0]["result"] = {  # type: ignore[index]
+            "status": "blocked",
+            "artifacts": {
+                "patch": patch_ref,
+                "stdout": stdout_ref,
+                "stderr": stderr_ref,
+            },
+        }
+        self._rollback(store, None)
+
+        observation = collect_node_observation(store, "task-1", "work")
+        normalized = _observation(observation)
+
+        self.assertEqual(observation["source_evidence_refs"], {"patch": patch_ref})
+        self.assertEqual(
+            normalized["document"]["source_evidence_refs"],
+            {"patch": patch_ref},
+        )
 
     def test_rollback_acceptance_failure_without_a2_attribution_remains_unknown(self) -> None:
         store = self._store(_task({"status": "blocked", "execution_attribution": _attribution("task-1", "work", 1, "auth")}))
