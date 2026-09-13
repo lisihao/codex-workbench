@@ -396,6 +396,75 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         events = self.base.read_events(task_id=self.task_id)
         self.assertTrue(any(event["event_type"] == "node_recovery.timer_decision_updated" for event in events))
 
+    def test_only_new_controlled_repair_audit_renews_an_expired_stage_once(self) -> None:
+        first = self._record("controlled-repair", cursor=1)
+        expired = "2020-01-01T00:00:00+00:00"
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, first["episode_id"]),
+            )
+
+        unrelated = self.store.record_episode(
+            self._observation("controlled-repair", cursor=2),
+            self._decision("observe_readiness"),
+        )
+        self.assertEqual(unrelated["decision"]["reason_kind"], "budget_exhausted")
+        self.assertEqual(unrelated["time_budget_deadline_at"], expired)
+
+        def repaired(reference: str, request_id: str) -> dict[str, object]:
+            observation = self._observation("controlled-repair", cursor=2)
+            observation.update({
+                "controlled_source_repair_ready": True,
+                "controlled_source_repair": {
+                    "audit_ref": reference,
+                    "request_id": request_id,
+                    "settled_at": "2026-09-13T00:00:00+00:00",
+                    "check_id": "dsh-d-pairing-write-v1",
+                    "source_delta_after": _fingerprint(reference),
+                },
+            })
+            return observation
+
+        audit_a = "sha256:" + _fingerprint("audit-a") + ":validation.json"
+        renewed = self.store.record_episode(
+            repaired(audit_a, "request-a"),
+            self._decision("repair_source", reason="controlled_source_write_verified"),
+        )
+        self.assertEqual((renewed["state"], renewed["action"]), ("ready", "repair_source"))
+        self.assertNotEqual(renewed["time_budget_deadline_at"], expired)
+        self.assertEqual(renewed["observation"]["controlled_source_repair_audit_refs"], [audit_a])
+
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, first["episode_id"]),
+            )
+        duplicate = self.store.record_episode(
+            repaired(audit_a, "different-wrapper"),
+            self._decision("repair_source", reason="controlled_source_write_verified"),
+        )
+        self.assertEqual(duplicate["decision"]["reason_kind"], "budget_exhausted")
+        self.assertEqual(duplicate["time_budget_deadline_at"], expired)
+
+        audit_b = "sha256:" + _fingerprint("audit-b") + ":validation.json"
+        second = self.store.record_episode(
+            repaired(audit_b, "request-b"),
+            self._decision("repair_source", reason="controlled_source_write_verified"),
+        )
+        self.assertEqual(second["action"], "repair_source")
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, first["episode_id"]),
+            )
+        replayed = self.store.record_episode(
+            repaired(audit_a, "request-a-replayed"),
+            self._decision("repair_source", reason="controlled_source_write_verified"),
+        )
+        self.assertEqual(replayed["decision"]["reason_kind"], "budget_exhausted")
+        self.assertEqual(replayed["time_budget_deadline_at"], expired)
+
     def test_enabled_task_sweep_is_bounded_and_cursor_paged(self) -> None:
         page = self.store.list_enabled_tasks(limit=1)
         self.assertEqual([row["task_id"] for row in page["tasks"]], [self.task_id])

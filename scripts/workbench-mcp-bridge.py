@@ -1134,7 +1134,11 @@ class MCPConnectionBridge:
         request_id = message.get("id")
         name, arguments = self._tool_call_parts(message)
         operation_read = (
-            name in {"workbench_handoff_lockfile", "workbench_restore_accepted_source"}
+            name in {
+                "workbench_handoff_lockfile",
+                "workbench_restore_accepted_source",
+                "workbench_repair_blocked_source",
+            }
             and name in self.tool_read_only
             and isinstance(arguments.get("op"), str)
             and arguments.get("op") in {"preview", "status"}

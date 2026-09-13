@@ -510,6 +510,21 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
             policy, observation, category=category, action="request_repair",
             reason_kind="repeated_recovery_failure",
         )
+    if (
+        observation.get("controlled_source_repair_ready") is True
+        and observation.get("readiness_ready") is True
+        and node_state == "blocked"
+        and observation.get("node_is_verifier") is False
+        and "repair_source" in policy.allowed_actions
+        and attempts_number < policy.max_action_attempts
+    ):
+        return _ready_action(
+            policy,
+            observation,
+            category=category,
+            action="repair_source",
+            reason_kind="controlled_source_write_verified",
+        )
     if attempts_number >= policy.max_action_attempts or elapsed_number >= policy.time_budget_seconds:
         return _result(
             category=category,

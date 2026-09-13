@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import socket
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -11,11 +13,16 @@ from codex_workbench.blocked_source_repair import (
     blocked_source_repair,
     blocked_source_repair_receipt,
 )
+from codex_workbench.api import WorkbenchHTTPServer
+from codex_workbench.authority import authority_machine_id
+from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecoveryError
 from codex_workbench.model import NodeResult
 from codex_workbench.node_recovery_policy import RecoveryPolicy
 from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.service import Coordinator
+from codex_workbench.service_client import AuthorityHTTPClient
+from codex_workbench.service_mcp import AuthorityMCPAdapter
 from codex_workbench.store import StateConflictError
 from tests.process_probe_fixture import isolated_process_catalog
 from tests.test_failed_attempt_recovery import _FailedAttemptRecoveryFixture
@@ -392,6 +399,70 @@ class BlockedSourceRepairTests(_FailedAttemptRecoveryFixture, unittest.TestCase)
                 **self._arguments(contract, blocked, request_id="undeclared-request"),
                 dry_run=True,
             )
+
+    def test_public_service_mcp_http_path_previews_applies_and_reads_one_receipt(self) -> None:
+        contract, _, blocked = self._blocked_source(task_id="blocked-source-public-api")
+        self._configure(contract.task_id, int(blocked["state_revision"]))
+        config = WorkbenchConfig(
+            self.state_root,
+            port=0,
+            deployment_role="authority",
+            authority_host=socket.gethostname(),
+            authority_machine_id=authority_machine_id(),
+        )
+        config.initialize()
+        server = WorkbenchHTTPServer(config, self.store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = AuthorityHTTPClient(
+            f"http://127.0.0.1:{server.server_port}",
+            config.token(),
+            backoff_seconds=0,
+        )
+        adapter = AuthorityMCPAdapter(client)
+        worker = next(node for node in blocked["nodes"] if node["node_id"] == "worker")
+        fields = {
+            "task_id": contract.task_id,
+            "node_id": "worker",
+            "expected_revision": int(blocked["state_revision"]),
+            "expected_attempt": int(worker["attempt"]),
+            "expected_contract_hash": blocked["contract_hash"],
+            "request_id": "public-source-repair",
+            "reason": "continue the preserved worker source through the original verifier",
+        }
+
+        def call(arguments: dict[str, object]) -> dict[str, object]:
+            response = adapter.handle({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "workbench_repair_blocked_source", "arguments": arguments},
+            })
+            assert response is not None
+            result = response["result"]
+            self.assertFalse(result.get("isError", False), result)
+            return json.loads(result["content"][0]["text"])
+
+        preview = call({"op": "preview", **fields})
+        self.assertTrue(preview["dry_run"])
+        applied = call({
+            "op": "apply", **fields,
+            "expected_fingerprint": preview["fingerprint"],
+        })
+        self.assertTrue(applied["queued"])
+        status = call({
+            "op": "status",
+            "task_id": contract.task_id,
+            "request_id": fields["request_id"],
+        })
+        self.assertEqual(status["status"], "queued")
+        self.assertEqual(status["receipt"], applied)
+        repeated = call({
+            "op": "apply", **fields,
+            "expected_fingerprint": preview["fingerprint"],
+        })
+        self.assertEqual(repeated, applied)
 
 
 if __name__ == "__main__":

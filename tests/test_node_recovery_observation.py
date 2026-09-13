@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -29,6 +31,13 @@ class _FixtureStore:
         self.artifacts = ArtifactStore(root / "artifacts")
         self.task = task
         self.rollback: dict[str, object] | None = None
+        self.database = root / "state.sqlite"
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS authority_requests("
+                "request_id TEXT, task_id TEXT, tool TEXT, state TEXT, "
+                "result_json TEXT, settled_at TEXT)"
+            )
 
     def get_task(self, task_id: str) -> dict[str, object]:
         if task_id != self.task["task_id"]:
@@ -37,6 +46,15 @@ class _FixtureStore:
 
     def current_blocked_worktree_recovery_rollback(self, *_args: object, **_kwargs: object) -> dict[str, object] | None:
         return self.rollback
+
+    @contextmanager
+    def connection(self):
+        connection = sqlite3.connect(self.database)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        finally:
+            connection.close()
 
 
 def _attribution(task_id: str, node_id: str, attempt: int, origin: str, cursor: int = 11) -> dict[str, object]:
@@ -176,6 +194,61 @@ class NodeRecoveryObservationTests(unittest.TestCase):
         self.assertNotIn("readiness_ready", first)
         self.assertFalse(first["material_progress"])
         self.assertEqual(first["failure_fingerprint"], second["failure_fingerprint"])
+
+    def test_content_verified_controlled_write_is_bound_to_current_node_revision_and_attempt(self) -> None:
+        store = self._store(_task({"status": "blocked", "artifacts": {}}))
+        source_delta = "d" * 64
+        audit = {
+            "task_id": "task-1",
+            "node_id": "work",
+            "expected_revision": 7,
+            "expected_attempt": 1,
+            "check_id": "dsh-d-pairing-write-v1",
+            "ok": True,
+            "historical_result_unchanged": True,
+            "source_delta_after": source_delta,
+            "execution": {"ok": True},
+        }
+        audit_ref = store.artifacts.put_text(json.dumps(audit, sort_keys=True), "validation.json")
+        result = {
+            **audit,
+            "status": "passed",
+            "audit_ref": audit_ref,
+            "task_state_changed": False,
+            "creates_attempt": False,
+            "accepts_task": False,
+            "recovery_requires_fresh_preview": True,
+        }
+        result.pop("execution")
+        with store.connection() as connection:
+            connection.execute(
+                "INSERT INTO authority_requests VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    "controlled-write-1",
+                    "task-1",
+                    "workbench_validate_blocked_node",
+                    "completed",
+                    json.dumps({"content": [{"type": "text", "text": json.dumps(result)}]}),
+                    "2026-09-13T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+
+        observation = collect_node_observation(store, "task-1", "work")
+        self.assertTrue(observation["controlled_source_repair_ready"])
+        self.assertEqual(observation["controlled_source_repair"]["audit_ref"], audit_ref)
+        self.assertEqual(observation["evidence_refs"]["controlled-repair"], audit_ref)
+        self.assertIn("controlled-repair-audit", observation["authoritative_material_progress"]["sources"])
+
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE authority_requests SET result_json = ? WHERE request_id = ?",
+                (json.dumps({"content": [{"type": "text", "text": "null"}]}), "controlled-write-1"),
+            )
+            connection.commit()
+        ignored = collect_node_observation(store, "task-1", "work")
+        self.assertFalse(ignored["controlled_source_repair_ready"])
+        self.assertNotIn("controlled_source_repair", ignored)
 
     def test_current_readiness_failure_maps_dependency_and_pre_execution(self) -> None:
         store = self._store(_task(None))

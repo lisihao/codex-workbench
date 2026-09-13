@@ -17,6 +17,7 @@ class ServiceMCPTests(unittest.TestCase):
             {"name": "workbench_list_tasks", "annotations": {"readOnlyHint": True}},
             {"name": "workbench_control_task", "annotations": {"readOnlyHint": False}},
             {"name": "workbench_handoff_lockfile", "annotations": {"readOnlyHint": False}},
+            {"name": "workbench_repair_blocked_source", "annotations": {"readOnlyHint": False}},
             {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
         ]}
         self.result = {"content": [{"type": "text", "text": "accepted request, not task acceptance"}]}
@@ -55,6 +56,16 @@ class ServiceMCPTests(unittest.TestCase):
                 result = self.call("workbench_handoff_lockfile", {"op": op, "request_id": "handoff-1"})
                 self.assertTrue(result["isError"])
         self.client.dispatch.assert_not_called()
+
+    def test_blocked_source_repair_preserves_business_id_for_every_operation(self):
+        for op in ("preview", "status", "apply"):
+            with self.subTest(op=op):
+                arguments = {"op": op, "task_id": "fixture", "request_id": "repair-1"}
+                self.assertEqual(self.call("workbench_repair_blocked_source", arguments), self.result)
+                envelope = self.client.dispatch.call_args.args[0]
+                self.assertEqual(envelope["arguments"], arguments)
+                self.assertEqual(envelope["request_id"], "repair-1")
+                self.assertEqual(self.client.dispatch.call_args.kwargs["read_only"], op in {"preview", "status"})
 
     def test_mutation_requires_stable_id_but_read_does_not(self):
         result = self.call("workbench_control_task", {"task_id": "task", "action": "pause"})

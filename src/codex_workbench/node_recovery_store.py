@@ -1999,14 +1999,41 @@ class NodeRecoveryStore:
         merged_observation = _merge_observation(
             previous_observation, observed["document"], allow_task_revision=True
         )
+        previous_consumed = previous_observation.get("controlled_source_repair_audit_refs", [])
+        if not isinstance(previous_consumed, list) or not all(
+            isinstance(reference, str) for reference in previous_consumed
+        ):
+            raise StateConflictError("recovery episode controlled repair history is invalid")
+        current_repair = merged_observation.get("controlled_source_repair")
+        current_audit_ref = (
+            current_repair.get("audit_ref") if isinstance(current_repair, Mapping) else None
+        )
+        repair_evidence_changed = (
+            isinstance(current_audit_ref, str)
+            and current_audit_ref not in previous_consumed
+        )
+        if repair_evidence_changed:
+            if len(previous_consumed) >= 64:
+                raise StateConflictError("recovery episode controlled repair history is full")
+            merged_observation["controlled_source_repair_audit_refs"] = [
+                *previous_consumed,
+                current_audit_ref,
+            ]
         merged_refs = _evidence_refs(merged_observation.get("evidence_refs"))
         merged_cursor = max(int(row["source_event_cursor"]), observed["source_event_cursor"])
         observation_changed = previous_observation != merged_observation or previous_refs != merged_refs
         policy_changed = int(row["policy_revision"]) != policy_revision
         source_changed = int(row["source_event_cursor"]) != merged_cursor
         task_changed = int(row["task_revision"]) != observed["task_revision"]
+        material = observation_changed or source_changed or task_changed
+        deadline = str(row["time_budget_deadline_at"])
+        if repair_evidence_changed:
+            # Only a new content-addressed repair receipt starts one fresh
+            # bounded stage. Task events, policy edits and repeated evidence
+            # cannot renew this clock.
+            deadline = _after(timestamp, policy.time_budget_seconds)
         timer_decision = False
-        if _due(str(row["time_budget_deadline_at"]), timestamp):
+        if not repair_evidence_changed and _due(deadline, timestamp):
             planned = _budget_exhausted_decision()
             timer_decision = True
         elif (
@@ -2028,7 +2055,6 @@ class NodeRecoveryStore:
                 ),
             )
         decision_changed = previous_decision != planned["document"]
-        material = observation_changed or source_changed or task_changed
         if not material and not policy_changed and not decision_changed:
             return self._episode_row(connection, row)
         if self._lease_is_live(row, timestamp):
@@ -2062,7 +2088,7 @@ class NodeRecoveryStore:
                 category = ?, phase = ?, observation_json = ?, decision_json = ?,
                 evidence_refs_json = ?, source_event_cursor = ?, state = ?, action = ?,
                 owner = ?, permission_required = ?, action_attempts = ?, current_stage_key = ?,
-                state_revision = ?, next_wakeup_at = ?, last_material_progress_at = ?,
+                state_revision = ?, time_budget_deadline_at = ?, next_wakeup_at = ?, last_material_progress_at = ?,
                 last_progress_json = ?, updated_at = ?
             WHERE episode_id = ? AND state_revision = ?
             """,
@@ -2073,7 +2099,7 @@ class NodeRecoveryStore:
                 canonical_json(merged_refs), merged_cursor,
                 planned["state"], planned["action"], planned["owner"],
                 int(planned["requires_authorization"]), action_attempts, stage_key, revision,
-                planned["next_wakeup_at"], timestamp if material else row["last_material_progress_at"],
+                deadline, planned["next_wakeup_at"], timestamp if material else row["last_material_progress_at"],
                 canonical_json(
                     {
                         "kind": "node_recovery.timer_decision_updated" if timer_decision and not material else "node_recovery.episode_updated",
