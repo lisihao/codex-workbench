@@ -1139,7 +1139,14 @@ class MCPConnectionBridge:
             and isinstance(arguments.get("op"), str)
             and arguments.get("op") in {"preview", "status"}
         )
-        if self._is_read_only(name) or operation_read:
+        # Match Authority's mixed-operation classification. Keep old sent
+        # records intact: they still fence mutations using the same identity.
+        dry_run_read = (
+            name in {"workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance"}
+            and name in self.tool_read_only
+            and arguments.get("dry_run") is True
+        )
+        if self._is_read_only(name) or operation_read or dry_run_read:
             outgoing, resumed = self._prepare_event_read(message, name, arguments)
             response = self._forward_read_only(outgoing)
             if response is None:

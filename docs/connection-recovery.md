@@ -10,6 +10,8 @@ Every mutating service request has a stable `request_id`. The Authority journals
 
 Read requests have bounded retries. Reconnection repeats MCP initialize and tools/list, compares server version and catalog fingerprint, and notifies the host when the catalog changes. A changed catalog requires an explicit tools/list refresh before another write. The bridge advertises `listChanged` because it emits that notification; this does not prove every Codex host version will immediately refresh its cached tools. If the host remains stale, restart only that Workbench MCP connection using the host's supported control.
 
+The mixed control, blocked-node validation and acceptance-amendment tools use read-only transport only for the Boolean `dry_run: true`. This includes correcting an invalid preview under the same request ID. See [task control recovery](task-control-recovery.md) for existing sent-record preservation and the distinction between a missing preview receipt and an unknown mutation.
+
 Event continuation uses the Authority cursor. A reconnect continues after the last observed cursor and does not duplicate returned events. A caller's explicit historical `after` is preserved. Events without an authoritative cursor are not silently discarded. Session continuation freezes the active task ID and compares it inside the steering transaction, so a concurrent session rebind cannot redirect the message to a different task.
 
 ## Installation and private state
