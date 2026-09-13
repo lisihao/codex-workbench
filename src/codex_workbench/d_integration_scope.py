@@ -9,7 +9,7 @@ direct repeat is rejected by the task revision compare-and-set.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
 import json
 from pathlib import Path, PurePosixPath
@@ -29,7 +29,9 @@ from .d_integration_profile import (
 )
 from .dirty_worktree_recovery import DirtyWorktreeRecoveryError
 from .model import canonical_hash, canonical_json, now_iso
+from .recovery_processes import RecoveryProcessError, assert_recovery_source_idle
 from .store import StateConflictError, WorkbenchStore
+from .worktrees import WorktreeManager
 
 
 ACTION_NAME = "amend_blocked_integration_scope"
@@ -167,6 +169,7 @@ def _preflight(store: WorkbenchStore, arguments: Mapping[str, Any]) -> dict[str,
     if canonical_json(native_before) != canonical_json(before["candidate"]):
         raise StateConflictError("integration scope amendment native binding changed during preview")
 
+    retained_e_before = _retained_e_worktree_identity(before)
     source_before, delta_before = _source_snapshot(store, arguments)
     _assert_source_matches_binding(source_before, before)
     source_identity = _source_identity(before, source_before)
@@ -184,12 +187,16 @@ def _preflight(store: WorkbenchStore, arguments: Mapping[str, Any]) -> dict[str,
         raise StateConflictError("integration scope amendment native binding changed during preview")
     if canonical_json(before) != canonical_json(after):
         raise StateConflictError("integration scope amendment durable binding changed during preview")
+    retained_e_after = _retained_e_worktree_identity(after)
+    if canonical_json(retained_e_before) != canonical_json(retained_e_after):
+        raise StateConflictError("integration scope amendment retained verifier identity changed during preview")
 
     plan = _plan(before)
     source = {
         "allocation": dict(before["d"]["allocation"]),
         "worktree_identity": source_identity,
         "source_delta": _delta_payload(delta_before),
+        "retained_verifier": retained_e_before,
     }
     fingerprint = canonical_hash(
         {
@@ -277,17 +284,13 @@ def _durable_binding_from_connection(
     # this binding so the two independent source snapshots can compare exactly.
     d["allocation"] = {**dict(allocation), "state": "active"}
 
-    pending_e_allocation = connection.execute(
-        """
-        SELECT allocation_id FROM worktree_allocations
-        WHERE task_id = ? AND node_id = 'E'
-          AND state IN ('active', 'quarantine_pending')
-        LIMIT 1
-        """,
-        (arguments["task_id"],),
-    ).fetchone()
-    if pending_e_allocation is not None:
-        raise StateConflictError("integration scope amendment pending verifier E has an active allocation")
+    e_retained_allocation = _retained_e_allocation(
+        connection,
+        task_id=str(arguments["task_id"]),
+        contract=contract,
+        e=nodes["E"],
+    )
+    nodes["E"]["retained_allocation"] = e_retained_allocation
 
     return {
         "candidate": candidate,
@@ -413,6 +416,240 @@ def _validate_lane(nodes: Mapping[str, Mapping[str, Any]], arguments: Mapping[st
         raise IntegrationScopeAmendmentError(
             "integration scope amendment verifier E must retain empty write_scopes"
         )
+
+
+def _retained_e_allocation(
+    connection: Any,
+    *,
+    task_id: str,
+    contract: Mapping[str, Any],
+    e: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Prove one active E allocation is a settled historical verifier record.
+
+    A verifier failure resets its node to pending so the selected owner can
+    repair, but the terminal allocation remains active for recovery and audit.
+    A currently active allocation is therefore acceptable only when its native
+    allocation, failure, and repair events prove that exact completed attempt.
+    """
+
+    attempt = _nonnegative_int(e.get("attempt"), "E attempt")
+    rows = connection.execute(
+        """
+        SELECT allocation_id, task_id, node_id, attempt, repository, base_sha,
+               branch, current_path, state, node_result_json, created_at, updated_at
+        FROM worktree_allocations
+        WHERE task_id = ? AND node_id = 'E'
+        ORDER BY attempt, allocation_id
+        """,
+        (task_id,),
+    ).fetchall()
+    future = [row for row in rows if int(row["attempt"]) > attempt]
+    if future:
+        raise StateConflictError("pending verifier E has a future allocation")
+    live = [row for row in rows if row["state"] in {"active", "quarantine_pending"}]
+    if not live:
+        return None
+    if len(live) != 1:
+        raise StateConflictError("pending verifier E has multiple live allocations")
+    allocation = live[0]
+    if allocation["state"] != "active":
+        raise StateConflictError("pending verifier E allocation is not an active retained record")
+    if int(allocation["attempt"]) != attempt:
+        raise StateConflictError("pending verifier E has a mismatched live allocation attempt")
+    repository = contract.get("repository")
+    base_sha = contract.get("base_sha")
+    expected_branch = WorktreeManager.branch_name(task_id, "E", attempt)
+    if (
+        allocation["task_id"] != task_id
+        or allocation["node_id"] != "E"
+        or allocation["repository"] != repository
+        or allocation["base_sha"] != base_sha
+        or allocation["branch"] != expected_branch
+        or not isinstance(allocation["current_path"], str)
+        or not allocation["current_path"]
+        or not isinstance(allocation["node_result_json"], str)
+        or not allocation["node_result_json"]
+    ):
+        raise StateConflictError("pending verifier E allocation does not match its task attempt")
+    result = _result_object(allocation["node_result_json"], "retained verifier E result")
+    if (
+        result.get("status") != "failed"
+        or result.get("result_kind") != "verifier"
+        or result.get("verdict") != "needs_fix"
+    ):
+        raise StateConflictError("pending verifier E allocation lacks a terminal failed verifier result")
+
+    allocated_event = _single_event(
+        connection,
+        task_id=task_id,
+        node_id="E",
+        event_type="worktree.allocated",
+        predicate=lambda payload: (
+            payload.get("allocation_id") == allocation["allocation_id"]
+            and payload.get("attempt") == attempt
+            and payload.get("path") == allocation["current_path"]
+            and payload.get("branch") == allocation["branch"]
+        ),
+        label="retained verifier E allocation",
+    )
+    failed_event = _single_event(
+        connection,
+        task_id=task_id,
+        node_id="E",
+        event_type="node.failed",
+        predicate=lambda payload: (
+            payload.get("attempt") == attempt
+            and isinstance(payload.get("result"), dict)
+            and canonical_json(payload["result"]) == canonical_json(result)
+        ),
+        label="retained verifier E failure",
+    )
+    repair_event = _single_event(
+        connection,
+        task_id=task_id,
+        node_id="E",
+        event_type="task.repair_scheduled",
+        predicate=lambda payload: payload.get("verifier_attempt") == attempt,
+        label="retained verifier E repair",
+    )
+    if not (
+        allocated_event["cursor"] < failed_event["cursor"] < repair_event["cursor"]
+    ):
+        raise StateConflictError("retained verifier E event ordering is invalid")
+    later_lifecycle = connection.execute(
+        """
+        SELECT event_type FROM events
+        WHERE task_id = ? AND node_id = 'E' AND cursor > ?
+          AND event_type IN ('node.started', 'node.indeterminate', 'node.accepted',
+                             'node.failed', 'node.blocked')
+        LIMIT 1
+        """,
+        (task_id, failed_event["cursor"]),
+    ).fetchone()
+    if later_lifecycle is not None:
+        raise StateConflictError("pending verifier E has later lifecycle evidence")
+    later_allocation_event = connection.execute(
+        """
+        SELECT cursor FROM events
+        WHERE task_id = ? AND node_id = 'E' AND cursor > ?
+          AND event_type = 'worktree.allocated'
+        LIMIT 1
+        """,
+        (task_id, failed_event["cursor"]),
+    ).fetchone()
+    if later_allocation_event is not None:
+        raise StateConflictError("pending verifier E has later allocation evidence")
+    return {
+        "allocation": dict(allocation),
+        "allocated_event": allocated_event,
+        "failed_event": failed_event,
+        "repair_event": repair_event,
+    }
+
+
+def _single_event(
+    connection: Any,
+    *,
+    task_id: str,
+    node_id: str,
+    event_type: str,
+    predicate: Callable[[Mapping[str, Any]], bool],
+    label: str,
+) -> dict[str, Any]:
+    """Return exactly one native task event whose JSON payload matches a proof."""
+
+    rows = connection.execute(
+        """
+        SELECT cursor, payload_json, created_at FROM events
+        WHERE task_id = ? AND node_id = ? AND event_type = ?
+        ORDER BY cursor
+        """,
+        (task_id, node_id, event_type),
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise StateConflictError(f"{label} event payload is invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise StateConflictError(f"{label} event payload is invalid")
+        if predicate(payload):
+            matches.append(
+                {
+                    "cursor": int(row["cursor"]),
+                    "created_at": str(row["created_at"]),
+                    "payload": payload,
+                }
+            )
+    if len(matches) != 1:
+        raise StateConflictError(f"{label} evidence is missing or ambiguous")
+    return matches[0]
+
+
+def _retained_e_worktree_identity(binding: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Require a historically settled retained E worktree to be idle and intact."""
+
+    task = binding.get("task")
+    e = binding.get("e")
+    if not isinstance(task, Mapping) or not isinstance(e, Mapping):
+        raise StateConflictError("integration scope amendment retained verifier binding is invalid")
+    retained = e.get("retained_allocation")
+    if retained is None:
+        return None
+    if not isinstance(retained, Mapping):
+        raise StateConflictError("integration scope amendment retained verifier allocation is invalid")
+    allocation = retained.get("allocation")
+    if not isinstance(allocation, Mapping):
+        raise StateConflictError("integration scope amendment retained verifier allocation is invalid")
+    root = _worktree_root(str(allocation.get("current_path", "")))
+    try:
+        assert_recovery_source_idle(root)
+    except RecoveryProcessError as error:
+        raise StateConflictError(
+            "integration scope amendment cannot prove retained verifier E is idle: " + str(error)
+        ) from error
+    top_level = _git_text(root, "rev-parse", "--show-toplevel")
+    if Path(top_level).resolve(strict=True) != root:
+        raise StateConflictError("retained verifier E is not an isolated Git worktree")
+    head = _git_text(root, "rev-parse", "HEAD")
+    branch = _git_text(root, "branch", "--show-current")
+    common_dir = _git_text(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    contract = task.get("contract")
+    if not isinstance(contract, Mapping):
+        raise StateConflictError("integration scope amendment task contract is invalid")
+    repository = contract.get("repository")
+    if not isinstance(repository, str) or not repository:
+        raise StateConflictError("integration scope amendment task repository is invalid")
+    repository_common = _git_text(
+        Path(repository).expanduser().resolve(strict=True),
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    if (
+        head != allocation.get("base_sha")
+        or branch != allocation.get("branch")
+        or common_dir != repository_common
+    ):
+        raise StateConflictError("retained verifier E Git identity no longer matches its allocation")
+    return {
+        "allocation_id": allocation.get("allocation_id"),
+        "attempt": allocation.get("attempt"),
+        "worktree": str(root),
+        "top_level": top_level,
+        "head": head,
+        "branch": branch,
+        "git_common_dir": common_dir,
+        "result_sha256": sha256(str(allocation["node_result_json"]).encode()).hexdigest(),
+        "event_cursors": {
+            "allocated": retained["allocated_event"]["cursor"],
+            "failed": retained["failed_event"]["cursor"],
+            "repair": retained["repair_event"]["cursor"],
+        },
+        "idle_observation": "idle",
+    }
 
 
 def _source_snapshot(
