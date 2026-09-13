@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_workbench import d_integration_scope as scope
+from codex_workbench.accepted_source_repair import prepare_accepted_source_repair
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.d_integration_profile import (
@@ -22,6 +23,7 @@ from codex_workbench.d_integration_profile import (
 )
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract, canonical_hash, canonical_json
+from codex_workbench.recovery_processes import RecoveryProcessError
 from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
 
@@ -246,6 +248,161 @@ class DIntegrationScopeTests(unittest.TestCase):
     def _preview(self) -> dict:
         return scope.amend_blocked_integration_scope(self.config, self.store, self.arguments)
 
+    def _create_real_retained_verifier_lane(self) -> tuple[TaskContract, dict, Path]:
+        """Create E-a1 through native verifier failure/reset before D-a2 blocks."""
+
+        task_id = "retained-verifier-fixture"
+        contract = TaskContract(
+            task_id=task_id,
+            repository=str(self.repository),
+            base_sha=self.base_sha,
+            objective="retain a settled verifier allocation while D needs a scoped repair",
+            allowed_scope=("src", "legacy"),
+            acceptance_commands=("git diff --check",),
+            executor_model="fixture",
+            verifier_model="fixture",
+        )
+        nodes = [
+            NodeSpec("A", task_id, "A", "fixture", "fixture", write_scopes=("src",), ordinal=1),
+            NodeSpec("B", task_id, "B", "fixture", "fixture", depends_on=("A",), write_scopes=("src",), ordinal=2),
+            NodeSpec("C", task_id, "C", "fixture", "fixture", depends_on=("B",), write_scopes=("src",), ordinal=3),
+            NodeSpec(
+                "D", task_id, "D", "fixture", "fixture", depends_on=("A", "B", "C"),
+                read_scopes=("src",), write_scopes=("src",), ordinal=4,
+            ),
+            NodeSpec(
+                "E", task_id, "E", "fixture", "fixture", depends_on=("A", "B", "C", "D"),
+                read_scopes=("legacy/*.md",), write_scopes=(), verifier=True, ordinal=5,
+            ),
+        ]
+        self.store.create_task(contract, nodes, task_id + "-create")
+        self.store.queue_task(task_id)
+
+        def accept_worker(node_id: str, relative: str, content: str) -> None:
+            claimed = self.store.claim_ready_node("retained-" + node_id, self.epoch)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            self.assertEqual(claimed["node_id"], node_id)
+            worktree = self.worktrees.prepare(
+                str(self.repository), self.base_sha, task_id, node_id, int(claimed["attempt"])
+            )
+            self.store.assign_worktree(
+                task_id,
+                node_id,
+                str(worktree),
+                attempt=int(claimed["attempt"]),
+                coordinator_epoch=int(claimed["coordinator_epoch"]),
+                lease_epoch=int(claimed["lease_epoch"]),
+            )
+            dependency_input = apply_accepted_ancestor_patches(
+                self.store.get_task(task_id), node_id, worktree, self.store.artifacts, self.worktrees,
+            )
+            input_tree = self.base_sha
+            artifacts: dict[str, str] = {}
+            if dependency_input is not None:
+                input_tree = dependency_input.input_tree_sha
+                artifacts["dependency-input"] = self.store.artifacts.put_text(
+                    canonical_json(dependency_input.receipt), node_id + "-input.json",
+                )
+            target = worktree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            artifacts["patch"] = self.store.artifacts.put_bytes(
+                self.worktrees.diff_patch(worktree, input_tree), node_id + ".patch",
+            )
+            self.store.settle_claimed(
+                claimed,
+                NodeResult(
+                    "succeeded", node_id + " accepted", artifacts=artifacts,
+                    actual_model="fixture", result_kind="worker", checks=("fixture",),
+                    changed_paths=(relative,),
+                ),
+            )
+
+        accept_worker("A", "src/retained-a.ts", "export const retainedA = 1\n")
+        accept_worker("B", "src/retained-b.ts", "export const retainedB = 1\n")
+        accept_worker("C", "src/retained-c.ts", "export const retainedC = 1\n")
+        accept_worker("D", "src/retained-d.ts", "export const retainedD = 1\n")
+
+        verifier = self.store.claim_ready_node("retained-E", self.epoch)
+        self.assertIsNotNone(verifier)
+        assert verifier is not None
+        self.assertEqual((verifier["node_id"], verifier["attempt"]), ("E", 1))
+        verifier_worktree = self.worktrees.prepare(
+            str(self.repository), self.base_sha, task_id, "E", int(verifier["attempt"])
+        )
+        self.store.assign_worktree(
+            task_id,
+            "E",
+            str(verifier_worktree),
+            attempt=int(verifier["attempt"]),
+            coordinator_epoch=int(verifier["coordinator_epoch"]),
+            lease_epoch=int(verifier["lease_epoch"]),
+        )
+        evidence = self.store.artifacts.put_text("retained verifier evidence\n", "retained-E.log")
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "D requires scoped integration repair",
+                artifacts={"test-log": evidence},
+                actual_model="fixture",
+                result_kind="verifier",
+                checks=("fixture verifier",),
+                evidence=(evidence,),
+                verdict="needs_fix",
+                repair_node_ids=("D",),
+            ),
+        )
+        after_failure = self.store.get_task(task_id)
+        e_after_failure = next(node for node in after_failure["nodes"] if node["node_id"] == "E")
+        self.assertEqual((e_after_failure["state"], e_after_failure["attempt"]), ("pending", 1))
+        self.assertIsNone(e_after_failure["worktree"])
+        self.assertIsNone(e_after_failure["result"])
+
+        claimed_d = self.store.claim_ready_node("retained-D-repair", self.epoch)
+        self.assertIsNotNone(claimed_d)
+        assert claimed_d is not None
+        self.assertEqual((claimed_d["node_id"], claimed_d["attempt"]), ("D", 2))
+        binding = claimed_d.get("accepted_source_repair")
+        self.assertIsInstance(binding, dict)
+        prepared = prepare_accepted_source_repair(self.store, binding, self.worktrees)
+        self.store.assign_worktree(
+            task_id,
+            "D",
+            str(prepared.worktree),
+            attempt=int(claimed_d["attempt"]),
+            coordinator_epoch=int(claimed_d["coordinator_epoch"]),
+            lease_epoch=int(claimed_d["lease_epoch"]),
+            recovery_preflight=prepared.receipt,
+        )
+        blocked_input = self.store.artifacts.put_text(
+            canonical_json(prepared.dependency_input.receipt), "retained-D-repair-input.json",
+        )
+        self.store.settle_claimed(
+            claimed_d,
+            NodeResult(
+                "blocked",
+                "D remains blocked pending fixed integration scope coverage",
+                artifacts={"dependency-input": blocked_input},
+                actual_model="fixture",
+                result_kind="worker",
+                changed_paths=("src/retained-d.ts",),
+            ),
+        )
+        blocked = self.store.get_task(task_id)
+        self.assertEqual(blocked["state"], "blocked")
+        return contract, {
+            "task_id": task_id,
+            "node_id": "D",
+            "expected_revision": blocked["state_revision"],
+            "expected_attempt": 2,
+            "expected_contract_hash": blocked["contract_hash"],
+            "profile_id": SCOPE_PROFILE_ID,
+            "reason": "bind the retained verifier allocation before amending D scope",
+            "dry_run": True,
+        }, prepared.worktree
+
     def _raw_nodes(self) -> dict[str, tuple[object, ...]]:
         with self.store.connection() as connection:
             rows = connection.execute(
@@ -337,6 +494,7 @@ class DIntegrationScopeTests(unittest.TestCase):
         self.assertEqual(preview["scope_changes"]["E"]["read_scopes"]["before"], ["legacy/*.md"])
         self.assertEqual(preview["scope_changes"]["E"]["read_scopes"]["added"], list(NODE_READ_ADDITIONS))
         self.assertEqual(preview["scope_changes"]["E"]["write_scopes"]["after"], [])
+        self.assertIsNone(preview["source"]["retained_verifier"])
         self.assertTrue(preview["nodes_would_change"])
         self.assertFalse(preview["nodes_changed"])
         self.assertFalse(preview["queued"])
@@ -557,6 +715,246 @@ class DIntegrationScopeTests(unittest.TestCase):
                 )
         with self.store.connection() as connection:
             self.assertEqual(tuple(connection.iterdump()), database_before)
+
+    def test_native_retained_verifier_allocation_accepts_legacy_event_and_pretty_result(self) -> None:
+        contract, arguments, source = self._create_real_retained_verifier_lane()
+        with self.store.transaction() as connection:
+            repair = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND node_id = 'E' AND event_type = 'task.repair_scheduled'
+                """,
+                (contract.task_id,),
+            ).fetchone()
+            assert repair is not None
+            payload = json.loads(str(repair["payload_json"]))
+            self.assertIn("repair_node_ids", payload)
+            payload.pop("repair_node_ids")
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                (canonical_json(payload), repair["cursor"]),
+            )
+            allocation = connection.execute(
+                """
+                SELECT allocation_id, node_result_json FROM worktree_allocations
+                WHERE task_id = ? AND node_id = 'E' AND attempt = 1
+                """,
+                (contract.task_id,),
+            ).fetchone()
+            assert allocation is not None
+            pretty_result = json.dumps(
+                json.loads(str(allocation["node_result_json"])), indent=2, sort_keys=True,
+            )
+            connection.execute(
+                "UPDATE worktree_allocations SET node_result_json = ? WHERE allocation_id = ?",
+                (pretty_result, allocation["allocation_id"]),
+            )
+
+        preview = scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        with self.store.connection() as connection:
+            e_allocation_before = tuple(connection.execute(
+                "SELECT * FROM worktree_allocations WHERE task_id = ? AND node_id = 'E' AND attempt = 1",
+                (contract.task_id,),
+            ).fetchone())
+            e_events_before = tuple(
+                tuple(row) for row in connection.execute(
+                    """
+                    SELECT cursor, event_type, payload_json, created_at FROM events
+                    WHERE task_id = ? AND node_id = 'E' ORDER BY cursor
+                    """,
+                    (contract.task_id,),
+                ).fetchall()
+            )
+            ancestors_before = {
+                str(row["node_id"]): tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT node_id, spec_json, state, attempt, worktree, result_json, recovery_json
+                    FROM nodes WHERE task_id = ? AND node_id IN ('A', 'B', 'C') ORDER BY node_id
+                    """,
+                    (contract.task_id,),
+                ).fetchall()
+            }
+        source_before = (source / "src" / "retained-d.ts").read_bytes()
+        retained = preview["source"]["retained_verifier"]
+        self.assertEqual(retained["attempt"], 1)
+        self.assertEqual(retained["idle_observation"], "idle")
+        self.assertEqual(set(retained["event_cursors"]), {"allocated", "failed", "repair"})
+        self.assertIn("result_sha256", retained)
+        self.assertNotIn("node_result_json", retained)
+        self.assertNotIn("payload", retained)
+
+        applied = scope.amend_blocked_integration_scope(
+            self.config,
+            self.store,
+            {**arguments, "dry_run": False, "expected_fingerprint": preview["fingerprint"]},
+        )
+        after = self.store.get_task(contract.task_id)
+        after_nodes = {node["node_id"]: node for node in after["nodes"]}
+        self.assertFalse(applied["dry_run"])
+        self.assertEqual((after["state"], after["state_revision"]), (
+            "blocked", arguments["expected_revision"] + 1,
+        ))
+        self.assertEqual(after_nodes["D"]["read_scopes"], ["src", *NODE_READ_ADDITIONS])
+        self.assertEqual(after_nodes["D"]["write_scopes"], ["src", *NODE_WRITE_ADDITIONS])
+        self.assertEqual(after_nodes["E"]["read_scopes"], ["legacy/*.md", *NODE_READ_ADDITIONS])
+        self.assertEqual(after_nodes["E"]["write_scopes"], [])
+        self.assertEqual(
+            (after_nodes["E"]["state"], after_nodes["E"]["attempt"], after_nodes["E"]["result"]),
+            ("pending", 1, None),
+        )
+        self.assertEqual((source / "src" / "retained-d.ts").read_bytes(), source_before)
+        with self.store.connection() as connection:
+            self.assertEqual(
+                tuple(connection.execute(
+                    "SELECT * FROM worktree_allocations WHERE task_id = ? AND node_id = 'E' AND attempt = 1",
+                    (contract.task_id,),
+                ).fetchone()),
+                e_allocation_before,
+            )
+            self.assertEqual(
+                tuple(
+                    tuple(row) for row in connection.execute(
+                        """
+                        SELECT cursor, event_type, payload_json, created_at FROM events
+                        WHERE task_id = ? AND node_id = 'E' ORDER BY cursor
+                        """,
+                        (contract.task_id,),
+                    ).fetchall()
+                ),
+                e_events_before,
+            )
+            ancestors_after = {
+                str(row["node_id"]): tuple(row)
+                for row in connection.execute(
+                    """
+                    SELECT node_id, spec_json, state, attempt, worktree, result_json, recovery_json
+                    FROM nodes WHERE task_id = ? AND node_id IN ('A', 'B', 'C') ORDER BY node_id
+                    """,
+                    (contract.task_id,),
+                ).fetchall()
+            }
+        self.assertEqual(ancestors_after, ancestors_before)
+
+    def test_native_retained_verifier_idle_failure_rejects_preview_without_mutation(self) -> None:
+        contract, arguments, _ = self._create_real_retained_verifier_lane()
+        before = self.store.get_task(contract.task_id)
+        with patch(
+            "codex_workbench.d_integration_scope.assert_recovery_source_idle",
+            side_effect=RecoveryProcessError("fixture E process remains active"),
+        ):
+            with self.assertRaisesRegex(StateConflictError, "retained verifier E is idle"):
+                scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        self.assertEqual(self.store.get_task(contract.task_id), before)
+
+    def test_retained_verifier_allocation_result_and_event_drift_reject_apply(self) -> None:
+        contract, arguments, _ = self._create_real_retained_verifier_lane()
+        preview = scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        apply = {**arguments, "dry_run": False, "expected_fingerprint": preview["fingerprint"]}
+        contract_before = self.store.get_task(contract.task_id)
+        with self.store.connection() as connection:
+            allocation = connection.execute(
+                """
+                SELECT allocation_id, node_result_json, updated_at FROM worktree_allocations
+                WHERE task_id = ? AND node_id = 'E' AND attempt = 1
+                """,
+                (contract.task_id,),
+            ).fetchone()
+            repair = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND node_id = 'E' AND event_type = 'task.repair_scheduled'
+                """,
+                (contract.task_id,),
+            ).fetchone()
+        assert allocation is not None and repair is not None
+        original_result = str(allocation["node_result_json"])
+        original_updated_at = str(allocation["updated_at"])
+        original_repair = str(repair["payload_json"])
+
+        with self.subTest("allocation"):
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE worktree_allocations SET updated_at = ? WHERE allocation_id = ?",
+                    ("2026-09-13T00:00:00+00:00", allocation["allocation_id"]),
+                )
+            with self.assertRaisesRegex(StateConflictError, "fingerprint changed"):
+                scope.amend_blocked_integration_scope(self.config, self.store, apply)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE worktree_allocations SET updated_at = ? WHERE allocation_id = ?",
+                    (original_updated_at, allocation["allocation_id"]),
+                )
+
+        with self.subTest("result"):
+            pretty_result = json.dumps(json.loads(original_result), indent=2, sort_keys=True)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE worktree_allocations SET node_result_json = ? WHERE allocation_id = ?",
+                    (pretty_result, allocation["allocation_id"]),
+                )
+            with self.assertRaisesRegex(StateConflictError, "fingerprint changed"):
+                scope.amend_blocked_integration_scope(self.config, self.store, apply)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE worktree_allocations SET node_result_json = ? WHERE allocation_id = ?",
+                    (original_result, allocation["allocation_id"]),
+                )
+
+        with self.subTest("event"):
+            changed_repair = json.loads(original_repair)
+            changed_repair["feedback_steering_id"] = "changed-after-preview"
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                    (canonical_json(changed_repair), repair["cursor"]),
+                )
+            with self.assertRaisesRegex(StateConflictError, "fingerprint changed"):
+                scope.amend_blocked_integration_scope(self.config, self.store, apply)
+            with self.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                    (original_repair, repair["cursor"]),
+                )
+
+        self.assertEqual(self.store.get_task(contract.task_id), contract_before)
+
+    def test_native_retained_verifier_rejects_future_allocation_and_later_unresolved_event(self) -> None:
+        contract, arguments, _ = self._create_real_retained_verifier_lane()
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO worktree_allocations(
+                    allocation_id, task_id, node_id, attempt, repository, base_sha,
+                    branch, current_path, state, created_at, updated_at
+                ) VALUES(?, ?, 'E', 2, ?, ?, ?, ?, 'superseded', ?, ?)
+                """,
+                (
+                    "retained-e-future",
+                    contract.task_id,
+                    str(self.repository),
+                    self.base_sha,
+                    WorktreeManager.branch_name(contract.task_id, "E", 2),
+                    str(self.worktrees.worktree_path(contract.task_id, "E", 1)),
+                    "2026-09-13T00:00:00+00:00",
+                    "2026-09-13T00:00:00+00:00",
+                ),
+            )
+        with self.assertRaisesRegex(StateConflictError, "future allocation"):
+            scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        with self.store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM worktree_allocations WHERE allocation_id = 'retained-e-future'"
+            )
+            WorkbenchStore._event(
+                connection,
+                "node.indeterminate",
+                contract.task_id,
+                "E",
+                {"attempt": 2, "result": {"status": "indeterminate"}},
+            )
+        with self.assertRaisesRegex(StateConflictError, "later lifecycle"):
+            scope.amend_blocked_integration_scope(self.config, self.store, arguments)
 
 
 if __name__ == "__main__":

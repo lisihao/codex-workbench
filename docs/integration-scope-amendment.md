@@ -14,6 +14,8 @@ Apply the reviewed preview with `dry_run: false`, its `expected_fingerprint`, an
 
 This operation does not modify repository files, execute generators or grant filesystem privileges to a Worker. It does not make an earlier out-of-scope change retrospectively compliant. The actual coordinator remains responsible for approving the exact scope preview and subsequent recovery.
 
+A pending verifier can retain the allocation of an earlier rejected attempt. Allocation state is not proof that an executor is running: native verifier settlement clears E's execution fields while preserving its worktree record. A retained same-attempt allocation is eligible only when its allocation, failed-verifier and repair-scheduled events agree, no later E execution invalidates that history, and the native read-only process check proves its source idle. The preview and transaction bind the unchanged allocation and historical evidence; they never delete, reclassify or rewrite them. Unknown activity, conflicting history and quarantine-in-progress remain blocking conditions.
+
 ## Restricted metadata writes
 
 The separate [controlled validation entry](controlled-validation.md) owns metadata execution. Its D pairing profile receives an explicit bounded list of Markdown pairs; it does not run `--all`. Its Agent Note profile receives reviewed English and Chinese text and creates only their exact approved paths. Neither profile exposes shell commands, arbitrary environment variables or general writable directories.
