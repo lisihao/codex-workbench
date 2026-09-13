@@ -16,7 +16,7 @@ The existing Coordinator control pool consumes bounded event metadata and sweeps
 | `resume_node` | Existing blocked-node retry CAS | Proven pre-execution dependency failure, fresh readiness and clean source with matching revision/attempt/allocation; never changes historical acceptance |
 | `repair_source` | Existing failed-attempt preparation followed by the ordinary worker executor | Explicit action grant, ready blocked non-verifier, fresh source/revision/attempt/policy binding and bounded repair count; never accepts the task |
 
-The fixed validation profiles currently cover the bounded DSH B IPC and pairing checks documented in [controlled validation](controlled-validation.md). This does not provide arbitrary acceptance commands, arbitrary Unix/Git grants or generic project compatibility. Existing readiness checks and those fixed profile plans do not yet constitute a general pre-dispatch capability proof for every project's acceptance surface.
+The autonomous policy's fixed validation allowlist covers the bounded DSH B IPC and pairing checks documented in [controlled validation](controlled-validation.md). The separate D metadata profiles require operator-selected file/content previews and are not added to this autonomous allowlist. This does not provide arbitrary acceptance commands, arbitrary Unix/Git grants or generic project compatibility. Existing readiness checks and those fixed profile plans do not yet constitute a general pre-dispatch capability proof for every project's acceptance surface.
 
 ## Configuration and observation
 

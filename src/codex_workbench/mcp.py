@@ -14,6 +14,8 @@ from .acceptance_amendment import ACCEPTANCE_AMENDMENT_TOOL, amend_task_acceptan
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
+from .d_integration_profile import SCOPE_PROFILE_ID
+from .d_integration_scope import amend_blocked_integration_scope
 from .node_recovery_api import RECOVERY_TOOLS, recovery_tool
 from .lockfile_handoff import TOOL as LOCKFILE_HANDOFF_TOOL, lockfile_handoff
 from .session_notifications_api import SESSION_NOTIFICATION_TOOLS, session_notification_tool
@@ -355,7 +357,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_control_task",
-        "description": "Queue, pause, resume, cancel, steer, or explicitly resolve an indeterminate node. Queue/resume may include an instruction, which is validated and persisted atomically before launch. Resuming a blocked task requires an exact node attempt plus an explicit recovery or no-side-effects assertion.",
+        "description": "Queue, pause, resume, cancel, steer, resolve an indeterminate node, or preview/apply the fixed blocked DSH integration scope amendment. Queue/resume may atomically persist an instruction before launch. Blocked resume requires an exact attempt and explicit recovery assertion; scope amendment never launches work.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -373,6 +375,7 @@ TOOLS: list[dict[str, Any]] = [
                         "resolve_indeterminate",
                         "resolve_indeterminate_locally",
                         "normalize_indeterminate_scope",
+                        "amend_blocked_integration_scope",
                     ]
                 },
                 "expected_revision": {"type": "integer"},
@@ -397,6 +400,9 @@ TOOLS: list[dict[str, Any]] = [
                 "exact_path": {"type": "string", "minLength": 1},
                 "expected_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "confirm_scope_normalization": {"type": "boolean"},
+                "profile_id": {"const": SCOPE_PROFILE_ID},
+                "expected_contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "expected_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                 "dry_run": {"type": "boolean"},
             },
         },
@@ -1221,6 +1227,13 @@ class WorkbenchMCPServer:
         if name == "workbench_control_task":
             task_id = arguments["task_id"]
             action = arguments["action"]
+            if action == "amend_blocked_integration_scope":
+                amendment_arguments = {key: value for key, value in arguments.items() if key != "action"}
+                return self._text(amend_blocked_integration_scope(
+                    self.config, self.store, amendment_arguments,
+                ))
+            if {"profile_id", "expected_contract_hash", "expected_fingerprint"}.intersection(arguments):
+                raise ValueError("integration amendment fields are only supported by amend_blocked_integration_scope")
             source_fields = {
                 "source_only", "confirm_preserve_unknown_ignored",
                 "confirm_source_only_extraction", "expected_source_delta_sha256",
