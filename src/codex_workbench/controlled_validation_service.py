@@ -84,6 +84,8 @@ VALIDATION_TOOL = {
             "note_anchor": {"type": "string", "minLength": 1},
             "note_english": {"type": "string", "minLength": 1, "maxLength": 65536},
             "note_chinese": {"type": "string", "minLength": 1, "maxLength": 65536},
+            "note_expected_english_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "note_expected_chinese_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "confirm_note_write": {"type": "boolean", "default": False},
         },
     },
@@ -140,7 +142,11 @@ def _validate_d_fields(values: dict[str, Any]) -> None:
     """Reject metadata fields outside the one D check that owns them."""
 
     check_id = values["check_id"]
-    note_fields = {"note_anchor", "note_english", "note_chinese", "confirm_note_write"}
+    note_fields = {
+        "note_anchor", "note_english", "note_chinese",
+        "note_expected_english_sha256", "note_expected_chinese_sha256",
+        "confirm_note_write",
+    }
     if check_id == D_PAIRING_WRITE:
         if any(field in values for field in note_fields):
             raise ValueError("D pairing writes do not accept Agent Note fields")

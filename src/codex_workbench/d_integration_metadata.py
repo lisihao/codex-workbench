@@ -60,11 +60,13 @@ class PairingMetadata:
 
 @dataclass(frozen=True)
 class AgentNoteMetadata:
-    """The exact two bytestrings for a D Agent Note creation request."""
+    """The exact two bytestrings and optional current hashes for a D Agent Note write."""
 
     anchor: str
     english: bytes
     chinese: bytes
+    expected_english_sha256: str | None = None
+    expected_chinese_sha256: str | None = None
 
     @property
     def chinese_path(self) -> str:
@@ -83,6 +85,8 @@ class AgentNoteMetadata:
             "note_chinese_sha256": sha256(self.chinese).hexdigest(),
             "note_english_bytes": len(self.english),
             "note_chinese_bytes": len(self.chinese),
+            "note_expected_english_sha256": self.expected_english_sha256,
+            "note_expected_chinese_sha256": self.expected_chinese_sha256,
         }
 
 
@@ -105,10 +109,16 @@ def metadata_request_from_arguments(
         return PairingMetadata(_pair_anchors(arguments.get("pair_anchors")))
     if check_id == NOTE_WRITE_ID:
         anchor = _note_anchor(arguments.get("note_anchor"))
+        expected_english, expected_chinese = _paired_expected_digest(
+            arguments.get("note_expected_english_sha256"),
+            arguments.get("note_expected_chinese_sha256"),
+        )
         return AgentNoteMetadata(
             anchor=anchor,
             english=_note_bytes(arguments.get("note_english"), "note_english"),
             chinese=_note_bytes(arguments.get("note_chinese"), "note_chinese"),
+            expected_english_sha256=expected_english,
+            expected_chinese_sha256=expected_chinese,
         )
     return None
 
@@ -126,10 +136,16 @@ def normalize_metadata_request(
     if check_id == NOTE_WRITE_ID:
         if not isinstance(request, AgentNoteMetadata):
             raise DIntegrationMetadataError("D Agent Note validation requires exact note metadata")
+        expected_english, expected_chinese = _paired_expected_digest(
+            request.expected_english_sha256,
+            request.expected_chinese_sha256,
+        )
         return AgentNoteMetadata(
             anchor=_note_anchor(request.anchor),
             english=_stored_note_bytes(request.english, "note_english"),
             chinese=_stored_note_bytes(request.chinese, "note_chinese"),
+            expected_english_sha256=expected_english,
+            expected_chinese_sha256=expected_chinese,
         )
     if request is not None:
         raise DIntegrationMetadataError("B validation checks do not accept D metadata")
@@ -222,6 +238,24 @@ def _stored_note_bytes(value: object, field: str) -> bytes:
     except UnicodeDecodeError as error:
         raise DIntegrationMetadataError(f"{field} must retain UTF-8 bytes") from error
     return value
+
+
+def _paired_expected_digest(english: object, chinese: object) -> tuple[str | None, str | None]:
+    """Validate the all-or-none current-byte identities for an existing note pair."""
+
+    if english is None and chinese is None:
+        return None, None
+    if not isinstance(english, str) or not isinstance(chinese, str):
+        raise DIntegrationMetadataError(
+            "Agent Note update requires both expected current SHA-256 digests"
+        )
+    for value, field in (
+        (english, "note_expected_english_sha256"),
+        (chinese, "note_expected_chinese_sha256"),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise DIntegrationMetadataError(f"{field} must be a lowercase SHA-256 digest")
+    return english, chinese
 
 
 def _clean_relative_path(value: object, label: str) -> str:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 import subprocess
 import tempfile
@@ -167,6 +168,34 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
                 self.worktree, NOTE_WRITE_ID, self.runtime, metadata=missing_parent
             )
 
+    def test_note_update_binds_both_expected_current_hashes_and_rejects_drift(self) -> None:
+        anchor = ".agents/notes/implemented/architecture/2026-09-13-update.md"
+        english = self.worktree / anchor
+        chinese = self.worktree / (anchor.removesuffix(".md") + ".zh.md")
+        english.write_bytes(b"old English\n")
+        chinese.write_bytes(b"old Chinese\n")
+        request = AgentNoteMetadata(
+            anchor,
+            b"new English\n",
+            b"new Chinese\n",
+            sha256(english.read_bytes()).hexdigest(),
+            sha256(chinese.read_bytes()).hexdigest(),
+        )
+        plan = validation.plan_validation(self.worktree, NOTE_WRITE_ID, self.runtime, metadata=request)
+        assert plan.metadata is not None and plan.metadata.agent_note is not None
+        self.assertEqual(
+            plan.metadata.agent_note.english_sha256,
+            request.expected_english_sha256,
+        )
+        self.assertEqual(
+            plan.metadata.agent_note.chinese_sha256,
+            request.expected_chinese_sha256,
+        )
+
+        chinese.write_bytes(b"concurrent change\n")
+        with self.assertRaisesRegex(validation.ControlledValidationError, "expected current SHA-256"):
+            validation._assert_immutable_plan(plan)
+
     def test_source_symlinks_and_profile_marker_drift_cannot_reuse_a_plan(self) -> None:
         request = PairingMetadata(("docs/d-guide.md",))
         plan = validation.plan_validation(self.worktree, PAIRING_WRITE_ID, self.runtime, metadata=request)
@@ -198,6 +227,13 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
                 "note_anchor": ".agents/notes/implemented/bugfix/2026-09-13-invalid.md",
                 "note_english": "English\n",
                 "note_chinese": "中文\n",
+            })
+        with self.assertRaisesRegex(DIntegrationMetadataError, "both expected current"):
+            metadata_request_from_arguments(NOTE_WRITE_ID, {
+                "note_anchor": ".agents/notes/implemented/bug-fix/2026-09-13-invalid.md",
+                "note_english": "English\n",
+                "note_chinese": "中文\n",
+                "note_expected_english_sha256": "a" * 64,
             })
 
 
