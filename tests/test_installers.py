@@ -184,6 +184,27 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(module.authority_max_workers({"max_workers": 4}), 8)
         self.assertEqual(module.authority_max_workers({"max_workers": 12}), 12)
 
+    def test_worktree_recycle_root_follows_managed_worktree_symlink(self) -> None:
+        module = self._macos_installer_module()
+        with tempfile.TemporaryDirectory(dir=PHYSICAL_TMP) as directory:
+            root = Path(directory)
+            state_root = root / "state"
+            physical_worktrees = root / "external" / "workbench" / "worktrees"
+            state_root.mkdir()
+            physical_worktrees.mkdir(parents=True)
+            (state_root / "worktrees").symlink_to(physical_worktrees)
+            legacy = state_root / "recycle" / "worktrees"
+
+            self.assertEqual(
+                module.worktree_recycle_root(state_root, str(legacy)),
+                physical_worktrees.parent / "recycle" / "worktrees",
+            )
+            custom = root / "custom-recycle"
+            self.assertEqual(
+                module.worktree_recycle_root(state_root, str(custom)),
+                custom,
+            )
+
     def test_authority_installer_persists_a_valid_spark_lane_and_performance_refresh_contract(self) -> None:
         module = self._macos_installer_module()
         self.assertEqual(module.authority_spark_workers({}, max_workers=8), 4)

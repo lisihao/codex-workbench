@@ -11,8 +11,10 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import time
+import traceback
 import uuid
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -42,6 +44,7 @@ LOGIN_FAILURE_WINDOW_SECONDS = 60.0
 LOGIN_FAILURE_TRACKER_LIMIT = 256
 SNAPSHOT_TASK_LIMIT = 10
 TASK_PAGE_MAX_LIMIT = 25
+SLOW_SERVICE_REQUEST_TRACE_SECONDS = 2.0
 ANONYMOUS_MAX_COLLECTION_ITEMS = 50
 ANONYMOUS_MAX_STRING_LENGTH = 256
 ANONYMOUS_MAX_DEPTH = 6
@@ -88,6 +91,30 @@ _ANONYMOUS_SENSITIVE_FIELDS = frozenset(
         "worktree",
     }
 )
+
+
+def log_slow_service_request(thread_id: int, stage: dict[str, str]) -> None:
+    """Write a bounded code-location trace without request data."""
+
+    frame = sys._current_frames().get(thread_id)
+    if frame is None:
+        return
+    locations = [
+        {"file": Path(item.filename).name, "line": item.lineno, "function": item.name}
+        for item in traceback.extract_stack(frame)[-12:]
+    ]
+    print(
+        json.dumps(
+            {
+                "event": "authority.service_request_slow",
+                "stage": stage["value"],
+                "locations": locations,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class WorkbenchHTTPServer(ThreadingHTTPServer):
@@ -393,19 +420,32 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if not self._authenticated():
             return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
         if parsed.path == "/api/service/requests":
+            trace_stage = {"value": "read_body"}
+            trace_timer = threading.Timer(
+                SLOW_SERVICE_REQUEST_TRACE_SECONDS,
+                log_slow_service_request,
+                args=(threading.get_ident(), trace_stage),
+            )
+            trace_timer.daemon = True
+            trace_timer.start()
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 2 * 1024 * 1024:
-                    raise ValueError("service request body must be between 1 byte and 2 MiB")
-                envelope = json.loads(self.rfile.read(length))
-                receipt = self.server.authority_service.dispatch(
-                    envelope, authenticated_actor="authority-control-token",
-                )
-                return self._json(receipt)
-            except (CommandConflictError, StateConflictError) as error:
-                return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 2 * 1024 * 1024:
+                        raise ValueError("service request body must be between 1 byte and 2 MiB")
+                    envelope = json.loads(self.rfile.read(length))
+                    trace_stage["value"] = "dispatch"
+                    receipt = self.server.authority_service.dispatch(
+                        envelope, authenticated_actor="authority-control-token",
+                    )
+                    trace_stage["value"] = "write_response"
+                    return self._json(receipt)
+                except (CommandConflictError, StateConflictError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.CONFLICT)
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            finally:
+                trace_timer.cancel()
         if parsed.path == "/api/clients/observe":
             try:
                 body = json.loads(self._read_body() or b"{}")

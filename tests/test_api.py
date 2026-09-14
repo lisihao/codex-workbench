@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import hmac
 from http import HTTPStatus
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -19,6 +21,7 @@ from codex_workbench.api import (
     LOGIN_FAILURE_WINDOW_SECONDS,
     SNAPSHOT_TASK_LIMIT,
     WorkbenchHTTPServer,
+    log_slow_service_request,
 )
 from codex_workbench.artifacts import ArtifactStore
 from codex_workbench.claude_quota import (
@@ -34,6 +37,97 @@ from codex_workbench.store import WorkbenchStore
 
 
 class APITests(unittest.TestCase):
+    def test_slow_service_request_trace_contains_only_code_locations(self) -> None:
+        output = io.StringIO()
+        with redirect_stderr(output):
+            log_slow_service_request(threading.get_ident(), {"value": "dispatch"})
+
+        trace = json.loads(output.getvalue())
+        self.assertEqual(trace["event"], "authority.service_request_slow")
+        self.assertEqual(trace["stage"], "dispatch")
+        self.assertTrue(trace["locations"])
+        self.assertEqual(
+            set(trace["locations"][-1]),
+            {"file", "line", "function"},
+        )
+        self.assertNotIn("task", output.getvalue().lower())
+        self.assertNotIn("argument", output.getvalue().lower())
+
+    def test_service_request_timer_reports_dispatch_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            dispatch_entered = threading.Event()
+            release_dispatch = threading.Event()
+            trace_written = threading.Event()
+            request_errors: list[BaseException] = []
+
+            def slow_dispatch(*_args, **_kwargs):
+                dispatch_entered.set()
+                release_dispatch.wait(timeout=2)
+                return {"state": "completed", "result": {}}
+
+            def capture_trace(thread_id: int, stage: dict[str, str]) -> None:
+                log_slow_service_request(thread_id, stage)
+                trace_written.set()
+
+            server.authority_service.dispatch = slow_dispatch
+            thread.start()
+            request = Request(
+                f"http://127.0.0.1:{server.server_address[1]}/api/service/requests",
+                data=json.dumps({
+                    "tool": "workbench_harness_health",
+                    "arguments": {},
+                }).encode(),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {config.token()}",
+                    "Content-Type": "application/json",
+                },
+            )
+            output = io.StringIO()
+
+            def send_request() -> None:
+                try:
+                    with urlopen(request, timeout=2) as response:
+                        self.assertEqual(json.load(response)["state"], "completed")
+                except BaseException as error:
+                    request_errors.append(error)
+
+            try:
+                with mock.patch(
+                    "codex_workbench.api.SLOW_SERVICE_REQUEST_TRACE_SECONDS",
+                    0.01,
+                ), mock.patch(
+                    "codex_workbench.api.log_slow_service_request",
+                    side_effect=capture_trace,
+                ), redirect_stderr(output):
+                    request_thread = threading.Thread(target=send_request)
+                    request_thread.start()
+                    self.assertTrue(dispatch_entered.wait(timeout=1))
+                    self.assertTrue(trace_written.wait(timeout=1))
+                    release_dispatch.set()
+                    request_thread.join(timeout=2)
+                    self.assertFalse(request_thread.is_alive())
+            finally:
+                release_dispatch.set()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(request_errors, [])
+            trace = json.loads(output.getvalue())
+            self.assertEqual(trace["stage"], "dispatch")
+            self.assertTrue(any(
+                location["function"] == "slow_dispatch"
+                for location in trace["locations"]
+            ))
+
     def test_ai_frontier_endpoint_and_summaries_are_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
