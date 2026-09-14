@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from copy import deepcopy
+from datetime import UTC, datetime
 import hmac
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -44,7 +45,8 @@ LOGIN_FAILURE_WINDOW_SECONDS = 60.0
 LOGIN_FAILURE_TRACKER_LIMIT = 256
 SNAPSHOT_TASK_LIMIT = 10
 TASK_PAGE_MAX_LIMIT = 25
-SLOW_SERVICE_REQUEST_TRACE_SECONDS = 2.0
+SLOW_SERVICE_REQUEST_TRACE_SECONDS = (2.0, 5.0)
+SLOW_SERVICE_REQUEST_TRACE_THREAD_LIMIT = 32
 ANONYMOUS_MAX_COLLECTION_ITEMS = 50
 ANONYMOUS_MAX_STRING_LENGTH = 256
 ANONYMOUS_MAX_DEPTH = 6
@@ -93,22 +95,48 @@ _ANONYMOUS_SENSITIVE_FIELDS = frozenset(
 )
 
 
-def log_slow_service_request(thread_id: int, stage: dict[str, str]) -> None:
-    """Write a bounded code-location trace without request data."""
+def log_slow_service_request(
+    request_thread_id: int,
+    stage: dict[str, str],
+    trace_id: str,
+    started_monotonic: float,
+    sample_after_seconds: float,
+) -> None:
+    """Write correlated bounded process-thread code locations without request data."""
 
-    frame = sys._current_frames().get(thread_id)
-    if frame is None:
+    frames = sys._current_frames()
+    if request_thread_id not in frames:
         return
-    locations = [
-        {"file": Path(item.filename).name, "line": item.lineno, "function": item.name}
-        for item in traceback.extract_stack(frame)[-12:]
-    ]
+    request_frame = frames[request_thread_id]
+    selected_frames = [(request_thread_id, request_frame)]
+    selected_frames.extend(
+        (thread_id, frame)
+        for thread_id, frame in sorted(frames.items())
+        if thread_id != request_thread_id
+    )
+    observed_threads = []
+    for thread_id, frame in selected_frames[:SLOW_SERVICE_REQUEST_TRACE_THREAD_LIMIT]:
+        locations = [
+            {"file": Path(item.filename).name, "line": item.lineno, "function": item.name}
+            for item in traceback.extract_stack(frame)[-12:]
+        ]
+        observed_threads.append({
+            "thread_id": thread_id,
+            "role": "request" if thread_id == request_thread_id else "process",
+            "locations": locations,
+        })
     print(
         json.dumps(
             {
                 "event": "authority.service_request_slow",
+                "trace_id": trace_id,
+                "observed_at_utc": datetime.now(UTC).isoformat(),
+                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                "sample_after_seconds": sample_after_seconds,
+                "process_id": os.getpid(),
+                "request_thread_id": request_thread_id,
                 "stage": stage["value"],
-                "locations": locations,
+                "threads": observed_threads,
             },
             sort_keys=True,
         ),
@@ -421,13 +449,26 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return self._json({"error": "authentication required"}, HTTPStatus.UNAUTHORIZED)
         if parsed.path == "/api/service/requests":
             trace_stage = {"value": "read_body"}
-            trace_timer = threading.Timer(
-                SLOW_SERVICE_REQUEST_TRACE_SECONDS,
-                log_slow_service_request,
-                args=(threading.get_ident(), trace_stage),
-            )
-            trace_timer.daemon = True
-            trace_timer.start()
+            trace_id = uuid.uuid4().hex[:12]
+            started_monotonic = time.monotonic()
+            request_thread_id = threading.get_ident()
+            trace_timers = [
+                threading.Timer(
+                    sample_after_seconds,
+                    log_slow_service_request,
+                    args=(
+                        request_thread_id,
+                        trace_stage,
+                        trace_id,
+                        started_monotonic,
+                        sample_after_seconds,
+                    ),
+                )
+                for sample_after_seconds in SLOW_SERVICE_REQUEST_TRACE_SECONDS
+            ]
+            for trace_timer in trace_timers:
+                trace_timer.daemon = True
+                trace_timer.start()
             try:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -445,7 +486,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError, json.JSONDecodeError) as error:
                     return self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             finally:
-                trace_timer.cancel()
+                for trace_timer in trace_timers:
+                    trace_timer.cancel()
         if parsed.path == "/api/clients/observe":
             try:
                 body = json.loads(self._read_body() or b"{}")

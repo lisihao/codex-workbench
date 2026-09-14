@@ -5,6 +5,7 @@ import hmac
 from http import HTTPStatus
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -39,15 +40,32 @@ from codex_workbench.store import WorkbenchStore
 class APITests(unittest.TestCase):
     def test_slow_service_request_trace_contains_only_code_locations(self) -> None:
         output = io.StringIO()
+        started = 10.0
         with redirect_stderr(output):
-            log_slow_service_request(threading.get_ident(), {"value": "dispatch"})
+            with mock.patch("codex_workbench.api.time.monotonic", return_value=12.5):
+                log_slow_service_request(
+                    threading.get_ident(),
+                    {"value": "dispatch"},
+                    "trace123",
+                    started,
+                    2.0,
+                )
 
         trace = json.loads(output.getvalue())
         self.assertEqual(trace["event"], "authority.service_request_slow")
+        self.assertEqual(trace["trace_id"], "trace123")
+        self.assertEqual(trace["elapsed_seconds"], 2.5)
+        self.assertEqual(trace["sample_after_seconds"], 2.0)
+        self.assertEqual(trace["process_id"], os.getpid())
+        self.assertEqual(trace["request_thread_id"], threading.get_ident())
+        self.assertTrue(trace["observed_at_utc"].endswith("+00:00"))
         self.assertEqual(trace["stage"], "dispatch")
-        self.assertTrue(trace["locations"])
+        request_trace = next(
+            item for item in trace["threads"] if item["role"] == "request"
+        )
+        self.assertTrue(request_trace["locations"])
         self.assertEqual(
-            set(trace["locations"][-1]),
+            set(request_trace["locations"][-1]),
             {"file", "line", "function"},
         )
         self.assertNotIn("task", output.getvalue().lower())
@@ -72,8 +90,20 @@ class APITests(unittest.TestCase):
                 release_dispatch.wait(timeout=2)
                 return {"state": "completed", "result": {}}
 
-            def capture_trace(thread_id: int, stage: dict[str, str]) -> None:
-                log_slow_service_request(thread_id, stage)
+            def capture_trace(
+                thread_id: int,
+                stage: dict[str, str],
+                trace_id: str,
+                started_monotonic: float,
+                sample_after_seconds: float,
+            ) -> None:
+                log_slow_service_request(
+                    thread_id,
+                    stage,
+                    trace_id,
+                    started_monotonic,
+                    sample_after_seconds,
+                )
                 trace_written.set()
 
             server.authority_service.dispatch = slow_dispatch
@@ -102,7 +132,7 @@ class APITests(unittest.TestCase):
             try:
                 with mock.patch(
                     "codex_workbench.api.SLOW_SERVICE_REQUEST_TRACE_SECONDS",
-                    0.01,
+                    (0.01, 10.0),
                 ), mock.patch(
                     "codex_workbench.api.log_slow_service_request",
                     side_effect=capture_trace,
@@ -123,9 +153,12 @@ class APITests(unittest.TestCase):
             self.assertEqual(request_errors, [])
             trace = json.loads(output.getvalue())
             self.assertEqual(trace["stage"], "dispatch")
+            self.assertEqual(trace["sample_after_seconds"], 0.01)
             self.assertTrue(any(
                 location["function"] == "slow_dispatch"
-                for location in trace["locations"]
+                for item in trace["threads"]
+                if item["role"] == "request"
+                for location in item["locations"]
             ))
 
     def test_ai_frontier_endpoint_and_summaries_are_read_only(self) -> None:
