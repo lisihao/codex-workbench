@@ -28,7 +28,12 @@ from .dependency_inputs import (
     apply_recorded_dependency_input,
     base_dependency_input,
     load_recorded_dependency_input,
+    rebind_recorded_lockfile_handoffs,
     validate_dependency_input_lineage,
+)
+from .lockfile_handoff import (
+    LockfileHandoffError,
+    _ready_lockfile_handoffs_from_connection,
 )
 from .model import canonical_json
 from .store import StateConflictError, WorkbenchStore
@@ -232,6 +237,7 @@ def build_accepted_repair_bindings(
     snapshot = _task_snapshot(task_id, contract, nodes)
 
     bindings: dict[str, AcceptedSourceRepairBinding] = {}
+    ready_lockfile_handoffs: list[dict[str, Any]] | None = None
     for node_id in requested:
         node = nodes.get(node_id)
         if node is None:
@@ -294,13 +300,29 @@ def build_accepted_repair_bindings(
                     node_id=node_id,
                     base_sha=base_sha,
                 )
+                validated_dependency_input = dependency_input
+                if dependency_input.receipt.get("schema_version") == 2:
+                    if ready_lockfile_handoffs is None:
+                        ready_lockfile_handoffs = _ready_lockfile_handoffs_from_connection(
+                            store,
+                            connection,
+                            task_id,
+                            verify_artifacts=True,
+                        )
+                    validated_dependency_input = rebind_recorded_lockfile_handoffs(
+                        snapshot,
+                        node_id,
+                        store.artifacts,
+                        dependency_input,
+                        ready_lockfile_handoffs=ready_lockfile_handoffs,
+                    )
                 validate_dependency_input_lineage(
                     snapshot,
                     node_id,
-                    dependency_input,
+                    validated_dependency_input,
                     artifacts=store.artifacts,
                 )
-            except (DependencyInputError, ValueError) as error:
+            except (DependencyInputError, LockfileHandoffError, ValueError) as error:
                 raise AcceptedSourceRepairError(
                     f"accepted-source repair owner {node_id} dependency input is invalid: {error}"
                 ) from error
@@ -569,33 +591,25 @@ def prepare_accepted_source_repair(
         )
         refresh_accepted_ancestors = parsed["requester"]["kind"] == "blocked_consumer"
         if refresh_accepted_ancestors:
-            target_spec = next(
-                node for node in store.get_task(parsed["task_id"])["nodes"]
-                if node["node_id"] == parsed["node_id"]
+            refreshed = apply_accepted_ancestor_patches(
+                store.get_task(parsed["task_id"]),
+                parsed["node_id"],
+                target,
+                store.artifacts,
+                manager,
+                ready_lockfile_handoffs=_ready_lockfile_handoffs(
+                    store, parsed["task_id"]
+                ),
             )
-            if target_spec["depends_on"]:
-                refreshed = apply_accepted_ancestor_patches(
-                    store.get_task(parsed["task_id"]),
-                    parsed["node_id"],
-                    target,
-                    store.artifacts,
-                    manager,
-                    ready_lockfile_handoffs=_ready_lockfile_handoffs(
-                        store, parsed["task_id"]
-                    ),
-                )
-                if refreshed is None:
-                    raise AcceptedSourceRepairError(
-                        "accepted-source repair cannot refresh its required ancestor input"
-                    )
-                dependency_input = refreshed
-            else:
+            if refreshed is None:
                 dependency_input = base_dependency_input(
                     task_id=parsed["task_id"],
                     node_id=parsed["node_id"],
                     base_sha=source["base_sha"],
                     worktree=target,
                 )
+            else:
+                dependency_input = refreshed
         else:
             dependency_input = _restore_dependency_input(
                 store,

@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.authority_service import AuthorityService
+from codex_workbench.accepted_source_repair import AcceptedSourceRepairError
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import (
     DependencyInput,
@@ -228,6 +229,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
         *,
         task_id: str,
         with_upstream: bool,
+        downstream_before_lock_owner: bool = False,
     ) -> tuple[TaskContract, dict[str, object], Path]:
         command = self._check_command()
         contract = TaskContract(
@@ -272,7 +274,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
             depends_on=("worker",),
             read_scopes=("packages/a/package.json", "pnpm-lock.yaml"),
             write_scopes=("pnpm-lock.yaml",),
-            ordinal=2,
+            ordinal=3 if downstream_before_lock_owner else 2,
         )
         downstream = NodeSpec(
             "downstream",
@@ -283,7 +285,7 @@ class LockfileHandoffInputTests(unittest.TestCase):
             command=command,
             depends_on=("worker",),
             read_scopes=("packages/a/package.json", "pnpm-lock.yaml"),
-            ordinal=3,
+            ordinal=2 if downstream_before_lock_owner else 3,
         )
         verifier = NodeSpec(
             "verify",
@@ -556,6 +558,50 @@ class LockfileHandoffInputTests(unittest.TestCase):
             coordinator._pool.shutdown(wait=True)
         return observed
 
+    def _run_worker_then_block_downstream(self, task_id: str) -> dict[str, object]:
+        """Accept the resumed owner, then create one durable blocked consumer."""
+
+        coordinator = Coordinator(
+            self.store,
+            self.config.state_root,
+            coordinator_epoch=self.epoch,
+            max_workers=1,
+            pnpm_materializer=_RecoveryMaterializer(),
+        )
+        pnpm = self.root / "pnpm-11-owner-repair-fixture"
+        pnpm.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  echo 11.25.0\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        pnpm.chmod(0o700)
+        try:
+            with patch.dict(os.environ, {"CODEX_WORKBENCH_PNPM": str(pnpm)}):
+                owner = coordinator._claim_next_ready_node("scope-owner-repair-worker")
+                assert owner is not None
+                self.assertEqual(owner["node_id"], "worker")
+                coordinator._execute_claimed(owner)
+                consumer = coordinator._claim_next_ready_node("scope-owner-repair-consumer")
+                assert consumer is not None
+                self.assertEqual(consumer["node_id"], "downstream")
+                self.store.settle_claimed(
+                    consumer,
+                    NodeResult(
+                        "blocked",
+                        "downstream requires its accepted owner to continue",
+                        result_kind="worker",
+                        changed_paths=(),
+                        checks=("fixture blocked consumer",),
+                    ),
+                )
+                return consumer
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
     def _failure_summary(self, task: dict[str, object], node_id: str) -> str:
         node = next(
             (
@@ -741,6 +787,164 @@ class LockfileHandoffInputTests(unittest.TestCase):
         self.assertEqual((task["state"], worker["state"], worker["attempt"]),
                          ("accepted", "accepted", 2))
         self.assertIn("worker", worktrees)
+
+    def test_scope_amendment_lineage_allows_blocked_consumer_owner_repair(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-scope-owner-repair",
+            with_upstream=False,
+            downstream_before_lock_owner=True,
+        )
+        self._apply_ready_handoff(contract, blocked, "handoff-scope-owner-repair-ready")
+        ready_before = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        self._resume_via_control_task(contract, self.store.get_task(contract.task_id))
+        consumer = self._run_worker_then_block_downstream(contract.task_id)
+        before_amendment = self.store.get_task(contract.task_id)
+        owner_before = next(
+            node for node in before_amendment["nodes"] if node["node_id"] == "worker"
+        )
+        recorded_ref = owner_before["result"]["artifacts"]["dependency-input"]
+        recorded = load_recorded_dependency_input(
+            self.store.artifacts,
+            recorded_ref,
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=self.base_sha,
+        )
+        self.assertEqual(
+            recorded.receipt["lockfile_handoffs"][0]["contract_hash"],
+            ready_before[0]["contract_hash"],
+        )
+
+        amended = self._amend_contract_with_rebound_handoffs(
+            contract.task_id,
+            node_id="downstream",
+        )
+        with self.store.connection() as connection:
+            amendment_row = connection.execute(
+                "SELECT cursor, payload_json FROM events WHERE task_id = ? "
+                "AND event_type = 'task.blocked_integration_scope_amended'",
+                (contract.task_id,),
+            ).fetchone()
+        assert amendment_row is not None
+        original_amendment = str(amendment_row["payload_json"])
+        forged_amendment = json.loads(original_amendment)
+        forged_amendment["new_contract"]["objective"] = "forged lineage"
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                (canonical_json(forged_amendment), amendment_row["cursor"]),
+            )
+        task_before_rejection = self.store.get_task(contract.task_id)
+        with self.assertRaisesRegex(
+            AcceptedSourceRepairError,
+            "dependency input is invalid",
+        ):
+            self.store.schedule_blocked_consumer_owner_repairs(
+                contract.task_id,
+                "downstream",
+                ["worker"],
+                {"worker": "must reject a forged scope lineage"},
+                expected_revision=int(amended["state_revision"]),
+                expected_attempt=int(consumer["attempt"]),
+                reason="forged lineage must not authorize owner repair",
+            )
+        self.assertEqual(
+            self.store.get_task(contract.task_id),
+            task_before_rejection,
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                (original_amendment, amendment_row["cursor"]),
+            )
+        receipt = self.store.schedule_blocked_consumer_owner_repairs(
+            contract.task_id,
+            "downstream",
+            ["worker"],
+            {"worker": "continue the accepted owner on the amended scope"},
+            expected_revision=int(amended["state_revision"]),
+            expected_attempt=int(consumer["attempt"]),
+            reason="scope-amended downstream requires its accepted owner",
+        )
+
+        self.assertEqual(receipt["revision"], int(amended["state_revision"]) + 1)
+        task = self.store.get_task(contract.task_id)
+        owner = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        self.assertEqual((task["state"], owner["state"], owner["attempt"]), ("queued", "pending", 2))
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        binding = json.loads(str(recovery_json))
+        self.assertEqual(
+            binding["source"]["dependency_input"]["lockfile_handoffs"][0]["contract_hash"],
+            ready_before[0]["contract_hash"],
+        )
+        self.assertEqual(
+            get_ready_lockfile_handoffs(self.store, contract.task_id)[0]["contract_hash"],
+            amended["contract_hash"],
+        )
+
+        coordinator = Coordinator(
+            self.store,
+            self.config.state_root,
+            coordinator_epoch=self.epoch,
+            max_workers=1,
+            pnpm_materializer=_RecoveryMaterializer(),
+        )
+        pnpm = self.root / "pnpm-11-owner-continuation-fixture"
+        pnpm.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  echo 11.25.0\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        pnpm.chmod(0o700)
+        try:
+            with patch.dict(os.environ, {"CODEX_WORKBENCH_PNPM": str(pnpm)}):
+                claimed = coordinator._claim_next_ready_node("scope-amended-owner-continuation")
+                assert claimed is not None
+                self.assertEqual((claimed["node_id"], claimed["attempt"]), ("worker", 3))
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        continued = self.store.get_task(contract.task_id)
+        owner = next(node for node in continued["nodes"] if node["node_id"] == "worker")
+        continued_worktree = Path(owner["worktree"])
+        restored_files = {
+            "package": (continued_worktree / "packages/a/package.json").read_text(
+                encoding="utf-8"
+            ),
+            "lockfile": (continued_worktree / "pnpm-lock.yaml").read_text(
+                encoding="utf-8"
+            ),
+        }
+        self.assertEqual(
+            (owner["state"], owner["attempt"]),
+            ("accepted", 3),
+            self._failure_summary(continued, "worker") + canonical_json(restored_files),
+        )
+        package = json.loads(
+            (continued_worktree / "packages/a/package.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(package["dependencies"]["@fixture/b"], "workspace:*")
+        continued_input = load_recorded_dependency_input(
+            self.store.artifacts,
+            owner["result"]["artifacts"]["dependency-input"],
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=self.base_sha,
+        )
+        self.assertEqual(continued_input.input_tree_sha, recorded.input_tree_sha)
+        self.assertEqual(
+            continued_input.receipt["lockfile_handoffs"][0]["contract_hash"],
+            amended["contract_hash"],
+        )
 
     def test_recorded_overlay_rebind_changes_no_content_identity(self) -> None:
         contract, blocked, _source = self._blocked_task(
