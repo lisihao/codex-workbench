@@ -1188,6 +1188,52 @@ class LockfileHandoffInputTests(unittest.TestCase):
                 ready_lockfile_handoffs=ready,
             )
 
+    def test_replay_accepts_exact_repaired_lockfile_bytes_as_idempotent(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-exact-after-idempotency",
+            with_upstream=False,
+        )
+        self._apply_ready_handoff(
+            contract,
+            blocked,
+            "handoff-exact-after-idempotency-ready",
+        )
+        handoffs = normalize_lockfile_handoffs(
+            self.store.artifacts,
+            get_ready_lockfile_handoffs(self.store, contract.task_id),
+            task_id=contract.task_id,
+            contract=self.store.get_task(contract.task_id)["contract"],
+        )
+        target = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "idempotent-lockfile-input",
+            2,
+        )
+        first_applied: set[str] = set()
+        apply_pending_lockfile_handoffs(
+            target,
+            self.store.artifacts,
+            handoffs,
+            [],
+            applied_request_ids=first_applied,
+        )
+        repaired = (target / "pnpm-lock.yaml").read_bytes()
+
+        replayed: set[str] = set()
+        apply_pending_lockfile_handoffs(
+            target,
+            self.store.artifacts,
+            handoffs,
+            [],
+            applied_request_ids=replayed,
+        )
+
+        self.assertEqual(replayed, {handoffs[0].request_id})
+        self.assertEqual((target / "pnpm-lock.yaml").read_bytes(), repaired)
+        self.assertEqual(sha256(repaired).hexdigest(), handoffs[0].sha256)
+
     def test_contract_rebinding_event_tampering_is_rejected(self) -> None:
         contract, blocked, _source = self._blocked_task(
             task_id="handoff-contract-rebind-tamper",

@@ -17,7 +17,11 @@ from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
 from .d_integration_profile import SCOPE_PROFILE_ID
 from .d_integration_scope import amend_blocked_integration_scope
-from .node_recovery_api import RECOVERY_TOOLS, recovery_tool
+from .node_recovery_api import (
+    RECOVERY_TOOLS,
+    recovery_tool,
+    resume_owner_repairs_tool,
+)
 from .lockfile_handoff import TOOL as LOCKFILE_HANDOFF_TOOL, lockfile_handoff
 from .session_notifications_api import SESSION_NOTIFICATION_TOOLS, session_notification_tool
 from .delivery import DeliveryError, GitHubDelivery, GitHubDeliveryRequest
@@ -1140,6 +1144,10 @@ class WorkbenchMCPServer:
             return self._text(_invoke_blocked_source_repair(self.store, validated))
         if name in {"workbench_configure_node_recovery", "workbench_get_node_recovery"}:
             return self._text(recovery_tool(self.store, name, arguments))
+        if name == "workbench_resume_owner_repairs":
+            return self._text(
+                resume_owner_repairs_tool(self.config, self.store, arguments)
+            )
         if name in {"workbench_read_session_notifications", "workbench_ack_session_notification"}:
             return self._text(session_notification_tool(self.store, name, arguments))
         if name == "workbench_amend_task_acceptance":

@@ -1,11 +1,19 @@
 """Task-policy activation uses the same authenticated Authority journal."""
 from pathlib import Path
+import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from codex_workbench.authority_service import AuthorityService
+from codex_workbench.config import WorkbenchConfig
 from codex_workbench.model import NodeSpec, TaskContract
-from codex_workbench.node_recovery_api import recovery_tool
+from codex_workbench.node_recovery_api import (
+    recovery_tool,
+    resume_owner_repairs_tool,
+)
+from codex_workbench.node_recovery_policy import RecoveryPolicy
+from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.node_recovery_source_repair import SourceRepairNodeActions
 from codex_workbench.service import Coordinator
 from codex_workbench.store import StateConflictError, WorkbenchStore
@@ -78,6 +86,91 @@ class NodeRecoveryAPITests(unittest.TestCase):
         after = self.store.get_task("policy-task")
         self.assertEqual(before["nodes"], after["nodes"])
         self.assertEqual(after["state"], "inbox")
+
+    def test_authenticated_configure_accepts_journal_request_id(self):
+        response = recovery_tool(self.store, "workbench_configure_node_recovery", {
+            "task_id": "policy-task",
+            "expected_revision": 1,
+            "policy": {"enabled": True},
+            "request_id": "configure-policy-through-authority-journal",
+        })
+        self.assertTrue(response["policy"]["enabled"])
+
+    def test_external_deployment_resume_verifies_identity_before_store_cas(self):
+        config = WorkbenchConfig(Path(self.temp.name) / "runtime")
+        config.install_manifest.parent.mkdir(parents=True)
+        config.install_manifest.write_text(json.dumps({
+            "version": "1.19.30",
+            "commit": "a" * 40,
+            "tag": "v1.19.30",
+            "installed_at": "2026-09-14T20:00:00+00:00",
+        }), encoding="utf-8")
+        NodeRecoveryStore(self.store).configure_policy(
+            "policy-task",
+            RecoveryPolicy(enabled=True, allowed_actions=("resume_owner_repairs",)),
+            expected_task_revision=1,
+            actor="fixture",
+        )
+        with self.store.transaction() as connection:
+            failure_cursor = self.store._event(
+                connection,
+                "node.accepted_source_repair_rolled_back",
+                "policy-task",
+                "worker",
+                {"attempt": 3},
+                created_at="2026-09-14T19:00:00+00:00",
+            )
+        candidate = {
+            "task_revision": 1,
+            "event_cursor": 17,
+            "progress_fingerprint": "progress-fixture",
+            "owner_node_ids": ["worker"],
+            "owner_attempts": {"worker": 3},
+            "failure_event_cursors": {"worker": failure_cursor},
+        }
+        stored = {
+            "request_id": "resume-external-deployment",
+            "revision": 2,
+            "event_cursor": 18,
+            "owner_node_ids": ["worker"],
+        }
+        authority = {
+            "active": True,
+            "instance_id": "authority-fixture",
+            "authority_epoch": 2,
+            "started_at": "2026-09-14T20:00:05+00:00",
+        }
+        with (
+            patch.object(
+                self.store,
+                "exhausted_blocked_owner_repair_candidate",
+                return_value=candidate,
+            ),
+            patch.object(self.store, "authority_status", return_value=authority),
+            patch.object(
+                self.store,
+                "resume_exhausted_blocked_owner_repairs",
+                return_value=stored,
+            ) as resume,
+        ):
+            result = resume_owner_repairs_tool(config, self.store, {
+                "task_id": "policy-task",
+                "node_id": "verify",
+                "expected_revision": 1,
+                "expected_attempt": 1,
+                "expected_version": "1.19.30",
+                "expected_commit": "a" * 40,
+                "expected_tag": "v1.19.30",
+                "confirm_deployment": True,
+                "request_id": "resume-external-deployment",
+            })
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deployment"]["authority_epoch"], 2)
+        self.assertEqual(result["owner_node_ids"], ["worker"])
+        call = resume.call_args.kwargs
+        self.assertEqual(call["expected_event_cursor"], 17)
+        self.assertEqual(len(call["repair_fingerprint"]), 64)
+        self.assertEqual(len(call["readiness_fingerprint"]), 64)
 
 
 if __name__ == "__main__":
