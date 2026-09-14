@@ -4618,7 +4618,7 @@ class WorkbenchStore:
                     or type(source_attempt) is not int
                     or owner is None
                     or owner["state"] != "accepted"
-                    or int(owner["attempt"]) != source_attempt + 1
+                    or int(owner["attempt"]) < source_attempt + 1
                     or owner["recovery_json"] is not None
                 ):
                     raise StateConflictError(

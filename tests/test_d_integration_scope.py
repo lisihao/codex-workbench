@@ -1225,6 +1225,36 @@ class DIntegrationScopeTests(unittest.TestCase):
             [("A", 2), ("B", 2), ("C", 2)],
         )
 
+    def test_rebased_d_accepts_owner_attempts_beyond_first_repair_target(self) -> None:
+        contract, arguments, _d_source = self._create_real_retained_verifier_lane()
+        preview = scope.amend_blocked_integration_scope(
+            self.config, self.store, arguments
+        )
+        scope.amend_blocked_integration_scope(
+            self.config,
+            self.store,
+            {**arguments, "dry_run": False, "expected_fingerprint": preview["fingerprint"]},
+        )
+        self._repair_blocked_consumer_owners(contract)
+        with self.store.transaction() as connection:
+            for owner_id in ("A", "B", "C"):
+                connection.execute(
+                    "UPDATE nodes SET attempt = attempt + 2 WHERE task_id = ? AND node_id = ?",
+                    (contract.task_id, owner_id),
+                )
+        wait = self.store.blocked_owner_repair_wait(contract.task_id, "D", 2)
+        assert wait is not None
+        self.assertFalse(wait["pending"])
+        self.assertTrue(all(item["satisfied"] for item in wait["dependencies"]))
+
+        queued = self._queue_rebased_d_source(
+            contract,
+            "rebase-d-after-multiple-owner-attempts",
+        )
+
+        self.assertTrue(queued["refresh_accepted_ancestors"])
+        self.assertEqual(queued["next_attempt"], 3)
+
     def test_rebased_d_conflict_rolls_back_without_repairing_owners_again(self) -> None:
         contract, arguments, d_source = self._create_real_retained_verifier_lane()
         preview = scope.amend_blocked_integration_scope(self.config, self.store, arguments)
