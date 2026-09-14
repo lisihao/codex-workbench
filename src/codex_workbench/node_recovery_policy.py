@@ -21,6 +21,7 @@ Action = Literal[
     "source_only_recovery",
     "request_repair",
     "resume_node",
+    "resume_owner_repairs",
     "repair_source",
 ]
 Category = Literal[
@@ -45,6 +46,7 @@ ALLOWED_ACTIONS: Final[frozenset[str]] = frozenset(
         "source_only_recovery",
         "request_repair",
         "resume_node",
+        "resume_owner_repairs",
         "repair_source",
     }
 )
@@ -562,11 +564,19 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
                 next_wakeup_at=_wakeup(now, policy.backoff_seconds),
             )
         if repair_deployed:
+            if "resume_owner_repairs" in policy.allowed_actions:
+                return _ready_action(
+                    policy,
+                    observation,
+                    category="tooling_bug",
+                    action="resume_owner_repairs",
+                    reason_kind="verified_repair_resumes_exhausted_owners",
+                )
             return _result(
                 category="tooling_bug",
                 action=None,
                 state="needs_action",
-                reason_kind="accepted_owner_repair_retry_requires_reconciliation",
+                reason_kind="accepted_owner_repair_resume_action_unconfigured",
                 owner="authority",
                 requires_authorization=False,
                 next_wakeup_at=_wakeup(now, policy.backoff_seconds),

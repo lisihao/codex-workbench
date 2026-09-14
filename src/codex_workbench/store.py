@@ -7196,7 +7196,7 @@ class WorkbenchStore:
                     and owner["recovery_json"] is None
                 )
                 preparation_failure: dict[str, Any] | None = None
-                if not satisfied:
+                if not satisfied and owner["state"] not in {"pending", "running"}:
                     failure_row = connection.execute(
                         """
                         SELECT cursor, payload_json FROM events
@@ -7267,6 +7267,270 @@ class WorkbenchStore:
             "dependencies": dependencies,
             "progress_fingerprint": canonical_hash(dependencies),
         }
+
+    def exhausted_blocked_owner_repair_candidate(
+        self,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+    ) -> dict[str, Any]:
+        """Return one exact exhausted owner-repair set eligible for reconciliation."""
+
+        wait = self.blocked_owner_repair_wait(task_id, node_id, attempt)
+        if wait is None or wait["pending"] is not True or wait["preparation_exhausted"] is not True:
+            raise StateConflictError("blocked owner repair preparation is not exhausted")
+        task = self.get_task(task_id)
+        node = next(
+            (item for item in task["nodes"] if item["node_id"] == node_id),
+            None,
+        )
+        if (
+            task["state"] != "blocked"
+            or node is None
+            or node["state"] != "blocked"
+            or int(node["attempt"]) != attempt
+        ):
+            raise StateConflictError("blocked owner repair requester changed")
+        exhausted = [
+            item for item in wait["dependencies"] if item["preparation_exhausted"] is True
+        ]
+        return {
+            "task_id": task_id,
+            "node_id": node_id,
+            "node_attempt": attempt,
+            "task_revision": int(task["state_revision"]),
+            "event_cursor": int(wait["event_cursor"]),
+            "progress_fingerprint": str(wait["progress_fingerprint"]),
+            "owner_node_ids": [str(item["node_id"]) for item in exhausted],
+            "owner_attempts": {
+                str(item["node_id"]): int(item["current_attempt"])
+                for item in exhausted
+            },
+            "failure_event_cursors": {
+                str(item["node_id"]): int(item["preparation_failure"]["event_cursor"])
+                for item in exhausted
+            },
+        }
+
+    def resume_exhausted_blocked_owner_repairs(
+        self,
+        *,
+        request_id: str,
+        action_fingerprint: str,
+        task_id: str,
+        node_id: str,
+        expected_attempt: int,
+        expected_revision: int,
+        expected_event_cursor: int,
+        expected_progress_fingerprint: str,
+        repair_fingerprint: str,
+        readiness_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Requeue only exhausted pre-execution owners after verified repair readiness."""
+
+        for value, name in (
+            (request_id, "request_id"),
+            (action_fingerprint, "action_fingerprint"),
+            (expected_progress_fingerprint, "expected_progress_fingerprint"),
+            (repair_fingerprint, "repair_fingerprint"),
+            (readiness_fingerprint, "readiness_fingerprint"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be non-empty")
+        candidate = self.exhausted_blocked_owner_repair_candidate(
+            task_id, node_id, expected_attempt,
+        )
+        if (
+            candidate["task_revision"] != expected_revision
+            or candidate["event_cursor"] != expected_event_cursor
+            or candidate["progress_fingerprint"] != expected_progress_fingerprint
+        ):
+            raise StateConflictError("exhausted owner repair candidate changed")
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE event_type = 'task.exhausted_owner_repairs_resumed'
+                  AND json_extract(payload_json, '$.request_id') = ?
+                ORDER BY cursor DESC LIMIT 1
+                """,
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                payload = json.loads(str(existing["payload_json"]))
+                if payload.get("action_fingerprint") != action_fingerprint:
+                    raise StateConflictError("owner repair resume request id was reused")
+                return {**payload, "event_cursor": int(existing["cursor"])}
+            consumed = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE task_id = ? AND node_id = ?
+                  AND event_type = 'task.exhausted_owner_repairs_resumed'
+                  AND json_extract(payload_json, '$.repair_fingerprint') = ?
+                LIMIT 1
+                """,
+                (task_id, node_id, repair_fingerprint),
+            ).fetchone()
+            if consumed is not None:
+                raise StateConflictError(
+                    "verified repair evidence was already consumed"
+                )
+            task = connection.execute(
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            requester = connection.execute(
+                "SELECT state, attempt FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            if (
+                task is None
+                or requester is None
+                or task["state"] != "blocked"
+                or int(task["state_revision"]) != expected_revision
+                or requester["state"] != "blocked"
+                or int(requester["attempt"]) != expected_attempt
+            ):
+                raise StateConflictError("owner repair resume requester changed")
+            schedule = connection.execute(
+                """
+                SELECT payload_json FROM events
+                WHERE cursor = ? AND task_id = ? AND node_id = ?
+                  AND event_type = 'task.blocked_owner_repair_scheduled'
+                """,
+                (expected_event_cursor, task_id, node_id),
+            ).fetchone()
+            if schedule is None:
+                raise StateConflictError("owner repair schedule event changed")
+            schedule_payload = json.loads(str(schedule["payload_json"]))
+            owners = candidate["owner_node_ids"]
+            if not owners or any(
+                owner not in schedule_payload.get("repair_node_ids", []) for owner in owners
+            ):
+                raise StateConflictError("owner repair exhausted set changed")
+            from .accepted_source_repair import parse_accepted_source_repair_binding
+
+            continued: dict[str, list[dict[str, Any]]] = {}
+            for owner_id in owners:
+                owner = connection.execute(
+                    """
+                    SELECT state, attempt, recovery_json FROM nodes
+                    WHERE task_id = ? AND node_id = ?
+                    """,
+                    (task_id, owner_id),
+                ).fetchone()
+                if (
+                    owner is None
+                    or owner["state"] != "blocked"
+                    or int(owner["attempt"]) != candidate["owner_attempts"][owner_id]
+                ):
+                    raise StateConflictError("exhausted owner state changed")
+                binding = parse_accepted_source_repair_binding(owner["recovery_json"])
+                if (
+                    binding is None
+                    or binding["requester"]["kind"] != "blocked_consumer"
+                    or binding["requester"]["node_id"] != node_id
+                    or binding["requester"]["attempt"] != expected_attempt
+                ):
+                    raise StateConflictError("exhausted owner repair binding changed")
+                target_attempt = int(owner["attempt"]) + 1
+                continued[owner_id] = self._continue_attempt_steering(
+                    connection,
+                    task_id=task_id,
+                    node_id=owner_id,
+                    source_attempt=int(owner["attempt"]),
+                    target_attempt=target_attempt,
+                    timestamp=timestamp,
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE nodes
+                    SET state = 'pending', worker_id = NULL, worktree = NULL,
+                        effective_executor = NULL, effective_model = NULL,
+                        started_at = NULL, settled_at = NULL, result_json = NULL,
+                        coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+                    WHERE task_id = ? AND node_id = ? AND state = 'blocked'
+                      AND attempt = ? AND recovery_json = ?
+                    """,
+                    (
+                        timestamp,
+                        task_id,
+                        owner_id,
+                        owner["attempt"],
+                        owner["recovery_json"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError("exhausted owner repair resume CAS failed")
+            revision = expected_revision + 1
+            connection.execute(
+                """
+                UPDATE tasks
+                SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL
+                WHERE task_id = ?
+                """,
+                (revision, timestamp, task_id),
+            )
+            payload = {
+                "request_id": request_id,
+                "action_fingerprint": action_fingerprint,
+                "requester_node_id": node_id,
+                "requester_attempt": expected_attempt,
+                "owner_node_ids": owners,
+                "owner_attempts": candidate["owner_attempts"],
+                "next_attempts": {
+                    owner: candidate["owner_attempts"][owner] + 1 for owner in owners
+                },
+                "failure_event_cursors": candidate["failure_event_cursors"],
+                "repair_fingerprint": repair_fingerprint,
+                "readiness_fingerprint": readiness_fingerprint,
+                "continued_steering": continued,
+                "revision": revision,
+            }
+            cursor = self._event(
+                connection,
+                "task.exhausted_owner_repairs_resumed",
+                task_id,
+                node_id,
+                payload,
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "task.state_changed",
+                task_id,
+                None,
+                {
+                    "from": "blocked",
+                    "to": "queued",
+                    "revision": revision,
+                    "exhausted_owner_repairs_resumed": True,
+                },
+                created_at=timestamp,
+            )
+            return {**payload, "event_cursor": cursor}
+
+    def exhausted_owner_repair_resume_receipt(
+        self, request_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one exact exhausted-owner resume receipt without replaying it."""
+
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be non-empty")
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE event_type = 'task.exhausted_owner_repairs_resumed'
+                  AND json_extract(payload_json, '$.request_id') = ?
+                ORDER BY cursor DESC LIMIT 1
+                """,
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(str(row["payload_json"])), "event_cursor": int(row["cursor"])}
 
     def resolve_indeterminate(
         self,
@@ -13121,7 +13385,16 @@ class WorkbenchStore:
             not control_state_preserved
             and int(row["attempt"]) < max_target_attempt
         )
+        continued_steering: list[dict[str, Any]] = []
         if retry_scheduled:
+            continued_steering = self._continue_attempt_steering(
+                connection,
+                task_id=task_id,
+                node_id=node_id,
+                source_attempt=int(row["attempt"]),
+                target_attempt=int(row["attempt"]) + 1,
+                timestamp=timestamp,
+            )
             changed = connection.execute(
                 """
                 UPDATE nodes
@@ -13148,19 +13421,18 @@ class WorkbenchStore:
             changed = connection.execute(
                 """
                 UPDATE nodes
-                SET state = 'accepted', attempt = ?, worker_id = NULL, worktree = ?,
+                SET state = 'blocked', worker_id = NULL, worktree = NULL,
                     effective_executor = NULL, effective_model = NULL,
-                    started_at = NULL, settled_at = ?, result_json = ?, recovery_json = NULL,
+                    started_at = NULL, settled_at = ?, result_json = ?, recovery_json = ?,
                     coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
                 WHERE task_id = ? AND node_id = ? AND state = 'running'
                   AND attempt = ? AND coordinator_epoch = ? AND lease_epoch = ?
                   AND worktree IS NULL
                 """,
                 (
-                    source["attempt"],
-                    source["worktree"],
                     timestamp,
-                    repair["source_result_json"],
+                    canonical_json(result.to_dict()),
+                    canonical_json(repair),
                     timestamp,
                     task_id,
                     node_id,
@@ -13206,6 +13478,7 @@ class WorkbenchStore:
                 "retry_scheduled": retry_scheduled,
                 "next_attempt": int(row["attempt"]) + 1 if retry_scheduled else None,
                 "max_target_attempt": max_target_attempt,
+                "continued_steering": continued_steering,
             },
             created_at=timestamp,
         )
@@ -13225,6 +13498,75 @@ class WorkbenchStore:
                 },
                 created_at=timestamp,
             )
+
+    @staticmethod
+    def _continue_attempt_steering(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        node_id: str,
+        source_attempt: int,
+        target_attempt: int,
+        timestamp: str,
+    ) -> list[dict[str, Any]]:
+        """Copy delivered attempt guidance to one later pre-execution retry."""
+
+        rows = connection.execute(
+            """
+            SELECT steering.steering_id, steering.instruction
+            FROM task_steering AS steering
+            WHERE steering.task_id = ? AND steering.scope = 'attempt'
+              AND steering.target_node_id = ? AND steering.target_attempt = ?
+              AND EXISTS (
+                  SELECT 1 FROM events AS delivery
+                  WHERE delivery.task_id = steering.task_id
+                    AND delivery.node_id = steering.target_node_id
+                    AND delivery.event_type = 'task.steering_delivered'
+                    AND json_extract(delivery.payload_json, '$.steering_id') = steering.steering_id
+                    AND json_extract(delivery.payload_json, '$.attempt') = ?
+              )
+            ORDER BY steering.sequence
+            """,
+            (task_id, node_id, source_attempt, source_attempt),
+        ).fetchall()
+        continued: list[dict[str, Any]] = []
+        for row in rows:
+            steering_id = "steering-" + canonical_hash(
+                {
+                    "kind": "accepted-source-preparation-continuation",
+                    "source_steering_id": row["steering_id"],
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "target_attempt": target_attempt,
+                }
+            )[:24]
+            sequence = WorkbenchStore._next_steering_sequence(connection, task_id)
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence,
+                    scope, target_node_id, target_attempt
+                ) VALUES(?, ?, ?, ?, ?, 'attempt', ?, ?)
+                """,
+                (
+                    steering_id,
+                    task_id,
+                    row["instruction"],
+                    timestamp,
+                    sequence,
+                    node_id,
+                    target_attempt,
+                ),
+            ).rowcount
+            if inserted:
+                continued.append(
+                    {
+                        "source_steering_id": str(row["steering_id"]),
+                        "steering_id": steering_id,
+                        "target_attempt": target_attempt,
+                    }
+                )
+        return continued
 
     def _prevalidate_settlement(
         self,

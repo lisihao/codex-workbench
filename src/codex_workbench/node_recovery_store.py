@@ -1673,11 +1673,13 @@ class NodeRecoveryStore:
                 """,
                 (canonical_json(refs), verified, timestamp, timestamp, repair["repair_link_id"]),
             )
+            policy = self._policy_from_document(json.loads(str(episode["policy_json"])))
             if paused:
                 planned = _suspended_decision("user_pause")
+                deadline = str(episode["time_budget_deadline_at"])
             else:
-                policy = self._policy_from_document(json.loads(str(episode["policy_json"])))
                 planned = _repair_deployed_wait_decision(policy.backoff_seconds, timestamp)
+                deadline = _after(timestamp, policy.time_budget_seconds)
             observed = json.loads(str(episode["observation_json"]))
             for key in ("validated_source_delta", "validated_install_manifest", "validated_runtime_fingerprint", "validation_audit_ref",
                         "last_validation_profile", "repair_wait_kind", "repair_wait_state"):
@@ -1692,6 +1694,7 @@ class NodeRecoveryStore:
                 UPDATE node_recovery_episodes
                 SET phase = 'repair_deployed', state = ?, action = ?, owner = ?,
                     permission_required = ?, state_revision = ?, next_wakeup_at = ?,
+                    time_budget_deadline_at = ?,
                     last_material_progress_at = ?, last_progress_json = ?, decision_json = ?, updated_at = ?,
                     repair_deployment_fingerprint = ?, observation_json = ?
                 WHERE episode_id = ? AND state_revision = ?
@@ -1699,6 +1702,7 @@ class NodeRecoveryStore:
                 (
                     planned["state"], planned["action"], planned["owner"],
                     int(planned["requires_authorization"]), revision, planned["next_wakeup_at"],
+                    deadline,
                     timestamp,
                     canonical_json(
                         {

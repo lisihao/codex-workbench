@@ -723,6 +723,12 @@ class NodeRecoveryStoreTests(unittest.TestCase):
             repair_fingerprint=deployment,
         )
         self.assertEqual(repeated["revision"], linked["revision"])
+        expired = "2020-01-01T00:00:00+00:00"
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
         deployed = self.store.mark_repair_deployed(
             linked["episode_id"], expected_revision=linked["revision"], expected_node_attempt=0,
             verified_deployment_fingerprint=_fingerprint("verified-deployment"),
@@ -733,6 +739,87 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         self.assertEqual(deployed["repair"]["repair_fingerprint"], deployment)
         self.assertEqual(deployed["repair"]["verified_deployment_fingerprint"], _fingerprint("verified-deployment"))
         self.assertIsNotNone(deployed["repair"]["deployed_at"])
+        self.assertNotEqual(deployed["time_budget_deadline_at"], expired)
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
+        replayed_deployment = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=deployed["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=_fingerprint("verified-deployment"),
+            expected_repair_fingerprint=deployment,
+            evidence_refs={"deployment": "sha256:" + deployment + ":deployment.json"},
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(replayed_deployment["time_budget_deadline_at"], expired)
+
+    def _assert_repair_deployment_preserves_control(self, control_state: str) -> None:
+        episode = self._record("repair-" + control_state)
+        claimed = self._claim(episode)
+        repair_fingerprint = _fingerprint("repair-" + control_state)
+        linked = self.store.link_repair(
+            claimed["episode_id"],
+            owner_id="fixture-owner",
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+            expected_revision=claimed["revision"],
+            repair_request_id="repair-request-" + control_state,
+            repair_task_id="repair-task-" + control_state,
+            repair_fingerprint=repair_fingerprint,
+        )
+        expired = "2000-01-01T00:00:00+00:00"
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
+        task = self.base.get_task(self.task_id)
+        self.base.queue_task(
+            self.task_id, expected_revision=int(task["state_revision"])
+        )
+        task = self.base.get_task(self.task_id)
+        self.base.transition_task(
+            self.task_id,
+            control_state,
+            expected_revision=int(task["state_revision"]),
+        )
+        deployment = _fingerprint("deployment-" + control_state)
+        evidence = {"deployment": "sha256:" + deployment + ":deployment.json"}
+        deployed = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=linked["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=deployment,
+            expected_repair_fingerprint=repair_fingerprint,
+            evidence_refs=evidence,
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(self.base.get_task(self.task_id)["state"], control_state)
+        self.assertEqual(
+            (deployed["state"], deployed["decision"]["reason_kind"]),
+            ("suspended", "user_pause"),
+        )
+        self.assertEqual(deployed["time_budget_deadline_at"], expired)
+        replayed = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=deployed["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=deployment,
+            expected_repair_fingerprint=repair_fingerprint,
+            evidence_refs=evidence,
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(replayed["revision"], deployed["revision"])
+        self.assertEqual(replayed["time_budget_deadline_at"], expired)
+
+    def test_repair_deployment_preserves_pause_and_does_not_renew_its_budget(self) -> None:
+        self._assert_repair_deployment_preserves_control("paused")
+
+    def test_repair_deployment_preserves_cancel_and_does_not_renew_its_budget(self) -> None:
+        self._assert_repair_deployment_preserves_control("cancelled")
 
     def test_cursor_cas_and_bounded_documents_reject_unsafe_history(self) -> None:
         self.assertEqual(self.store.read_cursor(), 0)

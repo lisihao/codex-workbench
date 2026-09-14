@@ -371,12 +371,17 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
         task = self.store.get_task(contract.task_id)
         owner = next(node for node in task["nodes"] if node["node_id"] == "B")
         self.assertEqual((task["state"], owner["state"], owner["attempt"]), (
-            "needs_fix", "accepted", 1,
+            "needs_fix", "blocked", 3,
         ))
-        self.assertEqual(owner["result"], accepted_before["result"])
-        next_claim = self.store.claim_ready_node("must-not-loop", self.epoch)
-        assert next_claim is not None
-        self.assertEqual(next_claim["node_id"], "verify")
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        binding = parse_accepted_source_repair_binding(recovery_json)
+        assert binding is not None
+        self.assertEqual(json.loads(binding["source_result_json"]), accepted_before["result"])
+        self.assertIsNone(self.store.claim_ready_node("must-not-loop", self.epoch))
         rollbacks = [
             event
             for event in self.store.read_events(task_id=contract.task_id)

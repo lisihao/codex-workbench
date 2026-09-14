@@ -9,10 +9,14 @@ from unittest.mock import patch
 
 from codex_workbench import accepted_source_repair
 from codex_workbench.accepted_source_repair import AcceptedSourceRepairError
-from codex_workbench.model import NodeResult
+from codex_workbench.model import NodeResult, canonical_hash
+from codex_workbench.node_recovery import NodeRecoveryReconciler
 from codex_workbench.node_recovery_observation import collect_node_observation
+from codex_workbench.node_recovery_owner_repair import OwnerRepairNodeActions
 from codex_workbench.node_recovery_policy import RecoveryPolicy, plan_recovery
+from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.service import Coordinator
+from codex_workbench.store import StateConflictError
 from tests.process_probe_fixture import isolated_process_catalog
 
 
@@ -206,14 +210,13 @@ class BlockedOwnerAutoContinuationTests(unittest.TestCase):
                 attempts,
                 [
                     ("B", 2), ("B", 3), ("B", 4), ("B", 5),
-                    ("C", 2), ("C", 3), ("C", 4), ("C", 5),
                 ],
             )
             task = store.get_task(contract.task_id)
             nodes = {node["node_id"]: node for node in task["nodes"]}
             self.assertEqual(task["state"], "blocked")
-            self.assertEqual((nodes["B"]["state"], nodes["B"]["attempt"]), ("accepted", 1))
-            self.assertEqual((nodes["C"]["state"], nodes["C"]["attempt"]), ("accepted", 1))
+            self.assertEqual((nodes["B"]["state"], nodes["B"]["attempt"]), ("blocked", 5))
+            self.assertEqual((nodes["C"]["state"], nodes["C"]["attempt"]), ("pending", 1))
             self.assertEqual(nodes["D"]["result"], d_before["result"])
             self.assertIsNone(coordinator._claim_next_ready_node("must-not-spin"))
 
@@ -223,10 +226,11 @@ class BlockedOwnerAutoContinuationTests(unittest.TestCase):
             assert owner_wait is not None
             self.assertTrue(owner_wait["pending"])
             self.assertTrue(owner_wait["preparation_exhausted"])
-            self.assertTrue(all(
-                dependency["preparation_exhausted"]
+            exhaustion = {
+                dependency["node_id"]: dependency["preparation_exhausted"]
                 for dependency in owner_wait["dependencies"]
-            ))
+            }
+            self.assertEqual(exhaustion, {"B": True, "C": False})
             observed = collect_node_observation(store, contract.task_id, "D")
             self.assertTrue(observed["blocked_owner_repair_preparation_exhausted"])
             observed.update({
@@ -294,6 +298,302 @@ class BlockedOwnerAutoContinuationTests(unittest.TestCase):
                 (timed_out["action"], timed_out["reason_kind"], timed_out["owner"]),
                 (None, "accepted_owner_repair_repair_budget_exhausted", "authority"),
             )
+
+            current = store.get_task(contract.task_id)
+            recovery = NodeRecoveryStore(store)
+            resume_policy = RecoveryPolicy(
+                enabled=True,
+                allowed_actions=("request_repair", "resume_owner_repairs"),
+                repair_repository=str(fixture.repository),
+                repair_allowed_scopes=("src",),
+            )
+            recovery.configure_policy(
+                contract.task_id,
+                resume_policy,
+                expected_task_revision=int(current["state_revision"]),
+                actor="verified-repair-fixture",
+            )
+            initial_repair_observation = collect_node_observation(
+                store, contract.task_id, "D"
+            )
+            initial_repair_observation.update({
+                "now": "2026-09-14T16:05:00+00:00",
+                "elapsed_seconds": 0,
+                "action_attempts": 0,
+            })
+            request_decision = plan_recovery(
+                resume_policy, initial_repair_observation
+            )
+            self.assertEqual(
+                (request_decision["state"], request_decision["action"]),
+                ("ready", "request_repair"),
+            )
+            adapter = OwnerRepairNodeActions(store)
+            repair_fingerprint = canonical_hash({"repair": "verified-owner-harness"})
+            deployment_fingerprint = canonical_hash({"deployment": "verified-owner-harness"})
+            episode = recovery.record_episode(
+                initial_repair_observation,
+                request_decision,
+            )
+            claimed_episode = recovery.claim_due(
+                episode["episode_id"],
+                "repair-link-fixture",
+                fixture.epoch,
+                expected_revision=episode["revision"],
+                expected_node_attempt=int(d_before["attempt"]),
+            )
+            assert claimed_episode is not None
+            repair_action_fingerprint = canonical_hash({
+                "episode_id": claimed_episode["episode_id"],
+                "action": "request_repair",
+            })
+            intended = recovery.begin_action(
+                claimed_episode["episode_id"],
+                "fixture-request-repair",
+                repair_action_fingerprint,
+                {"stage_key": "request_repair"},
+                owner_id="repair-link-fixture",
+                coordinator_epoch=fixture.epoch,
+                lease_epoch=claimed_episode["lease_epoch"],
+                expected_revision=claimed_episode["revision"],
+                expected_node_attempt=int(d_before["attempt"]),
+            )
+            linked = recovery.link_repair(
+                intended["episode"]["episode_id"],
+                owner_id="repair-link-fixture",
+                coordinator_epoch=fixture.epoch,
+                lease_epoch=intended["episode"]["lease_epoch"],
+                expected_revision=intended["episode"]["revision"],
+                repair_request_id="repair-owner-harness",
+                repair_task_id="repair-owner-harness-task",
+                repair_fingerprint=repair_fingerprint,
+            )
+            settled_repair_request = recovery.settle_action(
+                linked["episode_id"],
+                "fixture-request-repair",
+                owner_id="repair-link-fixture",
+                coordinator_epoch=fixture.epoch,
+                lease_epoch=linked["lease_epoch"],
+                expected_revision=linked["revision"],
+                expected_node_attempt=int(d_before["attempt"]),
+                receipt={
+                    "ok": True,
+                    "known_effects": True,
+                    "stage_succeeded": True,
+                    "evidence_refs": {},
+                    "observation_patch": {
+                        "repair_requested": True,
+                        "repair_linked": True,
+                        "repair_fingerprint": repair_fingerprint,
+                    },
+                },
+                next_decision={
+                    "category": "tooling_bug",
+                    "state": "waiting",
+                    "action": None,
+                    "owner": "repair",
+                    "reason_kind": "repair_deployment_wait",
+                    "requires_authorization": False,
+                    "next_wakeup_at": "2000-01-01T00:00:00+00:00",
+                },
+                receipt_state="completed",
+                effect_dispatched=True,
+                material_progress=True,
+            )["episode"]
+            with store.transaction() as connection:
+                connection.execute(
+                    "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                    ("2000-01-01T00:00:00+00:00", episode["episode_id"]),
+                )
+            deployment_ref = store.artifacts.put_text(
+                "verified owner repair deployment\n", "deployment.json"
+            )
+            deployed = recovery.mark_repair_deployed(
+                settled_repair_request["episode_id"],
+                expected_revision=settled_repair_request["revision"],
+                expected_node_attempt=int(d_before["attempt"]),
+                verified_deployment_fingerprint=deployment_fingerprint,
+                expected_repair_fingerprint=repair_fingerprint,
+                evidence_refs={"deployment": deployment_ref},
+                verified_by="fixture-deployment-verifier",
+                fresh_readiness_verified=True,
+            )
+            self.assertNotEqual(
+                deployed["time_budget_deadline_at"], "2000-01-01T00:00:00+00:00"
+            )
+            repaired_observation = {
+                **initial_repair_observation,
+                "repair_deployed_verified": True,
+                "repair_deployed": True,
+                "readiness_ready": True,
+                "repair_fingerprint": repair_fingerprint,
+                "validated_runtime_fingerprint": deployment_fingerprint,
+            }
+
+            def observe_repaired(
+                observed_store: object,
+                task_id: str,
+                node_id: str,
+                *,
+                source_event_cursor: int = 0,
+            ) -> dict[str, object]:
+                snapshot = collect_node_observation(
+                    observed_store,  # type: ignore[arg-type]
+                    task_id,
+                    node_id,
+                    source_event_cursor=source_event_cursor,
+                )
+                if node_id == "D":
+                    snapshot.update({
+                        "repair_fingerprint": repair_fingerprint,
+                        "repair_deployed": True,
+                        "repair_deployed_verified": True,
+                        "readiness_ready": True,
+                        "validated_runtime_fingerprint": deployment_fingerprint,
+                    })
+                return snapshot
+
+            loop = NodeRecoveryReconciler(
+                store,
+                coordinator_epoch=fixture.epoch,
+                adapters={"resume_owner_repairs": adapter},
+                observer=observe_repaired,
+                monotonic=lambda: 0,
+            )
+            completed_recovery = loop.reconcile_once()
+            self.assertEqual(len(completed_recovery), 1)
+            completed_episode = recovery.get_episode(episode["episode_id"])
+            resume_actions = [
+                item
+                for item in completed_episode["actions"]
+                if item["stage_key"] == "resume_owner_repairs"
+            ]
+            self.assertEqual(len(resume_actions), 1)
+            action = resume_actions[0]
+            self.assertEqual(
+                action["action_input"]["action"], "resume_owner_repairs"
+            )
+            self.assertTrue(action["receipt"]["stage_succeeded"])
+            self.assertIn(
+                "owner-repair-resume", action["receipt"]["evidence_refs"]
+            )
+            replayed_action = adapter.execute(action["action_input"])
+            self.assertEqual(
+                replayed_action["request_id"], action["action_input"]["request_id"]
+            )
+            resume_events = [
+                event
+                for event in store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "task.exhausted_owner_repairs_resumed"
+            ]
+            self.assertEqual(len(resume_events), 1)
+            self.assertEqual(
+                resume_events[0]["payload"]["request_id"],
+                action["action_input"]["request_id"],
+            )
+
+            resumed_task = store.get_task(contract.task_id)
+            resumed_nodes = {node["node_id"]: node for node in resumed_task["nodes"]}
+            self.assertEqual(resumed_task["state"], "queued")
+            self.assertEqual((resumed_nodes["B"]["state"], resumed_nodes["B"]["attempt"]), (
+                "pending", 5,
+            ))
+            self.assertEqual((resumed_nodes["C"]["state"], resumed_nodes["C"]["attempt"]), (
+                "pending", 1,
+            ))
+
+            with patch.object(
+                accepted_source_repair,
+                "prepare_accepted_source_repair",
+                side_effect=AcceptedSourceRepairError(
+                    "first verified repair did not fix owner preparation"
+                ),
+            ):
+                failed_after_repair = coordinator._claim_next_ready_node(
+                    "owner-after-first-repair"
+                )
+                assert failed_after_repair is not None
+                self.assertEqual(
+                    (failed_after_repair["node_id"], failed_after_repair["attempt"]),
+                    ("B", 6),
+                )
+                self.assertIn("repair B", failed_after_repair["steering"])
+                coordinator._execute_claimed(failed_after_repair)
+
+            same_evidence_observation = collect_node_observation(
+                store, contract.task_id, "D"
+            )
+            same_evidence_observation.update(repaired_observation)
+            same_evidence_observation["task_revision"] = store.get_task(
+                contract.task_id
+            )["state_revision"]
+            replay_plan = adapter.prepare(
+                same_evidence_observation,
+                "resume_owner_repairs",
+                "resume-with-reused-repair-evidence",
+            )
+            with self.assertRaisesRegex(StateConflictError, "already consumed"):
+                adapter.execute(replay_plan)
+
+            refreshed_readiness_plan = adapter.prepare(
+                {
+                    **same_evidence_observation,
+                    "validated_runtime_fingerprint": "runtime-" + "e" * 64,
+                },
+                "resume_owner_repairs",
+                "resume-with-reused-repair-new-readiness",
+            )
+            with self.assertRaisesRegex(StateConflictError, "already consumed"):
+                adapter.execute(refreshed_readiness_plan)
+
+            new_evidence_observation = {
+                **same_evidence_observation,
+                "repair_fingerprint": "repair-" + "c" * 64,
+                "validated_runtime_fingerprint": "runtime-" + "d" * 64,
+            }
+            second_plan = adapter.prepare(
+                new_evidence_observation,
+                "resume_owner_repairs",
+                "resume-with-new-repair-evidence",
+            )
+            second_resumed = adapter.execute(second_plan)
+            self.assertTrue(second_resumed["stage_succeeded"])
+
+            completed_attempts: list[tuple[str, int, tuple[str, ...]]] = []
+
+            class RepairedExecutor:
+                def execute(self, request: object) -> NodeResult:
+                    completed_attempts.append((
+                        str(request.node_id),  # type: ignore[attr-defined]
+                        int(request.attempt),  # type: ignore[attr-defined]
+                        tuple(request.steering),  # type: ignore[attr-defined]
+                    ))
+                    return NodeResult(
+                        "succeeded",
+                        f"verified repair continued {request.node_id}",  # type: ignore[attr-defined]
+                    )
+
+            with patch.object(coordinator, "_executor", return_value=RepairedExecutor()):
+                b_claim = coordinator._claim_next_ready_node("owner-after-repair-B")
+                assert b_claim is not None
+                coordinator._execute_claimed(b_claim)
+                c_claim = coordinator._claim_next_ready_node("owner-after-repair-C")
+                assert c_claim is not None
+                coordinator._execute_claimed(c_claim)
+            self.assertEqual(
+                [(node_id, attempt) for node_id, attempt, _ in completed_attempts],
+                [("B", 7), ("C", 2)],
+            )
+            self.assertIn("repair B", completed_attempts[0][2])
+            self.assertIn("repair C", completed_attempts[1][2])
+            final_wait = store.blocked_owner_repair_wait(
+                contract.task_id, "D", int(d_before["attempt"])
+            )
+            assert final_wait is not None
+            self.assertFalse(final_wait["pending"])
+            final_task = store.get_task(contract.task_id)
+            final_d = next(node for node in final_task["nodes"] if node["node_id"] == "D")
+            self.assertEqual(final_d["result"], d_before["result"])
 
 
 if __name__ == "__main__":

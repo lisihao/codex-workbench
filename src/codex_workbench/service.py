@@ -264,6 +264,7 @@ class Coordinator:
         from .node_recovery_actions import JournaledNodeActions
         from .node_recovery_readiness import ReadinessNodeActions
         from .node_recovery_local import LocalNodeActions
+        from .node_recovery_owner_repair import OwnerRepairNodeActions
         from .node_recovery_repair import RepairNodeActions
         from .node_recovery_source_repair import SourceRepairNodeActions
         from .node_recovery_store import NodeRecoveryStore
@@ -285,6 +286,7 @@ class Coordinator:
                 "source_only_recovery": journaled,
                 "materialize_dependencies": local, "resume_node": local,
                 "repair_source": SourceRepairNodeActions(self.store),
+                "resume_owner_repairs": OwnerRepairNodeActions(self.store),
                 "request_repair": RepairNodeActions(self.config, NodeRecoveryStore(self.store), authority_service),
             },
         )
