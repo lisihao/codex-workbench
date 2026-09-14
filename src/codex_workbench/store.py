@@ -14603,9 +14603,27 @@ class WorkbenchStore:
 
     def stale_tasks(self, max_age_seconds: int = 300) -> list[dict[str, str]]:
         cutoff = datetime.now(UTC).timestamp() - max_age_seconds
-        active = {"planning", "ready", "queued", "running", "verifying", "needs_fix", "needs_approval"}
+        active = (
+            "planning",
+            "ready",
+            "queued",
+            "running",
+            "verifying",
+            "needs_fix",
+            "needs_approval",
+        )
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, state, updated_at
+                FROM tasks
+                WHERE state IN (?, ?, ?, ?, ?, ?, ?)
+                ORDER BY updated_at DESC, rowid DESC
+                """,
+                active,
+            ).fetchall()
         return [
-            {"task_id": task["task_id"], "state": task["state"], "updated_at": task["updated_at"]}
-            for task in self.list_tasks()
-            if task["state"] in active and datetime.fromisoformat(task["updated_at"]).timestamp() < cutoff
+            {"task_id": row["task_id"], "state": row["state"], "updated_at": row["updated_at"]}
+            for row in rows
+            if datetime.fromisoformat(row["updated_at"]).timestamp() < cutoff
         ]

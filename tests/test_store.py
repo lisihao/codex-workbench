@@ -533,6 +533,42 @@ class StoreTests(unittest.TestCase):
             ["planning_request.enqueued", "planning_request.claimed", "planning_request.succeeded"],
         )
 
+    def test_stale_tasks_reads_only_active_task_summaries(self) -> None:
+        self.store.create_task(
+            self.contract,
+            verified([NodeSpec("a", "task-1", "A", "fixture", "fixture", "ok")], "task-1"),
+            "stale-task-command",
+        )
+        terminal_contract = self._planning_contract("terminal-task")
+        self.store.create_task(
+            terminal_contract,
+            self._planning_nodes(terminal_contract.task_id),
+            "terminal-task-command",
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE tasks SET state = 'running', updated_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE task_id = 'task-1'"
+            )
+            connection.execute(
+                "UPDATE tasks SET state = 'accepted', updated_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE task_id = 'terminal-task'"
+            )
+
+        with mock.patch.object(
+            self.store,
+            "list_tasks",
+            side_effect=AssertionError("stale diagnostics must not hydrate task graphs"),
+        ):
+            self.assertEqual(
+                self.store.stale_tasks(),
+                [{
+                    "task_id": "task-1",
+                    "state": "running",
+                    "updated_at": "2000-01-01T00:00:00+00:00",
+                }],
+            )
+
     def test_planning_request_completion_and_failure_are_fenced(self) -> None:
         self.store.enqueue_planning_request("plan-fence", "plan-task", {"objective": "fence"})
         claimed = self.store.claim_planning_request(self.epoch)
