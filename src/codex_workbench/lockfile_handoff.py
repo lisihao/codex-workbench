@@ -366,7 +366,10 @@ def _validate_scope_amendment_contract_change(
     """Require the referenced D amendment to be a monotonic scope-only change."""
 
     if (
-        payload.get("profile_id") != "dsh-task-template-integration-v1"
+        payload.get("profile_id") not in {
+            "dsh-task-template-integration-v1",
+            "dsh-task-template-integration-v2",
+        }
         or payload.get("old_contract_hash") != old_contract_hash
         or payload.get("new_contract_hash") != new_contract_hash
         or payload.get("revision") != task_revision

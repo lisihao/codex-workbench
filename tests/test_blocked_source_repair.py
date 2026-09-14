@@ -156,6 +156,7 @@ class BlockedSourceRepairTests(_FailedAttemptRecoveryFixture, unittest.TestCase)
                 coordinator._execute_claimed(claimed)
 
             verifier = coordinator._claim_next_ready_node("blocked-source-verifier")
+            self.assertIsNotNone(verifier, self.store.get_task(contract.task_id))
             assert verifier is not None
             self.assertEqual(verifier["node_id"], "verify")
             with patch.object(coordinator, "_executor") as executor:
@@ -388,6 +389,78 @@ class BlockedSourceRepairTests(_FailedAttemptRecoveryFixture, unittest.TestCase)
             any("events_blocked_source_repair_request_id_idx" in str(row[3]) for row in plan),
             plan,
         )
+
+    def test_pre_refresh_marker_pending_binding_and_receipt_remain_readable(self) -> None:
+        contract, _, blocked = self._blocked_source(task_id="blocked-source-legacy-marker")
+        self._configure(contract.task_id, int(blocked["state_revision"]))
+        _, queued = self._preview_and_queue(
+            contract, blocked, request_id="legacy-refresh-marker"
+        )
+        with self.store.transaction() as connection:
+            node = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            ).fetchone()
+            event = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND event_type = 'node.blocked_source_repair_queued'
+                """,
+                (contract.task_id,),
+            ).fetchone()
+            assert node is not None and event is not None
+            binding = json.loads(str(node["recovery_json"]))
+            payload = json.loads(str(event["payload_json"]))
+            for field in ("refresh_accepted_ancestors", "owner_repair_event_cursor"):
+                binding.pop(field)
+                payload.pop(field)
+            connection.execute(
+                "UPDATE nodes SET recovery_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                (json.dumps(binding, sort_keys=True, separators=(",", ":")), contract.task_id),
+            )
+            connection.execute(
+                "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")), event["cursor"]),
+            )
+
+        receipt = blocked_source_repair_receipt(self.store, "legacy-refresh-marker")
+        assert receipt is not None
+        self.assertFalse(receipt["refresh_accepted_ancestors"])
+        self.assertIsNone(receipt["owner_repair_event_cursor"])
+        claimed = self.store.claim_ready_node("legacy-refresh-marker-worker", self.epoch)
+        assert claimed is not None
+        self.assertFalse(claimed["failed_attempt_recovery"]["refresh_accepted_ancestors"])
+        self.assertIsNone(claimed["failed_attempt_recovery"]["owner_repair_event_cursor"])
+        self.assertEqual(queued["request_id"], receipt["request_id"])
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            context = coordinator._execution_attribution_context(claimed)
+            coordinator._prepare_failed_attempt_recovery(claimed, context)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'worker'",
+                (contract.task_id,),
+            ).fetchone()
+            assert row is not None
+            assigned = json.loads(str(row["recovery_json"]))
+            assigned.pop("refresh_accepted_ancestors")
+            assigned.pop("owner_repair_event_cursor")
+            legacy_assigned_json = json.dumps(
+                assigned, sort_keys=True, separators=(",", ":")
+            )
+            connection.execute(
+                "UPDATE nodes SET recovery_json = ? WHERE task_id = ? AND node_id = 'worker'",
+                (legacy_assigned_json, contract.task_id),
+            )
+        parsed = self.store._failed_attempt_recovery_binding(
+            legacy_assigned_json, next_attempt=2, allow_assigned=True
+        )
+        assert parsed is not None
+        self.assertFalse(parsed["refresh_accepted_ancestors"])
+        self.assertIsNone(parsed["owner_repair_event_cursor"])
 
     def test_undeclared_untracked_source_path_is_not_preserved(self) -> None:
         contract, source, blocked = self._blocked_source(task_id="blocked-source-undeclared")

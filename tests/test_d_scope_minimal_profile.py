@@ -13,12 +13,16 @@ from codex_workbench.d_integration_profile import (
 
 EXPECTED_WRITES = (
     "scripts/gen-cordis-catalog.ts",
+    "scripts/gen-doc-graphs.ts",
     "packages/extensions/tool-cordis/src/api-catalog.ts",
     "packages/extensions/cordis-client-runner/src/client/slot-catalog.ts",
     "packages/core/session/src/known-event-types.ts",
     "examples/acp-agent/tests/acp.snapshot.ts",
     "examples/acp-agent/tests/fixtures/task-template/task-template.cordis.yml",
     "examples/acp-agent/tests/fixtures/task-template/task-template.cordis.snapshot.yml",
+    "packages/prompt/README.md",
+    "packages/prompt/README.zh.md",
+    "packages/prompt/README.i18n.yaml",
     "packages/prompt/task-template-rpc/package.json",
 )
 
@@ -48,7 +52,6 @@ REMOVED_SPECULATIVE_WRITES = (
     "packages/prompt/task-template/README.i18n.yaml",
     "packages/orchestration/orchestration/README.i18n.yaml",
     "packages/physical-operator/physical-operator/README.i18n.yaml",
-    "packages/prompt/README.i18n.yaml",
 )
 
 REMOVED_BROAD_OR_UNNEEDED_READS = (
@@ -63,9 +66,9 @@ REMOVED_BROAD_OR_UNNEEDED_READS = (
 class DScopeMinimalProfileTests(unittest.TestCase):
     """Keep the fixed profile at the evidence-supported file boundary."""
 
-    def test_write_scope_is_exactly_the_eight_evidenced_files(self) -> None:
+    def test_write_scope_is_exactly_the_twelve_evidenced_files(self) -> None:
         self.assertEqual(NODE_WRITE_ADDITIONS, EXPECTED_WRITES)
-        self.assertEqual(len(NODE_WRITE_ADDITIONS), 8)
+        self.assertEqual(len(NODE_WRITE_ADDITIONS), 12)
         self.assertTrue(set(NODE_WRITE_ADDITIONS).isdisjoint(REMOVED_SPECULATIVE_WRITES))
 
     def test_read_scope_separates_exact_inputs_from_outputs(self) -> None:

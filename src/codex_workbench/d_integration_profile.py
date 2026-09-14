@@ -1,11 +1,12 @@
 """Closed source-file additions for the blocked DSH template integration repair."""
 
-SCOPE_PROFILE_ID = "dsh-task-template-integration-v1"
+SCOPE_PROFILE_ID = "dsh-task-template-integration-v2"
 PAIRING_WRITE_ID = "dsh-d-pairing-write-v1"
 NOTE_WRITE_ID = "dsh-d-agent-note-write-v1"
 
 _GENERATOR_WRITES = (
     "scripts/gen-cordis-catalog.ts",
+    "scripts/gen-doc-graphs.ts",
     "packages/extensions/tool-cordis/src/api-catalog.ts",
     "packages/extensions/cordis-client-runner/src/client/slot-catalog.ts",
     "packages/core/session/src/known-event-types.ts",
@@ -17,9 +18,16 @@ _ASSEMBLED_SNAPSHOT_WRITES = (
     "examples/acp-agent/tests/fixtures/task-template/task-template.cordis.snapshot.yml",
 )
 
+_PROMPT_INDEX_WRITES = (
+    "packages/prompt/README.md",
+    "packages/prompt/README.zh.md",
+    "packages/prompt/README.i18n.yaml",
+)
+
 NODE_WRITE_ADDITIONS = (
     *_GENERATOR_WRITES,
     *_ASSEMBLED_SNAPSHOT_WRITES,
+    *_PROMPT_INDEX_WRITES,
     "packages/prompt/task-template-rpc/package.json",
 )
 

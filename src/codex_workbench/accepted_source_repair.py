@@ -23,6 +23,7 @@ from typing import Any, TypedDict
 from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
+    apply_accepted_ancestor_patches,
     apply_ready_lockfile_handoffs_to_dependency_input,
     apply_recorded_dependency_input,
     base_dependency_input,
@@ -34,7 +35,8 @@ from .store import StateConflictError, WorkbenchStore
 from .worktrees import WorktreeError, WorktreeManager
 
 
-ACCEPTED_SOURCE_REPAIR_KIND = "accepted-source-repair-v1"
+LEGACY_ACCEPTED_SOURCE_REPAIR_KIND = "accepted-source-repair-v1"
+ACCEPTED_SOURCE_REPAIR_KIND = "accepted-source-repair-v2"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -64,13 +66,21 @@ class AcceptedSourceRepairBinding(TypedDict):
     authorization_revision: int
     task_id: str
     node_id: str
-    verifier_node_id: str
-    verifier_attempt: int
+    requester: AcceptedSourceRepairRequester
     repair_node_ids: list[str]
     source_status: str
     source_allocation_id: str
     source_result_json: str
     source: AcceptedSourceRepairSource
+
+
+class AcceptedSourceRepairRequester(TypedDict):
+    """Durable origin that requested an accepted owner to resume."""
+
+    kind: str
+    node_id: str
+    attempt: int
+    result_sha256: str | None
 
 
 class AcceptedSourceRepairPreparedReceipt(TypedDict):
@@ -107,43 +117,50 @@ def build_accepted_repair_bindings(
     connection: sqlite3.Connection,
     task_id: str,
     repair_node_ids: Sequence[str],
-    verifier_node_id: str,
-    verifier_attempt: int,
+    requester_node_id: str,
+    requester_attempt: int,
     authorization_revision: int,
+    *,
+    requester_kind: str = "verifier",
 ) -> dict[str, AcceptedSourceRepairBinding]:
-    """Build filesystem-free source bindings for an explicit verifier repair.
+    """Build filesystem-free source bindings for an explicit repair request.
 
     This function only reads the supplied SQLite connection and verified
     content-addressed artifacts.  Callers may invoke it while authorizing the
     verifier transition, but must perform all Git worktree preparation after
     that write transaction commits.  The caller is responsible for proving
-    that the currently-running verifier result is a failed repair request;
-    the signature intentionally does not accept a mutable verifier result.
+    that the requester result warrants the exact owners. A verifier request is
+    built while that verifier is running; a blocked-consumer request binds the
+    already-settled blocked receipt by digest.
 
     @param store: The authority store owning task state and artifacts.
     @param connection: A caller-owned SQLite connection used only for reads.
     @param task_id: Task whose verifier requested the repair.
     @param repair_node_ids: Exact accepted source owners to resume.
-    @param verifier_node_id: The running verifier that authorized this repair.
-    @param verifier_attempt: Current verifier attempt.
+    @param requester_node_id: Verifier or blocked consumer requesting repair.
+    @param requester_attempt: Current requester attempt.
     @param authorization_revision: Task revision the caller will commit.
+    @param requester_kind: Either ``verifier`` or ``blocked_consumer``.
     @returns: One immutable binding for each requested owner.
     """
 
     task_id = _text(task_id, "task_id")
-    verifier_node_id = _text(verifier_node_id, "verifier_node_id")
+    requester_node_id = _text(requester_node_id, "requester_node_id")
     requested = _repair_node_ids(repair_node_ids)
-    _positive_int(verifier_attempt, "verifier_attempt")
+    _positive_int(requester_attempt, "requester_attempt")
     _positive_int(authorization_revision, "authorization_revision")
+    if requester_kind not in {"verifier", "blocked_consumer"}:
+        raise AcceptedSourceRepairError("accepted-source repair requester kind is invalid")
 
     task = connection.execute(
         "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
     ).fetchone()
     if task is None:
         raise KeyError(task_id)
-    if task["state"] != "verifying":
+    expected_task_state = "verifying" if requester_kind == "verifier" else "blocked"
+    if task["state"] != expected_task_state:
         raise AcceptedSourceRepairError(
-            f"task {task_id} is {task['state']}, expected verifying"
+            f"task {task_id} is {task['state']}, expected {expected_task_state}"
         )
     if authorization_revision != int(task["state_revision"]) + 1:
         raise AcceptedSourceRepairError(
@@ -158,18 +175,37 @@ def build_accepted_repair_bindings(
         "SELECT * FROM nodes WHERE task_id = ? ORDER BY node_id", (task_id,)
     ).fetchall()
     nodes = _node_rows(task_id, rows)
-    verifier = nodes.get(verifier_node_id)
-    if verifier is None:
-        raise AcceptedSourceRepairError("accepted-source repair verifier is missing")
-    verifier_spec = verifier["spec"]
-    if verifier_spec.get("verifier") is not True:
-        raise AcceptedSourceRepairError("accepted-source repair node is not a verifier")
-    if verifier["row"]["state"] != "running":
-        raise AcceptedSourceRepairError("accepted-source repair verifier is not running")
-    if int(verifier["row"]["attempt"]) != verifier_attempt:
-        raise AcceptedSourceRepairError("accepted-source repair verifier attempt is stale")
-    if verifier_node_id in requested:
-        raise AcceptedSourceRepairError("accepted-source repair cannot select its verifier")
+    requester = nodes.get(requester_node_id)
+    if requester is None:
+        raise AcceptedSourceRepairError("accepted-source repair requester is missing")
+    requester_spec = requester["spec"]
+    requester_row = requester["row"]
+    if requester_kind == "verifier":
+        if requester_spec.get("verifier") is not True:
+            raise AcceptedSourceRepairError("accepted-source repair requester is not a verifier")
+        if requester_row["state"] != "running":
+            raise AcceptedSourceRepairError("accepted-source repair verifier is not running")
+        requester_result_sha256 = None
+    else:
+        if requester_spec.get("verifier") is True:
+            raise AcceptedSourceRepairError("accepted-source repair requester is a verifier")
+        if requester_row["state"] != "blocked" or not isinstance(requester_row["result_json"], str):
+            raise AcceptedSourceRepairError("accepted-source repair consumer is not durably blocked")
+        try:
+            requester_result = json.loads(str(requester_row["result_json"]))
+        except json.JSONDecodeError as error:
+            raise AcceptedSourceRepairError(
+                "accepted-source repair blocked consumer result is invalid"
+            ) from error
+        if not isinstance(requester_result, dict) or requester_result.get("status") != "blocked":
+            raise AcceptedSourceRepairError(
+                "accepted-source repair consumer lacks a blocked result"
+            )
+        requester_result_sha256 = sha256(str(requester_row["result_json"]).encode()).hexdigest()
+    if int(requester_row["attempt"]) != requester_attempt:
+        raise AcceptedSourceRepairError("accepted-source repair requester attempt is stale")
+    if requester_node_id in requested:
+        raise AcceptedSourceRepairError("accepted-source repair cannot select its requester")
     for node_id in requested:
         if node_id not in nodes:
             raise AcceptedSourceRepairError(
@@ -178,6 +214,20 @@ def build_accepted_repair_bindings(
 
     dependencies = _dependencies(nodes)
     _assert_acyclic(dependencies)
+    if requester_kind == "blocked_consumer":
+        ancestors: set[str] = set()
+        pending = list(dependencies[requester_node_id])
+        while pending:
+            ancestor = pending.pop()
+            if ancestor in ancestors:
+                continue
+            ancestors.add(ancestor)
+            pending.extend(dependencies[ancestor])
+        unrelated = sorted(set(requested) - ancestors)
+        if unrelated:
+            raise AcceptedSourceRepairError(
+                "blocked consumer repair selects non-ancestor owner " + unrelated[0]
+            )
     _require_repaired_accepted_descendants(nodes, dependencies, set(requested))
     snapshot = _task_snapshot(task_id, contract, nodes)
 
@@ -265,14 +315,18 @@ def build_accepted_repair_bindings(
             frozen_dependency_input = None
 
         binding: AcceptedSourceRepairBinding = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": ACCEPTED_SOURCE_REPAIR_KIND,
             "state": "authorized",
             "authorization_revision": authorization_revision,
             "task_id": task_id,
             "node_id": node_id,
-            "verifier_node_id": verifier_node_id,
-            "verifier_attempt": verifier_attempt,
+            "requester": {
+                "kind": requester_kind,
+                "node_id": requester_node_id,
+                "attempt": requester_attempt,
+                "result_sha256": requester_result_sha256,
+            },
             "repair_node_ids": list(requested),
             "source_status": "succeeded",
             "source_allocation_id": str(allocation["allocation_id"]),
@@ -327,48 +381,84 @@ def parse_accepted_source_repair_binding(
         value = raw
     if not isinstance(value, Mapping):
         raise AcceptedSourceRepairError("accepted-source repair binding is invalid")
-    if value.get("kind") != ACCEPTED_SOURCE_REPAIR_KIND:
+    kind = value.get("kind")
+    if kind not in {LEGACY_ACCEPTED_SOURCE_REPAIR_KIND, ACCEPTED_SOURCE_REPAIR_KIND}:
         return None
-    required = {
+    common_required = {
         "schema_version",
         "kind",
         "state",
         "authorization_revision",
         "task_id",
         "node_id",
-        "verifier_node_id",
-        "verifier_attempt",
         "repair_node_ids",
         "source_status",
         "source_allocation_id",
         "source_result_json",
         "source",
     }
+    required = common_required | (
+        {"verifier_node_id", "verifier_attempt"}
+        if kind == LEGACY_ACCEPTED_SOURCE_REPAIR_KIND
+        else {"requester"}
+    )
     if set(value) != required:
         raise AcceptedSourceRepairError(
             "accepted-source repair binding has an invalid shape"
         )
-    if value["schema_version"] != 1 or value["state"] != "authorized":
+    expected_schema = 1 if kind == LEGACY_ACCEPTED_SOURCE_REPAIR_KIND else 2
+    if value["schema_version"] != expected_schema or value["state"] != "authorized":
         raise AcceptedSourceRepairError("accepted-source repair binding is not claimable")
     authorization_revision = _positive_int(
         value["authorization_revision"], "accepted-source authorization_revision"
     )
     task_id = _text(value["task_id"], "accepted-source task_id")
     node_id = _text(value["node_id"], "accepted-source node_id")
-    verifier_node_id = _text(
-        value["verifier_node_id"], "accepted-source verifier_node_id"
-    )
-    verifier_attempt = _positive_int(
-        value["verifier_attempt"], "accepted-source verifier_attempt"
-    )
+    if kind == LEGACY_ACCEPTED_SOURCE_REPAIR_KIND:
+        requester: AcceptedSourceRepairRequester = {
+            "kind": "verifier",
+            "node_id": _text(
+                value["verifier_node_id"], "accepted-source verifier_node_id"
+            ),
+            "attempt": _positive_int(
+                value["verifier_attempt"], "accepted-source verifier_attempt"
+            ),
+            "result_sha256": None,
+        }
+    else:
+        raw_requester = value["requester"]
+        if not isinstance(raw_requester, Mapping) or set(raw_requester) != {
+            "kind", "node_id", "attempt", "result_sha256",
+        }:
+            raise AcceptedSourceRepairError("accepted-source repair requester is invalid")
+        requester_kind = raw_requester["kind"]
+        if requester_kind not in {"verifier", "blocked_consumer"}:
+            raise AcceptedSourceRepairError("accepted-source repair requester kind is invalid")
+        result_digest = raw_requester["result_sha256"]
+        if result_digest is not None and (
+            not isinstance(result_digest, str) or _SHA256.fullmatch(result_digest) is None
+        ):
+            raise AcceptedSourceRepairError("accepted-source repair requester digest is invalid")
+        if requester_kind == "verifier" and result_digest is not None:
+            raise AcceptedSourceRepairError("accepted-source verifier requester cannot bind a result")
+        if requester_kind == "blocked_consumer" and result_digest is None:
+            raise AcceptedSourceRepairError("accepted-source blocked requester must bind a result")
+        requester = {
+            "kind": requester_kind,
+            "node_id": _text(raw_requester["node_id"], "accepted-source requester node_id"),
+            "attempt": _positive_int(
+                raw_requester["attempt"], "accepted-source requester attempt"
+            ),
+            "result_sha256": result_digest,
+        }
     repair_node_ids = _repair_node_ids(value["repair_node_ids"])
     if node_id not in repair_node_ids:
         raise AcceptedSourceRepairError(
             "accepted-source repair binding does not select its source owner"
         )
-    if verifier_node_id in repair_node_ids:
+    if requester["node_id"] in repair_node_ids:
         raise AcceptedSourceRepairError(
-            "accepted-source repair binding selects its verifier"
+            "accepted-source repair binding selects its requester"
         )
     if value["source_status"] != "succeeded":
         raise AcceptedSourceRepairError(
@@ -422,14 +512,13 @@ def parse_accepted_source_repair_binding(
             base_sha=source["base_sha"],
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": ACCEPTED_SOURCE_REPAIR_KIND,
         "state": "authorized",
         "authorization_revision": authorization_revision,
         "task_id": task_id,
         "node_id": node_id,
-        "verifier_node_id": verifier_node_id,
-        "verifier_attempt": verifier_attempt,
+        "requester": requester,
         "repair_node_ids": list(repair_node_ids),
         "source_status": "succeeded",
         "source_allocation_id": allocation_id,
@@ -478,12 +567,42 @@ def prepare_accepted_source_repair(
             parsed["node_id"],
             target_attempt,
         )
-        dependency_input = _restore_dependency_input(
-            store,
-            manager,
-            parsed,
-            target,
-        )
+        refresh_accepted_ancestors = parsed["requester"]["kind"] == "blocked_consumer"
+        if refresh_accepted_ancestors:
+            target_spec = next(
+                node for node in store.get_task(parsed["task_id"])["nodes"]
+                if node["node_id"] == parsed["node_id"]
+            )
+            if target_spec["depends_on"]:
+                refreshed = apply_accepted_ancestor_patches(
+                    store.get_task(parsed["task_id"]),
+                    parsed["node_id"],
+                    target,
+                    store.artifacts,
+                    manager,
+                    ready_lockfile_handoffs=_ready_lockfile_handoffs(
+                        store, parsed["task_id"]
+                    ),
+                )
+                if refreshed is None:
+                    raise AcceptedSourceRepairError(
+                        "accepted-source repair cannot refresh its required ancestor input"
+                    )
+                dependency_input = refreshed
+            else:
+                dependency_input = base_dependency_input(
+                    task_id=parsed["task_id"],
+                    node_id=parsed["node_id"],
+                    base_sha=source["base_sha"],
+                    worktree=target,
+                )
+        else:
+            dependency_input = _restore_dependency_input(
+                store,
+                manager,
+                parsed,
+                target,
+            )
         patch = _verified_artifact_bytes(
             store, source["patch_ref"], "accepted-source patch"
         )
@@ -492,12 +611,13 @@ def prepare_accepted_source_repair(
                 "accepted-source repair patch artifact hash does not match its binding"
         )
         manager.apply_patch(target, store.artifacts.verify(source["patch_ref"]))
-        dependency_input = _apply_ready_lockfile_handoffs(
-            store,
-            parsed,
-            target,
-            dependency_input,
-        )
+        if not refresh_accepted_ancestors:
+            dependency_input = _apply_ready_lockfile_handoffs(
+                store,
+                parsed,
+                target,
+                dependency_input,
+            )
         restored_patch = manager.diff_patch(target, dependency_input.input_tree_sha)
         if restored_patch != patch:
             raise AcceptedSourceRepairError(
@@ -519,7 +639,7 @@ def prepare_accepted_source_repair(
         parsed["task_id"], parsed["node_id"], target_attempt
     )
     receipt: AcceptedSourceRepairPreparedReceipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": ACCEPTED_SOURCE_REPAIR_KIND,
         "state": "prepared",
         "authorization_revision": parsed["authorization_revision"],
@@ -1008,8 +1128,6 @@ def _apply_ready_lockfile_handoffs(
     """Derive the claimed repair input before replaying its source patch."""
 
     try:
-        from .lockfile_handoff import get_ready_lockfile_handoffs
-
         task = store.get_task(binding["task_id"])
         return apply_ready_lockfile_handoffs_to_dependency_input(
             task,
@@ -1017,15 +1135,27 @@ def _apply_ready_lockfile_handoffs(
             target,
             store.artifacts,
             dependency_input,
-            ready_lockfile_handoffs=get_ready_lockfile_handoffs(
-                store,
-                binding["task_id"],
+            ready_lockfile_handoffs=_ready_lockfile_handoffs(
+                store, binding["task_id"]
             ),
             manifest_phase="prepared",
         )
     except (DependencyInputError, StateConflictError, ValueError) as error:
         raise AcceptedSourceRepairError(
             f"accepted-source repair cannot apply ready lockfile handoff: {error}"
+        ) from error
+
+
+def _ready_lockfile_handoffs(store: WorkbenchStore, task_id: str) -> list[dict]:
+    """Return only durable ready lockfile overlays for a refreshed input."""
+
+    try:
+        from .lockfile_handoff import get_ready_lockfile_handoffs
+
+        return get_ready_lockfile_handoffs(store, task_id)
+    except (StateConflictError, ValueError) as error:
+        raise AcceptedSourceRepairError(
+            f"accepted-source repair lockfile handoffs are unavailable: {error}"
         ) from error
 
 

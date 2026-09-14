@@ -109,14 +109,14 @@ class LockfileHandoffWiringTests(unittest.TestCase):
             events = connection.execute('SELECT * FROM events ORDER BY cursor').fetchall()
             events_before = [tuple(row) for row in events]
         self.store.initialize()
-        self.assertEqual(self.store.health()['schema_version'], 15)
+        self.assertEqual(self.store.health()['schema_version'], 16)
         self.assertEqual(self.store.get_task(contract.task_id), before)
         with self.store.connection() as connection:
             self.assertEqual([tuple(row) for row in connection.execute('SELECT * FROM events ORDER BY cursor')], events_before)
             self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='events_type_cursor_idx'").fetchone())
             dump = tuple(connection.iterdump())
         with patch('codex_workbench.store.SCHEMA_VERSION', 14):
-            with self.assertRaisesRegex(RuntimeError, 'unsupported schema version 15; expected 14'):
+            with self.assertRaisesRegex(RuntimeError, 'unsupported schema version 16; expected 14'):
                 self.store.initialize()
         with self.store.connection() as connection:
             self.assertEqual(tuple(connection.iterdump()), dump)

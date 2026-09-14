@@ -2028,6 +2028,7 @@ class DirtyWorktreeRecovery:
         recovery: Mapping[str, object],
         source_only: bool = False,
         prepare_dependency_input: Callable[[Path], DependencyInput] | None = None,
+        refresh_dependency_input: bool = False,
     ) -> RecoveryOutcome:
         """Restore a sealed failed attempt before its normal executor runs.
 
@@ -2049,15 +2050,27 @@ class DirtyWorktreeRecovery:
                 target_attempt,
                 recovery,
             )
-            comparison_tree = self._restore_recorded_input(target, recovery)
+            prepared_dependency_input: DependencyInput | None = None
+            if refresh_dependency_input:
+                if prepare_dependency_input is None:
+                    raise DirtyWorktreeRecoveryError(
+                        "refreshed retry input requires a dependency input provider"
+                    )
+                prepared_dependency_input = prepare_dependency_input(target)
+                if not isinstance(prepared_dependency_input, DependencyInput):
+                    raise DirtyWorktreeRecoveryError(
+                        "refreshed retry input provider did not return a dependency input"
+                    )
+                comparison_tree = prepared_dependency_input.input_tree_sha
+            else:
+                comparison_tree = self._restore_recorded_input(target, recovery)
             patch = self._load_patch(recovery)
             self.worktrees.apply_patch(target, self._patch_path(recovery))
             self.mark_untracked_intent_to_add(
                 target,
                 self._recovery_untracked_paths(recovery),
             )
-            prepared_dependency_input: DependencyInput | None = None
-            if prepare_dependency_input is not None:
+            if prepare_dependency_input is not None and not refresh_dependency_input:
                 prepared_dependency_input = prepare_dependency_input(target)
                 if not isinstance(prepared_dependency_input, DependencyInput):
                     raise DirtyWorktreeRecoveryError(

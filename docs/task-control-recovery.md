@@ -34,6 +34,14 @@ MCP 将工作树恢复拒绝作为当前请求的 `isError` 返回，连接继�
 
 执行器在节点 claim 时取得不可变指导快照。保存一条指导不等于已把它注入正在运行的进程：
 
+MCP `workbench_control_task` 的 `steer` 支持三种明确范围：省略 `steering_scope` 或设为 `task` 时，指导对任务所有节点及后续 attempt 生效；`node` 必须同时给出 `steering_node_id`，从该节点的下一 attempt 起对其后续重试生效；`attempt` 还必须给出精确的未来 `steering_attempt`，只注入该次执行。目标 attempt 不能早于节点当前 attempt 的下一次，避免把新授权追写到已启动或已结束的执行。
+
+schema 16 之前的指导没有可验证的原始范围，迁移后保留为 `legacy` 并继续按旧版 task-wide 语义投递；系统不根据指导文本或首次领取节点猜测归属，也不删除历史。操作员核实单条记录的真实归属后，可通过 `rescope_steering` 携带精确 `steering_id`、最新 `expected_revision` 和新范围执行一次 CAS 修订；`task.steering_rescoped` 保存旧范围、新范围、目标和 revision，已明确范围的记录不能再次改写。Verifier 拒绝产生的反馈不再写成任务级指导，而是分别绑定到实际 `repair_node_ids` 所对应的 owner 节点及其下一 attempt，Verifier 自身和无关节点不会取得该反馈。
+
+若普通集成节点先于最终 Verifier 发现已验收祖先的明确缺陷，MCP `repair_blocked_owners` 可以打破“Verifier 不可达、owner 又只能由 Verifier 续修”的循环。调用方必须绑定 blocked consumer 的 `node_id`、`expected_attempt`、最新 `expected_revision`、非空 `reason`，以及完整的 `repair_node_ids`/`repair_instructions` 映射。每个 owner 必须是 consumer 的传递祖先；若选择上游 owner，其仍为 accepted 的下游 owner 也必须一起选择，独立 sibling、Verifier、缺失 patch/allocation 或带外部/破坏权限的合同均拒绝。事务保留 consumer 的 blocked result 和 allocation，只把选定 owner 置为带 `accepted-source-repair-v2` 的 pending，并为其精确下一 attempt 写入 scoped steering。最后一个 owner 结算后，如果只剩 blocked consumer，任务持久转回 `blocked`，不会伪装成仍有执行器的 `running`。
+
+随后 `workbench_repair_blocked_source` 的预检以 `task.blocked_owner_repair_scheduled` 事件、consumer result 摘要和每个 owner 的 source/target attempt 证明修复已完成。它从保留的 consumer worktree 捕获旧 delta，但在新 target 先装配最新 accepted ancestor input，再只应用 consumer 自己的 patch；绝不以旧工作树整树覆盖新 owner。补丁冲突会在模型启动前显式失败，consumer 恢复到原 blocked attempt，owner 保持 accepted，刷新后的 dependency-input receipt 留在回滚 Evidence，之后仍需重新预检。旧版本没有 refresh 标记的 blocked-source binding/receipt 只在 `source_task_state=blocked` 时按 `false` 读取，既不改写历史审计，也不猜测发生过 owner refresh。
+
 - status=not_delivered：已保存，但还没有 attempt 取得它。
 - scheduled_for=next_attempt：任务已可调度，下一次 claim 会取得它。
 - scheduled_for=future_attempt：已有 attempt 正在运行；该进程不会收到后来追加的指导。

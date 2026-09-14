@@ -268,7 +268,24 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
                 "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
                 (contract.task_id,),
             ).fetchone()["recovery_json"]
+            feedback = connection.execute(
+                """
+                SELECT instruction, scope, target_node_id, target_attempt
+                FROM task_steering WHERE task_id = ? ORDER BY sequence
+                """,
+                (contract.task_id,),
+            ).fetchall()
         self.assertIsNotNone(parse_accepted_source_repair_binding(stored, next_attempt=2))
+        self.assertEqual(
+            [
+                (
+                    row["instruction"], row["scope"],
+                    row["target_node_id"], row["target_attempt"],
+                )
+                for row in feedback
+            ],
+            [("Verifier rejected attempt 1: B must update its accepted implementation", "node", "B", 2)],
+        )
 
         coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
         observed: dict[str, object] = {}
@@ -286,6 +303,10 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
             claimed = coordinator._claim_next_ready_node("accepted-owner-repair")
             assert claimed is not None
             self.assertEqual((claimed["node_id"], claimed["attempt"]), ("B", 2))
+            self.assertEqual(
+                claimed["steering"],
+                ("Verifier rejected attempt 1: B must update its accepted implementation",),
+            )
             self.assertIn("accepted_source_repair", claimed)
             with patch.object(coordinator, "_executor") as executor:
                 executor.return_value.execute.side_effect = execute
@@ -341,8 +362,8 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
         self.assertEqual(
             prepared.receipt,
             {
-                "schema_version": 1,
-                "kind": "accepted-source-repair-v1",
+                "schema_version": 2,
+                "kind": "accepted-source-repair-v2",
                 "state": "prepared",
                 "authorization_revision": int(before["state_revision"]) + 1,
                 "source_allocation_id": binding["source_allocation_id"],
@@ -492,7 +513,7 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
         for repair_ids, message in (
             (("missing",), "owner missing is missing"),
             (("B", "B"), "repair_node_ids are duplicated"),
-            (("verify",), "cannot select its verifier"),
+            (("verify",), "cannot select its requester"),
         ):
             with self.subTest(repair_ids=repair_ids), self.assertRaisesRegex(
                 AcceptedSourceRepairError, message

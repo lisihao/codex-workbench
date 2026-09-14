@@ -177,8 +177,10 @@ def _preflight(store: WorkbenchStore, request: Mapping[str, Any]) -> dict[str, A
     node = candidate.get("node")
     if not isinstance(task, Mapping) or not isinstance(node, Mapping):
         raise StateConflictError("blocked source repair task or node candidate is invalid")
-    if task.get("state") != "blocked" or node.get("state") != "blocked":
-        raise StateConflictError("blocked source repair requires a blocked task and worker")
+    if task.get("state") not in {"blocked", "queued", "running"} or node.get("state") != "blocked":
+        raise StateConflictError(
+            "blocked source repair requires a blocked worker in a blocked, queued, or idle-running task"
+        )
     contract_hash = snapshot.get("contract_hash")
     if not isinstance(contract_hash, str) or contract_hash != request["expected_contract_hash"]:
         raise StateConflictError("blocked source repair contract hash changed")
@@ -324,16 +326,18 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
         ).rowcount
         if node_changed != 1:
             raise StateConflictError("blocked source repair node compare-and-set failed")
+        source_task_state = str(authorization["source_task_state"])
         task_changed = connection.execute(
             """
             UPDATE tasks
             SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL, verdict = NULL
-            WHERE task_id = ? AND state = 'blocked' AND state_revision = ? AND contract_hash = ?
+            WHERE task_id = ? AND state = ? AND state_revision = ? AND contract_hash = ?
             """,
             (
                 revision,
                 timestamp,
                 request["task_id"],
+                source_task_state,
                 request["expected_revision"],
                 request["expected_contract_hash"],
             ),
@@ -360,6 +364,8 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
             "source_attempt": authorization["source"]["attempt"],
             "source_node_state": authorization["source_node_state"],
             "source_task_state": authorization["source_task_state"],
+            "refresh_accepted_ancestors": authorization["refresh_accepted_ancestors"],
+            "owner_repair_event_cursor": authorization["owner_repair_event_cursor"],
             "source_delta_sha256": delta.sha256,
             "changed_paths": list(delta.changed_paths),
             "untracked_paths": list(delta.untracked_paths),
@@ -384,7 +390,7 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
             str(request["task_id"]),
             None,
             {
-                "from": "blocked",
+                "from": source_task_state,
                 "to": "queued",
                 "revision": revision,
                 "blocker": None,
@@ -434,6 +440,8 @@ def _preview(preflight: Mapping[str, Any]) -> dict[str, Any]:
         ).hexdigest(),
         "source_node_state": authorization["source_node_state"],
         "source_task_state": authorization["source_task_state"],
+        "refresh_accepted_ancestors": authorization["refresh_accepted_ancestors"],
+        "owner_repair_event_cursor": authorization["owner_repair_event_cursor"],
         "historical_result_unchanged": True,
         "source_only_ignored": True,
     }
@@ -552,6 +560,8 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         "source_attempt",
         "source_node_state",
         "source_task_state",
+        "refresh_accepted_ancestors",
+        "owner_repair_event_cursor",
         "source_delta_sha256",
         "changed_paths",
         "untracked_paths",
@@ -560,8 +570,13 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         "historical_result_unchanged",
         "mode",
     }
-    if set(payload) != required:
+    legacy_required = required - {
+        "refresh_accepted_ancestors", "owner_repair_event_cursor",
+    }
+    if frozenset(payload) not in {frozenset(required), frozenset(legacy_required)}:
         raise StateConflictError("blocked source repair queued receipt has an invalid shape")
+    refresh_accepted_ancestors = payload.get("refresh_accepted_ancestors", False)
+    owner_repair_event_cursor = payload.get("owner_repair_event_cursor")
     for field, maximum in (
         ("request_id", _REQUEST_ID_MAX),
         ("task_id", 512),
@@ -592,7 +607,13 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         or payload.get("kind") != _KIND
         or payload.get("queued") is not True
         or payload.get("source_node_state") != "blocked"
-        or payload.get("source_task_state") != "blocked"
+        or payload.get("source_task_state") not in {"blocked", "queued"}
+        or type(refresh_accepted_ancestors) is not bool
+        or (
+            refresh_accepted_ancestors
+            and (type(owner_repair_event_cursor) is not int or owner_repair_event_cursor < 1)
+        )
+        or (not refresh_accepted_ancestors and owner_repair_event_cursor is not None)
         or payload.get("source_only_ignored") is not True
         or payload.get("historical_result_unchanged") is not True
         or payload.get("mode") != _MODE
@@ -616,7 +637,12 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         or cursor < 1
     ):
         raise StateConflictError("blocked source repair queued receipt paths are invalid")
-    return {**dict(payload), "authorization_event_cursor": cursor}
+    return {
+        **dict(payload),
+        "refresh_accepted_ancestors": refresh_accepted_ancestors,
+        "owner_repair_event_cursor": owner_repair_event_cursor,
+        "authorization_event_cursor": cursor,
+    }
 
 
 def _positive_int(value: object, label: str) -> int:
