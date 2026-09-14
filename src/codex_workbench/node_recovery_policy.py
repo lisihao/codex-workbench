@@ -491,6 +491,16 @@ def plan_recovery(policy: RecoveryPolicy, observation: dict[str, object]) -> dic
             requires_authorization=True,
             next_wakeup_at=None,
         )
+    if observation.get("blocked_owner_repairs_pending") is True:
+        return _result(
+            category=category,
+            action=None,
+            state="waiting",
+            reason_kind="accepted_owner_repairs_pending",
+            owner="authority",
+            requires_authorization=False,
+            next_wakeup_at=_wakeup(now, policy.backoff_seconds),
+        )
 
     attempts = observation.get("action_attempts", 0)
     elapsed = observation.get("elapsed_seconds", 0)

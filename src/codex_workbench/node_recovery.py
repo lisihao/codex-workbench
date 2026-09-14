@@ -43,6 +43,9 @@ _PROGRESS_FIELDS = frozenset({
 _EVENT_TYPES = frozenset({
     "node.blocked", "node.failed", "node.accepted", "node.started",
     "node.blocked_worktree_recovery_rolled_back",
+    "node.blocked_source_repair_queued", "node.failed_attempt_recovery_prepared",
+    "node.accepted_source_repair_authorized", "node.accepted_source_repair_assigned",
+    "task.blocked_owner_repair_scheduled",
     "task.state_changed", "approval.decided", "node_recovery.policy_configured",
 })
 _REPAIR_DELIVERY_EVENT_TYPES = frozenset({
@@ -407,6 +410,9 @@ class NodeRecoveryReconciler:
             for parent_task_id in self._linked_repair_parents(repair_task_id):
                 dirty[parent_task_id] = max(dirty.get(parent_task_id, 0), event_cursor)
         for task_id, event_cursor in dirty.items():
+            self.recovery.reconcile_superseded_attempts(
+                task_id, coordinator_epoch=self.coordinator_epoch
+            )
             self._refresh_task(task_id, event_cursor)
         if events:
             self.recovery.advance_cursor(cursor, int(events[-1]["cursor"]))
@@ -415,6 +421,9 @@ class NodeRecoveryReconciler:
             tasks = page["tasks"]
             for task in tasks:
                 self._reconcile_unknown(task["task_id"])
+                self.recovery.reconcile_superseded_attempts(
+                    task["task_id"], coordinator_epoch=self.coordinator_epoch
+                )
                 self._refresh_task(task["task_id"], 0)
             self._task_cursor = page["next_cursor"]
             self._next_sweep = self.monotonic() + self.sweep_seconds

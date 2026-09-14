@@ -7113,6 +7113,106 @@ class WorkbenchStore:
                 "blocked_consumer_preserved": True,
             }
 
+    def blocked_owner_repair_wait(
+        self,
+        task_id: str,
+        node_id: str,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        """Return the current accepted-owner dependencies for one blocked consumer."""
+
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be non-empty")
+        if not isinstance(node_id, str) or not node_id:
+            raise ValueError("node_id must be non-empty")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise ValueError("attempt must be a positive integer")
+        with self.connection() as connection:
+            requester = connection.execute(
+                "SELECT result_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            event = connection.execute(
+                """
+                SELECT cursor, payload_json FROM events
+                WHERE task_id = ? AND node_id = ?
+                  AND event_type = 'task.blocked_owner_repair_scheduled'
+                  AND json_extract(payload_json, '$.requester_attempt') = ?
+                ORDER BY cursor DESC LIMIT 1
+                """,
+                (task_id, node_id, attempt),
+            ).fetchone()
+            if requester is None or event is None:
+                return None
+            try:
+                payload = json.loads(str(event["payload_json"]))
+            except json.JSONDecodeError as error:
+                raise StateConflictError(
+                    "blocked owner repair wait event is invalid JSON"
+                ) from error
+            repair_ids = payload.get("repair_node_ids") if isinstance(payload, dict) else None
+            source_attempts = (
+                payload.get("repair_source_attempts")
+                if isinstance(payload, dict)
+                else None
+            )
+            requester_result = requester["result_json"]
+            if (
+                not isinstance(payload, dict)
+                or payload.get("requester_attempt") != attempt
+                or not isinstance(requester_result, str)
+                or payload.get("requester_result_sha256")
+                != sha256(requester_result.encode()).hexdigest()
+                or not isinstance(repair_ids, list)
+                or not repair_ids
+                or len(repair_ids) > 32
+                or any(not isinstance(owner, str) or not owner for owner in repair_ids)
+                or len(set(repair_ids)) != len(repair_ids)
+                or not isinstance(source_attempts, dict)
+                or set(source_attempts) != set(repair_ids)
+            ):
+                raise StateConflictError("blocked owner repair wait event is invalid")
+            dependencies: list[dict[str, Any]] = []
+            for owner_id in repair_ids:
+                source_attempt = source_attempts.get(owner_id)
+                if isinstance(source_attempt, bool) or not isinstance(source_attempt, int):
+                    raise StateConflictError(
+                        "blocked owner repair wait source attempt is invalid"
+                    )
+                owner = connection.execute(
+                    """
+                    SELECT state, attempt, recovery_json FROM nodes
+                    WHERE task_id = ? AND node_id = ?
+                    """,
+                    (task_id, owner_id),
+                ).fetchone()
+                if owner is None or int(owner["attempt"]) < source_attempt:
+                    raise StateConflictError(
+                        "blocked owner repair wait dependency is invalid"
+                    )
+                satisfied = (
+                    owner["state"] == "accepted"
+                    and int(owner["attempt"]) >= source_attempt + 1
+                    and owner["recovery_json"] is None
+                )
+                dependencies.append(
+                    {
+                        "node_id": owner_id,
+                        "source_attempt": source_attempt,
+                        "target_attempt": source_attempt + 1,
+                        "current_attempt": int(owner["attempt"]),
+                        "state": str(owner["state"]),
+                        "satisfied": satisfied,
+                    }
+                )
+        return {
+            "event_cursor": int(event["cursor"]),
+            "requester_attempt": attempt,
+            "pending": any(not item["satisfied"] for item in dependencies),
+            "dependencies": dependencies,
+            "progress_fingerprint": canonical_hash(dependencies),
+        }
+
     def resolve_indeterminate(
         self,
         task_id: str,

@@ -70,11 +70,12 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         cursor: int = 1,
         phase: str = "blocked_observed",
         profile: str = "dsh-b-ipc-v1",
+        attempt: int = 0,
     ) -> dict[str, object]:
         return {
             "task_id": self.task_id,
             "node_id": "worker",
-            "attempt": 0,
+            "attempt": attempt,
             "task_revision": self._task_revision(),
             "failure_fingerprint": _fingerprint(label),
             "origin": "authority_validation",
@@ -150,6 +151,169 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         self.assertEqual(
             sum(event["event_type"] == "node_recovery.needs_action" for event in events_after),
             1,
+        )
+
+    def test_newer_started_attempt_supersedes_only_safe_unleased_episode(self) -> None:
+        safe_decision = {
+            **self._decision(
+                None,
+                state="needs_action",
+                reason="budget_exhausted",
+            ),
+            "requires_authorization": False,
+        }
+        safe = self.store.record_episode(
+            self._observation("superseded", cursor=3), safe_decision
+        )
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE nodes SET state = 'running', attempt = 1
+                WHERE task_id = ? AND node_id = 'worker'
+                """,
+                (self.task_id,),
+            )
+            started_cursor = self.base._event(
+                connection,
+                "node.started",
+                self.task_id,
+                "worker",
+                {"attempt": 1},
+            )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [safe["episode_id"]],
+        )
+        resolved = self.store.get_episode(safe["episode_id"])
+        self.assertEqual(
+            (
+                resolved["state"],
+                resolved["phase"],
+                resolved["owner"],
+                resolved["permission_required"],
+                resolved["decision"]["reason_kind"],
+            ),
+            ("resolved", "attempt_superseded", "authority", False, "attempt_superseded"),
+        )
+        self.assertEqual(
+            resolved["observation"]["superseded_start_event_cursor"],
+            started_cursor,
+        )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [],
+        )
+
+        unknown = self.store.record_episode(
+            self._observation("unknown-intent", cursor=started_cursor, attempt=1),
+            self._decision(),
+        )
+        claimed = self.store.claim_due(
+            unknown["episode_id"],
+            "unknown-owner",
+            self.epoch,
+            expected_revision=unknown["revision"],
+            expected_node_attempt=1,
+        )
+        assert claimed is not None
+        self.store.begin_action(
+            claimed["episode_id"],
+            "unknown-request",
+            _fingerprint("unknown-action"),
+            {"stage_key": "observe_readiness"},
+            owner_id="unknown-owner",
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+            expected_revision=claimed["revision"],
+            expected_node_attempt=1,
+        )
+        self.store.recover_interrupted()
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE nodes SET attempt = 2
+                WHERE task_id = ? AND node_id = 'worker'
+                """,
+                (self.task_id,),
+            )
+            self.base._event(
+                connection,
+                "node.started",
+                self.task_id,
+                "worker",
+                {"attempt": 2},
+            )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [],
+        )
+        preserved = self.store.get_episode(unknown["episode_id"])
+        self.assertEqual(preserved["state"], "needs_action")
+        self.assertTrue(preserved["permission_required"])
+        self.assertEqual(preserved["actions"][0]["state"], "unknown")
+
+    def test_owner_repair_dependency_wait_is_not_relabelled_as_user_budget(self) -> None:
+        observation = {
+            **self._observation("owner-dependency-wait"),
+            "blocked_owner_repairs_pending": True,
+            "blocked_owner_repair": {
+                "event_cursor": 9,
+                "requester_attempt": 1,
+                "pending": True,
+                "dependencies": [
+                    {
+                        "node_id": "owner",
+                        "source_attempt": 1,
+                        "target_attempt": 2,
+                        "current_attempt": 2,
+                        "state": "running",
+                        "satisfied": False,
+                    }
+                ],
+                "progress_fingerprint": _fingerprint("owner-progress"),
+            },
+        }
+        decision = {
+            "category": "unknown",
+            "state": "waiting",
+            "action": None,
+            "owner": "authority",
+            "reason_kind": "accepted_owner_repairs_pending",
+            "requires_authorization": False,
+            "next_wakeup_at": "2099-01-01T00:00:00+00:00",
+        }
+        episode = self.store.record_episode(observation, decision)
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE node_recovery_episodes
+                SET time_budget_deadline_at = '2000-01-01T00:00:00+00:00'
+                WHERE episode_id = ?
+                """,
+                (episode["episode_id"],),
+            )
+        refreshed = self.store.record_episode(observation, decision)
+        self.assertEqual(
+            (
+                refreshed["state"],
+                refreshed["owner"],
+                refreshed["permission_required"],
+                refreshed["decision"]["reason_kind"],
+                refreshed["next_wakeup_at"],
+            ),
+            (
+                "waiting",
+                "authority",
+                False,
+                "accepted_owner_repairs_pending",
+                "2099-01-01T00:00:00+00:00",
+            ),
         )
 
     def test_claim_intent_and_settlement_use_stage_local_attempt_budget(self) -> None:

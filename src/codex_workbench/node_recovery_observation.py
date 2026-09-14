@@ -115,6 +115,10 @@ def collect_node_observation(
     node_state = _text(node.get("state"), "unknown")
     raw_result = node.get("result")
     source_result = dict(raw_result) if isinstance(raw_result, Mapping) else {}
+    owner_repair_wait = None
+    owner_repair_reader = getattr(store, "blocked_owner_repair_wait", None)
+    if callable(owner_repair_reader) and node_state == "blocked" and node_attempt > 0:
+        owner_repair_wait = owner_repair_reader(task_id, node_id, node_attempt)
     rollback = store.current_blocked_worktree_recovery_rollback(
         task_id,
         node_id,
@@ -178,7 +182,15 @@ def collect_node_observation(
         result.get("execution_attribution"), task_id, node_id, attribution_attempt
     )
     origin = attribution.failure.origin if attribution_current else "unknown"
-    effective_cursor = max(source_event_cursor, rollback_event_cursor or 0)
+    effective_cursor = max(
+        source_event_cursor,
+        rollback_event_cursor or 0,
+        (
+            int(owner_repair_wait["event_cursor"])
+            if isinstance(owner_repair_wait, Mapping)
+            else 0
+        ),
+    )
     if attribution_current and attribution is not None and attribution.state.event_cursor is not None:
         effective_cursor = max(effective_cursor, attribution.state.event_cursor)
 
@@ -285,6 +297,7 @@ def collect_node_observation(
         or source_refs
         or dependency_refs
         or controlled_repair is not None
+        or owner_repair_wait is not None
     )
     progress_detail = {
         "authoritative": material_progress,
@@ -300,6 +313,8 @@ def collect_node_observation(
             controlled_repair=controlled_repair,
         ),
     }
+    if owner_repair_wait is not None:
+        progress_detail["sources"].append("blocked-owner-repair")
 
     fingerprint_code = typed_failure_code or _failure_code(
         readiness_failure=readiness_failure,
@@ -364,6 +379,14 @@ def collect_node_observation(
         "source_event_cursor": effective_cursor,
         "material_progress": material_progress,
         "authoritative_material_progress": progress_detail,
+        **(
+            {
+                "blocked_owner_repair": owner_repair_wait,
+                "blocked_owner_repairs_pending": owner_repair_wait["pending"],
+            }
+            if owner_repair_wait is not None
+            else {}
+        ),
         **({
             "rollback_event_cursor": rollback_event_cursor,
             "rollback_provenance": rollback_provenance,
