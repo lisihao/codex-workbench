@@ -1,4 +1,6 @@
 let cursor = 0;
+let olderTasks = [];
+let latestTaskSignature = null;
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 
@@ -172,6 +174,13 @@ async function refreshSnapshot() {
   const build = data.build?.commit ? ` · ${data.build.commit.slice(0, 10)}` : "";
   document.querySelector("#health").textContent = `v${data.version}${build} · online`;
   const counts = data.health.task_counts || {};
+  const taskTotal = data.task_page?.total ?? Object.values(counts).reduce((total, value) => total + Number(value || 0), 0);
+  const currentTaskSignature = data.tasks.map((task) => `${task.task_id}:${task.state_revision}`).join("|");
+  if (latestTaskSignature !== null && latestTaskSignature !== currentTaskSignature) olderTasks = [];
+  latestTaskSignature = currentTaskSignature;
+  const latestTaskIds = new Set(data.tasks.map((task) => String(task.task_id)));
+  olderTasks = olderTasks.filter((task) => !latestTaskIds.has(String(task.task_id)));
+  const visibleTasks = [...data.tasks, ...olderTasks];
   const active = (counts.running || 0) + (counts.queued || 0) + (counts.verifying || 0);
   const quota = data.quota;
   const quotaPolicy = data.quota_policy;
@@ -193,7 +202,7 @@ async function refreshSnapshot() {
   const alerts = data.alerts || [];
   authenticated = data.authenticated;
   document.querySelector("#metrics").innerHTML = [
-    metric("任务总数", data.tasks.length),
+    metric("任务总数", taskTotal),
     metric("运行/排队", active, active ? "running" : ""),
     metric("已验收", counts.accepted || 0, "ok"),
     metric("状态陈旧", data.diagnostics.stale_tasks.length, data.diagnostics.stale_tasks.length ? "error" : "ok"),
@@ -234,17 +243,37 @@ async function refreshSnapshot() {
   const backlog = acceptance.backlog || [];
   document.querySelector("#acceptance-summary").textContent = `${acceptance.counts.ok} ok · ${acceptance.counts.pending} pending · ${acceptance.counts.error} error · ${backlog.length} backlog`;
   document.querySelector("#acceptance").innerHTML = [...acceptance.checks, ...backlog].map(renderAcceptance).join("");
-  document.querySelector("#tasks").innerHTML = data.tasks.length ? data.tasks.map(renderTask).join("") : '<p class="muted">暂无任务</p>';
+  document.querySelector("#tasks").innerHTML = visibleTasks.length ? visibleTasks.map(renderTask).join("") : '<p class="muted">暂无任务</p>';
   document.querySelectorAll("button[data-task]").forEach((button) => button.addEventListener("click", controlTask));
   document.querySelectorAll("button[data-steer-task]").forEach((button) => button.addEventListener("click", steerTask));
   document.querySelectorAll("button[data-approval]").forEach((button) => button.addEventListener("click", decideApproval));
   const updated = document.querySelector("#updated");
-  updated.textContent = `刷新 ${new Date().toLocaleTimeString()}`;
+  updated.textContent = `已显示 ${visibleTasks.length}/${taskTotal} · 刷新 ${new Date().toLocaleTimeString()}`;
   updated.dataset.snapshotCursor = String(data.health.cursor || 0);
+  const loadOlder = document.querySelector("#load-older-tasks");
+  loadOlder.hidden = visibleTasks.length >= taskTotal;
+  loadOlder.dataset.offset = String(visibleTasks.length);
+  loadOlder.disabled = false;
   cursor = Math.max(cursor, data.health.cursor || 0);
   const renderedReceipt = await capturePhoneRender(data);
   await recordPhoneObservation(data, renderedReceipt);
   notifyNewAlerts(alerts);
+}
+
+async function loadOlderTasks(event) {
+  const button = event.currentTarget;
+  button.disabled = true;
+  const offset = Number(button.dataset.offset || 0);
+  const response = await fetch(`/api/tasks?limit=10&offset=${offset}`, {cache: "no-store"});
+  if (!response.ok) {
+    button.disabled = false;
+    alert((await response.json()).error || "读取更早任务失败");
+    return;
+  }
+  const page = await response.json();
+  const known = new Set(olderTasks.map((task) => String(task.task_id)));
+  olderTasks.push(...(page.tasks || []).filter((task) => !known.has(String(task.task_id))));
+  await refreshSnapshot();
 }
 
 function notifyNewAlerts(alerts) {
@@ -346,3 +375,4 @@ document.querySelector("#enable-notifications").addEventListener("click", async 
   const permission = await Notification.requestPermission();
   event.currentTarget.textContent = permission === "granted" ? "前台通知已启用" : "通知未授权";
 });
+document.querySelector("#load-older-tasks").addEventListener("click", loadOlderTasks);

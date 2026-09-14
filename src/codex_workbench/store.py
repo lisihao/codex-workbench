@@ -8645,15 +8645,19 @@ class WorkbenchStore:
             )
         return approval_id
 
-    def list_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_tasks(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("task list limit must be a positive integer")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("task list offset must be a non-negative integer")
         with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT task_id, contract_hash, state, state_revision, priority, created_at, updated_at,
                        blocker, verdict, contract_json
-                FROM tasks ORDER BY updated_at DESC LIMIT ?
+                FROM tasks ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
             return [self._task_row(connection, row) for row in rows]
 
