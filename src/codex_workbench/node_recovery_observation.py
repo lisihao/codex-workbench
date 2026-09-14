@@ -383,6 +383,9 @@ def collect_node_observation(
             {
                 "blocked_owner_repair": owner_repair_wait,
                 "blocked_owner_repairs_pending": owner_repair_wait["pending"],
+                "blocked_owner_repair_preparation_exhausted": owner_repair_wait.get(
+                    "preparation_exhausted", False
+                ),
             }
             if owner_repair_wait is not None
             else {}

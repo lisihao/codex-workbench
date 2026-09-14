@@ -2696,6 +2696,84 @@ class StoreTests(unittest.TestCase):
                 decided["approval_id"], "fail", expected_revision=revision
             )
 
+    def test_current_lease_settlement_conflict_becomes_indeterminate_once(self) -> None:
+        nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-conflict")
+        self.store.queue_task("task-1")
+        claim = self.store.claim_ready_node("worker-1", self.epoch)
+        assert claim is not None
+        rejected_result_ref = self.store.artifacts.put_text(
+            '{"result":"rejected"}', "settlement-conflict.json"
+        )
+
+        reconciled = self.store.reconcile_settlement_conflict(
+            "task-1",
+            "work",
+            attempt=claim["attempt"],
+            coordinator_epoch=claim["coordinator_epoch"],
+            lease_epoch=claim["lease_epoch"],
+            error="StateConflictError: settlement inputs changed",
+            executor_started=True,
+            rejected_result_ref=rejected_result_ref,
+        )
+        repeated = self.store.reconcile_settlement_conflict(
+            "task-1",
+            "work",
+            attempt=claim["attempt"],
+            coordinator_epoch=claim["coordinator_epoch"],
+            lease_epoch=claim["lease_epoch"],
+            error="StateConflictError: settlement inputs changed",
+            executor_started=True,
+            rejected_result_ref=rejected_result_ref,
+        )
+
+        self.assertTrue(reconciled)
+        self.assertFalse(repeated)
+        task = self.store.get_task("task-1")
+        self.assertEqual(task["state"], "needs_approval")
+        work = next(node for node in task["nodes"] if node["node_id"] == "work")
+        self.assertEqual(work["state"], "indeterminate")
+        approvals = self.store.list_approvals()
+        self.assertEqual(len(approvals), 1)
+        events = [
+            event
+            for event in self.store.read_events(task_id="task-1")
+            if event["event_type"] == "node.indeterminate"
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["reason"], "current_lease_settlement_conflict")
+        self.assertIn("settlement inputs changed", events[0]["payload"]["error"])
+        self.assertEqual(events[0]["payload"]["rejected_result_ref"], rejected_result_ref)
+        self.assertEqual(work["result"]["artifacts"]["settlement-conflict"], rejected_result_ref)
+
+    def test_stale_lease_settlement_conflict_remains_fenced(self) -> None:
+        nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
+        self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-stale-conflict")
+        self.store.queue_task("task-1")
+        claim = self.store.claim_ready_node("worker-1", self.epoch)
+        assert claim is not None
+        self.store.settle_claimed(claim, NodeResult("succeeded", "finished"))
+        rejected_result_ref = self.store.artifacts.put_text(
+            '{"result":"late"}', "settlement-conflict.json"
+        )
+
+        self.assertFalse(
+            self.store.reconcile_settlement_conflict(
+                "task-1",
+                "work",
+                attempt=claim["attempt"],
+                coordinator_epoch=claim["coordinator_epoch"],
+                lease_epoch=claim["lease_epoch"],
+                error="StateConflictError: node lease is stale",
+                executor_started=True,
+                rejected_result_ref=rejected_result_ref,
+            )
+        )
+        task = self.store.get_task("task-1")
+        work = next(node for node in task["nodes"] if node["node_id"] == "work")
+        self.assertEqual(work["state"], "accepted")
+        self.assertEqual(self.store.list_approvals(), [])
+
     def test_indeterminate_settlement_creates_one_durable_approval(self) -> None:
         nodes = [NodeSpec("work", "task-1", "work", "fixture", "fixture", "ok")]
         self.store.create_task(self.contract, verified(nodes, "task-1"), "cmd-indeterminate")

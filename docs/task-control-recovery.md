@@ -102,6 +102,8 @@ MacBook bridge、MCP adapter 与 Authority 对 `workbench_control_task`、`workb
 - assignment 后重启或执行器崩溃：target allocation 已是 attempt 的物理状态，节点进入 indeterminate。自动 retry 被明确拒绝，直到操作人完成显式恢复裁决；不会把同一 target 再派发给新 attempt。
 - 重复 queue：旧 revision 失败，不会创建第二份恢复授权。
 - 旧 attempt 晚到的 settlement：coordinator epoch、attempt 和 lease epoch fencing 拒绝写入。
+- 当前 lease 的 settlement 若因结果校验或恢复凭据冲突被拒绝，协调器会保存被拒绝的结果工件，并把可能已经执行的节点持久化为 `indeterminate`；只有已被新 epoch、attempt 或 lease 取代的晚到结果才静默丢弃，因此线程 Future 正常结束不会留下无人持有的 `running` 节点。`accepted-source-repair` 在 target assignment 和模型启动之前失败时不制造未知副作用审批：原 accepted allocation 和结果继续作为固定输入，节点以递增 attempt 在合同 `retry_limit` 内自动续行，重启也复用同一路径；额度耗尽才恢复原 accepted 节点并显式报告准备故障。
+- blocked consumer 等待的 accepted owner 若耗尽准备重试，等待投影会绑定实际失败事件并转为 `accepted_owner_repair_preparation_exhausted`。已配置且仍在任务时间/次数预算内的 `request_repair` 可进入现有维修生命周期；未配置时明确报告 `accepted_owner_repair_repair_action_unconfigured`，预算耗尽时报告 `accepted_owner_repair_repair_budget_exhausted`，责任仍归 Authority 且不会被通用计时器改写成用户责任。已经派单或关联的维修只根据其实际等待、部署和 fresh-readiness 回执推进，不以定时轮询冒充完成。
 - 暂停或取消与 settlement 竞态：节点的已租约结果可保存，但任务的 paused/cancelled 控制状态优先，不会被晚到结果推进到 verifying 或 accepted。
 
 ## Indeterminate 节点的显式本地恢复

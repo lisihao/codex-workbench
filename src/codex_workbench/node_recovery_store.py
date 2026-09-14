@@ -2181,10 +2181,12 @@ class NodeRecoveryStore:
             # cannot renew this clock.
             deadline = _after(timestamp, policy.time_budget_seconds)
         timer_decision = False
-        dependency_wait = (
-            planned["document"].get("reason_kind")
-            == "accepted_owner_repairs_pending"
-        )
+        dependency_wait = planned["document"].get("reason_kind") in {
+            "accepted_owner_repairs_pending",
+            "accepted_owner_repair_preparation_exhausted",
+            "accepted_owner_repair_repair_action_unconfigured",
+            "accepted_owner_repair_repair_budget_exhausted",
+        }
         if (
             not repair_evidence_changed
             and not dependency_wait

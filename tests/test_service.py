@@ -34,7 +34,7 @@ from codex_workbench.submission import CompiledNaturalLanguageRequest
 from codex_workbench.executors import ExecutionRequest, FixtureExecutor
 from codex_workbench.planner import PlannerError, archify_internal_directive
 from codex_workbench.routing import ROUTING_V3_POLICY_VERSION
-from codex_workbench.store import CommandConflictError, WorkbenchStore
+from codex_workbench.store import CommandConflictError, StateConflictError, WorkbenchStore
 
 
 def verified(nodes: list[NodeSpec], task_id: str) -> list[NodeSpec]:
@@ -1186,6 +1186,54 @@ raise AssertionError("fatal coordinator failure returned")
             )
             self.assertFalse(report["ready"])
             self.assertTrue(report["failures"])
+
+    def test_current_lease_settlement_conflict_cannot_leave_a_ghost_running_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("settlement-conflict", "test-machine")
+            contract = TaskContract(
+                task_id="settlement-conflict",
+                repository=str(root),
+                base_sha="fixture",
+                objective="expose a rejected current result",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "fixture",
+                "fixture",
+                "ok",
+            )
+            store.create_task(contract, verified([node], contract.task_id), "conflict-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("settlement-worker", epoch)
+            assert claimed is not None
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            try:
+                with patch.object(
+                    store,
+                    "settle_node",
+                    side_effect=StateConflictError("settlement inputs changed before commit"),
+                ):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            task = store.get_task(contract.task_id)
+            work = next(item for item in task["nodes"] if item["node_id"] == "work")
+            self.assertEqual((task["state"], work["state"]), ("needs_approval", "indeterminate"))
+            self.assertEqual(len(store.list_approvals()), 1)
+            event = next(
+                item
+                for item in store.read_events(task_id=contract.task_id)
+                if item["event_type"] == "node.indeterminate"
+            )
+            self.assertEqual(event["payload"]["reason"], "current_lease_settlement_conflict")
 
     def test_readiness_resolves_a_package_from_the_allocated_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -500,9 +500,9 @@ def parse_accepted_source_repair_binding(
     source = _source(value["source"], task_id, node_id)
     if source["attempt"] < 1:
         raise AcceptedSourceRepairError("accepted-source repair source attempt is invalid")
-    if next_attempt is not None and source["attempt"] + 1 != next_attempt:
+    if next_attempt is not None and next_attempt <= source["attempt"]:
         raise AcceptedSourceRepairError(
-            "accepted-source repair source does not match the claimed next attempt"
+            "accepted-source repair source does not precede the claimed target attempt"
         )
     expected_branch = WorktreeManager.branch_name(task_id, node_id, source["attempt"])
     if source["branch"] != expected_branch:
@@ -553,6 +553,8 @@ def prepare_accepted_source_repair(
     store: WorkbenchStore,
     binding: Mapping[str, Any] | str,
     manager: WorktreeManager,
+    *,
+    target_attempt: int | None = None,
 ) -> PreparedAcceptedSourceRepair:
     """Materialize an accepted source patch on a fresh claimed ``aN+1`` tree.
 
@@ -565,13 +567,26 @@ def prepare_accepted_source_repair(
     @param store: Authority store used for read-only fencing and artifacts.
     @param binding: The durable accepted-source authorization.
     @param manager: Existing worktree manager for the task repository.
+    @param target_attempt: Claimed target attempt, including a bounded preparation retry.
     @returns: Fresh worktree, reproduced dependency input, and a CAS receipt.
     """
 
     parsed = parse_accepted_source_repair_binding(binding)
     if parsed is None:
         raise AcceptedSourceRepairError("accepted-source repair binding is missing")
-    target_attempt = parsed["source"]["attempt"] + 1
+    target_attempt = (
+        parsed["source"]["attempt"] + 1
+        if target_attempt is None
+        else target_attempt
+    )
+    if (
+        isinstance(target_attempt, bool)
+        or not isinstance(target_attempt, int)
+        or target_attempt <= parsed["source"]["attempt"]
+    ):
+        raise AcceptedSourceRepairError(
+            "accepted-source repair target attempt must follow its source"
+        )
     initial = _preparation_snapshot(store, parsed, target_attempt)
     source = parsed["source"]
     repository = initial["repository"]

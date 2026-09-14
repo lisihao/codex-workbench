@@ -316,6 +316,43 @@ class NodeRecoveryStoreTests(unittest.TestCase):
             ),
         )
 
+    def test_exhausted_owner_repair_diagnostic_is_not_relabelled_as_user_budget(self) -> None:
+        observation = {
+            **self._observation("owner-preparation-exhausted"),
+            "blocked_owner_repairs_pending": True,
+            "blocked_owner_repair_preparation_exhausted": True,
+        }
+        decision = {
+            "category": "tooling_bug",
+            "state": "needs_action",
+            "action": None,
+            "owner": "authority",
+            "reason_kind": "accepted_owner_repair_repair_action_unconfigured",
+            "requires_authorization": False,
+            "next_wakeup_at": None,
+        }
+        episode = self.store.record_episode(observation, decision)
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE node_recovery_episodes
+                SET time_budget_deadline_at = '2000-01-01T00:00:00+00:00'
+                WHERE episode_id = ?
+                """,
+                (episode["episode_id"],),
+            )
+        refreshed = self.store.record_episode(observation, decision)
+        self.assertEqual(
+            (
+                refreshed["state"], refreshed["owner"],
+                refreshed["permission_required"], refreshed["decision"]["reason_kind"],
+            ),
+            (
+                "needs_action", "authority", False,
+                "accepted_owner_repair_repair_action_unconfigured",
+            ),
+        )
+
     def test_claim_intent_and_settlement_use_stage_local_attempt_budget(self) -> None:
         episode = self._record("stages")
         claimed = self._claim(episode)
