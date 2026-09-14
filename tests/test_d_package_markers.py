@@ -99,8 +99,8 @@ class DPackageMarkerTests(unittest.TestCase):
         self.assertEqual(profile.REQUIRED_PACKAGE_MARKERS, LITERAL_PACKAGE_MARKERS)
 
     def test_scope_source_identity_binds_literal_manifest_names(self) -> None:
-        binding, source_snapshot = self._scope_binding()
-        identity = scope._source_identity(binding, source_snapshot)
+        binding, _source_snapshot = self._scope_binding()
+        identity = scope._source_identity(binding)
         self.assertEqual(
             {path: marker["name"] for path, marker in identity["package_markers"].items()},
             LITERAL_PACKAGE_MARKERS,
@@ -123,7 +123,7 @@ class DPackageMarkerTests(unittest.TestCase):
         )
 
     def test_scope_rejects_wrong_and_arbitrary_ui_manifest_names(self) -> None:
-        binding, source_snapshot = self._scope_binding()
+        binding, _source_snapshot = self._scope_binding()
         for package_name in (
             "@deepseek-ai/dsh-ui-task-template",
             "@example.invalid/arbitrary-package",
@@ -134,7 +134,7 @@ class DPackageMarkerTests(unittest.TestCase):
                     scope.IntegrationScopeAmendmentError,
                     "required package marker name is invalid",
                 ):
-                    scope._source_identity(binding, source_snapshot)
+                    scope._source_identity(binding)
                 self._write_ui_marker(LITERAL_PACKAGE_MARKERS[UI_MARKER])
 
     def test_metadata_rejects_wrong_and_arbitrary_ui_manifest_names(self) -> None:

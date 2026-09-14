@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from codex_workbench import dependency_inputs
 from codex_workbench.dirty_worktree_recovery import (
     DirtyWorktreeRecoveryError,
     inspect_recovery_source_delta,
@@ -55,6 +56,27 @@ class SourceDeltaHashTests(ScopeNormalizationFixture, unittest.TestCase):
         after = self._inspect()
         self.assertNotEqual(before.sha256, after.sha256)
         self.assertIn("src/extra.ts", after.untracked_paths)
+
+    def test_change_between_delta_reads_is_rejected(self) -> None:
+        target = self.repository / "src/task-template.spec.ts"
+        target.write_text("first delta")
+
+        def mutate_between_reads() -> None:
+            target.write_text("changed during identity inspection")
+
+        with self.assertRaisesRegex(DirtyWorktreeRecoveryError, "changed while it was inspected"):
+            inspect_recovery_source_delta(
+                self.repository,
+                self.base_sha,
+                between_reads=mutate_between_reads,
+            )
+
+    def test_stable_delta_uses_three_git_reads_per_snapshot(self) -> None:
+        original = dependency_inputs._git_bytes
+        with patch.object(dependency_inputs, "_git_bytes", wraps=original) as git_bytes:
+            self._inspect()
+
+        self.assertEqual(git_bytes.call_count, 6)
 
     def test_symlink_delta_is_rejected(self) -> None:
         (self.repository / "src/link.ts").symlink_to("task-template.spec.ts")

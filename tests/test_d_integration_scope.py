@@ -704,6 +704,60 @@ class DIntegrationScopeTests(unittest.TestCase):
         with self.store.connection() as connection:
             self.assertEqual(tuple(connection.iterdump()), database_before)
 
+    def test_source_change_during_identity_observation_rejects_preview(self) -> None:
+        target = self.source / "src" / "d.ts"
+        original_identity = scope._source_identity
+        identity_calls = 0
+
+        def observe_then_mutate(binding):
+            nonlocal identity_calls
+            identity = original_identity(binding)
+            identity_calls += 1
+            if identity_calls == 1:
+                target.write_text("export const d = 2\n", encoding="utf-8")
+            return identity
+
+        with self.store.connection() as connection:
+            database_before = tuple(connection.iterdump())
+        with patch.object(scope, "_source_identity", side_effect=observe_then_mutate):
+            with self.assertRaisesRegex(
+                scope.IntegrationScopeAmendmentError,
+                "source delta changed while it was inspected",
+            ):
+                self._preview()
+        self.assertEqual(identity_calls, 1)
+        with self.store.connection() as connection:
+            self.assertEqual(tuple(connection.iterdump()), database_before)
+
+    def test_identity_change_during_durable_recheck_rejects_preview(self) -> None:
+        marker = self.source / next(iter(REQUIRED_PACKAGE_MARKERS))
+        package_name = REQUIRED_PACKAGE_MARKERS[next(iter(REQUIRED_PACKAGE_MARKERS))]
+        original_binding = scope._durable_binding
+        binding_calls = 0
+
+        def observe_then_mutate(store, arguments):
+            nonlocal binding_calls
+            binding = original_binding(store, arguments)
+            binding_calls += 1
+            if binding_calls == 2:
+                marker.write_text(
+                    json.dumps({"name": package_name, "identity_drift": True}) + "\n",
+                    encoding="utf-8",
+                )
+            return binding
+
+        with self.store.connection() as connection:
+            database_before = tuple(connection.iterdump())
+        with patch.object(scope, "_durable_binding", side_effect=observe_then_mutate):
+            with self.assertRaisesRegex(
+                StateConflictError,
+                "source identity changed during preview",
+            ):
+                self._preview()
+        self.assertEqual(binding_calls, 2)
+        with self.store.connection() as connection:
+            self.assertEqual(tuple(connection.iterdump()), database_before)
+
     def test_contract_and_spec_drift_are_rejected(self) -> None:
         preview = self._preview()
         changed_contract = {

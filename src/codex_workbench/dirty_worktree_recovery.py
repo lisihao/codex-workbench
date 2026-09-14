@@ -23,6 +23,7 @@ from .dependency_inputs import (
     DependencyInput,
     DependencyInputError,
     apply_recorded_dependency_input,
+    changed_and_untracked_paths_since_input_tree,
     changed_paths_since_input_tree,
     load_recorded_dependency_input,
 )
@@ -261,19 +262,19 @@ def _read_source_delta_file(worktree: Path, relative_path: str) -> tuple[str, st
 def _recovery_source_delta_paths(
     worktree: Path,
     comparison_tree: str,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     """List the tracked/untracked delta without reading any source-file content."""
 
-    changed_paths = tuple(
-        sorted(changed_paths_since_input_tree(worktree, comparison_tree))
+    resolved_tree, changed, untracked = changed_and_untracked_paths_since_input_tree(
+        worktree, comparison_tree
     )
-    untracked_paths = DirtyWorktreeRecovery.untracked_paths(worktree)
-    untracked = set(untracked_paths)
+    changed_paths = tuple(sorted(changed))
+    untracked_paths = tuple(sorted(untracked))
     if not untracked.issubset(changed_paths):
         raise DirtyWorktreeRecoveryError(
             "source delta untracked paths are missing from its change set"
         )
-    return changed_paths, untracked_paths
+    return resolved_tree, changed_paths, untracked_paths
 
 
 def _inspect_recovery_source_delta_once(
@@ -340,38 +341,41 @@ def inspect_recovery_source_delta(
     comparison_tree: str,
     *,
     validate_paths: Callable[[tuple[str, ...]], None] | None = None,
+    between_reads: Callable[[], None] | None = None,
 ) -> SourceDelta:
     """Return a stable digest for the current recoverable delta, excluding ignored files.
 
     The caller supplies the recorded input tree rather than an artifact
     reference so the digest remains identical for root and dependent workers
     that share the same materialized input. The entire path/content snapshot
-    is read twice; a path, deletion, executable-mode, or byte change between
-    reads is rejected instead of producing a race-prone digest.
+    is read twice; the optional callback runs between those reads so callers
+    can cover another source observation with the same drift check. A path,
+    deletion, executable-mode, or byte change between reads is rejected
+    instead of producing a race-prone digest.
     """
 
     root = worktree.resolve(strict=True)
-    resolved_tree = DirtyWorktreeRecovery._git_text(
-        root,
-        "rev-parse",
-        "--verify",
-        f"{comparison_tree}^{{tree}}",
+    first_tree, first_paths, first_untracked = _recovery_source_delta_paths(
+        root, comparison_tree
     )
-    first_paths, first_untracked = _recovery_source_delta_paths(root, resolved_tree)
     if validate_paths is not None:
         validate_paths(first_paths)
     first = _inspect_recovery_source_delta_once(
         root,
-        resolved_tree,
+        first_tree,
         first_paths,
         first_untracked,
     )
-    second_paths, second_untracked = _recovery_source_delta_paths(root, resolved_tree)
+    if between_reads is not None:
+        between_reads()
+    second_tree, second_paths, second_untracked = _recovery_source_delta_paths(
+        root, comparison_tree
+    )
     if validate_paths is not None:
         validate_paths(second_paths)
     second = _inspect_recovery_source_delta_once(
         root,
-        resolved_tree,
+        second_tree,
         second_paths,
         second_untracked,
     )
@@ -411,6 +415,7 @@ def inspect_indeterminate_source_delta(
     artifacts: ArtifactStore,
     expected_checkpoint_sha: str | None = None,
     recovery_label: str = "indeterminate",
+    between_delta_reads: Callable[[], None] | None = None,
 ) -> SourceDelta:
     """Validate one normalized source-only allocation and return its live delta.
 
@@ -511,6 +516,7 @@ def inspect_indeterminate_source_delta(
         source,
         comparison_tree,
         validate_paths=validate_paths,
+        between_reads=between_delta_reads,
     )
 
 

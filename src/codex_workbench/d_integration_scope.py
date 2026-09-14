@@ -170,16 +170,20 @@ def _preflight(store: WorkbenchStore, arguments: Mapping[str, Any]) -> dict[str,
         raise StateConflictError("integration scope amendment native binding changed during preview")
 
     retained_e_before = _retained_e_worktree_identity(before)
-    source_before, delta_before = _source_snapshot(store, arguments)
-    _assert_source_matches_binding(source_before, before)
-    source_identity = _source_identity(before, source_before)
+    source_identity_during: dict[str, Any] | None = None
 
-    # Source inspection is intentionally outside a SQL write transaction.  A
-    # second source snapshot detects source, result, allocation, or dependency
-    # input drift while marker files and Git identity were read.
-    source_after, delta_after = _source_snapshot(store, arguments)
-    if canonical_json(source_before) != canonical_json(source_after) or delta_before != delta_after:
-        raise StateConflictError("integration scope amendment source changed during preview")
+    def observe_source_identity() -> None:
+        nonlocal source_identity_during
+        source_identity_during = _source_identity(before)
+
+    source_snapshot, source_delta = _source_snapshot(
+        store,
+        arguments,
+        between_delta_reads=observe_source_identity,
+    )
+    _assert_source_matches_binding(source_snapshot, before)
+    if source_identity_during is None:
+        raise StateConflictError("integration scope amendment source identity was not observed")
 
     after = _durable_binding(store, arguments)
     native_after = acceptance_amendment._snapshot(store, arguments)
@@ -190,12 +194,15 @@ def _preflight(store: WorkbenchStore, arguments: Mapping[str, Any]) -> dict[str,
     retained_e_after = _retained_e_worktree_identity(after)
     if canonical_json(retained_e_before) != canonical_json(retained_e_after):
         raise StateConflictError("integration scope amendment retained verifier identity changed during preview")
+    source_identity_after = _source_identity(after)
+    if canonical_json(source_identity_during) != canonical_json(source_identity_after):
+        raise StateConflictError("integration scope amendment source identity changed during preview")
 
     plan = _plan(before)
     source = {
         "allocation": dict(before["d"]["allocation"]),
-        "worktree_identity": source_identity,
-        "source_delta": _delta_payload(delta_before),
+        "worktree_identity": source_identity_during,
+        "source_delta": _delta_payload(source_delta),
         "retained_verifier": retained_e_before,
     }
     fingerprint = canonical_hash(
@@ -655,6 +662,8 @@ def _retained_e_worktree_identity(binding: Mapping[str, Any]) -> dict[str, Any] 
 def _source_snapshot(
     store: WorkbenchStore,
     arguments: Mapping[str, Any],
+    *,
+    between_delta_reads: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Use the existing source-only snapshot/delta helper without mutating it."""
 
@@ -667,6 +676,7 @@ def _source_snapshot(
             preserve_untracked=None,
             expected_checkpoint_sha=None,
             expected_source_delta_sha256=None,
+            between_delta_reads=between_delta_reads,
         )
     except (DirtyWorktreeRecoveryError, ValueError) as error:
         raise IntegrationScopeAmendmentError(
@@ -701,7 +711,6 @@ def _assert_source_matches_binding(
 
 def _source_identity(
     binding: Mapping[str, Any],
-    source_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Bind a non-symlinked D worktree, Git identity, and package markers."""
 
@@ -749,8 +758,6 @@ def _source_identity(
     )
     if common_dir != repository_common:
         raise StateConflictError("D worktree no longer belongs to the task repository")
-    if source_snapshot.get("allocation") != allocation:
-        raise StateConflictError("integration scope amendment source allocation drifted")
     return {
         "worktree": str(root),
         "top_level": top_level,
