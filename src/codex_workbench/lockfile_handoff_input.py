@@ -816,6 +816,9 @@ def _apply_handoff(
         current = path.read_bytes()
     except OSError as error:
         raise LockfileHandoffInputError("lockfile handoff target lockfile is unavailable") from error
+    if current == after:
+        _require_after_bytes(worktree, artifacts, handoff)
+        return
     if current != before:
         raise LockfileHandoffInputError(
             "lockfile handoff target lockfile does not match its recorded before bytes"

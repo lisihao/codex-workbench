@@ -49,6 +49,7 @@ MCP_TOOL_NAMES = frozenset({
     "workbench_ack_session_notification",
     "workbench_configure_node_recovery",
     "workbench_get_node_recovery",
+    "workbench_resume_owner_repairs",
     "workbench_amend_task_acceptance",
     "workbench_validate_blocked_node",
     "workbench_acceptance_report",
