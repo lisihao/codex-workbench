@@ -217,6 +217,181 @@ class AcceptedSourceRepairFixture:
 
 
 class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
+    def test_preassignment_failure_restores_the_accepted_source_attempt(self) -> None:
+        contract, verifier = self._create_task()
+        accepted_before = next(
+            node
+            for node in self.store.get_task(contract.task_id)["nodes"]
+            if node["node_id"] == "B"
+        )
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B must update its accepted implementation",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        coordinator = Coordinator(
+            self.store, self.state_root, coordinator_epoch=self.epoch
+        )
+        try:
+            claimed = coordinator._claim_next_ready_node("accepted-owner-preparation")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("B", 2))
+            with patch(
+                "codex_workbench.accepted_source_repair.prepare_accepted_source_repair",
+                side_effect=AcceptedSourceRepairError(
+                    "fixture accepted-source target preparation failed"
+                ),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        owner = next(node for node in task["nodes"] if node["node_id"] == "B")
+        self.assertEqual((task["state"], owner["state"], owner["attempt"]), (
+            "queued", "pending", 2,
+        ))
+        self.assertIsNone(owner["worktree"])
+        self.assertIsNone(owner["result"])
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        retry_binding = parse_accepted_source_repair_binding(
+            recovery_json, next_attempt=3
+        )
+        assert retry_binding is not None
+        self.assertEqual(
+            json.loads(retry_binding["source_result_json"]), accepted_before["result"]
+        )
+        self.assertEqual(self.store.list_approvals(), [])
+        rollback = next(
+            event
+            for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.accepted_source_repair_rolled_back"
+        )
+        self.assertEqual(rollback["payload"]["source_attempt"], 1)
+        self.assertEqual(
+            rollback["payload"]["preparation_result"]["status"], "blocked"
+        )
+        self.assertTrue(rollback["payload"]["retry_scheduled"])
+        self.assertEqual(rollback["payload"]["next_attempt"], 3)
+
+        retry = coordinator._claim_next_ready_node("accepted-owner-retry")
+        assert retry is not None
+        self.assertEqual((retry["node_id"], retry["attempt"]), ("B", 3))
+        with patch.object(coordinator, "_executor") as executor:
+            executor.return_value.execute.return_value = NodeResult(
+                "succeeded", "accepted owner preparation recovered", checks=("fixture",)
+            )
+            coordinator._execute_claimed(retry)
+        completed = self.store.get_task(contract.task_id)
+        completed_owner = next(
+            node for node in completed["nodes"] if node["node_id"] == "B"
+        )
+        self.assertEqual((completed_owner["state"], completed_owner["attempt"]), (
+            "accepted", 3,
+        ))
+
+    def test_restart_before_accepted_source_assignment_restores_the_source(self) -> None:
+        contract, verifier = self._create_task()
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B must update its accepted implementation",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        claimed = self.store.claim_ready_node("accepted-owner-preparation", self.epoch)
+        assert claimed is not None
+        self.assertEqual((claimed["node_id"], claimed["attempt"]), ("B", 2))
+
+        recovered, orphans = self.store.recover_interrupted_with_orphans()
+
+        self.assertEqual((recovered, orphans), (1, ()))
+        task = self.store.get_task(contract.task_id)
+        owner = next(node for node in task["nodes"] if node["node_id"] == "B")
+        self.assertEqual((task["state"], owner["state"], owner["attempt"]), (
+            "queued", "pending", 2,
+        ))
+        self.assertEqual(self.store.list_approvals(), [])
+        rollback = next(
+            event
+            for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.accepted_source_repair_rolled_back"
+        )
+        self.assertIn("restarted before", rollback["payload"]["preparation_result"]["summary"])
+        retry = self.store.claim_ready_node("accepted-owner-retry", self.epoch)
+        assert retry is not None
+        self.assertEqual((retry["node_id"], retry["attempt"]), ("B", 3))
+
+    def test_preassignment_retries_are_bounded_by_the_task_contract(self) -> None:
+        contract, verifier = self._create_task(retry_limit=1)
+        accepted_before = next(
+            node
+            for node in self.store.get_task(contract.task_id)["nodes"]
+            if node["node_id"] == "B"
+        )
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B must update its accepted implementation",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        coordinator = Coordinator(
+            self.store, self.state_root, coordinator_epoch=self.epoch
+        )
+        try:
+            with patch(
+                "codex_workbench.accepted_source_repair.prepare_accepted_source_repair",
+                side_effect=AcceptedSourceRepairError("persistent preparation failure"),
+            ):
+                first = coordinator._claim_next_ready_node("accepted-owner-first")
+                assert first is not None
+                coordinator._execute_claimed(first)
+                second = coordinator._claim_next_ready_node("accepted-owner-second")
+                assert second is not None
+                coordinator._execute_claimed(second)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        task = self.store.get_task(contract.task_id)
+        owner = next(node for node in task["nodes"] if node["node_id"] == "B")
+        self.assertEqual((task["state"], owner["state"], owner["attempt"]), (
+            "needs_fix", "blocked", 3,
+        ))
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        binding = parse_accepted_source_repair_binding(recovery_json)
+        assert binding is not None
+        self.assertEqual(json.loads(binding["source_result_json"]), accepted_before["result"])
+        self.assertIsNone(self.store.claim_ready_node("must-not-loop", self.epoch))
+        rollbacks = [
+            event
+            for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "node.accepted_source_repair_rolled_back"
+        ]
+        self.assertEqual(
+            [event["payload"]["retry_scheduled"] for event in rollbacks],
+            [True, False],
+        )
+
     def test_preparation_block_preserves_staged_patch_and_attempt_guidance(self) -> None:
         self.enterContext(isolated_process_catalog(()))
         contract, verifier = self._create_task(retry_limit=1)

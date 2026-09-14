@@ -264,6 +264,7 @@ class Coordinator:
         from .node_recovery_actions import JournaledNodeActions
         from .node_recovery_readiness import ReadinessNodeActions
         from .node_recovery_local import LocalNodeActions
+        from .node_recovery_owner_repair import OwnerRepairNodeActions
         from .node_recovery_repair import RepairNodeActions
         from .node_recovery_source_repair import SourceRepairNodeActions
         from .node_recovery_store import NodeRecoveryStore
@@ -285,6 +286,7 @@ class Coordinator:
                 "source_only_recovery": journaled,
                 "materialize_dependencies": local, "resume_node": local,
                 "repair_source": SourceRepairNodeActions(self.store),
+                "resume_owner_repairs": OwnerRepairNodeActions(self.store),
                 "request_repair": RepairNodeActions(self.config, NodeRecoveryStore(self.store), authority_service),
             },
         )
@@ -894,6 +896,50 @@ class Coordinator:
             for label, model in self._futures.values()
             if model is not None and label not in routed
         )
+
+    def _settle_claimed_result(
+        self,
+        claimed: dict,
+        result: NodeResult,
+        *,
+        executor_started: bool,
+    ) -> None:
+        """Commit a result or durably expose a conflict on the still-current lease."""
+
+        try:
+            self.store.settle_node(
+                claimed["task_id"],
+                claimed["node_id"],
+                result,
+                attempt=claimed["attempt"],
+                coordinator_epoch=claimed["coordinator_epoch"],
+                lease_epoch=claimed["lease_epoch"],
+            )
+        except StateConflictError as error:
+            rejected_result_ref = self.artifacts.put_text(
+                canonical_json(
+                    {
+                        "schema_version": 1,
+                        "task_id": claimed["task_id"],
+                        "node_id": claimed["node_id"],
+                        "attempt": claimed["attempt"],
+                        "executor_started": executor_started,
+                        "conflict": f"{type(error).__name__}: {error}",
+                        "result": result.to_dict(),
+                    }
+                ),
+                "settlement-conflict.json",
+            )
+            self.store.reconcile_settlement_conflict(
+                claimed["task_id"],
+                claimed["node_id"],
+                attempt=claimed["attempt"],
+                coordinator_epoch=claimed["coordinator_epoch"],
+                lease_epoch=claimed["lease_epoch"],
+                error=f"{type(error).__name__}: {error}",
+                executor_started=executor_started,
+                rejected_result_ref=rejected_result_ref,
+            )
 
     @staticmethod
     def _claude_decision(
@@ -1856,7 +1902,10 @@ class Coordinator:
                     from .accepted_source_repair import prepare_accepted_source_repair
 
                     prepared = prepare_accepted_source_repair(
-                        self.store, accepted_source_repair, self.worktrees,
+                        self.store,
+                        accepted_source_repair,
+                        self.worktrees,
+                        target_attempt=int(claimed["attempt"]),
                     )
                     repair_artifact_kind = "accepted-source-repair"
                 worktree = prepared.worktree
@@ -1970,17 +2019,7 @@ class Coordinator:
                     result=result,
                     context=context,
                 )
-                try:
-                    self.store.settle_node(
-                        claimed["task_id"],
-                        claimed["node_id"],
-                        result,
-                        attempt=claimed["attempt"],
-                        coordinator_epoch=claimed["coordinator_epoch"],
-                        lease_epoch=claimed["lease_epoch"],
-                    )
-                except StateConflictError:
-                    pass
+                self._settle_claimed_result(claimed, result, executor_started=False)
                 return
             validate_historical_dispatch()
             cache_spec = {
@@ -2036,14 +2075,7 @@ class Coordinator:
                         claimed["task_id"],
                         claimed["node_id"],
                     )
-                    self.store.settle_node(
-                        claimed["task_id"],
-                        claimed["node_id"],
-                        result,
-                        attempt=claimed["attempt"],
-                        coordinator_epoch=claimed["coordinator_epoch"],
-                        lease_epoch=claimed["lease_epoch"],
-                    )
+                    self._settle_claimed_result(claimed, result, executor_started=False)
                     return
             if claim_route is None:
                 quota = self._latest_quota()
@@ -2226,6 +2258,22 @@ class Coordinator:
                     verdict="blocked" if claimed["spec"].get("verifier") else None,
                     **governance_receipt_fields(claimed["contract"]),
                 )
+        except StateConflictError as error:
+            before_execution = context.execute_started_at is None
+            context.failure_origin = "environment" if before_execution else "unknown"
+            phase = "pre-execution" if before_execution else "post-dispatch"
+            context.failure_detail = f"{phase} state changed: {error}"
+            result = NodeResult(
+                status="blocked" if before_execution else "indeterminate",
+                summary=f"{phase} state changed: {error}",
+                result_kind="verifier" if claimed["spec"].get("verifier") else "worker",
+                verdict=(
+                    "blocked"
+                    if before_execution and claimed["spec"].get("verifier")
+                    else None
+                ),
+                **governance_receipt_fields(claimed["contract"]),
+            )
         except Exception as error:
             harness_failure_ref = self._pre_execution_harness_failure_ref(
                 claimed, error, context
@@ -2290,18 +2338,11 @@ class Coordinator:
             result=result,
             context=context,
         )
-        try:
-            self.store.settle_node(
-                claimed["task_id"],
-                claimed["node_id"],
-                result,
-                attempt=claimed["attempt"],
-                coordinator_epoch=claimed["coordinator_epoch"],
-                lease_epoch=claimed["lease_epoch"],
-            )
-        except StateConflictError:
-            # A newer coordinator/node lease owns the durable state; this late result is fenced.
-            return
+        self._settle_claimed_result(
+            claimed,
+            result,
+            executor_started=context.execute_started_at is not None,
+        )
 
     def _prepare_failed_attempt_recovery(
         self,
@@ -2906,17 +2947,7 @@ class Coordinator:
             result=result,
             context=context,
         )
-        try:
-            self.store.settle_node(
-                claimed["task_id"],
-                claimed["node_id"],
-                result,
-                attempt=claimed["attempt"],
-                coordinator_epoch=claimed["coordinator_epoch"],
-                lease_epoch=claimed["lease_epoch"],
-            )
-        except StateConflictError:
-            return
+        self._settle_claimed_result(claimed, result, executor_started=False)
 
     def _run_blocked_worktree_recovery(self, claimed: dict) -> NodeResult:
         binding = claimed.get("blocked_worktree_recovery")

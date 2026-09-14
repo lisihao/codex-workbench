@@ -426,6 +426,154 @@ class NodeRecoveryStore:
                 raise KeyError(episode_id)
             return self._episode_row(connection, row)
 
+    def reconcile_superseded_attempts(
+        self,
+        task_id: str,
+        *,
+        coordinator_epoch: int,
+    ) -> list[str]:
+        """Resolve old safe episodes after a newer node attempt durably starts."""
+
+        task_id = _text(task_id, "task_id")
+        _positive_int(coordinator_epoch, "coordinator_epoch")
+        timestamp = now_iso()
+        resolved: list[str] = []
+        with self.base_store.transaction() as connection:
+            self.base_store._assert_active_coordinator(connection, coordinator_epoch)
+            task = self._task_row(connection, task_id)
+            if str(task["state"]).lower() in {"paused", "cancelled"}:
+                return []
+            rows = connection.execute(
+                """
+                SELECT episode.*, node.state AS current_node_state,
+                       node.attempt AS current_node_attempt
+                FROM node_recovery_episodes AS episode
+                JOIN nodes AS node
+                  ON node.task_id = episode.task_id
+                 AND node.node_id = episode.node_id
+                WHERE episode.task_id = ?
+                  AND episode.state IN ('waiting', 'ready', 'needs_action')
+                  AND node.attempt > episode.node_attempt
+                ORDER BY episode.node_id, episode.node_attempt, episode.episode_id
+                LIMIT 100
+                """,
+                (task_id,),
+            ).fetchall()
+            for row in rows:
+                if bool(row["permission_required"]) or self._lease_is_live(row, timestamp):
+                    continue
+                if str(row["current_node_state"]).lower() in {"paused", "cancelled"}:
+                    continue
+                unsettled = connection.execute(
+                    """
+                    SELECT 1 FROM node_recovery_actions
+                    WHERE episode_id = ? AND state IN ('executing', 'unknown')
+                    LIMIT 1
+                    """,
+                    (row["episode_id"],),
+                ).fetchone()
+                if unsettled is not None:
+                    continue
+                started = connection.execute(
+                    """
+                    SELECT cursor, payload_json FROM events
+                    WHERE task_id = ? AND node_id = ?
+                      AND event_type = 'node.started' AND cursor > ?
+                      AND json_extract(payload_json, '$.attempt') = ?
+                    ORDER BY cursor LIMIT 1
+                    """,
+                    (
+                        task_id,
+                        row["node_id"],
+                        row["source_event_cursor"],
+                        row["current_node_attempt"],
+                    ),
+                ).fetchone()
+                if started is None:
+                    continue
+                try:
+                    observation = json.loads(str(row["observation_json"]))
+                except json.JSONDecodeError as error:
+                    raise StateConflictError(
+                        "recovery episode observation is invalid JSON"
+                    ) from error
+                if not isinstance(observation, dict):
+                    raise StateConflictError("recovery episode observation is invalid")
+                observation.update(
+                    {
+                        "task_revision": int(task["state_revision"]),
+                        "superseded_by_attempt": int(row["current_node_attempt"]),
+                        "superseded_start_event_cursor": int(started["cursor"]),
+                    }
+                )
+                planned = _decision(
+                    {
+                        "category": str(row["category"]),
+                        "state": "resolved",
+                        "action": None,
+                        "reason_kind": "attempt_superseded",
+                        "owner": "authority",
+                        "requires_authorization": False,
+                        "next_wakeup_at": None,
+                    },
+                    observation=observation,
+                )
+                revision = int(row["state_revision"]) + 1
+                event_cursor = self.base_store._event(
+                    connection,
+                    "node_recovery.episode_superseded",
+                    task_id,
+                    str(row["node_id"]),
+                    {
+                        "episode_id": row["episode_id"],
+                        "node_attempt": int(row["node_attempt"]),
+                        "superseded_by_attempt": int(row["current_node_attempt"]),
+                        "started_event_cursor": int(started["cursor"]),
+                        "state_revision": revision,
+                        "reason_kind": "attempt_superseded",
+                    },
+                    created_at=timestamp,
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE node_recovery_episodes
+                    SET task_revision = ?, phase = 'attempt_superseded',
+                        observation_json = ?, decision_json = ?,
+                        source_event_cursor = ?, state = 'resolved', action = NULL,
+                        owner = 'authority', permission_required = 0,
+                        current_stage_key = NULL, next_wakeup_at = NULL,
+                        owner_id = NULL, coordinator_epoch = 0, lease_epoch = 0,
+                        lease_expires_at = NULL, state_revision = ?,
+                        last_material_progress_at = ?, last_progress_json = ?,
+                        updated_at = ?
+                    WHERE episode_id = ? AND state_revision = ?
+                    """,
+                    (
+                        int(task["state_revision"]),
+                        canonical_json(observation),
+                        canonical_json(planned["document"]),
+                        max(int(row["source_event_cursor"]), int(started["cursor"])),
+                        revision,
+                        timestamp,
+                        canonical_json(
+                            {
+                                "kind": "node_recovery.episode_superseded",
+                                "event_cursor": event_cursor,
+                                "started_event_cursor": int(started["cursor"]),
+                            }
+                        ),
+                        timestamp,
+                        row["episode_id"],
+                        row["state_revision"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError(
+                        "recovery episode supersede compare-and-set failed"
+                    )
+                resolved.append(str(row["episode_id"]))
+        return resolved
+
     def list_due(
         self,
         *,
@@ -1525,11 +1673,13 @@ class NodeRecoveryStore:
                 """,
                 (canonical_json(refs), verified, timestamp, timestamp, repair["repair_link_id"]),
             )
+            policy = self._policy_from_document(json.loads(str(episode["policy_json"])))
             if paused:
                 planned = _suspended_decision("user_pause")
+                deadline = str(episode["time_budget_deadline_at"])
             else:
-                policy = self._policy_from_document(json.loads(str(episode["policy_json"])))
                 planned = _repair_deployed_wait_decision(policy.backoff_seconds, timestamp)
+                deadline = _after(timestamp, policy.time_budget_seconds)
             observed = json.loads(str(episode["observation_json"]))
             for key in ("validated_source_delta", "validated_install_manifest", "validated_runtime_fingerprint", "validation_audit_ref",
                         "last_validation_profile", "repair_wait_kind", "repair_wait_state"):
@@ -1544,6 +1694,7 @@ class NodeRecoveryStore:
                 UPDATE node_recovery_episodes
                 SET phase = 'repair_deployed', state = ?, action = ?, owner = ?,
                     permission_required = ?, state_revision = ?, next_wakeup_at = ?,
+                    time_budget_deadline_at = ?,
                     last_material_progress_at = ?, last_progress_json = ?, decision_json = ?, updated_at = ?,
                     repair_deployment_fingerprint = ?, observation_json = ?
                 WHERE episode_id = ? AND state_revision = ?
@@ -1551,6 +1702,7 @@ class NodeRecoveryStore:
                 (
                     planned["state"], planned["action"], planned["owner"],
                     int(planned["requires_authorization"]), revision, planned["next_wakeup_at"],
+                    deadline,
                     timestamp,
                     canonical_json(
                         {
@@ -2033,7 +2185,17 @@ class NodeRecoveryStore:
             # cannot renew this clock.
             deadline = _after(timestamp, policy.time_budget_seconds)
         timer_decision = False
-        if not repair_evidence_changed and _due(deadline, timestamp):
+        dependency_wait = planned["document"].get("reason_kind") in {
+            "accepted_owner_repairs_pending",
+            "accepted_owner_repair_preparation_exhausted",
+            "accepted_owner_repair_repair_action_unconfigured",
+            "accepted_owner_repair_repair_budget_exhausted",
+        }
+        if (
+            not repair_evidence_changed
+            and not dependency_wait
+            and _due(deadline, timestamp)
+        ):
             planned = _budget_exhausted_decision()
             timer_decision = True
         elif (

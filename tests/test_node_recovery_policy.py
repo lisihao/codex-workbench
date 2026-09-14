@@ -31,6 +31,123 @@ def observation(category: str, **overrides: object) -> dict[str, object]:
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_blocked_consumer_waits_on_accepted_owner_repairs_under_authority(self) -> None:
+        policy = RecoveryPolicy(
+            enabled=True,
+            allowed_actions=("repair_source",),
+            time_budget_seconds=10,
+            backoff_seconds=30,
+        )
+        decision = plan_recovery(
+            policy,
+            observation(
+                "unknown",
+                elapsed_seconds=600,
+                action_attempts=policy.max_action_attempts,
+                blocked_owner_repairs_pending=True,
+            ),
+        )
+        self.assertEqual(
+            (
+                decision["state"],
+                decision["reason_kind"],
+                decision["owner"],
+                decision["requires_authorization"],
+                decision["next_wakeup_at"],
+            ),
+            (
+                "waiting",
+                "accepted_owner_repairs_pending",
+                "authority",
+                False,
+                "2026-09-11T12:00:30+00:00",
+            ),
+        )
+        for change in (
+            {"task_state": "paused"},
+            {"task_state": "cancelled"},
+            {"approval_pending": True},
+            {"node_state": "indeterminate"},
+            {"category": "unknown_effects"},
+        ):
+            with self.subTest(change=change):
+                self.assertNotEqual(
+                    plan_recovery(
+                        policy,
+                        {
+                            **observation(
+                                "unknown",
+                                blocked_owner_repairs_pending=True,
+                            ),
+                            **change,
+                        },
+                    )["reason_kind"],
+                    "accepted_owner_repairs_pending",
+                )
+
+    def test_exhausted_owner_preparation_uses_bounded_repair_evidence(self) -> None:
+        base = observation(
+            "unknown",
+            blocked_owner_repairs_pending=True,
+            blocked_owner_repair_preparation_exhausted=True,
+        )
+        unconfigured = plan_recovery(
+            RecoveryPolicy(enabled=True, allowed_actions=("repair_source",)),
+            {**base, "elapsed_seconds": 600, "action_attempts": 3},
+        )
+        self.assertEqual(
+            (
+                unconfigured["action"], unconfigured["reason_kind"],
+                unconfigured["owner"], unconfigured["requires_authorization"],
+            ),
+            (
+                None, "accepted_owner_repair_repair_action_unconfigured",
+                "authority", False,
+            ),
+        )
+
+        repair_policy = RecoveryPolicy(
+            enabled=True,
+            allowed_actions=("request_repair",),
+            repair_repository="/fixture/repository",
+            repair_allowed_scopes=("src",),
+            time_budget_seconds=10,
+        )
+        ready = plan_recovery(repair_policy, base)
+        self.assertEqual((ready["state"], ready["action"]), ("ready", "request_repair"))
+        timed_out = plan_recovery(
+            repair_policy, {**base, "elapsed_seconds": 600}
+        )
+        self.assertEqual(
+            (timed_out["action"], timed_out["reason_kind"], timed_out["owner"]),
+            (None, "accepted_owner_repair_repair_budget_exhausted", "authority"),
+        )
+        requested = plan_recovery(
+            repair_policy, {**base, "repair_requested": True}
+        )
+        self.assertEqual(
+            (requested["state"], requested["reason_kind"], requested["owner"]),
+            ("waiting", "repair_request_pending", "repair"),
+        )
+        linked = plan_recovery(
+            repair_policy,
+            {
+                **base,
+                "repair_linked": True,
+                "repair_wait_state": "needs_action",
+                "repair_wait_kind": "release_receipt_missing",
+                "repair_wait_owner": "delivery",
+                "repair_wait_requires_authorization": False,
+            },
+        )
+        self.assertEqual(
+            (
+                linked["state"], linked["reason_kind"], linked["owner"],
+                linked["requires_authorization"],
+            ),
+            ("needs_action", "release_receipt_missing", "delivery", False),
+        )
+
     def test_known_repeated_failure_uses_authorized_repair_without_relabeling_cause(self) -> None:
         policy = RecoveryPolicy(
             enabled=True, allowed_actions=("request_repair",),

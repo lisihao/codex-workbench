@@ -442,6 +442,15 @@ class DIntegrationScopeTests(unittest.TestCase):
             reason="D found exact upstream owner defects before E became reachable",
         )
         self.assertTrue(receipt["blocked_consumer_preserved"])
+        owner_wait = self.store.blocked_owner_repair_wait(
+            contract.task_id, "D", 2
+        )
+        assert owner_wait is not None
+        self.assertTrue(owner_wait["pending"])
+        self.assertEqual(
+            [item["node_id"] for item in owner_wait["dependencies"]],
+            ["A", "B", "C"],
+        )
         for owner in ("A", "B", "C"):
             claimed = self.store.claim_ready_node("repair-" + owner, self.epoch)
             self.assertIsNotNone(claimed)
@@ -492,6 +501,14 @@ class DIntegrationScopeTests(unittest.TestCase):
                     changed_paths=tuple(changed_paths),
                 ),
             )
+        settled_wait = self.store.blocked_owner_repair_wait(
+            contract.task_id, "D", 2
+        )
+        assert settled_wait is not None
+        self.assertFalse(settled_wait["pending"])
+        self.assertTrue(
+            all(item["satisfied"] for item in settled_wait["dependencies"])
+        )
         return instructions
 
     def _queue_rebased_d_source(self, contract: TaskContract, request_id: str) -> dict:

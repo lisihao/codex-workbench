@@ -31,6 +31,7 @@ class _FixtureStore:
         self.artifacts = ArtifactStore(root / "artifacts")
         self.task = task
         self.rollback: dict[str, object] | None = None
+        self.owner_repair_wait: dict[str, object] | None = None
         self.database = root / "state.sqlite"
         with sqlite3.connect(self.database) as connection:
             connection.execute(
@@ -46,6 +47,11 @@ class _FixtureStore:
 
     def current_blocked_worktree_recovery_rollback(self, *_args: object, **_kwargs: object) -> dict[str, object] | None:
         return self.rollback
+
+    def blocked_owner_repair_wait(
+        self, _task_id: str, _node_id: str, _attempt: int
+    ) -> dict[str, object] | None:
+        return self.owner_repair_wait
 
     @contextmanager
     def connection(self):
@@ -118,6 +124,44 @@ class NodeRecoveryObservationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="node-recovery-observation-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_blocked_owner_repair_dependencies_are_authoritative_progress(self) -> None:
+        store = _FixtureStore(
+            self.root,
+            _task(
+                {
+                    "status": "blocked",
+                    "summary": "fixture",
+                    "artifacts": {},
+                    "checks": [],
+                    "changed_paths": [],
+                }
+            ),
+        )
+        store.owner_repair_wait = {
+            "event_cursor": 29,
+            "requester_attempt": 1,
+            "pending": True,
+            "dependencies": [
+                {
+                    "node_id": "A",
+                    "source_attempt": 4,
+                    "target_attempt": 5,
+                    "current_attempt": 6,
+                    "state": "running",
+                    "satisfied": False,
+                }
+            ],
+            "progress_fingerprint": "f" * 64,
+        }
+        observed = collect_node_observation(store, "task-1", "work")
+        self.assertTrue(observed["blocked_owner_repairs_pending"])
+        self.assertEqual(observed["blocked_owner_repair"], store.owner_repair_wait)
+        self.assertEqual(observed["source_event_cursor"], 29)
+        self.assertIn(
+            "blocked-owner-repair",
+            observed["authoritative_material_progress"]["sources"],
+        )
 
     def _store(self, task: dict[str, object]) -> _FixtureStore:
         return _FixtureStore(self.root, task)

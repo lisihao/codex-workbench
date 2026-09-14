@@ -209,6 +209,39 @@ class NodeRecoveryLoopTests(unittest.TestCase):
         self.assertIsNone(self.store.claim_ready_node("fixture-d", self.epoch))
         self.assertEqual(self.task()["state"], "blocked")
 
+    def test_event_observer_supersedes_old_safe_episode_after_new_attempt_starts(self):
+        episode = self.loop._refresh_node(self.task_id, "B", 0)
+        self.assertNotEqual(episode["state"], "resolved")
+        self._advance_recovery_cursor()
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE nodes SET state = 'running', attempt = 2
+                WHERE task_id = ? AND node_id = 'B'
+                """,
+                (self.task_id,),
+            )
+            connection.execute(
+                """
+                UPDATE tasks SET state = 'running', state_revision = state_revision + 1
+                WHERE task_id = ?
+                """,
+                (self.task_id,),
+            )
+            self.store._event(
+                connection,
+                "node.started",
+                self.task_id,
+                "B",
+                {"attempt": 2},
+            )
+        self._event_loop()._observe()
+        resolved = self.recovery.get_episode(episode["episode_id"])
+        self.assertEqual(
+            (resolved["state"], resolved["decision"]["reason_kind"]),
+            ("resolved", "attempt_superseded"),
+        )
+
     def test_lost_write_response_queries_original_receipt_without_duplicate_effect(self):
         self.actions.lose_receipt = True
         self.loop.reconcile_once()

@@ -70,11 +70,12 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         cursor: int = 1,
         phase: str = "blocked_observed",
         profile: str = "dsh-b-ipc-v1",
+        attempt: int = 0,
     ) -> dict[str, object]:
         return {
             "task_id": self.task_id,
             "node_id": "worker",
-            "attempt": 0,
+            "attempt": attempt,
             "task_revision": self._task_revision(),
             "failure_fingerprint": _fingerprint(label),
             "origin": "authority_validation",
@@ -150,6 +151,206 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         self.assertEqual(
             sum(event["event_type"] == "node_recovery.needs_action" for event in events_after),
             1,
+        )
+
+    def test_newer_started_attempt_supersedes_only_safe_unleased_episode(self) -> None:
+        safe_decision = {
+            **self._decision(
+                None,
+                state="needs_action",
+                reason="budget_exhausted",
+            ),
+            "requires_authorization": False,
+        }
+        safe = self.store.record_episode(
+            self._observation("superseded", cursor=3), safe_decision
+        )
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE nodes SET state = 'running', attempt = 1
+                WHERE task_id = ? AND node_id = 'worker'
+                """,
+                (self.task_id,),
+            )
+            started_cursor = self.base._event(
+                connection,
+                "node.started",
+                self.task_id,
+                "worker",
+                {"attempt": 1},
+            )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [safe["episode_id"]],
+        )
+        resolved = self.store.get_episode(safe["episode_id"])
+        self.assertEqual(
+            (
+                resolved["state"],
+                resolved["phase"],
+                resolved["owner"],
+                resolved["permission_required"],
+                resolved["decision"]["reason_kind"],
+            ),
+            ("resolved", "attempt_superseded", "authority", False, "attempt_superseded"),
+        )
+        self.assertEqual(
+            resolved["observation"]["superseded_start_event_cursor"],
+            started_cursor,
+        )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [],
+        )
+
+        unknown = self.store.record_episode(
+            self._observation("unknown-intent", cursor=started_cursor, attempt=1),
+            self._decision(),
+        )
+        claimed = self.store.claim_due(
+            unknown["episode_id"],
+            "unknown-owner",
+            self.epoch,
+            expected_revision=unknown["revision"],
+            expected_node_attempt=1,
+        )
+        assert claimed is not None
+        self.store.begin_action(
+            claimed["episode_id"],
+            "unknown-request",
+            _fingerprint("unknown-action"),
+            {"stage_key": "observe_readiness"},
+            owner_id="unknown-owner",
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+            expected_revision=claimed["revision"],
+            expected_node_attempt=1,
+        )
+        self.store.recover_interrupted()
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE nodes SET attempt = 2
+                WHERE task_id = ? AND node_id = 'worker'
+                """,
+                (self.task_id,),
+            )
+            self.base._event(
+                connection,
+                "node.started",
+                self.task_id,
+                "worker",
+                {"attempt": 2},
+            )
+        self.assertEqual(
+            self.store.reconcile_superseded_attempts(
+                self.task_id, coordinator_epoch=self.epoch
+            ),
+            [],
+        )
+        preserved = self.store.get_episode(unknown["episode_id"])
+        self.assertEqual(preserved["state"], "needs_action")
+        self.assertTrue(preserved["permission_required"])
+        self.assertEqual(preserved["actions"][0]["state"], "unknown")
+
+    def test_owner_repair_dependency_wait_is_not_relabelled_as_user_budget(self) -> None:
+        observation = {
+            **self._observation("owner-dependency-wait"),
+            "blocked_owner_repairs_pending": True,
+            "blocked_owner_repair": {
+                "event_cursor": 9,
+                "requester_attempt": 1,
+                "pending": True,
+                "dependencies": [
+                    {
+                        "node_id": "owner",
+                        "source_attempt": 1,
+                        "target_attempt": 2,
+                        "current_attempt": 2,
+                        "state": "running",
+                        "satisfied": False,
+                    }
+                ],
+                "progress_fingerprint": _fingerprint("owner-progress"),
+            },
+        }
+        decision = {
+            "category": "unknown",
+            "state": "waiting",
+            "action": None,
+            "owner": "authority",
+            "reason_kind": "accepted_owner_repairs_pending",
+            "requires_authorization": False,
+            "next_wakeup_at": "2099-01-01T00:00:00+00:00",
+        }
+        episode = self.store.record_episode(observation, decision)
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE node_recovery_episodes
+                SET time_budget_deadline_at = '2000-01-01T00:00:00+00:00'
+                WHERE episode_id = ?
+                """,
+                (episode["episode_id"],),
+            )
+        refreshed = self.store.record_episode(observation, decision)
+        self.assertEqual(
+            (
+                refreshed["state"],
+                refreshed["owner"],
+                refreshed["permission_required"],
+                refreshed["decision"]["reason_kind"],
+                refreshed["next_wakeup_at"],
+            ),
+            (
+                "waiting",
+                "authority",
+                False,
+                "accepted_owner_repairs_pending",
+                "2099-01-01T00:00:00+00:00",
+            ),
+        )
+
+    def test_exhausted_owner_repair_diagnostic_is_not_relabelled_as_user_budget(self) -> None:
+        observation = {
+            **self._observation("owner-preparation-exhausted"),
+            "blocked_owner_repairs_pending": True,
+            "blocked_owner_repair_preparation_exhausted": True,
+        }
+        decision = {
+            "category": "tooling_bug",
+            "state": "needs_action",
+            "action": None,
+            "owner": "authority",
+            "reason_kind": "accepted_owner_repair_repair_action_unconfigured",
+            "requires_authorization": False,
+            "next_wakeup_at": None,
+        }
+        episode = self.store.record_episode(observation, decision)
+        with self.base.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE node_recovery_episodes
+                SET time_budget_deadline_at = '2000-01-01T00:00:00+00:00'
+                WHERE episode_id = ?
+                """,
+                (episode["episode_id"],),
+            )
+        refreshed = self.store.record_episode(observation, decision)
+        self.assertEqual(
+            (
+                refreshed["state"], refreshed["owner"],
+                refreshed["permission_required"], refreshed["decision"]["reason_kind"],
+            ),
+            (
+                "needs_action", "authority", False,
+                "accepted_owner_repair_repair_action_unconfigured",
+            ),
         )
 
     def test_claim_intent_and_settlement_use_stage_local_attempt_budget(self) -> None:
@@ -522,6 +723,12 @@ class NodeRecoveryStoreTests(unittest.TestCase):
             repair_fingerprint=deployment,
         )
         self.assertEqual(repeated["revision"], linked["revision"])
+        expired = "2020-01-01T00:00:00+00:00"
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
         deployed = self.store.mark_repair_deployed(
             linked["episode_id"], expected_revision=linked["revision"], expected_node_attempt=0,
             verified_deployment_fingerprint=_fingerprint("verified-deployment"),
@@ -532,6 +739,87 @@ class NodeRecoveryStoreTests(unittest.TestCase):
         self.assertEqual(deployed["repair"]["repair_fingerprint"], deployment)
         self.assertEqual(deployed["repair"]["verified_deployment_fingerprint"], _fingerprint("verified-deployment"))
         self.assertIsNotNone(deployed["repair"]["deployed_at"])
+        self.assertNotEqual(deployed["time_budget_deadline_at"], expired)
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
+        replayed_deployment = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=deployed["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=_fingerprint("verified-deployment"),
+            expected_repair_fingerprint=deployment,
+            evidence_refs={"deployment": "sha256:" + deployment + ":deployment.json"},
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(replayed_deployment["time_budget_deadline_at"], expired)
+
+    def _assert_repair_deployment_preserves_control(self, control_state: str) -> None:
+        episode = self._record("repair-" + control_state)
+        claimed = self._claim(episode)
+        repair_fingerprint = _fingerprint("repair-" + control_state)
+        linked = self.store.link_repair(
+            claimed["episode_id"],
+            owner_id="fixture-owner",
+            coordinator_epoch=self.epoch,
+            lease_epoch=claimed["lease_epoch"],
+            expected_revision=claimed["revision"],
+            repair_request_id="repair-request-" + control_state,
+            repair_task_id="repair-task-" + control_state,
+            repair_fingerprint=repair_fingerprint,
+        )
+        expired = "2000-01-01T00:00:00+00:00"
+        with self.base.transaction() as connection:
+            connection.execute(
+                "UPDATE node_recovery_episodes SET time_budget_deadline_at = ? WHERE episode_id = ?",
+                (expired, linked["episode_id"]),
+            )
+        task = self.base.get_task(self.task_id)
+        self.base.queue_task(
+            self.task_id, expected_revision=int(task["state_revision"])
+        )
+        task = self.base.get_task(self.task_id)
+        self.base.transition_task(
+            self.task_id,
+            control_state,
+            expected_revision=int(task["state_revision"]),
+        )
+        deployment = _fingerprint("deployment-" + control_state)
+        evidence = {"deployment": "sha256:" + deployment + ":deployment.json"}
+        deployed = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=linked["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=deployment,
+            expected_repair_fingerprint=repair_fingerprint,
+            evidence_refs=evidence,
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(self.base.get_task(self.task_id)["state"], control_state)
+        self.assertEqual(
+            (deployed["state"], deployed["decision"]["reason_kind"]),
+            ("suspended", "user_pause"),
+        )
+        self.assertEqual(deployed["time_budget_deadline_at"], expired)
+        replayed = self.store.mark_repair_deployed(
+            linked["episode_id"],
+            expected_revision=deployed["revision"],
+            expected_node_attempt=0,
+            verified_deployment_fingerprint=deployment,
+            expected_repair_fingerprint=repair_fingerprint,
+            evidence_refs=evidence,
+            verified_by="fixture-deployment-verifier",
+        )
+        self.assertEqual(replayed["revision"], deployed["revision"])
+        self.assertEqual(replayed["time_budget_deadline_at"], expired)
+
+    def test_repair_deployment_preserves_pause_and_does_not_renew_its_budget(self) -> None:
+        self._assert_repair_deployment_preserves_control("paused")
+
+    def test_repair_deployment_preserves_cancel_and_does_not_renew_its_budget(self) -> None:
+        self._assert_repair_deployment_preserves_control("cancelled")
 
     def test_cursor_cas_and_bounded_documents_reject_unsafe_history(self) -> None:
         self.assertEqual(self.store.read_cursor(), 0)
