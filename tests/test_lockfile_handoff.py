@@ -428,6 +428,75 @@ class LockfileHandoffTests(unittest.TestCase):
                 {**arguments, "op": "apply", "expected_attempt": 2, "expected_fingerprint": preview["fingerprint"]},
             )
 
+    def test_repair_worktree_follows_physical_worktree_root_and_is_fingerprinted(self) -> None:
+        physical_root = self.root / "physical-workbench" / "worktrees"
+        physical_root.mkdir(parents=True)
+        (self.config.state_root / "worktrees").symlink_to(
+            physical_root, target_is_directory=True
+        )
+        contract, before, _source = self._blocked_fixture("physical-repair-root")
+        arguments = self._arguments(contract, before, "physical-repair-root-handoff")
+
+        preflight = _preflight(self.config, self.store, arguments)
+        expected_parent = (physical_root.parent / "lockfile-handoffs").resolve()
+        self.assertEqual(Path(preflight["repair_worktree"]).parent, expected_parent)
+        with patch(
+            "codex_workbench.lockfile_handoff._repair_worktree_path",
+            return_value=self.root / "different-volume" / "repair",
+        ):
+            moved = _preflight(self.config, self.store, arguments)
+        self.assertNotEqual(preflight["fingerprint"], moved["fingerprint"])
+
+        fixture = _FixtureMaterializer()
+        preview = lockfile_handoff(self.config, self.store, arguments)
+        with patch(
+            "codex_workbench.lockfile_handoff._pnpm_materializer",
+            return_value=fixture,
+        ):
+            result = self._apply(arguments, preview)
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(Path(result["repair_worktree"]).parent, expected_parent)
+        self.assertTrue(Path(result["repair_worktree"]).is_dir())
+
+    def test_reservation_rejects_physical_worktree_root_drift(self) -> None:
+        contract, before, _source = self._blocked_fixture("repair-root-drift")
+        arguments = self._arguments(contract, before, "repair-root-drift-handoff")
+        preflight = _preflight(self.config, self.store, arguments)
+        with patch(
+            "codex_workbench.lockfile_handoff._repair_worktree_path",
+            return_value=self.root / "moved-worktrees" / "lockfile-handoffs" / "repair",
+        ):
+            with self.assertRaisesRegex(
+                LockfileHandoffError, "repair worktree root changed before reservation"
+            ):
+                _reserve(self.store, preflight)
+
+    def test_terminal_receipt_keeps_its_recorded_repair_path_after_root_change(self) -> None:
+        contract, before, _source = self._blocked_fixture("recorded-repair-root")
+        arguments = self._arguments(contract, before, "recorded-repair-root-handoff")
+        preview = lockfile_handoff(self.config, self.store, arguments)
+        fixture = _FixtureMaterializer(
+            error=DirtyWorktreeRecoveryError("fixture frozen install failed")
+        )
+        with patch(
+            "codex_workbench.lockfile_handoff._pnpm_materializer",
+            return_value=fixture,
+        ):
+            failed = self._apply(arguments, preview)
+        recorded_path = failed["repair_worktree"]
+
+        with patch(
+            "codex_workbench.lockfile_handoff._repair_worktree_path",
+            return_value=self.root / "new-root" / "repair",
+        ):
+            replay = lockfile_handoff(
+                self.config,
+                self.store,
+                {**arguments, "op": "apply", "expected_fingerprint": preview["fingerprint"]},
+            )
+        self.assertEqual(replay["state"], "failed")
+        self.assertEqual(replay["repair_worktree"], recorded_path)
+
     def test_frozen_failure_releases_without_attaching_overlay(self) -> None:
         contract, task, source = self._blocked_fixture("frozen-failure")
         arguments = self._arguments(contract, task, "handoff-frozen-failure")
