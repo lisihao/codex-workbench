@@ -71,6 +71,10 @@ class MobileCockpitStaticTests(unittest.TestCase):
         self.assertIn("const renderedReceipt = await capturePhoneRender(data);", javascript)
         self.assertIn("await recordPhoneObservation(data, renderedReceipt);", javascript)
         self.assertIn("if (!renderedReceipt) return;", javascript)
+        self.assertIn("已显示 ${visibleTasks.length}/${taskTotal}", javascript)
+        self.assertIn('id="load-older-tasks"', (STATIC / "index.html").read_text())
+        self.assertIn("async function loadOlderTasks(event)", javascript)
+        self.assertIn("/api/tasks?limit=10&offset=${offset}", javascript)
 
 
 if __name__ == "__main__":

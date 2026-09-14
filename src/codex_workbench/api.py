@@ -40,6 +40,8 @@ CONTENT_SECURITY_POLICY = (
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 60.0
 LOGIN_FAILURE_TRACKER_LIMIT = 256
+SNAPSHOT_TASK_LIMIT = 10
+TASK_PAGE_MAX_LIMIT = 25
 ANONYMOUS_MAX_COLLECTION_ITEMS = 50
 ANONYMOUS_MAX_STRING_LENGTH = 256
 ANONYMOUS_MAX_DEPTH = 6
@@ -232,6 +234,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/snapshot":
             quota = self.server.store.latest_quota()
+            store_health = self.server.store.health()
+            tasks = self.server.store.list_tasks(limit=SNAPSHOT_TASK_LIMIT)
+            task_total = sum(int(value) for value in store_health["task_counts"].values())
             return self._json(
                 {
                     "version": __version__,
@@ -243,8 +248,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "radar": self._radar_summary(),
                     "ai_frontier": self._ai_frontier_summary(),
                     "scheduler": self._scheduler_metrics(),
-                    "health": self.server.store.health(),
-                    "tasks": self.server.store.list_tasks(),
+                    "health": store_health,
+                    "tasks": tasks,
+                    "task_page": {
+                        "limit": SNAPSHOT_TASK_LIMIT,
+                        "returned": len(tasks),
+                        "total": task_total,
+                        "truncated": task_total > len(tasks),
+                    },
                     "approvals": self.server.store.list_approvals(),
                     "alerts": self.server.store.list_alerts(),
                     "quota": quota.__dict__ if quota else None,
@@ -289,7 +300,38 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 {"events": self.server.store.read_events(after=after, task_id=task_id)}
             )
         if parsed.path == "/api/tasks":
-            return self._json({"tasks": self.server.store.list_tasks()})
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", [str(SNAPSHOT_TASK_LIMIT)])[0])
+                offset = int(query.get("offset", ["0"])[0])
+            except (TypeError, ValueError):
+                return self._json(
+                    {"error": "task page limit and offset must be integers"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+            if not 1 <= limit <= TASK_PAGE_MAX_LIMIT or offset < 0:
+                return self._json(
+                    {
+                        "error": (
+                            f"task page limit must be 1-{TASK_PAGE_MAX_LIMIT} "
+                            "and offset must be non-negative"
+                        )
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+            health = self.server.store.health()
+            tasks = self.server.store.list_tasks(limit=limit, offset=offset)
+            total = sum(int(value) for value in health["task_counts"].values())
+            return self._json({
+                "tasks": tasks,
+                "task_page": {
+                    "limit": limit,
+                    "offset": offset,
+                    "returned": len(tasks),
+                    "total": total,
+                    "has_more": offset + len(tasks) < total,
+                },
+            })
         if parsed.path.startswith("/api/tasks/") and parsed.path.endswith("/delivery-objective"):
             task_id = unquote(
                 parsed.path.removeprefix("/api/tasks/").removesuffix("/delivery-objective")

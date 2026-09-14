@@ -3,11 +3,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tests.process_probe_fixture import isolated_process_catalog
 
 from codex_workbench.recovery_processes import (
     RecoveryProcessError,
+    _darwin_process_cwds,
     assert_recovery_source_idle,
     source_process_ids,
 )
@@ -42,51 +43,71 @@ class RecoveryProcessesTests(unittest.TestCase):
     def test_darwin_probe_matches_descendants_not_prefix_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory).resolve()
-            raw = f"p41\0\nfcwd\0n{source}/nested\0\np42\0\nfcwd\0n{source}-other\0".encode()
-            result = subprocess.CompletedProcess([], 0, raw, b"")
             with patch("codex_workbench.recovery_processes.sys.platform", "darwin"), patch(
-                "codex_workbench.recovery_processes.subprocess.run", return_value=result
+                "codex_workbench.recovery_processes._darwin_process_cwds",
+                return_value=((41, f"{source}/nested"), (42, f"{source}-other")),
             ):
                 self.assertEqual(source_process_ids(source), (41,))
 
     def test_probe_errors_refuse_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            for result in (
-                subprocess.CompletedProcess([], 2, b"", b""),
-                subprocess.CompletedProcess([], 0, b"", b"permission denied"),
+            with patch("codex_workbench.recovery_processes.sys.platform", "darwin"), patch(
+                "codex_workbench.recovery_processes._darwin_process_cwds",
+                side_effect=RecoveryProcessError("cwd lookup was incomplete"),
             ):
-                with self.subTest(result=result), patch("codex_workbench.recovery_processes.sys.platform", "darwin"), patch(
-                    "codex_workbench.recovery_processes.subprocess.run", return_value=result
-                ):
-                    with self.assertRaises(RecoveryProcessError):
-                        source_process_ids(Path(directory))
+                with self.assertRaises(RecoveryProcessError):
+                    source_process_ids(Path(directory))
 
-    def test_darwin_probe_retries_one_timeout_within_a_bounded_budget(self) -> None:
+    def test_darwin_probe_uses_same_process_snapshot_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory).resolve()
-            completed = subprocess.CompletedProcess([], 0, b"", b"")
             with patch(
                 "codex_workbench.recovery_processes.sys.platform", "darwin"
             ), patch(
-                "codex_workbench.recovery_processes.subprocess.run",
-                side_effect=[subprocess.TimeoutExpired("lsof", 5), completed],
-            ) as run:
+                "codex_workbench.recovery_processes._darwin_process_cwds",
+                return_value=(),
+            ) as probe:
                 self.assertEqual(source_process_ids(source), ())
-            self.assertEqual(run.call_count, 2)
+            probe.assert_called_once()
 
-    def test_darwin_probe_reports_exhausted_timeout_attempts(self) -> None:
+    def test_darwin_probe_rejects_incomplete_native_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with patch(
                 "codex_workbench.recovery_processes.sys.platform", "darwin"
             ), patch(
-                "codex_workbench.recovery_processes.subprocess.run",
-                side_effect=subprocess.TimeoutExpired("lsof", 5),
+                "codex_workbench.recovery_processes._darwin_process_cwds",
+                side_effect=RecoveryProcessError("process list changed during inspection"),
             ) as run, self.assertRaisesRegex(
                 RecoveryProcessError,
-                r"lsof timed out after 2 attempts in [0-9.]+s",
+                "process list changed",
             ):
                 source_process_ids(Path(directory))
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 1)
+
+    def test_native_process_list_zero_fill_fails_closed(self) -> None:
+        libproc = Mock()
+        libproc.proc_listpids = Mock(side_effect=[4, 0])
+        libproc.proc_pidinfo = Mock()
+        with patch("codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc):
+            with self.assertRaisesRegex(RecoveryProcessError, "process list failed"):
+                _darwin_process_cwds(501)
+
+    def test_native_cwd_zero_without_esrch_fails_closed(self) -> None:
+        libproc = Mock()
+
+        def list_pids(_kind, _uid, buffer, _size):
+            if buffer is None:
+                return 4
+            buffer[0] = 123
+            return 4
+
+        libproc.proc_listpids = Mock(side_effect=list_pids)
+        libproc.proc_pidinfo = Mock(return_value=0)
+        with patch(
+            "codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc
+        ), patch("codex_workbench.recovery_processes.ctypes.get_errno", return_value=0):
+            with self.assertRaisesRegex(RecoveryProcessError, "cwd lookup was incomplete"):
+                _darwin_process_cwds(501)
 
     def test_unreadable_linux_process_refuses_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -17,6 +17,7 @@ from codex_workbench.api import (
     ANONYMOUS_MAX_STRING_LENGTH,
     LOGIN_FAILURE_LIMIT,
     LOGIN_FAILURE_WINDOW_SECONDS,
+    SNAPSHOT_TASK_LIMIT,
     WorkbenchHTTPServer,
 )
 from codex_workbench.artifacts import ArtifactStore
@@ -226,6 +227,10 @@ class APITests(unittest.TestCase):
                 self.assertFalse(snapshot["authenticated"])
                 self.assertIsNone(snapshot["build"])
                 self.assertIsNone(snapshot["quota_policy"])
+                self.assertEqual(
+                    snapshot["task_page"],
+                    {"limit": SNAPSHOT_TASK_LIMIT, "returned": 0, "total": 0, "truncated": False},
+                )
                 self.assertEqual(len(snapshot["acceptance"]["checks"]), 12)
                 self.assertEqual(snapshot["acceptance"]["backlog"], [])
                 with mock.patch(
@@ -386,6 +391,71 @@ class APITests(unittest.TestCase):
                 with urlopen(artifact_request, timeout=2) as response:
                     artifact_body = response.read().decode()
                 self.assertEqual(artifact_body, "phone-visible evidence")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_snapshot_bounds_complete_task_cards_and_reports_total(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = WorkbenchConfig(root, host="127.0.0.1", port=0)
+            config.initialize()
+            store = WorkbenchStore(config.database)
+            store.initialize()
+            for index in range(SNAPSHOT_TASK_LIMIT + 2):
+                task_id = f"snapshot-bounded-{index:02d}"
+                contract = TaskContract(
+                    task_id=task_id,
+                    repository=str(root),
+                    base_sha="fixture",
+                    objective="bounded cockpit task",
+                    allowed_scope=("tests",),
+                )
+                store.create_task(
+                    contract,
+                    [
+                        NodeSpec("work", task_id, "work", "fixture", "fixture", "ok"),
+                        NodeSpec(
+                            "verify", task_id, "verify", "fixture", "fixture", "accepted",
+                            depends_on=("work",), verifier=True,
+                        ),
+                    ],
+                    task_id + "-create",
+                )
+            server = WorkbenchHTTPServer(config, store)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch(
+                    "codex_workbench.api.code_as_harness_health",
+                    return_value={"ok": True, "archify": {"ok": True}},
+                ):
+                    with urlopen(
+                        f"http://127.0.0.1:{server.server_address[1]}/api/snapshot",
+                        timeout=2,
+                    ) as response:
+                        snapshot = json.load(response)
+                self.assertEqual(len(snapshot["tasks"]), SNAPSHOT_TASK_LIMIT)
+                self.assertEqual(
+                    snapshot["task_page"],
+                    {
+                        "limit": SNAPSHOT_TASK_LIMIT,
+                        "returned": SNAPSHOT_TASK_LIMIT,
+                        "total": SNAPSHOT_TASK_LIMIT + 2,
+                        "truncated": True,
+                    },
+                )
+                with urlopen(
+                    f"http://127.0.0.1:{server.server_address[1]}/api/tasks?limit=2&offset=10",
+                    timeout=2,
+                ) as response:
+                    older = json.load(response)
+                self.assertEqual(len(older["tasks"]), 2)
+                self.assertEqual(
+                    older["task_page"],
+                    {"limit": 2, "offset": 10, "returned": 2, "total": 12, "has_more": False},
+                )
             finally:
                 server.shutdown()
                 server.server_close()

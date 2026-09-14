@@ -20,7 +20,7 @@ IPC 命令固定使用 `--no-cache --configLoader=runner`，避免 Vitest result
 
 先用 `dry_run: true` 预览。预览无任务、事件、artifact 或源码写入，返回当前完整绑定的 `fingerprint`、source delta、固定命令和权限计划。运行使用相同字段、`dry_run: false`、预览的 `expected_fingerprint`，并令 `validation_id` 等于稳定的 Authority `request_id`。pairing-write 另外要求 `confirm_pairing_write: true`。源码、分配、revision、attempt、依赖输入或执行计划变化时拒绝运行，必须重新预览。
 
-同一任务的预览和运行串行执行 source observation；并发调用在有界等待后返回明确的 busy 错误，不会启动第二组 Git 或进程扫描。macOS idle observation 在固定总预算内重试一次 `lsof` 超时，失败信息包含尝试次数和完整耗时；探针失败仍然拒绝验证。成功响应中的 `source_observation_duration_ms` 是本次等待与观察的墙钟时间，不是任务进度或性能承诺。
+同一任务的预览和运行串行执行 source observation；并发调用在有界等待后返回明确的 busy 错误，不会启动第二组 Git 或进程扫描。macOS idle observation 通过 Darwin `libproc` 读取同 UID 进程的 cwd，不再启动会被文件提供方拖慢的全用户 `lsof` 扫描；进程列表、cwd 记录或 ABI 不完整时仍 fail closed。成功响应中的 `source_observation_duration_ms` 是本次等待与观察的墙钟时间，不是任务进度或性能承诺。
 
 运行回执复用 Authority 请求 journal，保留命令、隔离环境、退出码、超时、权限和日志 artifact 引用，并返回 `audit_ref`。响应丢失后通过 `workbench_get_service_request` 查询同一 ID，禁止自动换 ID 重跑。执行期间同一任务的恢复 CAS 被挡住；结束后历史 worker result、revision、attempt 和已接受祖先不被这个工具修改。pairing-write 改变当前源码摘要，因此后续 source-only 恢复必须重新预览，不能沿用写入前摘要。
 

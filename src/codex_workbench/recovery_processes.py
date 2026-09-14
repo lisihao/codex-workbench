@@ -2,24 +2,102 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 from pathlib import Path
-import subprocess
 import sys
-import time
 
 
 class RecoveryProcessError(ValueError):
     """The source cannot be shown idle for a local source-only extraction."""
 
 
-_DARWIN_LSOF_ATTEMPTS = 2
-_DARWIN_LSOF_TIMEOUT_SECONDS = 5
+_PROC_UID_ONLY = 4
+_PROC_PIDVNODEPATHINFO = 9
+_MAXPATHLEN = 1024
+# Darwin's public proc_info.h defines vnode_info as 152 bytes and
+# proc_vnodepathinfo as two vnode_info_path records.
+_VNODE_INFO_SIZE = 152
+_VNODE_INFO_PATH_SIZE = _VNODE_INFO_SIZE + _MAXPATHLEN
+_PROC_VNODEPATHINFO_SIZE = 2 * _VNODE_INFO_PATH_SIZE
 
 
 def _inside_source(cwd: str, source: Path) -> bool:
     path = Path(cwd).resolve()
     return path == source or source in path.parents
+
+
+def _darwin_process_cwds(uid: int) -> tuple[tuple[int, str], ...]:
+    """Read same-UID cwd paths through Darwin libproc without spawning lsof."""
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as error:
+        raise RecoveryProcessError(
+            "cannot inspect source process activity: Darwin libproc is unavailable"
+        ) from error
+    libproc.proc_listpids.argtypes = [
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int,
+    ]
+    libproc.proc_listpids.restype = ctypes.c_int
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+
+    required = libproc.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
+    if required <= 0:
+        raise RecoveryProcessError("cannot inspect source process activity: process list unavailable")
+    pid_size = ctypes.sizeof(ctypes.c_int)
+    capacity = max(required // pid_size + 64, 128)
+    pids: tuple[int, ...] | None = None
+    for _attempt in range(3):
+        buffer = (ctypes.c_int * capacity)()
+        used = libproc.proc_listpids(
+            _PROC_UID_ONLY, uid, buffer, ctypes.sizeof(buffer)
+        )
+        if used <= 0:
+            raise RecoveryProcessError(
+                "cannot inspect source process activity: process list failed"
+            )
+        count = used // pid_size
+        if used < ctypes.sizeof(buffer):
+            pids = tuple(pid for pid in buffer[:count] if pid > 0)
+            break
+        capacity *= 2
+    if pids is None:
+        raise RecoveryProcessError(
+            "cannot inspect source process activity: process list changed during inspection"
+        )
+
+    observed: list[tuple[int, str]] = []
+    for pid in pids:
+        info = ctypes.create_string_buffer(_PROC_VNODEPATHINFO_SIZE)
+        ctypes.set_errno(0)
+        size = libproc.proc_pidinfo(
+            pid,
+            _PROC_PIDVNODEPATHINFO,
+            0,
+            info,
+            ctypes.sizeof(info),
+        )
+        if size <= 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.ESRCH:
+                continue
+            raise RecoveryProcessError(
+                "cannot inspect source process activity: cwd lookup was incomplete"
+            )
+        if size != _PROC_VNODEPATHINFO_SIZE:
+            raise RecoveryProcessError(
+                "cannot inspect source process activity: cwd record was incomplete"
+            )
+        raw_path = info.raw[_VNODE_INFO_SIZE:_VNODE_INFO_PATH_SIZE].split(b"\0", 1)[0]
+        if not raw_path:
+            continue
+        observed.append((pid, os.fsdecode(raw_path)))
+    return tuple(observed)
 
 
 def source_process_ids(worktree: Path) -> tuple[int, ...]:
@@ -35,50 +113,9 @@ def source_process_ids(worktree: Path) -> tuple[int, ...]:
         raise RecoveryProcessError("recovery source must be a directory")
     found: set[int] = set()
     if sys.platform == "darwin":
-        command = [
-            "/usr/sbin/lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-F0pn"
-        ]
-        started = time.monotonic()
-        result: subprocess.CompletedProcess[bytes] | None = None
-        for attempt in range(1, _DARWIN_LSOF_ATTEMPTS + 1):
-            try:
-                result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    timeout=_DARWIN_LSOF_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                break
-            except subprocess.TimeoutExpired as error:
-                if attempt == _DARWIN_LSOF_ATTEMPTS:
-                    duration = time.monotonic() - started
-                    raise RecoveryProcessError(
-                        "cannot inspect source process activity: lsof timed out after "
-                        f"{attempt} attempts in {duration:.3f}s"
-                    ) from error
-            except OSError as error:
-                duration = time.monotonic() - started
-                reason = f"errno {error.errno}" if error.errno is not None else type(error).__name__
-                raise RecoveryProcessError(
-                    "cannot inspect source process activity: lsof failed with "
-                    f"{reason} after {duration:.3f}s"
-                ) from error
-        assert result is not None
-        if result.returncode not in (0, 1) or result.stderr.strip():
-            raise RecoveryProcessError("source process inspection was incomplete")
-        pid: int | None = None
-        for field in result.stdout.split(b"\0"):
-            field = field.lstrip(b"\n")
-            if field.startswith(b"p"):
-                try:
-                    pid = int(field[1:])
-                except ValueError as error:
-                    raise RecoveryProcessError("invalid process inspection record") from error
-            elif field.startswith(b"n"):
-                if pid is None:
-                    raise RecoveryProcessError("process cwd lacks an owner")
-                if _inside_source(os.fsdecode(field[1:]), source):
-                    found.add(pid)
+        for pid, cwd in _darwin_process_cwds(os.getuid()):
+            if _inside_source(cwd, source):
+                found.add(pid)
     elif sys.platform.startswith("linux"):
         for entry in Path("/proc").iterdir():
             if not entry.name.isdecimal():
