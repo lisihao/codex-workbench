@@ -115,7 +115,7 @@ class StoreTests(unittest.TestCase):
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
             connection.execute("DROP TABLE delivery_receipts")
         self.store.initialize()
-        self.assertEqual(self.store.health()["schema_version"], 15)
+        self.assertEqual(self.store.health()["schema_version"], 16)
         with self.store.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -164,7 +164,7 @@ class StoreTests(unittest.TestCase):
             )
         migrated = WorkbenchStore(path)
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 15)
+        self.assertEqual(migrated.health()["schema_version"], 16)
         with migrated.connection() as connection:
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(nodes)").fetchall()
@@ -241,7 +241,7 @@ class StoreTests(unittest.TestCase):
         )
 
         migrated.initialize()
-        self.assertEqual(migrated.health()["schema_version"], 15)
+        self.assertEqual(migrated.health()["schema_version"], 16)
         with migrated.connection() as connection:
             columns = {
                 row["name"]
@@ -278,12 +278,12 @@ class StoreTests(unittest.TestCase):
             connection.executescript(
                 """
                 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO metadata(key, value) VALUES('schema_version', '16');
+                INSERT INTO metadata(key, value) VALUES('schema_version', '17');
                 """
             )
 
         unknown = WorkbenchStore(path)
-        with self.assertRaisesRegex(RuntimeError, "unsupported schema version 16; expected 15"):
+        with self.assertRaisesRegex(RuntimeError, "unsupported schema version 17; expected 16"):
             unknown.initialize()
 
         with sqlite3.connect(path) as connection:
@@ -339,12 +339,71 @@ class StoreTests(unittest.TestCase):
         migrated.initialize()
         with migrated.connection() as connection:
             rows = connection.execute(
-                "SELECT steering_id, sequence FROM task_steering "
+                "SELECT steering_id, sequence, scope, target_node_id, target_attempt FROM task_steering "
                 "WHERE task_id = 'old-task' ORDER BY sequence"
             ).fetchall()
         self.assertEqual(
             [(row["steering_id"], row["sequence"]) for row in rows],
             [("first", 1), ("second", 2), ("later", 3)],
+        )
+        self.assertEqual(
+            {(row["scope"], row["target_node_id"], row["target_attempt"]) for row in rows},
+            {("legacy", None, None)},
+        )
+
+    def test_schema_fifteen_preserves_steering_as_explicitly_ambiguous_legacy(self) -> None:
+        path = Path(self.temp.name) / "schema-fifteen.sqlite"
+        legacy = WorkbenchStore(path)
+        legacy.initialize()
+        contract = TaskContract(
+            task_id="schema-fifteen-task",
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="preserve pre-scope steering without guessing ownership",
+            allowed_scope=("src",),
+        )
+        legacy.create_task(
+            contract,
+            verified(
+                [NodeSpec("worker", contract.task_id, "worker", "fixture", "fixture", "ok")],
+                contract.task_id,
+            ),
+            "schema-fifteen-create",
+        )
+        with legacy.connection() as connection:
+            connection.executescript(
+                """
+                DROP TABLE task_steering;
+                CREATE TABLE task_steering (
+                    steering_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+                    instruction TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    sequence INTEGER NOT NULL
+                );
+                INSERT INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence
+                ) VALUES(
+                    'pre-v16', 'schema-fifteen-task', 'historical instruction',
+                    '2026-09-13T00:00:00+00:00', 1
+                );
+                UPDATE metadata SET value = '15' WHERE key = 'schema_version';
+                """
+            )
+
+        migrated = WorkbenchStore(path)
+        migrated.initialize()
+
+        with migrated.connection() as connection:
+            row = connection.execute(
+                "SELECT instruction, scope, target_node_id, target_attempt "
+                "FROM task_steering WHERE steering_id = 'pre-v16'"
+            ).fetchone()
+        assert row is not None
+        self.assertEqual(migrated.health()["schema_version"], 16)
+        self.assertEqual(
+            (row["instruction"], row["scope"], row["target_node_id"], row["target_attempt"]),
+            ("historical instruction", "legacy", None, None),
         )
 
     def test_planning_request_enqueue_is_idempotent_and_conflicts_on_changed_request(self) -> None:
@@ -1277,6 +1336,139 @@ class StoreTests(unittest.TestCase):
         event_types = {event["event_type"] for event in self.store.read_events(task_id="task-2")}
         self.assertIn("task.priority_changed", event_types)
         self.assertIn("task.steering_added", event_types)
+
+    def test_steering_scope_filters_nodes_attempts_and_explicitly_rescopes_legacy_rows(self) -> None:
+        task_id = "steering-scope"
+        contract = TaskContract(
+            task_id=task_id,
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="scope steering without changing historical text",
+            allowed_scope=("src",),
+            retry_limit=1,
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec("A", task_id, "A", "fixture", "fixture", "A"),
+                NodeSpec("B", task_id, "B", "fixture", "fixture", "B", depends_on=("A",)),
+                NodeSpec(
+                    "E", task_id, "E", "fixture", "fixture", "E",
+                    depends_on=("A", "B"), verifier=True,
+                ),
+            ],
+            "steering-scope-create",
+        )
+        task = self.store.get_task(task_id)
+        task_receipt = self.store.append_task_steering_receipt(
+            task_id,
+            "task-wide",
+            expected_revision=int(task["state_revision"]),
+            scope="task",
+        )
+        a_receipt = self.store.append_task_steering_receipt(
+            task_id,
+            "A only",
+            expected_revision=int(task_receipt["revision"]),
+            scope="node",
+            target_node_id="A",
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence, scope
+                ) VALUES('legacy-b', ?, 'legacy B only', '2026-09-13T00:00:00+00:00', 3, 'legacy')
+                """,
+                (task_id,),
+            )
+        self.store.queue_task(task_id, expected_revision=int(a_receipt["revision"]))
+
+        a1 = self.store.claim_ready_node("scope-a1", self.epoch)
+        assert a1 is not None
+        self.assertEqual(
+            (a1["node_id"], a1["steering"]),
+            ("A", ("task-wide", "A only", "legacy B only")),
+        )
+        self.store.settle_claimed(a1, NodeResult("succeeded", "A complete"))
+        current = self.store.get_task(task_id)
+        legacy = self.store.rescope_legacy_task_steering(
+            task_id,
+            "legacy-b",
+            expected_revision=int(current["state_revision"]),
+            scope="node",
+            target_node_id="B",
+        )
+        self.assertTrue(legacy["history_preserved"])
+        b1 = self.store.claim_ready_node("scope-b1", self.epoch)
+        assert b1 is not None
+        self.assertEqual((b1["node_id"], b1["steering"]), ("B", ("task-wide", "legacy B only")))
+        current = self.store.get_task(task_id)
+        attempt_receipt = self.store.append_task_steering_receipt(
+            task_id,
+            "B attempt two only",
+            expected_revision=int(current["state_revision"]),
+            scope="attempt",
+            target_node_id="B",
+            target_attempt=2,
+        )
+        self.store.settle_claimed(b1, NodeResult("failed", "retry B", retryable=True))
+        b2 = self.store.claim_ready_node("scope-b2", self.epoch)
+        assert b2 is not None
+        self.assertEqual(
+            (b2["node_id"], b2["attempt"], b2["steering"]),
+            ("B", 2, ("task-wide", "legacy B only", "B attempt two only")),
+        )
+        self.assertEqual(attempt_receipt["target_attempt"], 2)
+
+    def test_blocked_consumer_owner_repair_rejects_nonancestor_sibling(self) -> None:
+        task_id = "blocked-owner-relation"
+        contract = TaskContract(
+            task_id=task_id,
+            repository=str(Path(self.temp.name).resolve()),
+            base_sha="abc123",
+            objective="only repair ancestors of the blocked consumer",
+            allowed_scope=("src",),
+        )
+        self.store.create_task(
+            contract,
+            [
+                NodeSpec("A", task_id, "ancestor", "fixture", "fixture", "A", ordinal=1),
+                NodeSpec("F", task_id, "independent sibling", "fixture", "fixture", "F", ordinal=2),
+                NodeSpec(
+                    "D", task_id, "blocked consumer", "fixture", "fixture", "D",
+                    depends_on=("A",), ordinal=3,
+                ),
+                NodeSpec(
+                    "E", task_id, "verifier", "fixture", "fixture", "E",
+                    depends_on=("A", "F", "D"), verifier=True, ordinal=4,
+                ),
+            ],
+            "blocked-owner-relation-create",
+        )
+        self.store.queue_task(task_id)
+        for expected in ("A", "F"):
+            claimed = self.store.claim_ready_node("relation-" + expected, self.epoch)
+            assert claimed is not None
+            self.assertEqual(claimed["node_id"], expected)
+            self.store.settle_claimed(claimed, NodeResult("succeeded", expected + " accepted"))
+        blocked_claim = self.store.claim_ready_node("relation-D", self.epoch)
+        assert blocked_claim is not None
+        self.assertEqual(blocked_claim["node_id"], "D")
+        self.store.settle_claimed(blocked_claim, NodeResult("blocked", "D needs A repair"))
+        blocked = self.store.get_task(task_id)
+
+        with self.assertRaisesRegex(StateConflictError, "non-ancestor owner F"):
+            self.store.schedule_blocked_consumer_owner_repairs(
+                task_id,
+                "D",
+                ["F"],
+                {"F": "must not run"},
+                expected_revision=int(blocked["state_revision"]),
+                expected_attempt=1,
+                reason="reject an unrelated accepted sibling",
+            )
+        self.assertEqual(self.store.get_task(task_id), blocked)
 
     def test_claim_exposes_effective_codex_profile_and_reasoning_effort(self) -> None:
         worker = NodeSpec(

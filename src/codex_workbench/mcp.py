@@ -461,7 +461,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_control_task",
-        "description": "Queue, pause, resume, cancel, steer, resolve an indeterminate node, or preview/apply the fixed blocked DSH integration scope amendment. Queue/resume may atomically persist an instruction before launch. Blocked resume requires an exact attempt and explicit recovery assertion; scope amendment never launches work.",
+        "description": "Queue, pause, resume, cancel, steer, schedule exact accepted ancestors required by a blocked consumer, resolve an indeterminate node, or preview/apply the fixed blocked DSH integration scope amendment. Queue/resume may atomically persist an instruction before launch. Blocked recovery requires exact attempts and revisions; scope amendment never launches work.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -476,6 +476,8 @@ TOOLS: list[dict[str, Any]] = [
                         "cancel",
                         "set_priority",
                         "steer",
+                        "rescope_steering",
+                        "repair_blocked_owners",
                         "resolve_indeterminate",
                         "resolve_indeterminate_locally",
                         "normalize_indeterminate_scope",
@@ -486,6 +488,18 @@ TOOLS: list[dict[str, Any]] = [
                 "expected_attempt": {"type": "integer", "minimum": 1},
                 "priority": {"type": "integer", "minimum": -10, "maximum": 10},
                 "instruction": {"type": "string", "minLength": 1, "maxLength": 500},
+                "steering_scope": {"enum": ["task", "node", "attempt"]},
+                "steering_node_id": {"type": "string", "minLength": 1},
+                "steering_attempt": {"type": "integer", "minimum": 1},
+                "steering_id": {"type": "string", "minLength": 1},
+                "repair_node_ids": {
+                    "type": "array", "minItems": 1, "maxItems": 32,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "repair_instructions": {
+                    "type": "object", "minProperties": 1, "maxProperties": 32,
+                    "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
                 "reason": {"type": "string", "minLength": 1, "maxLength": 500},
                 "node_id": {"type": "string"},
                 "confirm_recovery": {"type": "boolean"},
@@ -1365,6 +1379,20 @@ class WorkbenchMCPServer:
             }
             if action != "normalize_indeterminate_scope" and normalization_fields.intersection(arguments):
                 raise ValueError("scope normalization fields are only supported by normalize_indeterminate_scope")
+            steering_fields = {
+                "steering_scope", "steering_node_id", "steering_attempt", "steering_id",
+            }
+            if action not in {"steer", "rescope_steering"} and steering_fields.intersection(arguments):
+                raise ValueError("steering scope fields require steer or rescope_steering")
+            if action == "steer" and "steering_id" in arguments:
+                raise ValueError("steer does not accept an existing steering_id")
+            repair_owner_fields = {"repair_node_ids", "repair_instructions"}
+            if action != "repair_blocked_owners" and repair_owner_fields.intersection(arguments):
+                raise ValueError("accepted-owner fields require repair_blocked_owners")
+            if action == "repair_blocked_owners" and "instruction" in arguments:
+                raise ValueError(
+                    "repair_blocked_owners requires per-owner repair_instructions"
+                )
             if dry_run and not (
                 action in {"resolve_indeterminate_locally", "normalize_indeterminate_scope"}
                 or (action == "resume" and self.store.get_task(task_id)["state"] == "blocked")
@@ -1440,8 +1468,39 @@ class WorkbenchMCPServer:
                     task_id,
                     instruction,
                     expected_revision=expected_revision,
+                    scope=arguments.get("steering_scope", "task"),
+                    target_node_id=arguments.get("steering_node_id"),
+                    target_attempt=arguments.get("steering_attempt"),
                 )
                 return self._text({"ok": True, "task_id": task_id, **receipt})
+            elif action == "rescope_steering":
+                steering_id = self._required_blocked_resume_text(arguments, "steering_id")
+                scope = arguments.get("steering_scope")
+                if not isinstance(scope, str):
+                    raise ValueError("rescope_steering requires steering_scope")
+                receipt = self.store.rescope_legacy_task_steering(
+                    task_id,
+                    steering_id,
+                    expected_revision=expected_revision,
+                    scope=scope,
+                    target_node_id=arguments.get("steering_node_id"),
+                    target_attempt=arguments.get("steering_attempt"),
+                )
+                return self._text({"ok": True, **receipt})
+            elif action == "repair_blocked_owners":
+                node_id = self._required_blocked_resume_text(arguments, "node_id")
+                reason = self._required_blocked_resume_text(arguments, "reason")
+                expected_attempt = self._required_blocked_resume_attempt(arguments)
+                receipt = self.store.schedule_blocked_consumer_owner_repairs(
+                    task_id,
+                    node_id,
+                    arguments.get("repair_node_ids"),
+                    arguments.get("repair_instructions"),
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                    reason=reason,
+                )
+                return self._text({"ok": True, **receipt})
             elif action == "resolve_indeterminate":
                 revision = self.store.resolve_indeterminate(
                     task_id,

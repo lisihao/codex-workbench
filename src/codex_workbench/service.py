@@ -2339,6 +2339,7 @@ class Coordinator:
         source_only = source.get("source_only_ignored", False)
         source_only_extraction = source.get("source_only_extraction", False)
         source_delta_sha256 = source.get("source_delta_sha256")
+        refresh_accepted_ancestors = binding.get("refresh_accepted_ancestors", False)
         if not (
             isinstance(source_worktree, str)
             and isinstance(source_branch, str)
@@ -2352,6 +2353,7 @@ class Coordinator:
             )
             and isinstance(source_only, bool)
             and isinstance(source_only_extraction, bool)
+            and isinstance(refresh_accepted_ancestors, bool)
         ):
             raise DirtyWorktreeRecoveryError("failed-attempt recovery source is invalid")
         if source_only_extraction:
@@ -2372,6 +2374,10 @@ class Coordinator:
         ):
             raise DirtyWorktreeRecoveryError(
                 "blocked source repair must retain the source-only recovery binding"
+            )
+        if refresh_accepted_ancestors and recovery_mode != "blocked_source_repair":
+            raise DirtyWorktreeRecoveryError(
+                "accepted-ancestor refresh is only supported for blocked source repair"
             )
         if source_base != contract["base_sha"]:
             raise DirtyWorktreeRecoveryError(
@@ -2438,28 +2444,30 @@ class Coordinator:
                 node_id=claimed["node_id"],
                 base_sha=source_base,
             )
-            dependency_input = rebind_recorded_lockfile_handoffs(
-                self.store.get_task(claimed["task_id"]),
-                claimed["node_id"],
-                self.artifacts,
-                loaded_dependency_input,
-                ready_lockfile_handoffs=self._ready_lockfile_handoffs(
-                    claimed["task_id"]
-                ),
-            )
-            if canonical_json(dependency_input.receipt) != canonical_json(
-                loaded_dependency_input.receipt
-            ):
-                dependency_ref = self.artifacts.put_text(
-                    canonical_json(dependency_input.receipt),
-                    "rebound-dependency-input.json",
+            dependency_input = loaded_dependency_input
+            if not refresh_accepted_ancestors:
+                dependency_input = rebind_recorded_lockfile_handoffs(
+                    self.store.get_task(claimed["task_id"]),
+                    claimed["node_id"],
+                    self.artifacts,
+                    loaded_dependency_input,
+                    ready_lockfile_handoffs=self._ready_lockfile_handoffs(
+                        claimed["task_id"]
+                    ),
                 )
-            validate_dependency_input_lineage(
-                self.store.get_task(claimed["task_id"]),
-                claimed["node_id"],
-                dependency_input,
-                artifacts=self.artifacts,
-            )
+                if canonical_json(dependency_input.receipt) != canonical_json(
+                    loaded_dependency_input.receipt
+                ):
+                    dependency_ref = self.artifacts.put_text(
+                        canonical_json(dependency_input.receipt),
+                        "rebound-dependency-input.json",
+                    )
+                validate_dependency_input_lineage(
+                    self.store.get_task(claimed["task_id"]),
+                    claimed["node_id"],
+                    dependency_input,
+                    artifacts=self.artifacts,
+                )
         else:
             if spec.get("depends_on"):
                 raise DirtyWorktreeRecoveryError(
@@ -2660,6 +2668,34 @@ class Coordinator:
             recovery_ref = self.artifacts.put_text(
                 canonical_json(recovery), "failed-attempt-recovery.json"
             )
+            def prepare_retry_input(prepared_target: Path) -> DependencyInput:
+                if refresh_accepted_ancestors:
+                    refreshed = apply_accepted_ancestor_patches(
+                        self.store.get_task(claimed["task_id"]),
+                        claimed["node_id"],
+                        prepared_target,
+                        self.artifacts,
+                        self.worktrees,
+                        ready_lockfile_handoffs=self._ready_lockfile_handoffs(
+                            claimed["task_id"]
+                        ),
+                    )
+                    if refreshed is None:
+                        raise DirtyWorktreeRecoveryError(
+                            "blocked source repair cannot refresh a missing ancestor input"
+                        )
+                    context.dependency_input_ref = self.artifacts.put_text(
+                        canonical_json(refreshed.receipt),
+                        "refreshed-dependency-input.json",
+                    )
+                    return refreshed
+                return self._apply_ready_lockfile_handoffs_to_recovery_input(
+                    claimed,
+                    prepared_target,
+                    dependency_input,
+                    manifest_phase="prepared",
+                )
+
             outcome = self.failed_attempt_recovery.prepare_for_retry(
                 repository=contract["repository"],
                 source_worktree=str(source_path),
@@ -2668,14 +2704,8 @@ class Coordinator:
                 target_attempt=target_attempt,
                 recovery=recovery,
                 source_only=source_only,
-                prepare_dependency_input=lambda prepared_target: (
-                    self._apply_ready_lockfile_handoffs_to_recovery_input(
-                        claimed,
-                        prepared_target,
-                        dependency_input,
-                        manifest_phase="prepared",
-                    )
-                ),
+                prepare_dependency_input=prepare_retry_input,
+                refresh_dependency_input=refresh_accepted_ancestors,
             )
             if outcome.status != "succeeded":
                 raise DirtyWorktreeRecoveryError(outcome.summary)

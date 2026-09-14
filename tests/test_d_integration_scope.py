@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from codex_workbench import d_integration_scope as scope
 from codex_workbench.accepted_source_repair import prepare_accepted_source_repair
+from codex_workbench.blocked_source_repair import blocked_source_repair
 from codex_workbench.authority import authority_machine_id
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.d_integration_profile import (
@@ -23,7 +24,10 @@ from codex_workbench.d_integration_profile import (
 )
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract, canonical_hash, canonical_json
+from codex_workbench.node_recovery_policy import RecoveryPolicy
+from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.recovery_processes import RecoveryProcessError
+from codex_workbench.service import Coordinator
 from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
 
@@ -415,6 +419,110 @@ class DIntegrationScopeTests(unittest.TestCase):
                 (self.contract.task_id,),
             ).fetchall()
         return {str(row["node_id"]): tuple(row) for row in rows}
+
+    def _repair_blocked_consumer_owners(
+        self,
+        contract: TaskContract,
+        *,
+        conflicting_d_path: bool = False,
+    ) -> dict[str, str]:
+        instructions = {
+            "A": "repair A documentation and type findings only",
+            "B": "repair B documentation and type findings only",
+            "C": "refresh C on the repaired accepted ancestor input",
+        }
+        blocked = self.store.get_task(contract.task_id)
+        receipt = self.store.schedule_blocked_consumer_owner_repairs(
+            contract.task_id,
+            "D",
+            ["A", "B", "C"],
+            instructions,
+            expected_revision=int(blocked["state_revision"]),
+            expected_attempt=2,
+            reason="D found exact upstream owner defects before E became reachable",
+        )
+        self.assertTrue(receipt["blocked_consumer_preserved"])
+        for owner in ("A", "B", "C"):
+            claimed = self.store.claim_ready_node("repair-" + owner, self.epoch)
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), (owner, 2))
+            self.assertEqual(claimed["steering"], (instructions[owner],))
+            binding = claimed.get("accepted_source_repair")
+            self.assertIsInstance(binding, dict)
+            prepared = prepare_accepted_source_repair(self.store, binding, self.worktrees)
+            self.store.assign_worktree(
+                contract.task_id,
+                owner,
+                str(prepared.worktree),
+                attempt=int(claimed["attempt"]),
+                coordinator_epoch=int(claimed["coordinator_epoch"]),
+                lease_epoch=int(claimed["lease_epoch"]),
+                recovery_preflight=prepared.receipt,
+            )
+            relative = f"src/retained-{owner.lower()}.ts"
+            (prepared.worktree / relative).write_text(
+                f"export const retained{owner} = 2\n", encoding="utf-8"
+            )
+            changed_paths = [relative]
+            if owner == "A" and conflicting_d_path:
+                (prepared.worktree / "src/retained-d.ts").write_text(
+                    "export const retainedD = 99\n", encoding="utf-8"
+                )
+                changed_paths.append("src/retained-d.ts")
+            dependency_ref = self.store.artifacts.put_text(
+                canonical_json(prepared.dependency_input.receipt),
+                owner + "-repair-input.json",
+            )
+            patch_ref = self.store.artifacts.put_bytes(
+                self.worktrees.diff_patch(
+                    prepared.worktree, prepared.dependency_input.input_tree_sha
+                ),
+                owner + "-repair.patch",
+            )
+            self.store.settle_claimed(
+                claimed,
+                NodeResult(
+                    "succeeded",
+                    owner + " owner repair accepted",
+                    artifacts={"patch": patch_ref, "dependency-input": dependency_ref},
+                    actual_model="fixture",
+                    result_kind="worker",
+                    checks=("fixture owner repair",),
+                    changed_paths=tuple(changed_paths),
+                ),
+            )
+        return instructions
+
+    def _queue_rebased_d_source(self, contract: TaskContract, request_id: str) -> dict:
+        task = self.store.get_task(contract.task_id)
+        NodeRecoveryStore(self.store).configure_policy(
+            contract.task_id,
+            RecoveryPolicy(
+                enabled=True,
+                allowed_actions=("repair_source",),
+                max_action_attempts=3,
+            ),
+            expected_task_revision=int(task["state_revision"]),
+            actor="d-integration-rebase-fixture",
+        )
+        arguments = {
+            "task_id": contract.task_id,
+            "node_id": "D",
+            "expected_revision": int(task["state_revision"]),
+            "expected_attempt": 2,
+            "expected_contract_hash": task["contract_hash"],
+            "request_id": request_id,
+            "reason": "replay only the retained D delta on refreshed accepted ancestors",
+        }
+        preview = blocked_source_repair(self.store, **arguments, dry_run=True)
+        self.assertTrue(preview["refresh_accepted_ancestors"])
+        return blocked_source_repair(
+            self.store,
+            **arguments,
+            dry_run=False,
+            expected_fingerprint=preview["fingerprint"],
+        )
 
     def _raw_allocations(self) -> tuple[tuple[object, ...], ...]:
         with self.store.connection() as connection:
@@ -955,6 +1063,146 @@ class DIntegrationScopeTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(StateConflictError, "later lifecycle"):
             scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+
+    def test_blocked_consumer_repairs_owners_then_replays_only_d_delta_before_e(self) -> None:
+        contract, arguments, d_source = self._create_real_retained_verifier_lane()
+        preview = scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        scope.amend_blocked_integration_scope(
+            self.config,
+            self.store,
+            {**arguments, "dry_run": False, "expected_fingerprint": preview["fingerprint"]},
+        )
+        d_result_before = next(
+            node for node in self.store.get_task(contract.task_id)["nodes"]
+            if node["node_id"] == "D"
+        )["result"]
+        d_source_before = (d_source / "src/retained-d.ts").read_bytes()
+
+        self._repair_blocked_consumer_owners(contract)
+        after_owners = self.store.get_task(contract.task_id)
+        d_after_owners = next(
+            node for node in after_owners["nodes"] if node["node_id"] == "D"
+        )
+        self.assertEqual((after_owners["state"], d_after_owners["state"]), ("blocked", "blocked"))
+        self.assertEqual(d_after_owners["result"], d_result_before)
+        self.assertEqual((d_source / "src/retained-d.ts").read_bytes(), d_source_before)
+
+        queued = self._queue_rebased_d_source(contract, "rebase-d-after-owners")
+        self.assertTrue(queued["refresh_accepted_ancestors"])
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        observed: dict[str, object] = {}
+        try:
+            claimed_d = coordinator._claim_next_ready_node("rebased-D")
+            self.assertIsNotNone(claimed_d)
+            assert claimed_d is not None
+            self.assertEqual((claimed_d["node_id"], claimed_d["attempt"]), ("D", 3))
+
+            def execute_d(request: object) -> NodeResult:
+                worktree = request.worktree  # type: ignore[attr-defined]
+                assert worktree is not None
+                observed["A"] = (worktree / "src/retained-a.ts").read_text(encoding="utf-8")
+                observed["B"] = (worktree / "src/retained-b.ts").read_text(encoding="utf-8")
+                observed["C"] = (worktree / "src/retained-c.ts").read_text(encoding="utf-8")
+                observed["D"] = (worktree / "src/retained-d.ts").read_text(encoding="utf-8")
+                observed["ancestors"] = [
+                    (item["node_id"], item["attempt"])
+                    for item in request.input_receipt["ancestors"]  # type: ignore[attr-defined]
+                ]
+                return NodeResult(
+                    "succeeded", "D continued on refreshed owners", checks=("fixture D",)
+                )
+
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = execute_d
+                coordinator._execute_claimed(claimed_d)
+            self.assertEqual(
+                observed,
+                {
+                    "A": "export const retainedA = 2\n",
+                    "B": "export const retainedB = 2\n",
+                    "C": "export const retainedC = 2\n",
+                    "D": "export const retainedD = 1\n",
+                    "ancestors": [("A", 2), ("B", 2), ("C", 2)],
+                },
+            )
+            verifier = coordinator._claim_next_ready_node("final-E")
+            self.assertIsNotNone(verifier)
+            assert verifier is not None
+            self.assertEqual(verifier["node_id"], "E")
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.return_value = NodeResult(
+                    "succeeded",
+                    "E accepted the owner repairs and rebased D delta",
+                    actual_model="fixture",
+                    result_kind="verifier",
+                    checks=("fixture E",),
+                    verdict="accepted",
+                )
+                coordinator._execute_claimed(verifier)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        accepted = self.store.get_task(contract.task_id)
+        self.assertEqual(accepted["state"], "accepted")
+        d_result = next(node for node in accepted["nodes"] if node["node_id"] == "D")["result"]
+        dependency_ref = d_result["artifacts"]["dependency-input"]
+        dependency_receipt = json.loads(
+            self.store.artifacts.verify(dependency_ref).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [(item["node_id"], item["attempt"]) for item in dependency_receipt["ancestors"]],
+            [("A", 2), ("B", 2), ("C", 2)],
+        )
+
+    def test_rebased_d_conflict_rolls_back_without_repairing_owners_again(self) -> None:
+        contract, arguments, d_source = self._create_real_retained_verifier_lane()
+        preview = scope.amend_blocked_integration_scope(self.config, self.store, arguments)
+        scope.amend_blocked_integration_scope(
+            self.config,
+            self.store,
+            {**arguments, "dry_run": False, "expected_fingerprint": preview["fingerprint"]},
+        )
+        self._repair_blocked_consumer_owners(contract, conflicting_d_path=True)
+        self._queue_rebased_d_source(contract, "conflicting-rebase-d")
+
+        coordinator = Coordinator(self.store, self.state_root, coordinator_epoch=self.epoch)
+        try:
+            claimed_d = coordinator._claim_next_ready_node("conflicting-D")
+            self.assertIsNotNone(claimed_d)
+            assert claimed_d is not None
+            with patch.object(coordinator, "_executor") as executor:
+                coordinator._execute_claimed(claimed_d)
+                executor.return_value.execute.assert_not_called()
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        rolled_back = self.store.get_task(contract.task_id)
+        nodes = {node["node_id"]: node for node in rolled_back["nodes"]}
+        self.assertEqual((rolled_back["state"], nodes["D"]["state"], nodes["D"]["attempt"]),
+                         ("blocked", "blocked", 2))
+        self.assertEqual(
+            (d_source / "src/retained-d.ts").read_text(encoding="utf-8"),
+            "export const retainedD = 1\n",
+        )
+        for owner in ("A", "B", "C"):
+            self.assertEqual((nodes[owner]["state"], nodes[owner]["attempt"]), ("accepted", 2))
+            self.assertIsNone(nodes[owner].get("recovery"))
+        rollback = next(
+            event for event in reversed(self.store.read_events(task_id=contract.task_id))
+            if event["event_type"] == "node.blocked_worktree_recovery_rolled_back"
+        )
+        self.assertTrue(rollback["payload"]["refresh_accepted_ancestors"])
+        self.assertEqual(rollback["payload"]["origin_task_state"], "blocked")
+        refreshed_ref = rollback["payload"]["preparation_result"]["artifacts"][
+            "dependency-input"
+        ]
+        refreshed = json.loads(
+            self.store.artifacts.verify(refreshed_ref).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [(item["node_id"], item["attempt"]) for item in refreshed["ancestors"]],
+            [("A", 2), ("B", 2), ("C", 2)],
+        )
 
 
 if __name__ == "__main__":

@@ -498,6 +498,187 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(steered["revision"], 4)
         self.assertIn("delivery", steered)
 
+    def test_control_exposes_scoped_steering_and_audited_legacy_rescope(self) -> None:
+        contract = self._create_list_task("mcp-scoped-steering")
+        before = self.store.get_task(contract.task_id)
+
+        for arguments, message in (
+            ({"steering_scope": "task", "steering_node_id": "work"}, "does not accept"),
+            ({"steering_scope": "node"}, "require target_node_id"),
+            ({"steering_scope": "attempt", "steering_node_id": "work"}, "requires target_attempt"),
+        ):
+            response = self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "steer",
+                    "expected_revision": before["state_revision"],
+                    "instruction": "must not persist",
+                    **arguments,
+                },
+            )
+            self.assertTrue(response["isError"])
+            self.assertIn(message, response["content"][0]["text"])
+            self.assertEqual(self.store.get_task(contract.task_id), before)
+
+        task_wide = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "steer",
+                    "expected_revision": before["state_revision"],
+                    "instruction": "task wide",
+                },
+            )["content"][0]["text"]
+        )
+        node_only = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "steer",
+                    "expected_revision": task_wide["revision"],
+                    "instruction": "work and its retries",
+                    "steering_scope": "node",
+                    "steering_node_id": "work",
+                },
+            )["content"][0]["text"]
+        )
+        exact_attempt = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "steer",
+                    "expected_revision": node_only["revision"],
+                    "instruction": "work attempt one only",
+                    "steering_scope": "attempt",
+                    "steering_node_id": "work",
+                    "steering_attempt": 1,
+                },
+            )["content"][0]["text"]
+        )
+        self.assertEqual(
+            (
+                task_wide["scope"],
+                node_only["scope"], node_only["target_node_id"], node_only["target_attempt"],
+                exact_attempt["scope"], exact_attempt["target_attempt"],
+            ),
+            ("task", "node", "work", 1, "attempt", 1),
+        )
+
+        with self.store.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence, scope
+                ) VALUES('mcp-legacy', ?, 'reviewed historical row',
+                         '2026-09-13T00:00:00+00:00', 4, 'legacy')
+                """,
+                (contract.task_id,),
+            )
+        rescoped = json.loads(
+            self.call(
+                "workbench_control_task",
+                {
+                    "task_id": contract.task_id,
+                    "action": "rescope_steering",
+                    "expected_revision": exact_attempt["revision"],
+                    "steering_id": "mcp-legacy",
+                    "steering_scope": "node",
+                    "steering_node_id": "work",
+                },
+            )["content"][0]["text"]
+        )
+        self.assertEqual(
+            (
+                rescoped["steering_id"], rescoped["scope"],
+                rescoped["target_node_id"], rescoped["target_attempt"],
+                rescoped["history_preserved"],
+            ),
+            ("mcp-legacy", "node", "work", 1, True),
+        )
+        event = next(
+            event for event in self.store.read_events(task_id=contract.task_id)
+            if event["event_type"] == "task.steering_rescoped"
+        )
+        self.assertEqual(event["payload"]["steering_id"], "mcp-legacy")
+
+        repeated = self.call(
+            "workbench_control_task",
+            {
+                "task_id": contract.task_id,
+                "action": "rescope_steering",
+                "expected_revision": rescoped["revision"],
+                "steering_id": "mcp-legacy",
+                "steering_scope": "task",
+            },
+        )
+        self.assertTrue(repeated["isError"])
+        self.assertIn("only an ambiguous legacy", repeated["content"][0]["text"])
+
+    def test_control_dispatches_exact_blocked_consumer_owner_repairs(self) -> None:
+        receipt = {
+            "task_id": "blocked-task",
+            "requester_node_id": "D",
+            "requester_attempt": 4,
+            "repair_node_ids": ["A", "B", "C"],
+            "revision": 51,
+            "state": "queued",
+            "blocked_consumer_preserved": True,
+        }
+        arguments = {
+            "task_id": "blocked-task",
+            "action": "repair_blocked_owners",
+            "expected_revision": 50,
+            "expected_attempt": 4,
+            "node_id": "D",
+            "reason": "D found exact accepted-owner defects before E was reachable",
+            "repair_node_ids": ["A", "B", "C"],
+            "repair_instructions": {
+                "A": "repair A only",
+                "B": "repair B only",
+                "C": "refresh C input only",
+            },
+        }
+        with patch.object(
+            self.store,
+            "schedule_blocked_consumer_owner_repairs",
+            return_value=receipt,
+        ) as repair:
+            response = json.loads(
+                self.call("workbench_control_task", arguments)["content"][0]["text"]
+            )
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["blocked_consumer_preserved"])
+        repair.assert_called_once_with(
+            "blocked-task",
+            "D",
+            ["A", "B", "C"],
+            {
+                "A": "repair A only",
+                "B": "repair B only",
+                "C": "refresh C input only",
+            },
+            expected_revision=50,
+            expected_attempt=4,
+            reason="D found exact accepted-owner defects before E was reachable",
+        )
+
+        for action in ("queue", "steer"):
+            invalid = self.call(
+                "workbench_control_task",
+                {
+                    "task_id": "blocked-task",
+                    "action": action,
+                    "expected_revision": 50,
+                    "repair_node_ids": ["A"],
+                },
+            )
+            self.assertTrue(invalid["isError"])
+            self.assertIn("require repair_blocked_owners", invalid["content"][0]["text"])
+
     def test_control_resume_retries_clean_block_only_after_explicit_assertion(self) -> None:
         contract = TaskContract(
             task_id="mcp-clean-blocked-resume",

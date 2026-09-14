@@ -84,7 +84,7 @@ from .worktrees import (
 
 # Older coordinators do not honor temporary lockfile ownership or schema-2
 # dependency inputs and must not admit work against this ledger.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _ARCHIFY_RENDER_COMMANDS = frozenset({"deliver", "compare", "visual-check"})
 _ARCHIFY_RECEIPT_ONLY_COMMANDS = frozenset({"validate", "migrate"})
 _DELIVERY_LEASE_SECONDS = 60 * 60
@@ -278,6 +278,21 @@ class WorkbenchStore:
                     connection,
                     "ALTER TABLE task_steering ADD COLUMN sequence INTEGER",
                 )
+            if "scope" not in steering_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE task_steering ADD COLUMN scope TEXT NOT NULL DEFAULT 'legacy'",
+                )
+            if "target_node_id" not in steering_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE task_steering ADD COLUMN target_node_id TEXT",
+                )
+            if "target_attempt" not in steering_columns:
+                self._schema_write(
+                    connection,
+                    "ALTER TABLE task_steering ADD COLUMN target_attempt INTEGER",
+                )
             # v9 had no explicit sequence. Its durable semantics were
             # chronological steering with the stable steering ID as the
             # tie-breaker; rowid reflected insertion/storage order only and
@@ -419,7 +434,10 @@ class WorkbenchStore:
                     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
                     instruction TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    sequence INTEGER NOT NULL
+                    sequence INTEGER NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'task',
+                    target_node_id TEXT,
+                    target_attempt INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS delivery_receipts (
                     command_id TEXT PRIMARY KEY,
@@ -4551,8 +4569,77 @@ class WorkbenchStore:
         ).fetchone()
         if task is None:
             raise KeyError(task_id)
-        if task["state"] != "blocked":
-            raise StateConflictError("blocked source repair task is no longer blocked")
+        if task["state"] not in {"blocked", "queued"}:
+            raise StateConflictError("blocked source repair task is no longer blocked or queued")
+        owner_repair_event = connection.execute(
+            """
+            SELECT cursor, payload_json FROM events
+            WHERE task_id = ? AND node_id = ?
+              AND event_type = 'task.blocked_owner_repair_scheduled'
+            ORDER BY cursor DESC LIMIT 1
+            """,
+            (task_id, node["node_id"]),
+        ).fetchone()
+        owner_repair_event_cursor: int | None = None
+        refresh_accepted_ancestors = owner_repair_event is not None
+        if owner_repair_event is not None:
+            try:
+                owner_payload = json.loads(str(owner_repair_event["payload_json"]))
+            except json.JSONDecodeError as error:
+                raise StateConflictError("blocked owner repair event is invalid JSON") from error
+            result_digest = sha256(source_result_json.encode()).hexdigest()
+            repair_ids = owner_payload.get("repair_node_ids") if isinstance(owner_payload, dict) else None
+            source_attempts = (
+                owner_payload.get("repair_source_attempts")
+                if isinstance(owner_payload, dict)
+                else None
+            )
+            if (
+                not isinstance(owner_payload, dict)
+                or owner_payload.get("requester_attempt") != int(node["attempt"])
+                or owner_payload.get("requester_result_sha256") != result_digest
+                or not isinstance(repair_ids, list)
+                or not repair_ids
+                or not isinstance(source_attempts, dict)
+                or set(source_attempts) != set(repair_ids)
+            ):
+                raise StateConflictError("blocked owner repair event no longer matches its consumer")
+            for owner_id in repair_ids:
+                source_attempt = source_attempts.get(owner_id)
+                owner = connection.execute(
+                    """
+                    SELECT state, attempt, recovery_json FROM nodes
+                    WHERE task_id = ? AND node_id = ?
+                    """,
+                    (task_id, owner_id),
+                ).fetchone()
+                if (
+                    not isinstance(owner_id, str)
+                    or type(source_attempt) is not int
+                    or owner is None
+                    or owner["state"] != "accepted"
+                    or int(owner["attempt"]) != source_attempt + 1
+                    or owner["recovery_json"] is not None
+                ):
+                    raise StateConflictError(
+                        "blocked source repair must wait for accepted-owner repairs to settle"
+                    )
+            owner_repair_event_cursor = int(owner_repair_event["cursor"])
+        if task["state"] == "queued":
+            unfinished = connection.execute(
+                """
+                SELECT node_id, state FROM nodes
+                WHERE task_id = ? AND node_id != ?
+                  AND json_extract(spec_json, '$.verifier') = 0
+                  AND state != 'accepted'
+                ORDER BY node_id
+                """,
+                (task_id, node["node_id"]),
+            ).fetchall()
+            if unfinished:
+                raise StateConflictError(
+                    "blocked source repair must wait for accepted-owner repairs to settle"
+                )
         try:
             contract = json.loads(str(task["contract_json"]))
         except json.JSONDecodeError as error:
@@ -4630,7 +4717,9 @@ class WorkbenchStore:
             "source_result_json": source_result_json,
             "mode": _BLOCKED_SOURCE_REPAIR_MODE,
             "source_node_state": "blocked",
-            "source_task_state": "blocked",
+            "source_task_state": str(task["state"]),
+            "refresh_accepted_ancestors": refresh_accepted_ancestors,
+            "owner_repair_event_cursor": owner_repair_event_cursor,
             "source": {
                 "attempt": int(node["attempt"]),
                 "worktree": str(allocation["current_path"]),
@@ -6482,12 +6571,18 @@ class WorkbenchStore:
         instruction: str,
         *,
         expected_revision: int,
+        scope: str = "task",
+        target_node_id: str | None = None,
+        target_attempt: int | None = None,
     ) -> int:
         return int(
             self.append_task_steering_receipt(
                 task_id,
                 instruction,
                 expected_revision=expected_revision,
+                scope=scope,
+                target_node_id=target_node_id,
+                target_attempt=target_attempt,
             )["revision"]
         )
 
@@ -6497,6 +6592,9 @@ class WorkbenchStore:
         instruction: str,
         *,
         expected_revision: int | None,
+        scope: str = "task",
+        target_node_id: str | None = None,
+        target_attempt: int | None = None,
     ) -> dict[str, Any]:
         """Persist steering and report only what can truthfully receive it."""
 
@@ -6507,6 +6605,9 @@ class WorkbenchStore:
                 task_id,
                 normalized,
                 expected_revision=expected_revision,
+                scope=scope,
+                target_node_id=target_node_id,
+                target_attempt=target_attempt,
             )
 
     @staticmethod
@@ -6592,6 +6693,9 @@ class WorkbenchStore:
         *,
         expected_revision: int | None,
         scheduled_for: str | None = None,
+        scope: str = "task",
+        target_node_id: str | None = None,
+        target_attempt: int | None = None,
     ) -> dict[str, Any]:
         instruction = self._normalize_steering_instruction(instruction)
         timestamp = now_iso()
@@ -6607,6 +6711,13 @@ class WorkbenchStore:
             )
         if task["state"] in {"accepted", "cancelled"}:
             raise StateConflictError(f"cannot steer task in {task['state']}")
+        scope, target_node_id, target_attempt = self._steering_scope(
+            connection,
+            task_id,
+            scope=scope,
+            target_node_id=target_node_id,
+            target_attempt=target_attempt,
+        )
         revision = int(task["state_revision"]) + 1
         sequence = self._next_steering_sequence(connection, task_id)
         steering_id = "steering-" + canonical_hash(
@@ -6614,14 +6725,22 @@ class WorkbenchStore:
                 "task_id": task_id,
                 "revision": revision,
                 "instruction": instruction,
+                "scope": scope,
+                "target_node_id": target_node_id,
+                "target_attempt": target_attempt,
             }
         )[:24]
         connection.execute(
             """
-            INSERT INTO task_steering(steering_id, task_id, instruction, created_at, sequence)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO task_steering(
+                steering_id, task_id, instruction, created_at, sequence,
+                scope, target_node_id, target_attempt
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (steering_id, task_id, instruction, timestamp, sequence),
+            (
+                steering_id, task_id, instruction, timestamp, sequence,
+                scope, target_node_id, target_attempt,
+            ),
         )
         connection.execute(
             """
@@ -6634,7 +6753,13 @@ class WorkbenchStore:
             "task.steering_added",
             task_id,
             None,
-            {"steering_id": steering_id, "revision": revision},
+            {
+                "steering_id": steering_id,
+                "revision": revision,
+                "scope": scope,
+                "target_node_id": target_node_id,
+                "target_attempt": target_attempt,
+            },
         )
         running_attempts = [
             {"node_id": str(row["node_id"]), "attempt": int(row["attempt"])}
@@ -6661,6 +6786,9 @@ class WorkbenchStore:
             "revision": revision,
             "state": task["state"],
             "objective_preserved": True,
+            "scope": scope,
+            "target_node_id": target_node_id,
+            "target_attempt": target_attempt,
             # Executors receive their steering snapshot when claimed. A
             # message appended after a node is already running cannot be
             # truthfully claimed as delivered to that process.
@@ -6673,6 +6801,309 @@ class WorkbenchStore:
                 "running_attempts": running_attempts,
             },
         }
+
+    @staticmethod
+    def _steering_scope(
+        connection: sqlite3.Connection,
+        task_id: str,
+        *,
+        scope: str,
+        target_node_id: str | None,
+        target_attempt: int | None,
+    ) -> tuple[str, str | None, int | None]:
+        """Validate task-wide, node-minimum, or exact-attempt delivery."""
+
+        if scope == "task":
+            if target_node_id is not None or target_attempt is not None:
+                raise ValueError("task steering scope does not accept a target")
+            return scope, None, None
+        if scope not in {"node", "attempt"}:
+            raise ValueError("steering scope must be task, node, or attempt")
+        if not isinstance(target_node_id, str) or not target_node_id.strip():
+            raise ValueError("node and attempt steering require target_node_id")
+        target_node_id = target_node_id.strip()
+        node = connection.execute(
+            "SELECT attempt FROM nodes WHERE task_id = ? AND node_id = ?",
+            (task_id, target_node_id),
+        ).fetchone()
+        if node is None:
+            raise ValueError("steering target node does not exist")
+        next_attempt = int(node["attempt"]) + 1
+        if target_attempt is not None and (
+            type(target_attempt) is not int or target_attempt < next_attempt
+        ):
+            raise ValueError("steering target_attempt must be a future positive attempt")
+        if scope == "attempt":
+            if target_attempt is None:
+                raise ValueError("attempt steering requires target_attempt")
+            return scope, target_node_id, target_attempt
+        return scope, target_node_id, target_attempt or next_attempt
+
+    def rescope_legacy_task_steering(
+        self,
+        task_id: str,
+        steering_id: str,
+        *,
+        expected_revision: int,
+        scope: str,
+        target_node_id: str | None = None,
+        target_attempt: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace one ambiguous legacy scope with an explicit audited scope."""
+
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT state_revision FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(task_id)
+            if int(task["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {task['state_revision']}"
+                )
+            steering = connection.execute(
+                "SELECT scope FROM task_steering WHERE task_id = ? AND steering_id = ?",
+                (task_id, steering_id),
+            ).fetchone()
+            if steering is None:
+                raise KeyError(steering_id)
+            if steering["scope"] != "legacy":
+                raise StateConflictError("only an ambiguous legacy steering record can be rescoped")
+            scope, target_node_id, target_attempt = self._steering_scope(
+                connection,
+                task_id,
+                scope=scope,
+                target_node_id=target_node_id,
+                target_attempt=target_attempt,
+            )
+            timestamp = now_iso()
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE task_steering
+                SET scope = ?, target_node_id = ?, target_attempt = ?
+                WHERE task_id = ? AND steering_id = ? AND scope = 'legacy'
+                """,
+                (scope, target_node_id, target_attempt, task_id, steering_id),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("legacy steering rescope compare-and-set failed")
+            connection.execute(
+                "UPDATE tasks SET state_revision = ?, updated_at = ? WHERE task_id = ?",
+                (revision, timestamp, task_id),
+            )
+            event_cursor = self._event(
+                connection,
+                "task.steering_rescoped",
+                task_id,
+                target_node_id,
+                {
+                    "steering_id": steering_id,
+                    "from_scope": "legacy",
+                    "scope": scope,
+                    "target_node_id": target_node_id,
+                    "target_attempt": target_attempt,
+                    "revision": revision,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "steering_id": steering_id,
+                "revision": revision,
+                "scope": scope,
+                "target_node_id": target_node_id,
+                "target_attempt": target_attempt,
+                "event_cursor": event_cursor,
+                "history_preserved": True,
+            }
+
+    def schedule_blocked_consumer_owner_repairs(
+        self,
+        task_id: str,
+        requester_node_id: str,
+        repair_node_ids: list[str],
+        repair_instructions: Mapping[str, str],
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Queue accepted source owners required by one blocked consumer."""
+
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
+        if type(expected_attempt) is not int or expected_attempt < 1:
+            raise ValueError("expected_attempt must be a positive integer")
+        requester_node_id = requester_node_id.strip() if isinstance(requester_node_id, str) else ""
+        if not requester_node_id:
+            raise ValueError("node_id must identify the blocked consumer")
+        reason = self._normalize_steering_instruction(reason)
+        if (
+            not isinstance(repair_node_ids, list)
+            or not repair_node_ids
+            or len(repair_node_ids) > 32
+            or any(not isinstance(value, str) or not value.strip() for value in repair_node_ids)
+        ):
+            raise ValueError("repair_node_ids must be a non-empty bounded string array")
+        owners = [value.strip() for value in repair_node_ids]
+        if len(set(owners)) != len(owners):
+            raise ValueError("repair_node_ids must be unique")
+        if not isinstance(repair_instructions, Mapping) or set(repair_instructions) != set(owners):
+            raise ValueError("repair_instructions must contain exactly one entry per repair owner")
+        instructions = {
+            owner: self._normalize_steering_instruction(repair_instructions[owner])
+            for owner in owners
+        }
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            requester = connection.execute(
+                "SELECT state, attempt FROM nodes WHERE task_id = ? AND node_id = ?",
+                (task_id, requester_node_id),
+            ).fetchone()
+            if task is None or requester is None:
+                raise KeyError((task_id, requester_node_id))
+            if int(task["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {task['state_revision']}"
+                )
+            if task["state"] != "blocked":
+                raise StateConflictError(f"task {task_id} is {task['state']}, expected blocked")
+            if requester["state"] != "blocked" or int(requester["attempt"]) != expected_attempt:
+                raise StateConflictError("blocked consumer identity changed before owner repair")
+            from .accepted_source_repair import build_accepted_repair_bindings
+
+            bindings = build_accepted_repair_bindings(
+                self,
+                connection,
+                task_id,
+                owners,
+                requester_node_id,
+                expected_attempt,
+                expected_revision + 1,
+                requester_kind="blocked_consumer",
+            )
+            steering_ids: dict[str, str] = {}
+            for owner in owners:
+                binding = bindings[owner]
+                target_attempt = int(binding["source"]["attempt"]) + 1
+                instruction = instructions[owner]
+                steering_id = "steering-" + canonical_hash(
+                    {
+                        "task_id": task_id,
+                        "requester_node_id": requester_node_id,
+                        "requester_attempt": expected_attempt,
+                        "owner_node_id": owner,
+                        "target_attempt": target_attempt,
+                        "instruction": instruction,
+                    }
+                )[:24]
+                sequence = self._next_steering_sequence(connection, task_id)
+                connection.execute(
+                    """
+                    INSERT INTO task_steering(
+                        steering_id, task_id, instruction, created_at, sequence,
+                        scope, target_node_id, target_attempt
+                    ) VALUES(?, ?, ?, ?, ?, 'attempt', ?, ?)
+                    """,
+                    (
+                        steering_id, task_id, instruction, timestamp, sequence,
+                        owner, target_attempt,
+                    ),
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE nodes
+                    SET state = 'pending', worker_id = NULL, worktree = NULL,
+                        effective_executor = NULL, effective_model = NULL,
+                        started_at = NULL, settled_at = NULL, result_json = NULL,
+                        recovery_json = ?, coordinator_epoch = 0, lease_epoch = 0,
+                        updated_at = ?
+                    WHERE task_id = ? AND node_id = ? AND state = 'accepted'
+                    """,
+                    (canonical_json(binding), timestamp, task_id, owner),
+                ).rowcount
+                if changed != 1:
+                    raise StateConflictError(
+                        f"accepted owner {owner} changed before repair authorization"
+                    )
+                steering_ids[owner] = steering_id
+                self._event(
+                    connection,
+                    "node.accepted_source_repair_authorized",
+                    task_id,
+                    owner,
+                    {
+                        "source_allocation_id": binding["source_allocation_id"],
+                        "source_attempt": binding["source"]["attempt"],
+                        "requester_kind": "blocked_consumer",
+                        "requester_node_id": requester_node_id,
+                        "requester_attempt": expected_attempt,
+                        "authorization_revision": expected_revision + 1,
+                        "steering_id": steering_id,
+                    },
+                    created_at=timestamp,
+                )
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL
+                WHERE task_id = ? AND state = 'blocked' AND state_revision = ?
+                """,
+                (revision, timestamp, task_id, expected_revision),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError("blocked owner repair task compare-and-set failed")
+            requester_digest = next(iter(bindings.values()))["requester"]["result_sha256"]
+            event_cursor = self._event(
+                connection,
+                "task.blocked_owner_repair_scheduled",
+                task_id,
+                requester_node_id,
+                {
+                    "requester_attempt": expected_attempt,
+                    "requester_result_sha256": requester_digest,
+                    "repair_node_ids": owners,
+                    "repair_source_attempts": {
+                        owner: int(bindings[owner]["source"]["attempt"])
+                        for owner in owners
+                    },
+                    "feedback_steering_ids": steering_ids,
+                    "reason": reason,
+                    "revision": revision,
+                    "blocked_consumer_preserved": True,
+                },
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "task.state_changed",
+                task_id,
+                None,
+                {
+                    "from": "blocked",
+                    "to": "queued",
+                    "revision": revision,
+                    "blocker": None,
+                    "blocked_owner_repair": True,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "requester_node_id": requester_node_id,
+                "requester_attempt": expected_attempt,
+                "repair_node_ids": owners,
+                "feedback_steering_ids": steering_ids,
+                "revision": revision,
+                "state": "queued",
+                "event_cursor": event_cursor,
+                "blocked_consumer_preserved": True,
+            }
 
     def resolve_indeterminate(
         self,
@@ -8491,7 +8922,9 @@ class WorkbenchStore:
         ).fetchall()
         steering_rows = connection.execute(
             """
-            SELECT steering_id, instruction, created_at, sequence FROM task_steering
+            SELECT steering_id, instruction, created_at, sequence,
+                   scope, target_node_id, target_attempt
+            FROM task_steering
             WHERE task_id = ? ORDER BY sequence
             """,
             (row["task_id"],),
@@ -10188,9 +10621,31 @@ class WorkbenchStore:
             mode_fields: set[str] = set()
         elif mode == _BLOCKED_SOURCE_REPAIR_MODE:
             mode_fields = {"mode", "source_node_state", "source_task_state"}
+            has_refresh_marker = "refresh_accepted_ancestors" in authorization
+            has_owner_cursor = "owner_repair_event_cursor" in authorization
+            if has_refresh_marker != has_owner_cursor:
+                raise StateConflictError("blocked source repair refresh binding is incomplete")
+            if has_refresh_marker:
+                mode_fields.update({
+                    "refresh_accepted_ancestors", "owner_repair_event_cursor",
+                })
+            refresh_accepted_ancestors = authorization.get(
+                "refresh_accepted_ancestors", False
+            )
+            owner_repair_event_cursor = authorization.get("owner_repair_event_cursor")
             if (
                 authorization.get("source_node_state") != "blocked"
-                or authorization.get("source_task_state") != "blocked"
+                or authorization.get("source_task_state") not in {"blocked", "queued"}
+                or type(refresh_accepted_ancestors) is not bool
+                or (
+                    refresh_accepted_ancestors
+                    and (type(owner_repair_event_cursor) is not int or owner_repair_event_cursor < 1)
+                )
+                or (not refresh_accepted_ancestors and owner_repair_event_cursor is not None)
+                or (
+                    not has_refresh_marker
+                    and authorization["source_task_state"] != "blocked"
+                )
             ):
                 raise StateConflictError("blocked source repair source-state markers are invalid")
         else:
@@ -10321,7 +10776,9 @@ class WorkbenchStore:
             binding.update({
                 "mode": mode,
                 "source_node_state": "blocked",
-                "source_task_state": "blocked",
+                "source_task_state": authorization["source_task_state"],
+                "refresh_accepted_ancestors": refresh_accepted_ancestors,
+                "owner_repair_event_cursor": owner_repair_event_cursor,
             })
         if state == "assigned":
             recovery = authorization["recovery"]
@@ -11183,10 +11640,26 @@ class WorkbenchStore:
             )
             steering_rows = connection.execute(
                 """
-                SELECT steering_id, instruction, sequence FROM task_steering
-                WHERE task_id = ? ORDER BY sequence
+                SELECT steering_id, instruction, sequence, scope,
+                       target_node_id, target_attempt
+                FROM task_steering AS steering
+                WHERE task_id = ? AND (
+                    scope IN ('task', 'legacy')
+                    OR (
+                        scope = 'node' AND target_node_id = ?
+                        AND ? >= target_attempt
+                    )
+                    OR (
+                        scope = 'attempt' AND target_node_id = ?
+                        AND target_attempt = ?
+                    )
+                )
+                ORDER BY sequence
                 """,
-                (selected["task_id"],),
+                (
+                    selected["task_id"], selected["node_id"], attempt,
+                    selected["node_id"], attempt,
+                ),
             ).fetchall()
             steering = tuple(str(row["instruction"]) for row in steering_rows)
             steering_deliveries = [
@@ -11203,6 +11676,9 @@ class WorkbenchStore:
                             "steering_id": str(row["steering_id"]),
                             "instruction": str(row["instruction"]),
                             "sequence": int(row["sequence"]),
+                            "scope": str(row["scope"]),
+                            "target_node_id": row["target_node_id"],
+                            "target_attempt": row["target_attempt"],
                             "node_id": str(selected["node_id"]),
                             "attempt": attempt,
                         },
@@ -11551,7 +12027,7 @@ class WorkbenchStore:
                 if task["state"] in {"paused", "cancelled"} or node["worktree"] is not None:
                     raise StateConflictError("accepted-source assignment was paused, cancelled or already assigned")
                 expected_preflight = {
-                    "kind": "accepted-source-repair-v1", "state": "prepared",
+                    "kind": accepted_binding["kind"], "state": "prepared",
                     "binding_sha256": canonical_hash(accepted_binding),
                     "source_allocation_id": accepted_binding["source_allocation_id"],
                     "source_attempt": accepted_binding["source"]["attempt"],
@@ -11770,7 +12246,10 @@ class WorkbenchStore:
             ):
                 if binding.get(field) != current.get(field):
                     raise StateConflictError("failed-attempt recovery binding changed before assignment")
-            for field in ("mode", "source_node_state", "source_task_state"):
+            for field in (
+                "mode", "source_node_state", "source_task_state",
+                "refresh_accepted_ancestors", "owner_repair_event_cursor",
+            ):
                 if binding.get(field) != current.get(field):
                     raise StateConflictError("failed-attempt recovery mode changed before assignment")
             try:
@@ -11853,6 +12332,12 @@ class WorkbenchStore:
                                 "mode": current["mode"],
                                 "source_node_state": current["source_node_state"],
                                 "source_task_state": current["source_task_state"],
+                                "refresh_accepted_ancestors": current[
+                                    "refresh_accepted_ancestors"
+                                ],
+                                "owner_repair_event_cursor": current[
+                                    "owner_repair_event_cursor"
+                                ],
                             }
                             if current.get("mode") == _BLOCKED_SOURCE_REPAIR_MODE
                             else {}
@@ -11945,6 +12430,12 @@ class WorkbenchStore:
                             "mode": current["mode"],
                             "source_node_state": current["source_node_state"],
                             "source_task_state": current["source_task_state"],
+                            "refresh_accepted_ancestors": current[
+                                "refresh_accepted_ancestors"
+                            ],
+                            "owner_repair_event_cursor": current[
+                                "owner_repair_event_cursor"
+                            ],
                         }
                         if current.get("mode") == _BLOCKED_SOURCE_REPAIR_MODE
                         else {}
@@ -12238,8 +12729,24 @@ class WorkbenchStore:
             source_task_state = "needs_fix"
         elif mode == _BLOCKED_SOURCE_REPAIR_MODE:
             source_node_state = recovery.get("source_node_state")
-            source_task_state = recovery.get("source_task_state")
-            if source_node_state != "blocked" or source_task_state != "blocked":
+            origin_task_state = recovery.get("source_task_state")
+            source_task_state = "blocked"
+            if (
+                source_node_state != "blocked"
+                or origin_task_state not in {"blocked", "queued"}
+                or type(recovery.get("refresh_accepted_ancestors")) is not bool
+                or (
+                    recovery["refresh_accepted_ancestors"]
+                    and (
+                        type(recovery.get("owner_repair_event_cursor")) is not int
+                        or recovery["owner_repair_event_cursor"] < 1
+                    )
+                )
+                or (
+                    not recovery["refresh_accepted_ancestors"]
+                    and recovery.get("owner_repair_event_cursor") is not None
+                )
+            ):
                 raise StateConflictError("blocked source repair rollback state markers are invalid")
         else:
             raise StateConflictError("failed-attempt recovery rollback mode is invalid")
@@ -12332,6 +12839,13 @@ class WorkbenchStore:
                     "mode": mode,
                     "source_node_state": source_node_state,
                     "source_task_state": source_task_state,
+                    "origin_task_state": origin_task_state,
+                    "refresh_accepted_ancestors": recovery[
+                        "refresh_accepted_ancestors"
+                    ],
+                    "owner_repair_event_cursor": recovery[
+                        "owner_repair_event_cursor"
+                    ],
                     "control_state_preserved": control_state_preserved,
                 },
                 created_at=timestamp,
@@ -12776,23 +13290,7 @@ class WorkbenchStore:
                     })
                 elif spec.get("verifier"):
                     feedback = f"Verifier rejected attempt {row['attempt']}: {result.summary}"[:500]
-                    steering_id = "steering-" + canonical_hash(
-                        {
-                            "task_id": task_id,
-                            "verifier_node": node_id,
-                            "attempt": int(row["attempt"]),
-                            "feedback": feedback,
-                        }
-                    )[:24]
-                    sequence = self._next_steering_sequence(connection, task_id)
-                    connection.execute(
-                        """
-                        INSERT OR IGNORE INTO task_steering(
-                            steering_id, task_id, instruction, created_at, sequence
-                        ) VALUES(?, ?, ?, ?, ?)
-                        """,
-                        (steering_id, task_id, feedback, timestamp, sequence),
-                    )
+                    feedback_steering_ids: list[str] = []
                     connection.execute(
                         """
                         UPDATE nodes
@@ -12806,6 +13304,31 @@ class WorkbenchStore:
                         (timestamp, task_id, node_id),
                     )
                     for owner_id, source_binding in owner_repair_bindings.items():
+                        target_attempt = int(source_binding["source"]["attempt"]) + 1
+                        steering_id = "steering-" + canonical_hash(
+                            {
+                                "task_id": task_id,
+                                "verifier_node": node_id,
+                                "attempt": int(row["attempt"]),
+                                "owner_node": owner_id,
+                                "target_attempt": target_attempt,
+                                "feedback": feedback,
+                            }
+                        )[:24]
+                        sequence = self._next_steering_sequence(connection, task_id)
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO task_steering(
+                                steering_id, task_id, instruction, created_at, sequence,
+                                scope, target_node_id, target_attempt
+                            ) VALUES(?, ?, ?, ?, ?, 'node', ?, ?)
+                            """,
+                            (
+                                steering_id, task_id, feedback, timestamp, sequence,
+                                owner_id, target_attempt,
+                            ),
+                        )
+                        feedback_steering_ids.append(steering_id)
                         connection.execute(
                             """UPDATE nodes SET state = 'pending', worker_id = NULL, worktree = NULL,
                                effective_executor = NULL, effective_model = NULL, started_at = NULL,
@@ -12828,7 +13351,8 @@ class WorkbenchStore:
                         node_id,
                         {
                             "verifier_attempt": int(row["attempt"]),
-                            "feedback_steering_id": steering_id,
+                            "feedback_steering_id": feedback_steering_ids[0],
+                            "feedback_steering_ids": feedback_steering_ids,
                             "repair_node_ids": list(owner_repair_bindings),
                             "accepted_ancestors_preserved": True,
                         },
@@ -12853,17 +13377,32 @@ class WorkbenchStore:
                     next_state = "needs_fix"
                     blocker = result.summary
             elif node_state == "accepted":
-                pending_non_verifiers = connection.execute(
+                remaining_non_verifiers = connection.execute(
                     """
-                    SELECT COUNT(*) AS count FROM nodes
+                    SELECT node_id, state, result_json FROM nodes
                     WHERE task_id = ?
                       AND json_extract(spec_json, '$.verifier') = 0
                       AND state != 'accepted'
+                    ORDER BY node_id
                     """,
                     (task_id,),
-                ).fetchone()["count"]
-                if pending_non_verifiers == 0:
+                ).fetchall()
+                if not remaining_non_verifiers:
                     next_state = "verifying"
+                elif all(item["state"] == "blocked" for item in remaining_non_verifiers):
+                    next_state = "blocked"
+                    try:
+                        blocked_result = json.loads(
+                            str(remaining_non_verifiers[0]["result_json"])
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        blocked_result = None
+                    blocker = (
+                        str(blocked_result["summary"])
+                        if isinstance(blocked_result, dict)
+                        and isinstance(blocked_result.get("summary"), str)
+                        else "accepted owner repairs settled; blocked consumer still requires continuation"
+                    )
 
             if next_state != task["state"] or blocker or verdict:
                 revision = task_revision + 1
