@@ -823,16 +823,27 @@ def accepted_ancestor_nodes(task: Mapping[str, Any], node_id: str) -> tuple[Mapp
 def changed_paths_since_input_tree(worktree: Path, input_tree_sha: str) -> set[str]:
     """Return the worker's delta from an inherited tree, including untracked files."""
 
+    _baseline, changed, _untracked = changed_and_untracked_paths_since_input_tree(
+        worktree, input_tree_sha
+    )
+    return changed
+
+
+def changed_and_untracked_paths_since_input_tree(
+    worktree: Path,
+    input_tree_sha: str,
+) -> tuple[str, set[str], set[str]]:
+    """Resolve one input tree and return its complete delta plus untracked subset."""
+
     baseline = _resolve_tree(worktree, input_tree_sha)
     changed = _nul_paths(
         _git_bytes(worktree, "diff", "--name-only", "--no-renames", "-z", baseline, "--")
     )
-    changed.update(
-        _nul_paths(
-            _git_bytes(worktree, "ls-files", "--others", "--exclude-standard", "-z")
-        )
+    untracked = _nul_paths(
+        _git_bytes(worktree, "ls-files", "--others", "--exclude-standard", "-z")
     )
-    return changed
+    changed.update(untracked)
+    return baseline, changed, untracked
 
 
 def _receipt_lockfile_handoffs(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:

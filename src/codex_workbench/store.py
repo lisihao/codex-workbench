@@ -5262,6 +5262,7 @@ class WorkbenchStore:
         preserve_untracked: bool | None,
         expected_checkpoint_sha: str | None,
         expected_source_delta_sha256: str | None,
+        between_delta_reads: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Any], Any]:
         """Verify the live blocked source delta without holding the SQLite write lock."""
 
@@ -5282,6 +5283,7 @@ class WorkbenchStore:
             artifacts=self.artifacts,
             expected_checkpoint_sha=expected_checkpoint_sha,
             recovery_label="blocked",
+            between_delta_reads=between_delta_reads,
         )
         if delta.untracked_paths and preserve_untracked is False:
             raise StateConflictError(
