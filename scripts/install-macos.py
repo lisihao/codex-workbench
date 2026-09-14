@@ -219,6 +219,24 @@ def absolute_path(path: Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
+def worktree_recycle_root(state_root: Path, configured: object) -> Path:
+    """Keep the managed recycle directory on the worktree filesystem by default."""
+
+    legacy = state_root / "recycle" / "worktrees"
+    if configured is not None and configured != str(legacy):
+        if not isinstance(configured, str) or not configured.strip():
+            raise SystemExit("worktree_recovery.recycle_root must be a non-empty path")
+        return absolute_path(Path(configured))
+    worktrees = state_root / "worktrees"
+    if not worktrees.is_symlink():
+        return legacy
+    try:
+        physical_worktrees = worktrees.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"worktree root symlink is unavailable: {worktrees}") from error
+    return physical_worktrees.parent / "recycle" / "worktrees"
+
+
 def resolve_optional_executable(value: object, *, label: str) -> Path | None:
     """Resolve one optional executable while rejecting malformed persisted paths."""
 
@@ -2074,7 +2092,9 @@ def main() -> int:
         raise SystemExit("worktree_recovery config must be a JSON object")
     recovery_config = dict(recovery_raw)
     recovery_config.setdefault("enabled", True)
-    recovery_config.setdefault("recycle_root", str(state_root / "recycle" / "worktrees"))
+    recovery_config["recycle_root"] = str(
+        worktree_recycle_root(state_root, recovery_config.get("recycle_root"))
+    )
     recovery_config.setdefault("restore_root", str(state_root / "restored-worktrees"))
     recovery_config.setdefault("outgoing_root", str(state_root / "recycle" / "outgoing"))
     recovery_config.setdefault("sweep_interval_seconds", 60)
