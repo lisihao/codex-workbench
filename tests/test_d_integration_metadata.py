@@ -29,6 +29,7 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
         self._write_profile_markers()
         self._write_pair("docs/d-guide.md", sidecar=False)
         self._write_pair("packages/d-package/README.md", sidecar=True)
+        self._write_pair("apps/cli/composition.md", sidecar=True)
         (self.worktree / ".agents/notes/implemented/architecture").mkdir(parents=True)
         loader = self.worktree / "node_modules/tsx/dist/esm/index.mjs"
         loader.parent.mkdir(parents=True)
@@ -61,7 +62,11 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
             english.with_name(english.stem + ".i18n.yaml").write_text("paired: true\n", encoding="utf-8")
 
     def test_pairing_plan_binds_selected_bytes_and_missing_sidecars_without_writing(self) -> None:
-        selected = ("docs/d-guide.md", "packages/d-package/README.md")
+        selected = (
+            "docs/d-guide.md",
+            "packages/d-package/README.md",
+            "apps/cli/composition.md",
+        )
         missing_sidecar = (self.worktree / "docs/d-guide.i18n.yaml").resolve(strict=False)
         self.assertFalse(missing_sidecar.exists())
 
@@ -75,9 +80,9 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
         self.assertFalse(missing_sidecar.exists())
         self.assertFalse(plan.allow_unix_socket)
         self.assertEqual(plan.check_id, PAIRING_WRITE_ID)
-        self.assertEqual(plan.commands[0].argv[-2:], selected)
-        self.assertEqual(plan.commands[1].argv[-2:], selected)
-        self.assertEqual(plan.commands[0].argv[-3], "--write")
+        self.assertEqual(plan.commands[0].argv[-len(selected):], selected)
+        self.assertEqual(plan.commands[1].argv[-len(selected):], selected)
+        self.assertEqual(plan.commands[0].argv[-len(selected) - 1], "--write")
         assert plan.metadata is not None
         bindings = plan.to_dict()["metadata"]["pairing_bindings"]
         self.assertFalse(bindings[0]["sidecar_exists"])
@@ -213,12 +218,18 @@ class DIntegrationMetadataPlanTests(unittest.TestCase):
             validation.plan_validation(self.worktree, PAIRING_WRITE_ID, self.runtime, metadata=request)
 
     def test_metadata_grammar_rejects_globs_instruction_files_and_unapproved_note_kinds(self) -> None:
+        request = metadata_request_from_arguments(
+            PAIRING_WRITE_ID, {"pair_anchors": ["apps/cli/composition.md"]}
+        )
+        self.assertEqual(request, PairingMetadata(("apps/cli/composition.md",)))
         for anchor in (
             "docs/*.md",
             "docs/AGENTS.md",
             "packages/skills/README.md",
             ".agents/notes/implemented/ARCHIVED/README.md",
             "docs/d-guide.zh.md",
+            "apps/cli/README.md",
+            "apps/web/composition.md",
         ):
             with self.subTest(anchor=anchor), self.assertRaises(DIntegrationMetadataError):
                 metadata_request_from_arguments(PAIRING_WRITE_ID, {"pair_anchors": [anchor]})

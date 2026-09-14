@@ -183,9 +183,11 @@ def _pair_anchor(value: object) -> str:
     parts = PurePosixPath(path).parts
     in_document_roots = parts[0] in {"docs", "packages"}
     in_implemented_notes = parts[:3] == (".agents", "notes", "implemented")
-    if not (in_document_roots or in_implemented_notes):
+    is_cli_composition = path == "apps/cli/composition.md"
+    if not (in_document_roots or in_implemented_notes or is_cli_composition):
         raise DIntegrationMetadataError(
-            "pair anchors must be under docs/, packages/, or .agents/notes/implemented/"
+            "pair anchors must be under docs/, packages/, .agents/notes/implemented/, "
+            "or the fixed apps/cli/composition.md output"
         )
     if any(part.casefold() in _FORBIDDEN_PAIR_COMPONENTS for part in parts):
         raise DIntegrationMetadataError("pair anchor selects an excluded archived, skill, or instruction path")

@@ -23,6 +23,9 @@ EXPECTED_WRITES = (
     "packages/prompt/README.md",
     "packages/prompt/README.zh.md",
     "packages/prompt/README.i18n.yaml",
+    "apps/cli/composition.md",
+    "apps/cli/composition.zh.md",
+    "apps/cli/composition.i18n.yaml",
     "packages/prompt/task-template-rpc/package.json",
 )
 
@@ -66,9 +69,9 @@ REMOVED_BROAD_OR_UNNEEDED_READS = (
 class DScopeMinimalProfileTests(unittest.TestCase):
     """Keep the fixed profile at the evidence-supported file boundary."""
 
-    def test_write_scope_is_exactly_the_twelve_evidenced_files(self) -> None:
+    def test_write_scope_is_exactly_the_fifteen_evidenced_files(self) -> None:
         self.assertEqual(NODE_WRITE_ADDITIONS, EXPECTED_WRITES)
-        self.assertEqual(len(NODE_WRITE_ADDITIONS), 12)
+        self.assertEqual(len(NODE_WRITE_ADDITIONS), 15)
         self.assertTrue(set(NODE_WRITE_ADDITIONS).isdisjoint(REMOVED_SPECULATIVE_WRITES))
 
     def test_read_scope_separates_exact_inputs_from_outputs(self) -> None:
