@@ -499,6 +499,7 @@ def _preflight(
     active_after = _active_lockfile_owner_rows(store)
     if canonical_json(active_after) != canonical_json(active_rows):
         raise LockfileHandoffError("lockfile owner activity changed during preview")
+    repair_worktree = _repair_worktree_path(request, config.state_root)
     fingerprint_payload = {
         "schema_version": _SCHEMA_VERSION,
         "kind": _KIND,
@@ -512,6 +513,7 @@ def _preflight(
         "manifest_fingerprint": source["manifest_fingerprint"],
         "lockfile": source["lockfile"],
         "changed_importers": source["changed_importers"],
+        "repair_worktree": str(repair_worktree),
     }
     return {
         "request": dict(request),
@@ -520,7 +522,7 @@ def _preflight(
         "source": source,
         "repository_identity": repository_identity,
         "active_owner_rows": active_rows,
-        "repair_worktree": _repair_worktree_path(request, config.state_root),
+        "repair_worktree": repair_worktree,
         "fingerprint": canonical_hash(fingerprint_payload),
     }
 
@@ -990,6 +992,10 @@ def _reserve(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, A
         }
     )
     repair_worktree = _repair_worktree_path(request, store.path.parent)
+    if repair_worktree != preflight["repair_worktree"]:
+        raise LockfileHandoffError(
+            "lockfile handoff repair worktree root changed before reservation"
+        )
     with store.transaction() as connection:
         existing = _receipt_from_connection(connection, request["task_id"], request["request_id"])
         if existing is not None:
@@ -1565,6 +1571,7 @@ def _assert_reserved_preflight(
         "manifest_fingerprint": preflight["source"]["manifest_fingerprint"],
         "lockfile": preflight["source"]["lockfile"],
         "changed_importers": preflight["source"]["changed_importers"],
+        "repair_worktree": str(preflight["repair_worktree"]),
     }
     for key, value in expected.items():
         if canonical_json(reservation.get(key)) != canonical_json(value):
@@ -2132,7 +2139,7 @@ def _request_fingerprint(request: Mapping[str, Any]) -> str:
 
 
 def _repair_worktree_path(request: Mapping[str, Any], state_root: Path) -> Path:
-    """Choose a deterministic retained private repair directory for one request."""
+    """Choose a deterministic retained repair directory on the worktree volume."""
 
     digest = canonical_hash(
         {
@@ -2142,7 +2149,12 @@ def _repair_worktree_path(request: Mapping[str, Any], state_root: Path) -> Path:
             "request_id": request["request_id"],
         }
     )[:32]
-    return (state_root / "lockfile-handoffs" / digest).expanduser().resolve(strict=False)
+    physical_worktree_root = (
+        state_root / "worktrees"
+    ).expanduser().resolve(strict=False)
+    return (
+        physical_worktree_root.parent / "lockfile-handoffs" / digest
+    ).resolve(strict=False)
 
 
 def _temporary_owner(task_id: str, node_id: str, attempt: int) -> str:
