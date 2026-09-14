@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 from urllib.error import HTTPError
@@ -63,10 +62,19 @@ class APITests(unittest.TestCase):
             store.initialize()
             server = WorkbenchHTTPServer(config, store)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
+            dispatch_entered = threading.Event()
+            release_dispatch = threading.Event()
+            trace_written = threading.Event()
+            request_errors: list[BaseException] = []
 
             def slow_dispatch(*_args, **_kwargs):
-                time.sleep(0.05)
+                dispatch_entered.set()
+                release_dispatch.wait(timeout=2)
                 return {"state": "completed", "result": {}}
+
+            def capture_trace(thread_id: int, stage: dict[str, str]) -> None:
+                log_slow_service_request(thread_id, stage)
+                trace_written.set()
 
             server.authority_service.dispatch = slow_dispatch
             thread.start()
@@ -83,18 +91,36 @@ class APITests(unittest.TestCase):
                 },
             )
             output = io.StringIO()
+
+            def send_request() -> None:
+                try:
+                    with urlopen(request, timeout=2) as response:
+                        self.assertEqual(json.load(response)["state"], "completed")
+                except BaseException as error:
+                    request_errors.append(error)
+
             try:
                 with mock.patch(
                     "codex_workbench.api.SLOW_SERVICE_REQUEST_TRACE_SECONDS",
                     0.01,
+                ), mock.patch(
+                    "codex_workbench.api.log_slow_service_request",
+                    side_effect=capture_trace,
                 ), redirect_stderr(output):
-                    with urlopen(request, timeout=2) as response:
-                        self.assertEqual(json.load(response)["state"], "completed")
+                    request_thread = threading.Thread(target=send_request)
+                    request_thread.start()
+                    self.assertTrue(dispatch_entered.wait(timeout=1))
+                    self.assertTrue(trace_written.wait(timeout=1))
+                    release_dispatch.set()
+                    request_thread.join(timeout=2)
+                    self.assertFalse(request_thread.is_alive())
             finally:
+                release_dispatch.set()
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
 
+            self.assertEqual(request_errors, [])
             trace = json.loads(output.getvalue())
             self.assertEqual(trace["stage"], "dispatch")
             self.assertTrue(any(
