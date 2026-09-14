@@ -214,6 +214,12 @@ def _preflight(store: WorkbenchStore, request: Mapping[str, Any]) -> dict[str, A
             observed_changed_paths=delta.changed_paths,
             source_delta_sha256=delta.sha256,
         )
+        continuation_steering = _accepted_owner_continuation_steering(
+            connection,
+            str(request["task_id"]),
+            str(request["node_id"]),
+            int(request["expected_attempt"]),
+        )
     fingerprint = canonical_hash(
         {
             "schema_version": _SCHEMA_VERSION,
@@ -225,6 +231,7 @@ def _preflight(store: WorkbenchStore, request: Mapping[str, Any]) -> dict[str, A
             "changed_paths": list(delta.changed_paths),
             "untracked_paths": list(delta.untracked_paths),
             "authorization": authorization,
+            "continuation_steering": continuation_steering,
         }
     )
     return {
@@ -233,6 +240,7 @@ def _preflight(store: WorkbenchStore, request: Mapping[str, Any]) -> dict[str, A
         "delta": delta,
         "policy": policy,
         "authorization": authorization,
+        "continuation_steering": continuation_steering,
         "fingerprint": fingerprint,
     }
 
@@ -244,8 +252,12 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
     snapshot = preflight["snapshot"]
     policy = preflight["policy"]
     authorization = preflight["authorization"]
+    continuation_steering = preflight["continuation_steering"]
     delta = preflight["delta"]
-    if not all(isinstance(value, Mapping) for value in (request, snapshot, policy, authorization)):
+    if (
+        not all(isinstance(value, Mapping) for value in (request, snapshot, policy, authorization))
+        or not isinstance(continuation_steering, list)
+    ):
         raise StateConflictError("blocked source repair queue preflight is invalid")
     timestamp = now_iso()
     with store.transaction() as connection:
@@ -287,6 +299,18 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
         )
         if canonical_json(current_authorization) != canonical_json(authorization):
             raise StateConflictError("blocked source repair authorization changed before queue")
+        current_continuation_steering = _accepted_owner_continuation_steering(
+            connection,
+            str(request["task_id"]),
+            str(request["node_id"]),
+            int(request["expected_attempt"]),
+        )
+        if canonical_json(current_continuation_steering) != canonical_json(
+            continuation_steering
+        ):
+            raise StateConflictError(
+                "blocked source repair continuation steering changed before queue"
+            )
         prior = int(
             connection.execute(
                 """
@@ -344,6 +368,62 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
         ).rowcount
         if task_changed != 1:
             raise StateConflictError("blocked source repair task compare-and-set failed")
+        continued_steering: list[dict[str, Any]] = []
+        next_attempt = int(request["expected_attempt"]) + 1
+        for source_steering in continuation_steering:
+            source_steering_id = str(source_steering["steering_id"])
+            steering_id = "steering-" + canonical_hash(
+                {
+                    "kind": "blocked-source-owner-guidance-continuation",
+                    "request_id": request["request_id"],
+                    "source_steering_id": source_steering_id,
+                    "target_attempt": next_attempt,
+                }
+            )[:24]
+            sequence = store._next_steering_sequence(
+                connection, str(request["task_id"])
+            )
+            connection.execute(
+                """
+                INSERT INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence,
+                    scope, target_node_id, target_attempt
+                ) VALUES(?, ?, ?, ?, ?, 'attempt', ?, ?)
+                """,
+                (
+                    steering_id,
+                    request["task_id"],
+                    source_steering["instruction"],
+                    timestamp,
+                    sequence,
+                    request["node_id"],
+                    next_attempt,
+                ),
+            )
+            continuation_event_cursor = store._event(
+                connection,
+                "task.owner_repair_guidance_continued",
+                str(request["task_id"]),
+                str(request["node_id"]),
+                {
+                    "request_id": request["request_id"],
+                    "source_steering_id": source_steering_id,
+                    "steering_id": steering_id,
+                    "source_attempt": int(request["expected_attempt"]),
+                    "target_attempt": next_attempt,
+                    "origin_authorization_event_cursor": source_steering[
+                        "origin_authorization_event_cursor"
+                    ],
+                },
+                created_at=timestamp,
+            )
+            continued_steering.append(
+                {
+                    "source_steering_id": source_steering_id,
+                    "steering_id": steering_id,
+                    "continuation_event_cursor": continuation_event_cursor,
+                }
+            )
         payload = {
             "schema_version": _SCHEMA_VERSION,
             "kind": _KIND,
@@ -375,6 +455,7 @@ def _queue(store: WorkbenchStore, preflight: Mapping[str, Any]) -> dict[str, Any
             "source_only_ignored": True,
             "historical_result_unchanged": True,
             "mode": _MODE,
+            "continued_steering": continued_steering,
         }
         cursor = store._event(
             connection,
@@ -444,7 +525,76 @@ def _preview(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "owner_repair_event_cursor": authorization["owner_repair_event_cursor"],
         "historical_result_unchanged": True,
         "source_only_ignored": True,
+        "continued_steering_count": len(preflight["continuation_steering"]),
     }
+
+
+def _accepted_owner_continuation_steering(
+    connection: sqlite3.Connection,
+    task_id: str,
+    node_id: str,
+    attempt: int,
+) -> list[dict[str, Any]]:
+    """Return delivered attempt-only guidance from a blocked-consumer owner repair."""
+
+    rows = connection.execute(
+        """
+        WITH lineage AS (
+            SELECT json_extract(payload_json, '$.steering_id') AS steering_id,
+                   cursor AS lineage_event_cursor,
+                   cursor AS origin_authorization_event_cursor
+            FROM events
+            WHERE task_id = ?
+              AND node_id = ?
+              AND event_type = 'node.accepted_source_repair_authorized'
+              AND json_extract(payload_json, '$.requester_kind') = 'blocked_consumer'
+            UNION ALL
+            SELECT json_extract(payload_json, '$.steering_id') AS steering_id,
+                   cursor AS lineage_event_cursor,
+                   json_extract(
+                       payload_json, '$.origin_authorization_event_cursor'
+                   ) AS origin_authorization_event_cursor
+            FROM events
+            WHERE task_id = ?
+              AND node_id = ?
+              AND event_type = 'task.owner_repair_guidance_continued'
+        )
+        SELECT steering.steering_id, steering.instruction, steering.sequence,
+               MIN(lineage.lineage_event_cursor) AS lineage_event_cursor,
+               MIN(lineage.origin_authorization_event_cursor)
+                   AS origin_authorization_event_cursor,
+               MIN(delivery.cursor) AS delivery_event_cursor
+        FROM lineage
+        JOIN task_steering AS steering
+          ON steering.task_id = ?
+         AND steering.steering_id = lineage.steering_id
+        JOIN events AS delivery
+          ON delivery.task_id = steering.task_id
+         AND delivery.node_id = steering.target_node_id
+         AND delivery.event_type = 'task.steering_delivered'
+         AND json_extract(delivery.payload_json, '$.steering_id') = steering.steering_id
+         AND json_extract(delivery.payload_json, '$.attempt') = steering.target_attempt
+        WHERE steering.scope = 'attempt'
+          AND steering.target_node_id = ?
+          AND steering.target_attempt = ?
+        GROUP BY steering.steering_id, steering.instruction, steering.sequence
+        ORDER BY steering.sequence, steering.steering_id
+        """,
+        (task_id, node_id, task_id, node_id, task_id, node_id, attempt),
+    ).fetchall()
+    return [
+        {
+            "steering_id": str(row["steering_id"]),
+            "instruction": str(row["instruction"]),
+            "sequence": int(row["sequence"]),
+            "lineage_event_cursor": int(row["lineage_event_cursor"]),
+            "origin_authorization_event_cursor": int(
+                row["origin_authorization_event_cursor"]
+            ),
+            "delivery_event_cursor": int(row["delivery_event_cursor"]),
+        }
+        for row in rows
+    ]
 
 
 def _policy(connection: sqlite3.Connection, task_id: str) -> dict[str, Any]:
@@ -569,11 +719,21 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         "source_only_ignored",
         "historical_result_unchanged",
         "mode",
+        "continued_steering",
     }
     legacy_required = required - {
-        "refresh_accepted_ancestors", "owner_repair_event_cursor",
+        "refresh_accepted_ancestors", "owner_repair_event_cursor", "continued_steering",
     }
-    if frozenset(payload) not in {frozenset(required), frozenset(legacy_required)}:
+    prior_required = required - {"continued_steering"}
+    legacy_with_continued = required - {
+        "refresh_accepted_ancestors", "owner_repair_event_cursor"
+    }
+    if frozenset(payload) not in {
+        frozenset(required),
+        frozenset(prior_required),
+        frozenset(legacy_with_continued),
+        frozenset(legacy_required),
+    }:
         raise StateConflictError("blocked source repair queued receipt has an invalid shape")
     refresh_accepted_ancestors = payload.get("refresh_accepted_ancestors", False)
     owner_repair_event_cursor = payload.get("owner_repair_event_cursor")
@@ -623,6 +783,7 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         raise StateConflictError("blocked source repair queued receipt fields are invalid")
     changed_paths = payload.get("changed_paths")
     untracked_paths = payload.get("untracked_paths")
+    continued_steering = payload.get("continued_steering", [])
     if (
         not isinstance(changed_paths, list)
         or not changed_paths
@@ -632,6 +793,24 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         or not all(isinstance(path, str) and path for path in untracked_paths)
         or untracked_paths != sorted(set(untracked_paths))
         or not set(untracked_paths).issubset(changed_paths)
+        or not isinstance(continued_steering, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item)
+            != {
+                "source_steering_id",
+                "steering_id",
+                "continuation_event_cursor",
+            }
+            or not all(
+                isinstance(item.get(field), str) and item[field]
+                for field in ("source_steering_id", "steering_id")
+            )
+            or isinstance(item.get("continuation_event_cursor"), bool)
+            or not isinstance(item.get("continuation_event_cursor"), int)
+            or item["continuation_event_cursor"] < 1
+            for item in continued_steering
+        )
         or isinstance(cursor, bool)
         or not isinstance(cursor, int)
         or cursor < 1
@@ -641,6 +820,7 @@ def _receipt_from_payload(payload: Mapping[str, Any], cursor: int) -> dict[str, 
         **dict(payload),
         "refresh_accepted_ancestors": refresh_accepted_ancestors,
         "owner_repair_event_cursor": owner_repair_event_cursor,
+        "continued_steering": continued_steering,
         "authorization_event_cursor": cursor,
     }
 

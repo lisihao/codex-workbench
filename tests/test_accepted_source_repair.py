@@ -14,11 +14,16 @@ from codex_workbench.accepted_source_repair import (
     parse_accepted_source_repair_binding,
     prepare_accepted_source_repair,
 )
+from codex_workbench.blocked_source_repair import blocked_source_repair
 from codex_workbench.dependency_inputs import apply_accepted_ancestor_patches
+from codex_workbench.dirty_worktree_recovery import DirtyWorktreeRecoveryError
 from codex_workbench.model import NodeResult, NodeSpec, TaskContract, canonical_json
+from codex_workbench.node_recovery_policy import RecoveryPolicy
+from codex_workbench.node_recovery_store import NodeRecoveryStore
 from codex_workbench.service import Coordinator
-from codex_workbench.store import WorkbenchStore
+from codex_workbench.store import StateConflictError, WorkbenchStore
 from codex_workbench.worktrees import WorktreeManager
+from tests.process_probe_fixture import isolated_process_catalog
 
 
 class AcceptedSourceRepairFixture:
@@ -54,6 +59,7 @@ class AcceptedSourceRepairFixture:
         self,
         *,
         include_descendant: bool = False,
+        retry_limit: int = 3,
     ) -> tuple[TaskContract, dict[str, object]]:
         contract = TaskContract(
             task_id="accepted-source-fixture",
@@ -63,6 +69,7 @@ class AcceptedSourceRepairFixture:
             allowed_scope=("src",),
             executor_model="fixture",
             verifier_model="fixture",
+            retry_limit=retry_limit,
         )
         a = NodeSpec(
             "A",
@@ -210,6 +217,186 @@ class AcceptedSourceRepairFixture:
 
 
 class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
+    def test_preparation_block_preserves_staged_patch_and_attempt_guidance(self) -> None:
+        self.enterContext(isolated_process_catalog(()))
+        contract, verifier = self._create_task(retry_limit=1)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B must update its accepted implementation",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        guidance = "keep the accepted B patch and apply the current owner feedback"
+        with self.store.transaction() as connection:
+            sequence = self.store._next_steering_sequence(
+                connection, contract.task_id
+            )
+            connection.execute(
+                """
+                INSERT INTO task_steering(
+                    steering_id, task_id, instruction, created_at, sequence,
+                    scope, target_node_id, target_attempt
+                ) VALUES(
+                    'fixture-owner-guidance', ?, ?, '2026-09-14T00:00:00+00:00',
+                    ?, 'attempt', 'B', 2
+                )
+                """,
+                (contract.task_id, guidance, sequence),
+            )
+            self.store._event(
+                connection,
+                "node.accepted_source_repair_authorized",
+                contract.task_id,
+                "B",
+                {
+                    "source_attempt": 1,
+                    "requester_kind": "blocked_consumer",
+                    "requester_node_id": "verify",
+                    "requester_attempt": 1,
+                    "authorization_revision": int(
+                        self.store.get_task(contract.task_id)["state_revision"]
+                    ),
+                    "steering_id": "fixture-owner-guidance",
+                },
+            )
+
+        coordinator = Coordinator(
+            self.store, self.state_root, coordinator_epoch=self.epoch
+        )
+        try:
+            claimed = coordinator._claim_next_ready_node("accepted-owner-preparation")
+            assert claimed is not None
+            self.assertEqual((claimed["node_id"], claimed["attempt"]), ("B", 2))
+            self.assertIn(guidance, claimed["steering"])
+            with patch.object(
+                coordinator,
+                "_materialize_worktree_dependencies",
+                side_effect=DirtyWorktreeRecoveryError(
+                    "fixture dependency materialization blocked"
+                ),
+            ):
+                coordinator._execute_claimed(claimed)
+
+            blocked = self.store.get_task(contract.task_id)
+            owner = next(node for node in blocked["nodes"] if node["node_id"] == "B")
+            self.assertEqual((blocked["state"], owner["state"], owner["attempt"]), ("blocked", "blocked", 2))
+            self.assertEqual(owner["result"]["changed_paths"], [])
+            source = Path(str(owner["worktree"]))
+            self.assertIn(
+                "src/b.txt",
+                self._git(source, "diff", "--cached", "--name-only").splitlines(),
+            )
+            with self.assertRaisesRegex(
+                StateConflictError,
+                "blocked result with non-empty changed_paths",
+            ):
+                self.store.blocked_worktree_recovery_candidate(
+                    contract.task_id,
+                    "B",
+                    expected_revision=int(blocked["state_revision"]),
+                    expected_attempt=2,
+                )
+
+            NodeRecoveryStore(self.store).configure_policy(
+                contract.task_id,
+                RecoveryPolicy(
+                    enabled=True,
+                    allowed_actions=("repair_source",),
+                    max_action_attempts=3,
+                ),
+                expected_task_revision=int(blocked["state_revision"]),
+                actor="accepted-source-preparation-fixture",
+            )
+            arguments = {
+                "task_id": contract.task_id,
+                "node_id": "B",
+                "expected_revision": int(blocked["state_revision"]),
+                "expected_attempt": 2,
+                "expected_contract_hash": blocked["contract_hash"],
+                "request_id": "accepted-source-preparation-recovery",
+                "reason": "preserve the prepared accepted patch after dependency setup blocked",
+            }
+            preview = blocked_source_repair(
+                self.store, **arguments, dry_run=True
+            )
+            self.assertEqual(preview["changed_paths"], ["src/b.txt"])
+            self.assertEqual(preview["continued_steering_count"], 1)
+            queued = blocked_source_repair(
+                self.store,
+                **arguments,
+                dry_run=False,
+                expected_fingerprint=preview["fingerprint"],
+            )
+            self.assertEqual(len(queued["continued_steering"]), 1)
+
+            retry = coordinator._claim_next_ready_node("accepted-owner-retry")
+            assert retry is not None
+            self.assertEqual((retry["node_id"], retry["attempt"]), ("B", 3))
+            self.assertIn(guidance, retry["steering"])
+            observed: dict[str, str] = {}
+
+            def block_after_recovery(request: object) -> NodeResult:
+                worktree = request.worktree  # type: ignore[attr-defined]
+                assert worktree is not None
+                observed["owner_patch"] = (worktree / "src/b.txt").read_text(
+                    encoding="utf-8"
+                )
+                return NodeResult("blocked", "fixture blocks after recovery")
+
+            with patch.object(coordinator, "_executor") as executor:
+                executor.return_value.execute.side_effect = block_after_recovery
+                coordinator._execute_claimed(retry)
+            self.assertEqual(observed["owner_patch"], "owner patch\n")
+
+            chained = self.store.get_task(contract.task_id)
+            chained_arguments = {
+                **arguments,
+                "expected_revision": int(chained["state_revision"]),
+                "expected_attempt": 3,
+                "request_id": "accepted-source-preparation-recovery-chain",
+            }
+            chained_preview = blocked_source_repair(
+                self.store, **chained_arguments, dry_run=True
+            )
+            self.assertEqual(chained_preview["continued_steering_count"], 1)
+            chained_queue = blocked_source_repair(
+                self.store,
+                **chained_arguments,
+                dry_run=False,
+                expected_fingerprint=chained_preview["fingerprint"],
+            )
+            self.assertEqual(len(chained_queue["continued_steering"]), 1)
+            with self.store.connection() as connection:
+                steering_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM task_steering WHERE task_id = ?",
+                        (contract.task_id,),
+                    ).fetchone()[0]
+                )
+            replay = blocked_source_repair(
+                self.store,
+                **chained_arguments,
+                dry_run=False,
+                expected_fingerprint=chained_preview["fingerprint"],
+            )
+            self.assertEqual(replay, chained_queue)
+            with self.store.connection() as connection:
+                self.assertEqual(
+                    int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM task_steering WHERE task_id = ?",
+                            (contract.task_id,),
+                        ).fetchone()[0]
+                    ),
+                    steering_count,
+                )
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
     def test_verifier_failure_without_owner_ids_preserves_accepted_workers(self) -> None:
         contract, verifier = self._create_task()
         before = self.store.get_task(contract.task_id)
