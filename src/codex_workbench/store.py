@@ -5026,6 +5026,7 @@ class WorkbenchStore:
         *,
         expected_revision: int,
         expected_attempt: int,
+        allow_empty_reported_changes: bool = False,
     ) -> dict[str, Any]:
         task = connection.execute(
             "SELECT state, state_revision, contract_json FROM tasks WHERE task_id = ?", (task_id,)
@@ -5058,7 +5059,11 @@ class WorkbenchStore:
         except json.JSONDecodeError as error:
             raise StateConflictError("blocked node result receipt is invalid JSON") from error
         changed_paths = result.get("changed_paths") if isinstance(result, dict) else None
-        if result.get("status") != "blocked" or not isinstance(changed_paths, list) or not changed_paths:
+        if (
+            result.get("status") != "blocked"
+            or not isinstance(changed_paths, list)
+            or (not changed_paths and not allow_empty_reported_changes)
+        ):
             raise StateConflictError(
                 "dirty-worktree recovery requires a blocked result with non-empty changed_paths"
             )
@@ -5159,6 +5164,7 @@ class WorkbenchStore:
             node_id,
             expected_revision=expected_revision,
             expected_attempt=expected_attempt,
+            allow_empty_reported_changes=True,
         )
         task = connection.execute(
             "SELECT contract_json, contract_hash FROM tasks WHERE task_id = ?", (task_id,)
