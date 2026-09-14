@@ -20,9 +20,12 @@ from codex_workbench.accepted_source_repair import AcceptedSourceRepairError
 from codex_workbench.config import WorkbenchConfig
 from codex_workbench.dependency_inputs import (
     DependencyInput,
+    DependencyInputError,
+    apply_accepted_ancestor_patches,
     apply_recorded_dependency_input,
     load_recorded_dependency_input,
     rebind_recorded_lockfile_handoffs,
+    validate_dependency_input_lineage,
 )
 from codex_workbench.lockfile_handoff import (
     LockfileHandoffError,
@@ -418,6 +421,44 @@ class LockfileHandoffInputTests(unittest.TestCase):
         assert isinstance(result, dict)
         self.assertEqual(result["state"], "ready")
         return result
+
+    def _task_with_refreshed_upstream(
+        self,
+        contract: TaskContract,
+        *,
+        changed_path: str,
+        content: str,
+    ) -> dict[str, object]:
+        """Project a newer accepted upstream patch without mutating the ledger."""
+
+        source = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "refreshed-upstream",
+            2,
+        )
+        path = source / changed_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        patch_ref = self.store.artifacts.put_bytes(
+            self.worktrees.diff_patch(source, self.base_sha),
+            "patch",
+        )
+        task = json.loads(canonical_json(self.store.get_task(contract.task_id)))
+        upstream = next(
+            node for node in task["nodes"] if node["node_id"] == "upstream"
+        )
+        upstream["attempt"] = 2
+        upstream["state"] = "accepted"
+        upstream["result"] = NodeResult(
+            "succeeded",
+            "accepted upstream refresh",
+            result_kind="worker",
+            changed_paths=(changed_path,),
+            artifacts={"patch": patch_ref},
+        ).to_dict()
+        return task
 
     def _amend_contract_with_rebound_handoffs(
         self,
@@ -994,6 +1035,158 @@ class LockfileHandoffInputTests(unittest.TestCase):
             rebound.receipt["lockfile_handoffs"][0]["lockfile"],
             recorded.receipt["lockfile_handoffs"][0]["lockfile"],
         )
+
+    def test_owner_overlay_replays_after_newer_accepted_ancestor(self) -> None:
+        contract, blocked, worker_source = self._blocked_task(
+            task_id="handoff-newer-accepted-ancestor",
+            with_upstream=True,
+        )
+        self._apply_ready_handoff(
+            contract,
+            blocked,
+            "handoff-newer-accepted-ancestor-ready",
+        )
+        ready = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        task = self._task_with_refreshed_upstream(
+            contract,
+            changed_path="packages/b/refreshed.ts",
+            content="export const refreshed = true\n",
+        )
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        worker["attempt"] = 2
+        target = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "refreshed-worker-input",
+            2,
+        )
+
+        dependency_input = apply_accepted_ancestor_patches(
+            task,
+            "worker",
+            target,
+            self.store.artifacts,
+            self.worktrees,
+            ready_lockfile_handoffs=ready,
+        )
+
+        self.assertIsNotNone(dependency_input)
+        assert dependency_input is not None
+        self.assertEqual(
+            dependency_input.receipt["ancestors"][0]["attempt"],
+            2,
+        )
+        self.assertEqual(
+            dependency_input.receipt["lockfile_handoffs"][0]["after_ancestors"],
+            ready[0]["after_ancestors"],
+        )
+        self.assertEqual(
+            (target / "packages/b/refreshed.ts").read_text(encoding="utf-8"),
+            "export const refreshed = true\n",
+        )
+        self.assertEqual(
+            sha256((target / "pnpm-lock.yaml").read_bytes()).hexdigest(),
+            ready[0]["lockfile"]["sha256"],
+        )
+        validate_dependency_input_lineage(
+            task,
+            "worker",
+            dependency_input,
+            artifacts=self.store.artifacts,
+        )
+
+        dependency_ref = self.store.artifacts.put_text(
+            canonical_json(dependency_input.receipt),
+            "dependency-input.json",
+        )
+        worker_patch_ref = self.store.artifacts.put_bytes(
+            self.worktrees.diff_patch(worker_source, self.base_sha),
+            "patch",
+        )
+        worker["state"] = "accepted"
+        worker["result"] = NodeResult(
+            "succeeded",
+            "accepted owner after refreshed ancestor",
+            result_kind="worker",
+            changed_paths=("packages/a/package.json",),
+            artifacts={
+                "patch": worker_patch_ref,
+                "dependency-input": dependency_ref,
+            },
+        ).to_dict()
+        descendant_target = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "refreshed-descendant-input",
+            2,
+        )
+        descendant_input = apply_accepted_ancestor_patches(
+            task,
+            "downstream",
+            descendant_target,
+            self.store.artifacts,
+            self.worktrees,
+            ready_lockfile_handoffs=ready,
+        )
+        self.assertIsNotNone(descendant_input)
+        assert descendant_input is not None
+        self.assertEqual(
+            [(item["node_id"], item["attempt"]) for item in descendant_input.receipt["ancestors"]],
+            [("upstream", 2), ("worker", 2)],
+        )
+        self.assertEqual(
+            sha256((descendant_target / "pnpm-lock.yaml").read_bytes()).hexdigest(),
+            ready[0]["lockfile"]["sha256"],
+        )
+        self.assertEqual(
+            json.loads(
+                (descendant_target / "packages/a/package.json").read_text(
+                    encoding="utf-8"
+                )
+            )["dependencies"]["@fixture/b"],
+            "workspace:*",
+        )
+
+    def test_owner_overlay_rejects_manifest_drift_from_newer_ancestor(self) -> None:
+        contract, blocked, _source = self._blocked_task(
+            task_id="handoff-newer-ancestor-manifest-drift",
+            with_upstream=True,
+        )
+        self._apply_ready_handoff(
+            contract,
+            blocked,
+            "handoff-newer-ancestor-manifest-drift-ready",
+        )
+        ready = get_ready_lockfile_handoffs(self.store, contract.task_id)
+        task = self._task_with_refreshed_upstream(
+            contract,
+            changed_path="packages/b/package.json",
+            content=json.dumps(
+                {"name": "@fixture/b", "version": "2.0.0"},
+                indent=2,
+            ) + "\n",
+        )
+        worker = next(node for node in task["nodes"] if node["node_id"] == "worker")
+        worker["attempt"] = 2
+        target = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "manifest-drift-worker-input",
+            2,
+        )
+
+        with self.assertRaisesRegex(DependencyInputError, "baseline manifest drifted"):
+            apply_accepted_ancestor_patches(
+                task,
+                "worker",
+                target,
+                self.store.artifacts,
+                self.worktrees,
+                ready_lockfile_handoffs=ready,
+            )
 
     def test_contract_rebinding_event_tampering_is_rejected(self) -> None:
         contract, blocked, _source = self._blocked_task(

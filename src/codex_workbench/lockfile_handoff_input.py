@@ -70,6 +70,7 @@ class LockfileHandoff:
     """One normalized immutable replacement applied after a source closure."""
 
     receipt: dict[str, Any]
+    replay_after_ancestors: tuple[tuple[str, int, str | None], ...] | None = None
 
     @property
     def request_id(self) -> str:
@@ -79,7 +80,15 @@ class LockfileHandoff:
 
     @property
     def after_ancestors(self) -> tuple[tuple[str, int, str | None], ...]:
-        """Return the exact original ancestor closure preceding this overlay."""
+        """Return the verified source closure after which to replay this overlay."""
+
+        if self.replay_after_ancestors is not None:
+            return self.replay_after_ancestors
+        return self.recorded_after_ancestors
+
+    @property
+    def recorded_after_ancestors(self) -> tuple[tuple[str, int, str | None], ...]:
+        """Return the immutable source closure recorded when the overlay was built."""
 
         return _ancestor_tuples(self.receipt["after_ancestors"], "after_ancestors")
 
@@ -193,6 +202,12 @@ def select_lockfile_handoffs_for_target(
         receipt = handoff.receipt
         blocked_node_id = str(receipt["blocked_node_id"])
         blocked_attempt = int(receipt["blocked_attempt"])
+        replay_after = _replay_after_accepted_owner_refresh(
+            nodes,
+            blocked_node_id,
+            actual_ancestors,
+            handoff.recorded_after_ancestors,
+        )
         if node_id == blocked_node_id:
             if target_attempt is None:
                 target_attempt = _positive_int(
@@ -202,15 +217,15 @@ def select_lockfile_handoffs_for_target(
                 raise LockfileHandoffInputError(
                     "lockfile handoff original owner attempt has not advanced"
                 )
-            if actual_ancestors != handoff.after_ancestors:
+            if replay_after is None:
                 raise LockfileHandoffInputError(
                     "lockfile handoff original owner ancestors drifted from its receipt"
                 )
-            selected.append(handoff)
+            selected.append(LockfileHandoff(receipt, replay_after))
             continue
         if not _depends_transitively(nodes, node_id, blocked_node_id):
             continue
-        if not _ordered_subsequence(handoff.after_ancestors, actual_ancestors):
+        if replay_after is None or not _ordered_subsequence(replay_after, actual_ancestors):
             raise LockfileHandoffInputError(
                 "lockfile handoff descendant ancestors drifted from its receipt"
             )
@@ -232,7 +247,7 @@ def select_lockfile_handoffs_for_target(
             raise LockfileHandoffInputError(
                 "lockfile handoff descendant lacks the resumed owner input receipt"
             )
-        selected.append(handoff)
+        selected.append(LockfileHandoff(receipt, replay_after))
     return tuple(selected)
 
 
@@ -1035,6 +1050,43 @@ def _ordered_subsequence(
 ) -> bool:
     iterator = iter(actual)
     return all(any(candidate == value for candidate in iterator) for value in expected)
+
+
+def _replay_after_accepted_owner_refresh(
+    nodes: Mapping[str, Mapping[str, Any]],
+    blocked_node_id: str,
+    actual_ancestors: Sequence[tuple[str, int, str | None]],
+    recorded_ancestors: Sequence[tuple[str, int, str | None]],
+) -> tuple[tuple[str, int, str | None], ...] | None:
+    """Bind an immutable overlay to newer accepted versions of the same predecessors.
+
+    The caller still validates the sealed manifest and lockfile bytes in the
+    reconstructed worktree before applying the overlay. This function only
+    identifies the replay position; it rejects graph changes, attempt rollback,
+    and a changed patch at the same attempt.
+
+    @param nodes: Current task nodes keyed by identifier.
+    @param blocked_node_id: Original owner of the lockfile handoff.
+    @param actual_ancestors: Current accepted closure for the replay target.
+    @param recorded_ancestors: Immutable closure sealed by the handoff receipt.
+    @returns: Current owner predecessor closure, or `None` when it cannot be rebound.
+    """
+
+    current = tuple(
+        source
+        for source in actual_ancestors
+        if _depends_transitively(nodes, blocked_node_id, source[0])
+    )
+    if tuple(source[0] for source in current) != tuple(
+        source[0] for source in recorded_ancestors
+    ):
+        return None
+    for recorded, candidate in zip(recorded_ancestors, current, strict=True):
+        if candidate[1] < recorded[1]:
+            return None
+        if candidate[1] == recorded[1] and candidate[2] != recorded[2]:
+            return None
+    return current
 
 
 def _artifact_bytes(
