@@ -69,7 +69,7 @@ if mode == "exit255":
     sys.stderr.flush()
     raise SystemExit(255)
 
-version = "2.0.0" if mode == "upgrade" and launch >= 2 else "1.0.0"
+version = "2.0.0" if mode in {"upgrade", "version-only"} and launch >= 2 else "1.0.0"
 tools = [
     {"name": "workbench_read", "annotations": {"readOnlyHint": True}},
     {"name": "workbench_read_events", "annotations": {"readOnlyHint": True}},
@@ -125,7 +125,7 @@ for raw in sys.stdin:
                 {"content": [{"type": "text", "text": str(len(payload)) if isinstance(payload, str) else "missing"}]},
             )
             continue
-        if mode in {"read-crash", "upgrade", "events", "events-list"} and launch == 1:
+        if mode in {"read-crash", "upgrade", "version-only", "events", "events-list"} and launch == 1:
             sys.stderr.write("prompt=do-not-store-this-secret\n")
             sys.stderr.flush()
             os._exit(0)
@@ -396,6 +396,37 @@ class MCPConnectionBridgeTests(unittest.TestCase):
         self.assertIn("tools_list_refresh_required", blocked["content"][0]["text"])
         self.assertEqual(
             self._by_id(output, 6)["result"]["content"][0]["text"], "write-ok"
+        )
+        self.assertEqual(self._log().count("write"), 1)
+
+    def test_server_version_only_reconnect_keeps_unchanged_catalog_writable(self) -> None:
+        messages = [
+            *self._initialize(),
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "workbench_read", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_write",
+                    "arguments": {"request_id": "version-only-write"},
+                },
+            },
+        ]
+        output = self._run("version-only", messages)
+
+        self.assertFalse(any(
+            item.get("method") == "notifications/tools/list_changed"
+            for item in output
+        ))
+        self.assertEqual(
+            self._by_id(output, 4)["result"]["content"][0]["text"],
+            "write-ok",
         )
         self.assertEqual(self._log().count("write"), 1)
 

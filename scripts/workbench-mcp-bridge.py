@@ -832,14 +832,11 @@ class MCPConnectionBridge:
         digest = _digest(tools)
         prior_version, prior_digest = self.state.server()
         version = self.server_version
-        changed = (
-            prior_digest is not None
-            and (prior_digest != digest or prior_version != version)
-        )
+        catalog_changed = prior_digest is not None and prior_digest != digest
         self.tools_digest = digest
         self.tool_read_only = self._catalog_read_only(tools)
         self.state.record_server(version, digest)
-        if reconnect and changed:
+        if reconnect and catalog_changed:
             self.catalog_refresh_required = True
             self._tools_changed_once(
                 f"tools:{prior_version}:{prior_digest}:{version}:{digest}"
