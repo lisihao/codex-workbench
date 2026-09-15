@@ -10,7 +10,7 @@
 
 D 集成修复另外使用 `dsh-d-pairing-write-v1` 和 `dsh-d-agent-note-write-v1`。它们要求目标是当前 blocked D allocation，且工作树包含已核对的 DSH 模板包标识，不改变上述 B 检查的固定文件集。任务及节点范围不足时，先由原协调器审阅独立的[范围修订](integration-scope-amendment.md)，不能从运行失败推导写权限。
 
-`dsh-d-pairing-write-v1` 必须显式传入 `pair_anchors`，每次 1–32 个英文 Markdown 路径，限于获准的 `docs/`、`packages/` 或 `.agents/notes/implemented/`。对应英文和中文文件必须已存在；配对 sidecar 可以缺失，预览把缺失状态也纳入指纹，但不会提前创建文件。只允许精确选中的 sidecar 和由其源字节决定的 Git 快照权限，不接受通配符、`--all`、符号链接逃逸或技能/AGENTS/归档路径。运行需要 `confirm_pairing_write: true`。
+`dsh-d-pairing-write-v1` 必须显式传入 `pair_anchors`，每次 1–32 个英文 Markdown 路径，限于获准的 `docs/`、`packages/`、`.agents/notes/implemented/`，以及唯一固定的 `apps/cli/composition.md` 生成输出。对应英文和中文文件必须已存在；配对 sidecar 可以缺失，预览把缺失状态也纳入指纹，但不会提前创建文件。只允许精确选中的 sidecar 和由其源字节决定的 Git 快照权限，不接受其他应用路径、通配符、`--all`、符号链接逃逸或技能/AGENTS/归档路径。运行需要 `confirm_pairing_write: true`。
 
 `dsh-d-agent-note-write-v1` 接收 `note_anchor`、`note_english` 和 `note_chinese`，运行另需 `confirm_note_write: true`。路径限于实现记录的六种项目类别及日期命名，父目录必须已存在。默认模式只创建指定英文和中文文件；已存在且内容不同的文件拒绝覆盖。修订刚由同一入口创建但尚未验收的双语 Note 时，必须同时传入 `note_expected_english_sha256` 与 `note_expected_chinese_sha256`；预览把两侧当前字节及预期摘要纳入指纹，执行前再次核对，两侧缺失、单边摘要或任一摘要不符均拒绝，固定写入程序只替换原两个叶子。该操作不开放 Git 写权限，不运行模型，不生成翻译内容，也不表示文档格式或翻译质量通过。写入之后单独预览并执行该对文件的 pairing 检查，再按项目规则验收。
 

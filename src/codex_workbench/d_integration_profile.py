@@ -1,6 +1,6 @@
 """Closed source-file additions for the blocked DSH template integration repair."""
 
-SCOPE_PROFILE_ID = "dsh-task-template-integration-v2"
+SCOPE_PROFILE_ID = "dsh-task-template-integration-v3"
 PAIRING_WRITE_ID = "dsh-d-pairing-write-v1"
 NOTE_WRITE_ID = "dsh-d-agent-note-write-v1"
 
@@ -24,10 +24,17 @@ _PROMPT_INDEX_WRITES = (
     "packages/prompt/README.i18n.yaml",
 )
 
+_CLI_COMPOSITION_WRITES = (
+    "apps/cli/composition.md",
+    "apps/cli/composition.zh.md",
+    "apps/cli/composition.i18n.yaml",
+)
+
 NODE_WRITE_ADDITIONS = (
     *_GENERATOR_WRITES,
     *_ASSEMBLED_SNAPSHOT_WRITES,
     *_PROMPT_INDEX_WRITES,
+    *_CLI_COMPOSITION_WRITES,
     "packages/prompt/task-template-rpc/package.json",
 )
 
