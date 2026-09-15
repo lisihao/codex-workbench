@@ -509,6 +509,12 @@ class ModelTests(unittest.TestCase):
             {"routing_strategy", "task_type", "complexity", "parallelizable", "claude_allowed"},
         )
 
+    def test_verifier_schema_uses_only_codex_supported_array_keywords(self) -> None:
+        repair_ids = CodexExecutor._verifier_schema()["properties"]["repair_node_ids"]
+
+        self.assertNotIn("uniqueItems", repair_ids)
+        self.assertEqual(repair_ids["maxItems"], 32)
+
     def test_luna_command_emits_explicit_max_effort_and_profile_metadata(self) -> None:
         request = ExecutionRequest(
             task_id="task-1",

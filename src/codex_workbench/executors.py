@@ -1803,7 +1803,7 @@ class CodexExecutor(ProcessExecutor):
             "verdict": {"enum": ["accepted", "needs_fix", "blocked"]},
             "summary": {"type": "string"},
             "repair_node_ids": {
-                "type": "array", "uniqueItems": True, "maxItems": 32,
+                "type": "array", "maxItems": 32,
                 "items": {"type": "string", "minLength": 1},
                 "description": "For needs_fix only: evidenced accepted worker owners whose source requires repair, including affected accepted descendants. Use an empty array when ownership is unknown or only the verification environment is unavailable.",
             },
