@@ -291,8 +291,20 @@ def apply_recorded_dependency_input(
     node_id: str,
     base_sha: str,
     worktree: Path,
+    replay_task: Mapping[str, Any] | None = None,
+    ready_lockfile_handoffs: object | None = None,
 ) -> DependencyInput:
-    """Materialize one recorded dependency-input receipt onto a clean tree."""
+    """Materialize one recorded dependency-input receipt onto a clean tree.
+
+    ``replay_task`` and ``ready_lockfile_handoffs`` let a recovery bind an
+    immutable historical handoff to a newer accepted ancestor attempt. Both
+    values are required together; ordinary artifact replay remains unchanged.
+    """
+
+    if (replay_task is None) != (ready_lockfile_handoffs is None):
+        raise DependencyInputError(
+            "recorded dependency input replay requires both task and ready handoffs"
+        )
 
     dependency_input = load_recorded_dependency_input(
         artifacts,
@@ -302,7 +314,43 @@ def apply_recorded_dependency_input(
         base_sha=base_sha,
     )
     _require_clean_worktree(worktree)
-    handoffs = _normalized_recorded_handoffs(artifacts, dependency_input)
+    if replay_task is None:
+        handoffs = _normalized_recorded_handoffs(artifacts, dependency_input)
+    else:
+        dependency_input = rebind_recorded_lockfile_handoffs(
+            replay_task,
+            node_id,
+            artifacts,
+            dependency_input,
+            ready_lockfile_handoffs=ready_lockfile_handoffs,
+        )
+        recorded_handoffs = _normalized_recorded_handoffs(
+            artifacts, dependency_input
+        )
+        try:
+            selected = select_lockfile_handoffs_for_target(
+                artifacts,
+                replay_task,
+                node_id,
+                ancestors=dependency_input.receipt["ancestors"],
+                ready_handoffs=ready_lockfile_handoffs,
+            )
+        except LockfileHandoffInputError as error:
+            raise DependencyInputError(
+                f"recorded dependency input replay lineage is unavailable: {error}"
+            ) from error
+        selected_by_identity = {
+            recorded_handoff_identity(item): item for item in selected
+        }
+        try:
+            handoffs = tuple(
+                selected_by_identity[recorded_handoff_identity(item)]
+                for item in recorded_handoffs
+            )
+        except KeyError as error:
+            raise DependencyInputError(
+                "recorded dependency input replay lost a historical handoff"
+            ) from error
     applied_request_ids: set[str] = set()
     applied_sources: list[dict[str, Any]] = []
     try:

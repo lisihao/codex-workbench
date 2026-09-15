@@ -2996,6 +2996,7 @@ class Coordinator:
             )
         loaded_recorded_dependency_input: DependencyInput | None = None
         recorded_dependency_input: DependencyInput | None = None
+        task_snapshot = self.store.get_task(claimed["task_id"])
         ready_lockfile_handoffs = self._ready_lockfile_handoffs(claimed["task_id"])
         if isinstance(recorded_dependency_ref, str):
             loaded_recorded_dependency_input = load_recorded_dependency_input(
@@ -3006,14 +3007,14 @@ class Coordinator:
                 base_sha=contract["base_sha"],
             )
             recorded_dependency_input = rebind_recorded_lockfile_handoffs(
-                self.store.get_task(claimed["task_id"]),
+                task_snapshot,
                 claimed["node_id"],
                 self.artifacts,
                 loaded_recorded_dependency_input,
                 ready_lockfile_handoffs=ready_lockfile_handoffs,
             )
             validate_dependency_input_lineage(
-                self.store.get_task(claimed["task_id"]),
+                task_snapshot,
                 claimed["node_id"],
                 recorded_dependency_input,
                 artifacts=self.artifacts,
@@ -3059,6 +3060,8 @@ class Coordinator:
             source_only=source_only_extraction is not None,
             expected_source_delta_sha256=expected_source_delta_sha256,
             prepare_dependency_input=prepare_dependency_input,
+            replay_task=task_snapshot,
+            ready_lockfile_handoffs=ready_lockfile_handoffs,
         )
         artifacts = {
             **outcome.artifacts,
