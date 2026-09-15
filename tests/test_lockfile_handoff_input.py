@@ -1100,6 +1100,33 @@ class LockfileHandoffInputTests(unittest.TestCase):
             canonical_json(dependency_input.receipt),
             "dependency-input.json",
         )
+        replay = self.worktrees.prepare(
+            str(self.repository),
+            self.base_sha,
+            contract.task_id,
+            "refreshed-recorded-input-replay",
+            3,
+        )
+        replayed = apply_recorded_dependency_input(
+            self.store.artifacts,
+            self.worktrees,
+            ref=dependency_ref,
+            task_id=contract.task_id,
+            node_id="worker",
+            base_sha=self.base_sha,
+            worktree=replay,
+            replay_task=task,
+            ready_lockfile_handoffs=ready,
+        )
+        self.assertEqual(replayed.input_tree_sha, dependency_input.input_tree_sha)
+        self.assertEqual(
+            (replay / "packages/b/refreshed.ts").read_text(encoding="utf-8"),
+            "export const refreshed = true\n",
+        )
+        self.assertEqual(
+            sha256((replay / "pnpm-lock.yaml").read_bytes()).hexdigest(),
+            ready[0]["lockfile"]["sha256"],
+        )
         worker_patch_ref = self.store.artifacts.put_bytes(
             self.worktrees.diff_patch(worker_source, self.base_sha),
             "patch",

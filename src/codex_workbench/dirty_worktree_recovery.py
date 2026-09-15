@@ -1808,6 +1808,8 @@ class DirtyWorktreeRecovery:
         source_only: bool = False,
         expected_source_delta_sha256: str | None = None,
         prepare_dependency_input: Callable[[Path], DependencyInput] | None = None,
+        replay_task: Mapping[str, Any] | None = None,
+        ready_lockfile_handoffs: object | None = None,
     ) -> RecoveryOutcome:
         """Prepare a verified recovery target without ever executing in source.
 
@@ -1847,7 +1849,12 @@ class DirtyWorktreeRecovery:
                 target_attempt,
                 recovery,
             )
-            comparison_tree = self._restore_recorded_input(target, recovery)
+            comparison_tree = self._restore_recorded_input(
+                target,
+                recovery,
+                replay_task=replay_task,
+                ready_lockfile_handoffs=ready_lockfile_handoffs,
+            )
             patch = self._load_patch(recovery)
             patch_path = self._patch_path(recovery)
             self.worktrees.apply_patch(target, patch_path)
@@ -2666,6 +2673,9 @@ class DirtyWorktreeRecovery:
         self,
         target: Path,
         recovery: Mapping[str, object],
+        *,
+        replay_task: Mapping[str, Any] | None = None,
+        ready_lockfile_handoffs: object | None = None,
     ) -> str:
         comparison_tree, task_id, node_id, dependency_input_ref = self._recovery_input_context(
             target,
@@ -2686,6 +2696,8 @@ class DirtyWorktreeRecovery:
                 node_id=str(node_id),
                 base_sha=base_sha,
                 worktree=target,
+                replay_task=replay_task,
+                ready_lockfile_handoffs=ready_lockfile_handoffs,
             )
         except DependencyInputError as error:
             raise DirtyWorktreeRecoveryError(
