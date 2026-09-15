@@ -207,6 +207,8 @@ Claude 没有被当作无限资源。Workbench 以被动方式读取兼容的本
 
 20% 是持续保留目标；30% 是新任务 admission guard，25% 是硬停线。由于上游 CLI 暴露的是显示文本而非可强制消费上限，系统不会声称能从代码层面保证单次模型回合绝不越线。有关可证明边界，见 [忠实度矩阵](docs/fidelity-matrix.md)。
 
+同一节点的 Claude→Codex provider fallback 共享从 provider 执行开始计算的单调时间预算；准备和独立 verifier 各自保持自己的阶段。资格探测至多使用 `min(15 秒, 剩余预算)`，模型 spawn 前会重新读取剩余时间。若首 provider 已耗尽预算，Workbench 不启动 fallback，保留首结果及工件并记录该原因；已启动的 CLI timeout 仍是 `indeterminate`。
+
 ## 快速开始
 
 当已授权任务因 workspace manifest 与 lockfile 不一致而卡在前置检查时，参见[一次性 lockfile 所有权交接](docs/lockfile-handoff.md)。该入口保留 frozen 检查、原任务和验收历史，不扩大 worker 写权限或开启自动恢复策略。
