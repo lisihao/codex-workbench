@@ -145,7 +145,7 @@ def build_accepted_repair_bindings(
     @param requester_node_id: Verifier or blocked consumer requesting repair.
     @param requester_attempt: Current requester attempt.
     @param authorization_revision: Task revision the caller will commit.
-    @param requester_kind: Either ``verifier`` or ``blocked_consumer``.
+    @param requester_kind: Running verifier, settled verifier, or blocked consumer.
     @returns: One immutable binding for each requested owner.
     """
 
@@ -154,7 +154,7 @@ def build_accepted_repair_bindings(
     requested = _repair_node_ids(repair_node_ids)
     _positive_int(requester_attempt, "requester_attempt")
     _positive_int(authorization_revision, "authorization_revision")
-    if requester_kind not in {"verifier", "blocked_consumer"}:
+    if requester_kind not in {"verifier", "settled_verifier", "blocked_consumer"}:
         raise AcceptedSourceRepairError("accepted-source repair requester kind is invalid")
 
     task = connection.execute(
@@ -162,7 +162,11 @@ def build_accepted_repair_bindings(
     ).fetchone()
     if task is None:
         raise KeyError(task_id)
-    expected_task_state = "verifying" if requester_kind == "verifier" else "blocked"
+    expected_task_state = {
+        "verifier": "verifying",
+        "settled_verifier": "needs_fix",
+        "blocked_consumer": "blocked",
+    }[requester_kind]
     if task["state"] != expected_task_state:
         raise AcceptedSourceRepairError(
             f"task {task_id} is {task['state']}, expected {expected_task_state}"
@@ -185,12 +189,37 @@ def build_accepted_repair_bindings(
         raise AcceptedSourceRepairError("accepted-source repair requester is missing")
     requester_spec = requester["spec"]
     requester_row = requester["row"]
-    if requester_kind == "verifier":
+    if requester_kind in {"verifier", "settled_verifier"}:
         if requester_spec.get("verifier") is not True:
             raise AcceptedSourceRepairError("accepted-source repair requester is not a verifier")
-        if requester_row["state"] != "running":
-            raise AcceptedSourceRepairError("accepted-source repair verifier is not running")
-        requester_result_sha256 = None
+        if requester_kind == "verifier":
+            if requester_row["state"] != "running":
+                raise AcceptedSourceRepairError("accepted-source repair verifier is not running")
+            requester_result_sha256 = None
+        else:
+            if requester_row["state"] != "failed" or not isinstance(
+                requester_row["result_json"], str
+            ):
+                raise AcceptedSourceRepairError(
+                    "accepted-source repair settled verifier is not durably failed"
+                )
+            try:
+                requester_result = json.loads(str(requester_row["result_json"]))
+            except json.JSONDecodeError as error:
+                raise AcceptedSourceRepairError(
+                    "accepted-source repair settled verifier result is invalid"
+                ) from error
+            if (
+                not isinstance(requester_result, dict)
+                or requester_result.get("status") != "failed"
+                or requester_result.get("verdict") != "needs_fix"
+            ):
+                raise AcceptedSourceRepairError(
+                    "accepted-source repair settled verifier lacks a needs_fix result"
+                )
+            requester_result_sha256 = sha256(
+                str(requester_row["result_json"]).encode()
+            ).hexdigest()
     else:
         if requester_spec.get("verifier") is True:
             raise AcceptedSourceRepairError("accepted-source repair requester is a verifier")
@@ -454,7 +483,7 @@ def parse_accepted_source_repair_binding(
         }:
             raise AcceptedSourceRepairError("accepted-source repair requester is invalid")
         requester_kind = raw_requester["kind"]
-        if requester_kind not in {"verifier", "blocked_consumer"}:
+        if requester_kind not in {"verifier", "settled_verifier", "blocked_consumer"}:
             raise AcceptedSourceRepairError("accepted-source repair requester kind is invalid")
         result_digest = raw_requester["result_sha256"]
         if result_digest is not None and (
@@ -463,8 +492,8 @@ def parse_accepted_source_repair_binding(
             raise AcceptedSourceRepairError("accepted-source repair requester digest is invalid")
         if requester_kind == "verifier" and result_digest is not None:
             raise AcceptedSourceRepairError("accepted-source verifier requester cannot bind a result")
-        if requester_kind == "blocked_consumer" and result_digest is None:
-            raise AcceptedSourceRepairError("accepted-source blocked requester must bind a result")
+        if requester_kind in {"settled_verifier", "blocked_consumer"} and result_digest is None:
+            raise AcceptedSourceRepairError("accepted-source settled requester must bind a result")
         requester = {
             "kind": requester_kind,
             "node_id": _text(raw_requester["node_id"], "accepted-source requester node_id"),
