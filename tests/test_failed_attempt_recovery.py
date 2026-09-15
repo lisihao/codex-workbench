@@ -2414,6 +2414,84 @@ class IndeterminateLocalRecoveryTests(_FailedAttemptRecoveryFixture, unittest.Te
                 expected_revision=int(indeterminate["state_revision"]),
             )
 
+    def test_approval_retry_discards_only_a_confirmed_readonly_verifier_worktree(self) -> None:
+        contract = TaskContract(
+            task_id="indeterminate-readonly-verifier",
+            repository=str(self.repository),
+            base_sha=self.base_sha,
+            objective="retry an interrupted read-only verifier",
+            allowed_scope=("src",),
+            executor_model="fixture",
+            verifier_model="fixture",
+            required_artifacts=(),
+        )
+        verifier = NodeSpec(
+            "verify",
+            contract.task_id,
+            "verify without writes",
+            "fixture",
+            "fixture",
+            "accepted",
+            verifier=True,
+        )
+        self.store.create_task(contract, [verifier], "verifier-create")
+        self.store.queue_task(contract.task_id)
+        claimed = self.store.claim_ready_node("verifier-worker", self.epoch)
+        assert claimed is not None
+        source = self.worktrees.prepare(
+            contract.repository,
+            contract.base_sha,
+            contract.task_id,
+            verifier.node_id,
+            int(claimed["attempt"]),
+        )
+        self.store.assign_worktree(
+            contract.task_id,
+            verifier.node_id,
+            str(source),
+            attempt=int(claimed["attempt"]),
+            coordinator_epoch=int(claimed["coordinator_epoch"]),
+            lease_epoch=int(claimed["lease_epoch"]),
+        )
+        self.assertEqual(self.store.recover_interrupted(), 1)
+        indeterminate = self.store.get_task(contract.task_id)
+        approval = self.store.list_approvals()[0]
+        with self.assertRaisesRegex(ValueError, "confirm_old_executor_ended"):
+            self.store.decide_approval(
+                approval["approval_id"],
+                "retry",
+                expected_revision=int(indeterminate["state_revision"]),
+            )
+
+        response = self.mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_decide_approval",
+                    "arguments": {
+                        "approval_id": approval["approval_id"],
+                        "decision": "retry",
+                        "expected_revision": int(indeterminate["state_revision"]),
+                        "confirm_old_executor_ended": True,
+                    },
+                },
+            }
+        )
+        assert response is not None
+        self.assertNotIn("isError", response["result"])
+        retried = self.store.get_task(contract.task_id)
+        retried_verifier = retried["nodes"][0]
+        self.assertEqual((retried["state"], retried_verifier["state"]), ("queued", "pending"))
+        self.assertIsNone(retried_verifier["worktree"])
+        event = next(
+            item
+            for item in self.store.read_events(task_id=contract.task_id)
+            if item["event_type"] == "node.indeterminate_resolved"
+        )
+        self.assertTrue(event["payload"]["discarded_readonly_verifier_worktree"])
+
     def test_stale_expected_attempt_is_rejected(self) -> None:
         contract, _, _ = self._indeterminate_owned_worktree_task(task_id="indeterminate-stale-attempt")
         task = self.store.get_task(contract.task_id)
