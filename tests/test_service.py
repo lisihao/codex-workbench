@@ -1235,6 +1235,62 @@ raise AssertionError("fatal coordinator failure returned")
             )
             self.assertEqual(event["payload"]["reason"], "current_lease_settlement_conflict")
 
+    def test_invalid_current_result_is_contained_without_killing_coordinator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = WorkbenchStore(root / "state.sqlite")
+            store.initialize()
+            epoch = store.activate_coordinator("invalid-result", "test-machine")
+            contract = TaskContract(
+                task_id="invalid-result",
+                repository=str(root),
+                base_sha="fixture",
+                objective="contain an invalid current result",
+                allowed_scope=("README.md",),
+                required_artifacts=(),
+            )
+            node = NodeSpec(
+                "work",
+                contract.task_id,
+                "work",
+                "fixture",
+                "fixture",
+                "ok",
+            )
+            store.create_task(contract, verified([node], contract.task_id), "invalid-create")
+            store.queue_task(contract.task_id)
+            claimed = store.claim_ready_node("invalid-worker", epoch)
+            assert claimed is not None
+            coordinator = Coordinator(store, root, coordinator_epoch=epoch)
+            try:
+                with patch.object(
+                    store,
+                    "settle_node",
+                    side_effect=ValueError(
+                        "verifier result status failed requires verdict needs_fix"
+                    ),
+                ):
+                    coordinator._execute_claimed(claimed)
+            finally:
+                coordinator._pool.shutdown(wait=True)
+
+            task = store.get_task(contract.task_id)
+            work = next(item for item in task["nodes"] if item["node_id"] == "work")
+            self.assertEqual((task["state"], work["state"]), ("needs_approval", "indeterminate"))
+            self.assertEqual(len(store.list_approvals()), 1)
+            event = next(
+                item
+                for item in store.read_events(task_id=contract.task_id)
+                if item["event_type"] == "node.indeterminate"
+            )
+            self.assertIn("requires verdict needs_fix", event["payload"]["error"])
+            rejected = json.loads(
+                coordinator.artifacts.verify(
+                    event["payload"]["rejected_result_ref"]
+                ).read_text()
+            )
+            self.assertEqual(rejected["result"]["status"], "succeeded")
+
     def test_readiness_resolves_a_package_from_the_allocated_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
