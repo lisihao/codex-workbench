@@ -915,7 +915,7 @@ class Coordinator:
                 coordinator_epoch=claimed["coordinator_epoch"],
                 lease_epoch=claimed["lease_epoch"],
             )
-        except StateConflictError as error:
+        except (StateConflictError, ValueError) as error:
             rejected_result_ref = self.artifacts.put_text(
                 canonical_json(
                     {
