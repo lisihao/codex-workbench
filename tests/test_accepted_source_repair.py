@@ -989,3 +989,12 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
 
         with self.assertRaisesRegex(AcceptedSourceRepairError, "accepted descendant C"):
             self._bindings(contract, verifier, ("B",))
+
+    def test_build_allows_intermediate_accepted_descendant_below_repair_frontier(self) -> None:
+        contract, verifier = self._create_task(include_descendant=True)
+
+        bindings = self._bindings(contract, verifier, ("A", "C"))
+
+        self.assertEqual(set(bindings), {"A", "C"})
+        self.assertEqual(bindings["A"]["repair_node_ids"], ["A", "C"])
+        self.assertEqual(bindings["C"]["repair_node_ids"], ["A", "C"])
