@@ -7539,6 +7539,7 @@ class WorkbenchStore:
         resolution: str,
         *,
         expected_revision: int,
+        confirm_old_executor_ended: bool = False,
     ) -> int:
         with self.connection() as connection:
             approval = connection.execute(
@@ -7556,6 +7557,7 @@ class WorkbenchStore:
                 str(approval["approval_id"]),
                 resolution,
                 expected_revision=expected_revision,
+                confirm_old_executor_ended=confirm_old_executor_ended,
             )
         if resolution not in {"retry", "fail", "cancel"}:
             raise ValueError("resolution must be retry, fail, or cancel")
@@ -7565,7 +7567,8 @@ class WorkbenchStore:
                 "SELECT state_revision, state FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             node = connection.execute(
-                "SELECT state, worktree, recovery_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                "SELECT state, worktree, recovery_json, spec_json FROM nodes "
+                "WHERE task_id = ? AND node_id = ?",
                 (task_id, node_id),
             ).fetchone()
             if task is None or node is None:
@@ -7576,18 +7579,28 @@ class WorkbenchStore:
                 )
             if node["state"] != "indeterminate":
                 raise StateConflictError(f"node {node_id} is {node['state']}, expected indeterminate")
+            clear_readonly_verifier_worktree = False
             if resolution == "retry":
-                self._assert_indeterminate_retry_is_safe(node)
+                clear_readonly_verifier_worktree = self._assert_indeterminate_retry_is_safe(
+                    node,
+                    confirm_old_executor_ended=confirm_old_executor_ended,
+                )
             node_state = "pending" if resolution == "retry" else "failed" if resolution == "fail" else "cancelled"
             task_state = "queued" if resolution == "retry" else "needs_fix" if resolution == "fail" else "cancelled"
             connection.execute(
                 """
                 UPDATE nodes SET state = ?, worker_id = NULL,
                                  effective_executor = NULL, effective_model = NULL,
-                                 started_at = NULL, settled_at = NULL, updated_at = ?
+                                 worktree = ?, started_at = NULL, settled_at = NULL, updated_at = ?
                 WHERE task_id = ? AND node_id = ?
                 """,
-                (node_state, timestamp, task_id, node_id),
+                (
+                    node_state,
+                    None if clear_readonly_verifier_worktree else node["worktree"],
+                    timestamp,
+                    task_id,
+                    node_id,
+                ),
             )
             revision = int(task["state_revision"]) + 1
             connection.execute(
@@ -7602,7 +7615,11 @@ class WorkbenchStore:
                 "node.indeterminate_resolved",
                 task_id,
                 node_id,
-                {"resolution": resolution, "task_revision": revision},
+                {
+                    "resolution": resolution,
+                    "task_revision": revision,
+                    "discarded_readonly_verifier_worktree": clear_readonly_verifier_worktree,
+                },
             )
             return revision
 
@@ -7633,6 +7650,7 @@ class WorkbenchStore:
         decision: str,
         *,
         expected_revision: int,
+        confirm_old_executor_ended: bool = False,
     ) -> int:
         if decision not in {"retry", "fail", "cancel"}:
             raise ValueError("decision must be retry, fail, or cancel")
@@ -7664,7 +7682,8 @@ class WorkbenchStore:
             task_id = str(approval["task_id"])
             node_id = str(request["node_id"])
             node = connection.execute(
-                "SELECT state, worktree, recovery_json FROM nodes WHERE task_id = ? AND node_id = ?",
+                "SELECT state, worktree, recovery_json, spec_json FROM nodes "
+                "WHERE task_id = ? AND node_id = ?",
                 (task_id, node_id),
             ).fetchone()
             if node is None:
@@ -7673,8 +7692,12 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"node {node_id} is {node['state']}, expected indeterminate"
                 )
+            clear_readonly_verifier_worktree = False
             if decision == "retry":
-                self._assert_indeterminate_retry_is_safe(node)
+                clear_readonly_verifier_worktree = self._assert_indeterminate_retry_is_safe(
+                    node,
+                    confirm_old_executor_ended=confirm_old_executor_ended,
+                )
             node_state = (
                 "pending" if decision == "retry" else "failed" if decision == "fail" else "cancelled"
             )
@@ -7682,10 +7705,16 @@ class WorkbenchStore:
                 """
                 UPDATE nodes SET state = ?, worker_id = NULL,
                                  effective_executor = NULL, effective_model = NULL,
-                                 started_at = NULL, settled_at = NULL, updated_at = ?
+                                 worktree = ?, started_at = NULL, settled_at = NULL, updated_at = ?
                 WHERE task_id = ? AND node_id = ?
                 """,
-                (node_state, timestamp, task_id, node_id),
+                (
+                    node_state,
+                    None if clear_readonly_verifier_worktree else node["worktree"],
+                    timestamp,
+                    task_id,
+                    node_id,
+                ),
             )
             remaining_indeterminate = int(
                 connection.execute(
@@ -7727,6 +7756,7 @@ class WorkbenchStore:
                     "approval_id": approval_id,
                     "decision": decision,
                     "task_revision": revision,
+                    "discarded_readonly_verifier_worktree": clear_readonly_verifier_worktree,
                 },
             )
             self._event(
@@ -7738,18 +7768,42 @@ class WorkbenchStore:
                     "approval_id": approval_id,
                     "resolution": decision,
                     "task_revision": revision,
+                    "discarded_readonly_verifier_worktree": clear_readonly_verifier_worktree,
                 },
             )
             return revision
 
     @staticmethod
-    def _assert_indeterminate_retry_is_safe(node: sqlite3.Row) -> None:
-        """Reject retry when an indeterminate attempt owns recovery state."""
+    def _assert_indeterminate_retry_is_safe(
+        node: sqlite3.Row,
+        *,
+        confirm_old_executor_ended: bool = False,
+    ) -> bool:
+        """Return whether retry must detach a completed read-only verifier worktree."""
 
-        if node["worktree"] is not None or node["recovery_json"] is not None:
+        if node["recovery_json"] is not None:
             raise StateConflictError(
                 "indeterminate retry requires explicit recovery because the attempt owns a worktree or recovery receipt"
             )
+        if node["worktree"] is None:
+            return False
+        try:
+            spec = json.loads(str(node["spec_json"]))
+        except json.JSONDecodeError as error:
+            raise StateConflictError("indeterminate node specification is invalid JSON") from error
+        if (
+            not isinstance(spec, dict)
+            or spec.get("verifier") is not True
+            or spec.get("write_scopes") != []
+        ):
+            raise StateConflictError(
+                "indeterminate retry requires explicit recovery because the attempt owns a worktree or recovery receipt"
+            )
+        if confirm_old_executor_ended is not True:
+            raise ValueError(
+                "read-only verifier retry requires confirm_old_executor_ended=true"
+            )
+        return True
 
     def indeterminate_local_recovery_candidate(
         self,

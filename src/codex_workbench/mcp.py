@@ -637,6 +637,7 @@ TOOLS: list[dict[str, Any]] = [
                 "approval_id": {"type": "string"},
                 "decision": {"enum": ["retry", "fail", "cancel"]},
                 "expected_revision": {"type": "integer", "minimum": 1},
+                "confirm_old_executor_ended": {"type": "boolean"},
             },
         },
     },
@@ -1345,6 +1346,9 @@ class WorkbenchMCPServer:
                 arguments["approval_id"],
                 arguments["decision"],
                 expected_revision=int(arguments["expected_revision"]),
+                confirm_old_executor_ended=self._optional_strict_boolean(
+                    arguments, "confirm_old_executor_ended"
+                ),
             )
             return self._text(
                 {
@@ -1515,6 +1519,9 @@ class WorkbenchMCPServer:
                     arguments["node_id"],
                     arguments["resolution"],
                     expected_revision=expected_revision,
+                    confirm_old_executor_ended=self._optional_strict_boolean(
+                        arguments, "confirm_old_executor_ended"
+                    ),
                 )
             elif action == "resolve_indeterminate_locally":
                 return self._text(
