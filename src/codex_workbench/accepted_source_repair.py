@@ -782,6 +782,15 @@ def _require_repaired_accepted_descendants(
     dependencies: Mapping[str, tuple[str, ...]],
     requested: set[str],
 ) -> None:
+    covered_by_repaired_descendant = set(requested)
+    pending_ancestors = list(requested)
+    while pending_ancestors:
+        node_id = pending_ancestors.pop()
+        for ancestor in dependencies[node_id]:
+            if ancestor in covered_by_repaired_descendant:
+                continue
+            covered_by_repaired_descendant.add(ancestor)
+            pending_ancestors.append(ancestor)
     children: dict[str, set[str]] = {node_id: set() for node_id in nodes}
     for node_id, parents in dependencies.items():
         for parent in parents:
@@ -797,6 +806,7 @@ def _require_repaired_accepted_descendants(
             if (
                 nodes[descendant]["row"]["state"] == "accepted"
                 and descendant not in requested
+                and descendant not in covered_by_repaired_descendant
             ):
                 raise AcceptedSourceRepairError(
                     "accepted-source repair omits accepted descendant " + descendant
