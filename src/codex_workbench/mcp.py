@@ -465,7 +465,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "workbench_control_task",
-        "description": "Queue, pause, resume, cancel, steer, schedule exact accepted ancestors required by a blocked consumer, resolve an indeterminate node, or preview/apply the fixed blocked DSH integration scope amendment. Queue/resume may atomically persist an instruction before launch. Blocked recovery requires exact attempts and revisions; scope amendment never launches work.",
+        "description": "Queue, pause, resume, cancel, steer, schedule exact accepted ancestors required by a blocked consumer or failed needs_fix verifier, resolve an indeterminate node, or preview/apply the fixed blocked DSH integration scope amendment. Queue/resume may atomically persist an instruction before launch. Blocked recovery requires exact attempts and revisions; scope amendment never launches work.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,

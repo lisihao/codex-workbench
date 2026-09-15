@@ -6937,7 +6937,7 @@ class WorkbenchStore:
         expected_attempt: int,
         reason: str,
     ) -> dict[str, Any]:
-        """Queue accepted source owners required by one blocked consumer."""
+        """Queue accepted source owners required by a blocked consumer or failed verifier."""
 
         if type(expected_revision) is not int or expected_revision < 1:
             raise ValueError("expected_revision must be a positive integer")
@@ -6969,7 +6969,8 @@ class WorkbenchStore:
                 "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             requester = connection.execute(
-                "SELECT state, attempt FROM nodes WHERE task_id = ? AND node_id = ?",
+                "SELECT state, attempt, spec_json, result_json FROM nodes "
+                "WHERE task_id = ? AND node_id = ?",
                 (task_id, requester_node_id),
             ).fetchone()
             if task is None or requester is None:
@@ -6978,10 +6979,35 @@ class WorkbenchStore:
                 raise StateConflictError(
                     f"expected task revision {expected_revision}, found {task['state_revision']}"
                 )
-            if task["state"] != "blocked":
-                raise StateConflictError(f"task {task_id} is {task['state']}, expected blocked")
-            if requester["state"] != "blocked" or int(requester["attempt"]) != expected_attempt:
-                raise StateConflictError("blocked consumer identity changed before owner repair")
+            if int(requester["attempt"]) != expected_attempt:
+                raise StateConflictError("repair requester attempt changed before owner repair")
+            requester_kind = "blocked_consumer"
+            if task["state"] == "blocked" and requester["state"] == "blocked":
+                pass
+            elif task["state"] == "needs_fix" and requester["state"] == "failed":
+                try:
+                    requester_spec = json.loads(str(requester["spec_json"]))
+                    requester_result = json.loads(str(requester["result_json"]))
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise StateConflictError(
+                        "failed verifier owner-repair receipt is invalid JSON"
+                    ) from error
+                if (
+                    not isinstance(requester_spec, dict)
+                    or requester_spec.get("verifier") is not True
+                    or not isinstance(requester_result, dict)
+                    or requester_result.get("status") != "failed"
+                    or requester_result.get("verdict") != "needs_fix"
+                    or requester_result.get("repair_node_ids") != owners
+                ):
+                    raise StateConflictError(
+                        "failed verifier owner-repair request does not match its needs_fix receipt"
+                    )
+                requester_kind = "settled_verifier"
+            else:
+                raise StateConflictError(
+                    "owner repair requires a blocked consumer or failed needs_fix verifier"
+                )
             from .accepted_source_repair import build_accepted_repair_bindings
 
             bindings = build_accepted_repair_bindings(
@@ -6992,7 +7018,7 @@ class WorkbenchStore:
                 requester_node_id,
                 expected_attempt,
                 expected_revision + 1,
-                requester_kind="blocked_consumer",
+                requester_kind=requester_kind,
             )
             steering_ids: dict[str, str] = {}
             for owner in owners:
@@ -7047,7 +7073,7 @@ class WorkbenchStore:
                     {
                         "source_allocation_id": binding["source_allocation_id"],
                         "source_attempt": binding["source"]["attempt"],
-                        "requester_kind": "blocked_consumer",
+                        "requester_kind": requester_kind,
                         "requester_node_id": requester_node_id,
                         "requester_attempt": expected_attempt,
                         "authorization_revision": expected_revision + 1,
@@ -7055,14 +7081,32 @@ class WorkbenchStore:
                     },
                     created_at=timestamp,
                 )
+            if requester_kind == "settled_verifier":
+                changed_requester = connection.execute(
+                    """
+                    UPDATE nodes
+                    SET state = 'pending', worker_id = NULL, worktree = NULL,
+                        effective_executor = NULL, effective_model = NULL,
+                        started_at = NULL, settled_at = NULL, result_json = NULL,
+                        recovery_json = NULL, coordinator_epoch = 0, lease_epoch = 0,
+                        updated_at = ?
+                    WHERE task_id = ? AND node_id = ? AND state = 'failed' AND attempt = ?
+                    """,
+                    (timestamp, task_id, requester_node_id, expected_attempt),
+                ).rowcount
+                if changed_requester != 1:
+                    raise StateConflictError(
+                        "failed verifier changed before owner repair authorization"
+                    )
             revision = expected_revision + 1
+            previous_task_state = str(task["state"])
             changed = connection.execute(
                 """
                 UPDATE tasks
                 SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL
-                WHERE task_id = ? AND state = 'blocked' AND state_revision = ?
+                WHERE task_id = ? AND state = ? AND state_revision = ?
                 """,
-                (revision, timestamp, task_id, expected_revision),
+                (revision, timestamp, task_id, previous_task_state, expected_revision),
             ).rowcount
             if changed != 1:
                 raise StateConflictError("blocked owner repair task compare-and-set failed")
@@ -7074,6 +7118,7 @@ class WorkbenchStore:
                 requester_node_id,
                 {
                     "requester_attempt": expected_attempt,
+                    "requester_kind": requester_kind,
                     "requester_result_sha256": requester_digest,
                     "repair_node_ids": owners,
                     "repair_source_attempts": {
@@ -7083,7 +7128,8 @@ class WorkbenchStore:
                     "feedback_steering_ids": steering_ids,
                     "reason": reason,
                     "revision": revision,
-                    "blocked_consumer_preserved": True,
+                    "requester_result_preserved_in_bindings": True,
+                    "blocked_consumer_preserved": requester_kind == "blocked_consumer",
                 },
                 created_at=timestamp,
             )
@@ -7093,11 +7139,12 @@ class WorkbenchStore:
                 task_id,
                 None,
                 {
-                    "from": "blocked",
+                    "from": previous_task_state,
                     "to": "queued",
                     "revision": revision,
                     "blocker": None,
-                    "blocked_owner_repair": True,
+                    "owner_repair": True,
+                    "requester_kind": requester_kind,
                 },
                 created_at=timestamp,
             )
@@ -7110,7 +7157,9 @@ class WorkbenchStore:
                 "revision": revision,
                 "state": "queued",
                 "event_cursor": event_cursor,
-                "blocked_consumer_preserved": True,
+                "requester_kind": requester_kind,
+                "requester_result_preserved_in_bindings": True,
+                "blocked_consumer_preserved": requester_kind == "blocked_consumer",
             }
 
     def blocked_owner_repair_wait(

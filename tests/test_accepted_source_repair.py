@@ -392,6 +392,77 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
             [True, False],
         )
 
+    def test_manual_owner_repair_resumes_an_exhausted_failed_verifier(self) -> None:
+        contract, verifier = self._create_task(retry_limit=0)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B requires one evidenced source repair",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        failed = self.store.get_task(contract.task_id)
+        self.assertEqual(failed["state"], "needs_fix")
+
+        receipt = self.store.schedule_blocked_consumer_owner_repairs(
+            contract.task_id,
+            "verify",
+            ["B"],
+            {"B": "remove the one verifier-identified source defect"},
+            expected_revision=int(failed["state_revision"]),
+            expected_attempt=1,
+            reason="continue exact owners from the exhausted verifier receipt",
+        )
+
+        self.assertEqual(receipt["requester_kind"], "settled_verifier")
+        resumed = self.store.get_task(contract.task_id)
+        owner = next(node for node in resumed["nodes"] if node["node_id"] == "B")
+        requester = next(node for node in resumed["nodes"] if node["node_id"] == "verify")
+        self.assertEqual(
+            (resumed["state"], owner["state"], requester["state"]),
+            ("queued", "pending", "pending"),
+        )
+        self.assertIsNone(requester["result"])
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        binding = parse_accepted_source_repair_binding(recovery_json)
+        assert binding is not None
+        self.assertEqual(binding["requester"]["kind"], "settled_verifier")
+        next_claim = self.store.claim_ready_node("manual-owner-repair", self.epoch)
+        assert next_claim is not None
+        self.assertEqual((next_claim["node_id"], next_claim["attempt"]), ("B", 2))
+
+    def test_manual_failed_verifier_owner_repair_requires_exact_receipt_ids(self) -> None:
+        contract, verifier = self._create_task(retry_limit=0)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B requires repair",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        failed = self.store.get_task(contract.task_id)
+
+        with self.assertRaisesRegex(StateConflictError, "does not match"):
+            self.store.schedule_blocked_consumer_owner_repairs(
+                contract.task_id,
+                "verify",
+                ["A"],
+                {"A": "unrequested repair"},
+                expected_revision=int(failed["state_revision"]),
+                expected_attempt=1,
+                reason="must not widen verifier-selected owners",
+            )
+
     def test_preparation_block_preserves_staged_patch_and_attempt_guidance(self) -> None:
         self.enterContext(isolated_process_catalog(()))
         contract, verifier = self._create_task(retry_limit=1)
