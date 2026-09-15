@@ -463,6 +463,117 @@ class AcceptedSourceRepairTests(AcceptedSourceRepairFixture, unittest.TestCase):
                 reason="must not widen verifier-selected owners",
             )
 
+    def test_settled_verifier_repair_refreshes_current_accepted_ancestors(self) -> None:
+        contract, verifier = self._create_task(retry_limit=0)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B requires repair on the current accepted ancestor input",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        failed = self.store.get_task(contract.task_id)
+        self.store.schedule_blocked_consumer_owner_repairs(
+            contract.task_id,
+            "verify",
+            ["B"],
+            {"B": "repair B on the refreshed accepted ancestor input"},
+            expected_revision=int(failed["state_revision"]),
+            expected_attempt=1,
+            reason="continue the settled verifier repair",
+        )
+        claimed = self.store.claim_ready_node("settled-verifier-refresh", self.epoch)
+        assert claimed is not None
+        self.assertEqual((claimed["node_id"], claimed["attempt"]), ("B", 2))
+
+        with patch(
+            "codex_workbench.accepted_source_repair._restore_dependency_input",
+            side_effect=AssertionError("settled verifier repair must refresh ancestors"),
+        ), patch(
+            "codex_workbench.accepted_source_repair.apply_accepted_ancestor_patches",
+            wraps=apply_accepted_ancestor_patches,
+        ) as refresh:
+            prepared = prepare_accepted_source_repair(
+                self.store, claimed["accepted_source_repair"], self.worktrees
+            )
+
+        refresh.assert_called_once()
+        self.assertEqual(
+            (prepared.worktree / "src/a.txt").read_text(encoding="utf-8"),
+            "ancestor\n",
+        )
+
+    def test_operator_can_resume_exhausted_preexecution_accepted_source_repair(self) -> None:
+        contract, verifier = self._create_task(retry_limit=0)
+        self.store.settle_claimed(
+            verifier,
+            NodeResult(
+                "failed",
+                "B requires repair",
+                verdict="needs_fix",
+                repair_node_ids=("B",),
+                checks=("fixture verifier",),
+            ),
+        )
+        failed = self.store.get_task(contract.task_id)
+        self.store.schedule_blocked_consumer_owner_repairs(
+            contract.task_id,
+            "verify",
+            ["B"],
+            {"B": "repair B after the preparation implementation is corrected"},
+            expected_revision=int(failed["state_revision"]),
+            expected_attempt=1,
+            reason="continue the settled verifier repair",
+        )
+        coordinator = Coordinator(
+            self.store, self.state_root, coordinator_epoch=self.epoch
+        )
+        try:
+            claimed = coordinator._claim_next_ready_node("exhausted-preparation")
+            assert claimed is not None
+            with patch(
+                "codex_workbench.accepted_source_repair.prepare_accepted_source_repair",
+                side_effect=AcceptedSourceRepairError(
+                    "accepted-source repair fixture preparation defect"
+                ),
+            ):
+                coordinator._execute_claimed(claimed)
+        finally:
+            coordinator._pool.shutdown(wait=True)
+
+        stopped = self.store.get_task(contract.task_id)
+        owner = next(node for node in stopped["nodes"] if node["node_id"] == "B")
+        self.assertEqual(
+            (stopped["state"], owner["state"], owner["attempt"], owner["worktree"]),
+            ("needs_fix", "blocked", 2, None),
+        )
+        receipt = self.store.resume_exhausted_accepted_source_repair(
+            contract.task_id,
+            "B",
+            expected_revision=int(stopped["state_revision"]),
+            expected_attempt=2,
+            reason="the accepted-source preparation implementation is now corrected",
+        )
+
+        self.assertEqual((receipt["state"], receipt["next_attempt"]), ("queued", 3))
+        resumed = self.store.get_task(contract.task_id)
+        owner = next(node for node in resumed["nodes"] if node["node_id"] == "B")
+        self.assertEqual((resumed["state"], owner["state"], owner["attempt"]), (
+            "queued", "pending", 2,
+        ))
+        with self.store.connection() as connection:
+            recovery_json = connection.execute(
+                "SELECT recovery_json FROM nodes WHERE task_id = ? AND node_id = 'B'",
+                (contract.task_id,),
+            ).fetchone()["recovery_json"]
+        self.assertIsNotNone(recovery_json)
+        next_claim = self.store.claim_ready_node("resumed-preparation", self.epoch)
+        assert next_claim is not None
+        self.assertEqual((next_claim["node_id"], next_claim["attempt"]), ("B", 3))
+
     def test_preparation_block_preserves_staged_patch_and_attempt_guidance(self) -> None:
         self.enterContext(isolated_process_catalog(()))
         contract, verifier = self._create_task(retry_limit=1)
