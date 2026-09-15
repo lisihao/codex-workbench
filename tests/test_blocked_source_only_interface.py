@@ -80,6 +80,35 @@ class BlockedSourceOnlyInterfaceTests(unittest.TestCase):
                 self.server._tool_result("workbench_control_task", {**self.arguments, name: True})
         self.store.capture_and_resume_blocked_worktree.assert_not_called()
 
+    def test_mcp_resumes_exhausted_accepted_source_preparation(self) -> None:
+        self.store.resume_exhausted_accepted_source_repair.return_value = {
+            "task_id": "fixture",
+            "node_id": "B",
+            "revision": 17,
+            "state": "queued",
+            "attempt": 2,
+            "next_attempt": 3,
+        }
+
+        result = self.server._tool_result("workbench_control_task", {
+            "action": "resume_accepted_source_repair",
+            "task_id": "fixture",
+            "node_id": "B",
+            "expected_revision": 16,
+            "expected_attempt": 2,
+            "reason": "resume after the preparation implementation was corrected",
+        })
+
+        value = json.loads(result["content"][0]["text"])
+        self.assertTrue(value["ok"])
+        self.store.resume_exhausted_accepted_source_repair.assert_called_once_with(
+            "fixture",
+            "B",
+            expected_revision=16,
+            expected_attempt=2,
+            reason="resume after the preparation implementation was corrected",
+        )
+
     def _parse(self, *extra: str):
         return build_parser().parse_args([
             "task", "resume-blocked-worktree", "fixture", "B",

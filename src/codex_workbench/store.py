@@ -11405,6 +11405,171 @@ class WorkbenchStore:
                 return "codex", model
         return None
 
+    def resume_exhausted_accepted_source_repair(
+        self,
+        task_id: str,
+        node_id: str,
+        *,
+        expected_revision: int,
+        expected_attempt: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Resume a pre-execution accepted-source preparation after its retry budget ended."""
+
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
+        if type(expected_attempt) is not int or expected_attempt < 1:
+            raise ValueError("expected_attempt must be a positive integer")
+        node_id = node_id.strip() if isinstance(node_id, str) else ""
+        if not node_id:
+            raise ValueError("node_id must identify the blocked repair owner")
+        reason = self._normalize_steering_instruction(reason)
+        timestamp = now_iso()
+        with self.transaction() as connection:
+            task = connection.execute(
+                "SELECT state, state_revision FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            node = connection.execute(
+                "SELECT state, attempt, worktree, result_json, recovery_json FROM nodes "
+                "WHERE task_id = ? AND node_id = ?",
+                (task_id, node_id),
+            ).fetchone()
+            if task is None or node is None:
+                raise KeyError((task_id, node_id))
+            if int(task["state_revision"]) != expected_revision:
+                raise StateConflictError(
+                    f"expected task revision {expected_revision}, found {task['state_revision']}"
+                )
+            if task["state"] != "needs_fix":
+                raise StateConflictError(
+                    f"task {task_id} is {task['state']}, expected needs_fix"
+                )
+            if node["state"] != "blocked" or int(node["attempt"]) != expected_attempt:
+                raise StateConflictError(
+                    "accepted-source preparation owner state or attempt changed"
+                )
+            if node["worktree"] is not None:
+                raise StateConflictError(
+                    "accepted-source preparation resume requires no assigned target worktree"
+                )
+            from .accepted_source_repair import parse_accepted_source_repair_binding
+
+            binding = parse_accepted_source_repair_binding(node["recovery_json"])
+            if (
+                binding is None
+                or binding["task_id"] != task_id
+                or binding["node_id"] != node_id
+                or expected_attempt <= int(binding["source"]["attempt"])
+            ):
+                raise StateConflictError(
+                    "blocked node lacks the matching accepted-source repair binding"
+                )
+            try:
+                result = json.loads(str(node["result_json"]))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise StateConflictError(
+                    "accepted-source preparation result is invalid JSON"
+                ) from error
+            summary = result.get("summary") if isinstance(result, dict) else None
+            if (
+                not isinstance(result, dict)
+                or result.get("status") != "blocked"
+                or result.get("changed_paths") != []
+                or not isinstance(summary, str)
+                or not summary.startswith("pre-execution state changed: accepted-source repair")
+            ):
+                raise StateConflictError(
+                    "blocked node is not an exhausted pre-execution accepted-source repair"
+                )
+            active = connection.execute(
+                "SELECT node_id FROM nodes WHERE task_id = ? "
+                "AND state IN ('running', 'indeterminate') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if active is not None:
+                raise StateConflictError(
+                    "accepted-source preparation cannot resume while another node is active"
+                )
+            next_attempt = expected_attempt + 1
+            continued_steering = self._continue_attempt_steering(
+                connection,
+                task_id=task_id,
+                node_id=node_id,
+                source_attempt=expected_attempt,
+                target_attempt=next_attempt,
+                timestamp=timestamp,
+            )
+            changed = connection.execute(
+                """
+                UPDATE nodes
+                SET state = 'pending', worker_id = NULL, worktree = NULL,
+                    effective_executor = NULL, effective_model = NULL,
+                    started_at = NULL, settled_at = NULL, result_json = NULL,
+                    coordinator_epoch = 0, lease_epoch = 0, updated_at = ?
+                WHERE task_id = ? AND node_id = ? AND state = 'blocked'
+                  AND attempt = ? AND worktree IS NULL
+                """,
+                (timestamp, task_id, node_id, expected_attempt),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError(
+                    "accepted-source preparation owner compare-and-set failed"
+                )
+            revision = expected_revision + 1
+            changed = connection.execute(
+                """
+                UPDATE tasks
+                SET state = 'queued', state_revision = ?, updated_at = ?, blocker = NULL
+                WHERE task_id = ? AND state = 'needs_fix' AND state_revision = ?
+                """,
+                (revision, timestamp, task_id, expected_revision),
+            ).rowcount
+            if changed != 1:
+                raise StateConflictError(
+                    "accepted-source preparation task compare-and-set failed"
+                )
+            event_cursor = self._event(
+                connection,
+                "node.accepted_source_repair_resumed",
+                task_id,
+                node_id,
+                {
+                    "attempt": expected_attempt,
+                    "next_attempt": next_attempt,
+                    "source_attempt": int(binding["source"]["attempt"]),
+                    "requester": binding["requester"],
+                    "reason": reason,
+                    "revision": revision,
+                    "continued_steering": continued_steering,
+                },
+                created_at=timestamp,
+            )
+            self._event(
+                connection,
+                "task.state_changed",
+                task_id,
+                None,
+                {
+                    "from": "needs_fix",
+                    "to": "queued",
+                    "revision": revision,
+                    "blocker": None,
+                    "accepted_source_repair_resumed": True,
+                },
+                created_at=timestamp,
+            )
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "revision": revision,
+                "state": "queued",
+                "attempt": expected_attempt,
+                "next_attempt": next_attempt,
+                "event_cursor": event_cursor,
+                "requester": binding["requester"],
+                "continued_steering": continued_steering,
+            }
+
     @staticmethod
     def _scope_access_pairs(
         candidate_reads: tuple[str, ...],

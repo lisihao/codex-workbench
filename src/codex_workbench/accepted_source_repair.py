@@ -633,7 +633,9 @@ def prepare_accepted_source_repair(
             parsed["node_id"],
             target_attempt,
         )
-        refresh_accepted_ancestors = parsed["requester"]["kind"] == "blocked_consumer"
+        refresh_accepted_ancestors = parsed["requester"]["kind"] in {
+            "blocked_consumer", "settled_verifier",
+        }
         if refresh_accepted_ancestors:
             refreshed = apply_accepted_ancestor_patches(
                 store.get_task(parsed["task_id"]),

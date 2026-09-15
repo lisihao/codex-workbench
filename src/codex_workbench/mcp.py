@@ -482,6 +482,7 @@ TOOLS: list[dict[str, Any]] = [
                         "steer",
                         "rescope_steering",
                         "repair_blocked_owners",
+                        "resume_accepted_source_repair",
                         "resolve_indeterminate",
                         "resolve_indeterminate_locally",
                         "normalize_indeterminate_scope",
@@ -1508,6 +1509,18 @@ class WorkbenchMCPServer:
                     node_id,
                     arguments.get("repair_node_ids"),
                     arguments.get("repair_instructions"),
+                    expected_revision=expected_revision,
+                    expected_attempt=expected_attempt,
+                    reason=reason,
+                )
+                return self._text({"ok": True, **receipt})
+            elif action == "resume_accepted_source_repair":
+                node_id = self._required_blocked_resume_text(arguments, "node_id")
+                reason = self._required_blocked_resume_text(arguments, "reason")
+                expected_attempt = self._required_blocked_resume_attempt(arguments)
+                receipt = self.store.resume_exhausted_accepted_source_repair(
+                    task_id,
+                    node_id,
                     expected_revision=expected_revision,
                     expected_attempt=expected_attempt,
                     reason=reason,
