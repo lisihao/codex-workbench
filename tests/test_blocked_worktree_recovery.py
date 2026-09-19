@@ -1347,9 +1347,9 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             runner=runner,
         ).materialize(worktree, timeout_seconds=5_400)
 
-        self.assertEqual(receipt["materialization_timeout_seconds"], 360)
+        self.assertEqual(receipt["materialization_timeout_seconds"], 900)
         self.assertEqual(receipt["store_dir"], str(store.resolve()))
-        self.assertEqual([timeout for _command, timeout in calls], [360, 360, 360])
+        self.assertEqual([timeout for _command, timeout in calls], [900, 900, 900])
         self.assertIn("--pm-on-fail=ignore", calls[1][0])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
 

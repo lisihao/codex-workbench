@@ -892,7 +892,10 @@ class PnpmOfflineMaterializer:
     # becoming an unbounded worker lease.
     MINIMUM_PNPM_11_VERSION = (11, 25, 0)
     MAX_MATERIALIZATION_SECONDS = 120
-    MAX_TEMPLATE_SEED_SECONDS = 360
+    # A cold APFS sparsebundle can spend several minutes cloning millions of
+    # linker entries even though clonefile keeps file data copy-on-write.
+    # Keep the phase bounded, but leave enough room for the measured cold path.
+    MAX_TEMPLATE_SEED_SECONDS = 900
     BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
     STORE_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM_STORE"
     LOCK_FILENAME = ".codex-workbench-pnpm-materialization.lock"
