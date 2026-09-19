@@ -152,6 +152,78 @@ class DependencyInputTests(unittest.TestCase):
             with self.assertRaisesRegex(DependencyInputError, "ancestor lineage"):
                 validate_dependency_input_lineage(task, "target", dependency_input)
 
+    def test_dependency_input_lineage_allows_older_selected_refreshing_ancestor(self) -> None:
+        task = self._lineage_task()
+        dependency_input = self._lineage_input(
+            [
+                {"node_id": "a", "attempt": 1, "patch_ref": "patch-a-old"},
+                {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+            ]
+        )
+
+        self.assertIsNone(
+            validate_dependency_input_lineage(
+                task,
+                "target",
+                dependency_input,
+                refreshing_ancestor_node_ids=("a",),
+            )
+        )
+
+    def test_dependency_input_lineage_rejects_unselected_or_nonhistorical_refresh(self) -> None:
+        task = self._lineage_task()
+        cases = (
+            (
+                self._lineage_input(
+                    [
+                        {"node_id": "a", "attempt": 1, "patch_ref": "patch-a-old"},
+                        {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+                    ]
+                ),
+                ("b",),
+            ),
+            (
+                self._lineage_input(
+                    [
+                        {"node_id": "a", "attempt": 2, "patch_ref": "patch-a-forged"},
+                        {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+                    ]
+                ),
+                ("a",),
+            ),
+            (
+                self._lineage_input(
+                    [
+                        {"node_id": "a", "attempt": 4, "patch_ref": "patch-a-future"},
+                        {"node_id": "b", "attempt": 3, "patch_ref": "patch-b"},
+                    ]
+                ),
+                ("a",),
+            ),
+            (
+                self._lineage_input(
+                    [
+                        {"node_id": "b", "attempt": 2, "patch_ref": "patch-b-old"},
+                        {"node_id": "a", "attempt": 1, "patch_ref": "patch-a-old"},
+                    ]
+                ),
+                ("a", "b"),
+            ),
+        )
+
+        for dependency_input, refreshing_ids in cases:
+            with self.subTest(
+                ancestors=dependency_input.receipt["ancestors"],
+                refreshing_ids=refreshing_ids,
+            ):
+                with self.assertRaisesRegex(DependencyInputError, "ancestor lineage"):
+                    validate_dependency_input_lineage(
+                        task,
+                        "target",
+                        dependency_input,
+                        refreshing_ancestor_node_ids=refreshing_ids,
+                    )
+
     def test_dependency_input_lineage_rejects_task_node_or_base_mismatch(self) -> None:
         task = self._lineage_task()
         dependency_input = self._lineage_input(
