@@ -111,7 +111,7 @@ def _darwin_process_cwds(uid: int) -> tuple[tuple[int, str], ...]:
         )
         if size <= 0:
             error_number = ctypes.get_errno()
-            if error_number == errno.ESRCH:
+            if error_number in {errno.ESRCH, errno.ENOENT}:
                 continue
             if _darwin_process_ended_or_is_zombie(pid):
                 continue

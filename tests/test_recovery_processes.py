@@ -1,3 +1,4 @@
+import errno
 from pathlib import Path
 import subprocess
 import sys
@@ -113,6 +114,26 @@ class RecoveryProcessesTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RecoveryProcessError, "cwd lookup was incomplete"):
                 _darwin_process_cwds(501)
+
+    def test_native_cwd_enoent_skips_process_without_a_resolvable_cwd(self) -> None:
+        libproc = Mock()
+
+        def list_pids(_kind, _uid, buffer, _size):
+            if buffer is None:
+                return 4
+            buffer[0] = 123
+            return 4
+
+        libproc.proc_listpids = Mock(side_effect=list_pids)
+        libproc.proc_pidinfo = Mock(return_value=0)
+        with patch(
+            "codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc
+        ), patch(
+            "codex_workbench.recovery_processes.ctypes.get_errno",
+            return_value=errno.ENOENT,
+        ), patch("codex_workbench.recovery_processes.subprocess.run") as run:
+            self.assertEqual(_darwin_process_cwds(501), ())
+        run.assert_not_called()
 
     def test_native_cwd_zero_skips_ps_confirmed_zombie(self) -> None:
         libproc = Mock()
