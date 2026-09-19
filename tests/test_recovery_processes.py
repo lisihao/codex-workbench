@@ -109,7 +109,7 @@ class RecoveryProcessesTests(unittest.TestCase):
             "codex_workbench.recovery_processes.ctypes.get_errno", return_value=0
         ), patch(
             "codex_workbench.recovery_processes.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 1, "", ""),
+            return_value=subprocess.CompletedProcess([], 2, "", "ps failed"),
         ):
             with self.assertRaisesRegex(RecoveryProcessError, "cwd lookup was incomplete"):
                 _darwin_process_cwds(501)
@@ -142,6 +142,27 @@ class RecoveryProcessesTests(unittest.TestCase):
             check=False,
             env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
         )
+
+    def test_native_cwd_zero_skips_pid_that_exited_after_snapshot(self) -> None:
+        libproc = Mock()
+
+        def list_pids(_kind, _uid, buffer, _size):
+            if buffer is None:
+                return 4
+            buffer[0] = 123
+            return 4
+
+        libproc.proc_listpids = Mock(side_effect=list_pids)
+        libproc.proc_pidinfo = Mock(return_value=0)
+        with patch(
+            "codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc
+        ), patch(
+            "codex_workbench.recovery_processes.ctypes.get_errno", return_value=0
+        ), patch(
+            "codex_workbench.recovery_processes.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 1, "", ""),
+        ):
+            self.assertEqual(_darwin_process_cwds(501), ())
 
     def test_native_cwd_zero_rejects_ps_confirmed_live_process(self) -> None:
         libproc = Mock()
