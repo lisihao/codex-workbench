@@ -27,3 +27,5 @@ Record unattended duration, recovery result, repeated work and user nudges from 
 ## Verification and release boundaries
 
 Use focused regressions while changing each slice, then affected integrations. Run a full gate once for each stable release fingerprint. The immediate preparation repair must ship independently of P0–P3 completion. Plans, commits, passing fixtures, releases, installed runtime and application-task acceptance are distinct milestones. Never queue or resume another coordinator's application task as part of a Workbench repair.
+
+Offline pnpm preparation keeps a bounded cache publication phase. If an install completed but its cache publication timed out, a later preparation of that same complete linker retries publication without reinstalling packages. Large workspaces receive an extended bounded publication window; exhaustion remains an explicit environment blocker rather than an unbounded retry.

@@ -895,7 +895,7 @@ class PnpmOfflineMaterializer:
     # A cold APFS sparsebundle can spend several minutes cloning millions of
     # linker entries even though clonefile keeps file data copy-on-write.
     # Keep the phase bounded, but leave enough room for the measured cold path.
-    MAX_TEMPLATE_SEED_SECONDS = 900
+    MAX_TEMPLATE_SEED_SECONDS = 1_800
     BINARY_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM"
     STORE_ENVIRONMENT_VARIABLE = "CODEX_WORKBENCH_PNPM_STORE"
     LOCK_FILENAME = ".codex-workbench-pnpm-materialization.lock"
@@ -1067,6 +1067,47 @@ class PnpmOfflineMaterializer:
             if not require_cached_template and self._linker_tree_is_complete(
                 worktree, available_linker_paths, template_signature["key"]
             ):
+                template: dict[str, object] = {
+                    "state": "reuse",
+                    "key": template_signature["key"],
+                    "path": str(worktree / "node_modules"),
+                }
+                publication: CommandOutcome | None = None
+                if template_directory is not None and not template_directory.exists():
+                    publication_started = time.monotonic()
+                    try:
+                        publication = self._publish_template(
+                            template_directory, template_signature, worktree, deadline
+                        )
+                    except (DirtyWorktreeRecoveryError, OSError) as error:
+                        template = {
+                            **template,
+                            "state": "publication_failed",
+                            "warning": "pnpm linker template publication failed from a complete local linker",
+                            "diagnostic": _bounded(
+                                str(error) or type(error).__name__,
+                                limit=_MATERIALIZATION_DIAGNOSTIC_OUTPUT_BYTES,
+                            ),
+                        }
+                    else:
+                        if publication is not None:
+                            template = {
+                                "state": "seeded",
+                                "key": template_signature["key"],
+                                "path": str(template_directory),
+                                "source": "complete-local-linker",
+                                "clone": publication.to_dict(),
+                            }
+                    finally:
+                        phase_seconds["publication"] = self._elapsed_seconds(publication_started)
+                commands = [version.to_dict(), {
+                    "command": ["pnpm-worktree", "reuse", str(worktree)],
+                    "exit_code": 0,
+                    "stdout": "reused complete worktree-local pnpm linker tree\n",
+                    "stderr": "",
+                }]
+                if publication is not None:
+                    commands.append(publication.to_dict())
                 return {
                     "schema_version": 1,
                     "kind": "pnpm-offline-materialization",
@@ -1079,18 +1120,9 @@ class PnpmOfflineMaterializer:
                         "path": str(lock_path),
                         "wait_seconds": lock_wait_seconds,
                     },
-                    "template": {
-                        "state": "reuse",
-                        "key": template_signature["key"],
-                        "path": str(worktree / "node_modules"),
-                    },
+                    "template": template,
                     **timing_receipt(),
-                    "commands": [version.to_dict(), {
-                        "command": ["pnpm-worktree", "reuse", str(worktree)],
-                        "exit_code": 0,
-                        "stdout": "reused complete worktree-local pnpm linker tree\n",
-                        "stderr": "",
-                    }],
+                    "commands": commands,
                 }
             if template_directory is not None:
                 cached_clone = self._clone_cached_template(
