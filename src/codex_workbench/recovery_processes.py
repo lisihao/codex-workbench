@@ -24,8 +24,8 @@ _VNODE_INFO_PATH_SIZE = _VNODE_INFO_SIZE + _MAXPATHLEN
 _PROC_VNODEPATHINFO_SIZE = 2 * _VNODE_INFO_PATH_SIZE
 
 
-def _darwin_process_is_zombie(pid: int) -> bool:
-    """Return whether Darwin ``ps`` identifies one PID as a zombie."""
+def _darwin_process_ended_or_is_zombie(pid: int) -> bool:
+    """Return whether Darwin ``ps`` finds no PID or identifies a zombie."""
 
     try:
         result = subprocess.run(
@@ -39,6 +39,8 @@ def _darwin_process_is_zombie(pid: int) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     state = result.stdout.strip()
+    if result.returncode == 1 and not state and not result.stderr:
+        return True
     return (
         result.returncode == 0
         and not result.stderr
@@ -111,7 +113,7 @@ def _darwin_process_cwds(uid: int) -> tuple[tuple[int, str], ...]:
             error_number = ctypes.get_errno()
             if error_number == errno.ESRCH:
                 continue
-            if _darwin_process_is_zombie(pid):
+            if _darwin_process_ended_or_is_zombie(pid):
                 continue
             raise RecoveryProcessError(
                 "cannot inspect source process activity: cwd lookup was incomplete"
