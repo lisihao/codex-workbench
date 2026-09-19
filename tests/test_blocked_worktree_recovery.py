@@ -77,6 +77,49 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_retry_replays_recorded_input_against_current_handoffs(self) -> None:
+        source = self.root / "source"
+        target = self.root / "target"
+        replay_task = {"task_id": "task", "contract": {"base_sha": "base"}}
+        ready_handoffs = ({"request_id": "handoff"},)
+        receipt = {"schema_version": 2, "patch_ref": "patch", "changed_paths": []}
+
+        with patch.object(
+            self.recovery, "_validate_snapshot", return_value=source
+        ), patch.object(
+            self.recovery, "_validate_target", return_value=target
+        ), patch.object(
+            self.recovery, "_restore_recorded_input", return_value="tree"
+        ) as restore, patch.object(
+            self.recovery, "_load_patch", return_value=b"patch"
+        ), patch.object(
+            self.recovery, "_patch_path", return_value=self.root / "patch"
+        ), patch.object(
+            self.recovery.worktrees, "apply_patch"
+        ), patch.object(
+            self.recovery, "mark_untracked_intent_to_add"
+        ), patch.object(
+            self.recovery, "_git_bytes", return_value=b"patch"
+        ):
+            outcome = self.recovery.prepare_for_retry(
+                repository=str(self.repository),
+                source_worktree=str(source),
+                target_worktree=str(target),
+                target_branch="repair",
+                target_attempt=2,
+                recovery=receipt,
+                replay_task=replay_task,
+                ready_lockfile_handoffs=ready_handoffs,
+            )
+
+        self.assertEqual(outcome.status, "succeeded", outcome.summary)
+        restore.assert_called_once_with(
+            target,
+            receipt,
+            replay_task=replay_task,
+            ready_lockfile_handoffs=ready_handoffs,
+        )
+
     @staticmethod
     def _git(repository: Path, *arguments: str) -> str:
         return subprocess.run(
