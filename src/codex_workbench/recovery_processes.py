@@ -6,6 +6,7 @@ import ctypes
 import errno
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -14,12 +15,8 @@ class RecoveryProcessError(ValueError):
 
 
 _PROC_UID_ONLY = 4
-_PROC_PIDTBSDINFO = 3
 _PROC_PIDVNODEPATHINFO = 9
 _MAXPATHLEN = 1024
-_PROC_BSDINFO_SIZE = 136
-_PROC_BSDINFO_STATUS_OFFSET = 4
-_SZOMB = 5
 # Darwin's public proc_info.h defines vnode_info as 152 bytes and
 # proc_vnodepathinfo as two vnode_info_path records.
 _VNODE_INFO_SIZE = 152
@@ -27,30 +24,28 @@ _VNODE_INFO_PATH_SIZE = _VNODE_INFO_SIZE + _MAXPATHLEN
 _PROC_VNODEPATHINFO_SIZE = 2 * _VNODE_INFO_PATH_SIZE
 
 
-def _darwin_process_ended_or_zombie(libproc: object, pid: int) -> bool:
-    """Return whether a failed cwd lookup belongs to an exited or zombie PID."""
+def _darwin_process_is_zombie(pid: int) -> bool:
+    """Return whether Darwin ``ps`` identifies one PID as a zombie."""
 
-    info = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
-    ctypes.set_errno(0)
-    size = libproc.proc_pidinfo(  # type: ignore[attr-defined]
-        pid,
-        _PROC_PIDTBSDINFO,
-        0,
-        info,
-        ctypes.sizeof(info),
-    )
-    if size <= 0:
-        return ctypes.get_errno() == errno.ESRCH
-    if size != _PROC_BSDINFO_SIZE:
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "state="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
-    status = int.from_bytes(
-        info.raw[
-            _PROC_BSDINFO_STATUS_OFFSET:
-            _PROC_BSDINFO_STATUS_OFFSET + ctypes.sizeof(ctypes.c_uint32)
-        ],
-        byteorder=sys.byteorder,
+    state = result.stdout.strip()
+    return (
+        result.returncode == 0
+        and not result.stderr
+        and bool(state)
+        and "\n" not in state
+        and state.startswith("Z")
     )
-    return status == _SZOMB
 
 
 def _inside_source(cwd: str, source: Path) -> bool:
@@ -59,7 +54,7 @@ def _inside_source(cwd: str, source: Path) -> bool:
 
 
 def _darwin_process_cwds(uid: int) -> tuple[tuple[int, str], ...]:
-    """Read same-UID cwd paths through Darwin libproc without spawning lsof."""
+    """Read same-UID cwd paths through libproc with bounded zombie fallback."""
 
     try:
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -116,7 +111,7 @@ def _darwin_process_cwds(uid: int) -> tuple[tuple[int, str], ...]:
             error_number = ctypes.get_errno()
             if error_number == errno.ESRCH:
                 continue
-            if _darwin_process_ended_or_zombie(libproc, pid):
+            if _darwin_process_is_zombie(pid):
                 continue
             raise RecoveryProcessError(
                 "cannot inspect source process activity: cwd lookup was incomplete"
