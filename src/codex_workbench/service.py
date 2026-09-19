@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 import traceback
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .artifacts import ArtifactStore
 from .config import WorkbenchConfig
@@ -2473,6 +2473,8 @@ class Coordinator:
             if isinstance(source_artifacts, dict)
             else None
         )
+        replay_task: Mapping[str, Any] | None = None
+        replay_ready_lockfile_handoffs: object | None = None
         if dependency_ref is not None:
             if not isinstance(dependency_ref, str) or not dependency_ref:
                 raise DirtyWorktreeRecoveryError(
@@ -2486,14 +2488,21 @@ class Coordinator:
                 base_sha=source_base,
             )
             dependency_input = loaded_dependency_input
+            if loaded_dependency_input.receipt.get("schema_version") == 2:
+                replay_task = self.store.get_task(claimed["task_id"])
+                replay_ready_lockfile_handoffs = self._ready_lockfile_handoffs(
+                    claimed["task_id"]
+                )
             if not refresh_accepted_ancestors:
                 dependency_input = rebind_recorded_lockfile_handoffs(
-                    self.store.get_task(claimed["task_id"]),
+                    replay_task or self.store.get_task(claimed["task_id"]),
                     claimed["node_id"],
                     self.artifacts,
                     loaded_dependency_input,
-                    ready_lockfile_handoffs=self._ready_lockfile_handoffs(
-                        claimed["task_id"]
+                    ready_lockfile_handoffs=(
+                        replay_ready_lockfile_handoffs
+                        if replay_ready_lockfile_handoffs is not None
+                        else self._ready_lockfile_handoffs(claimed["task_id"])
                     ),
                 )
                 if canonical_json(dependency_input.receipt) != canonical_json(
@@ -2747,6 +2756,8 @@ class Coordinator:
                 source_only=source_only,
                 prepare_dependency_input=prepare_retry_input,
                 refresh_dependency_input=refresh_accepted_ancestors,
+                replay_task=replay_task,
+                ready_lockfile_handoffs=replay_ready_lockfile_handoffs,
             )
             if outcome.status != "succeeded":
                 raise DirtyWorktreeRecoveryError(outcome.summary)

@@ -2045,6 +2045,8 @@ class DirtyWorktreeRecovery:
         source_only: bool = False,
         prepare_dependency_input: Callable[[Path], DependencyInput] | None = None,
         refresh_dependency_input: bool = False,
+        replay_task: Mapping[str, Any] | None = None,
+        ready_lockfile_handoffs: object | None = None,
     ) -> RecoveryOutcome:
         """Restore a sealed failed attempt before its normal executor runs.
 
@@ -2079,7 +2081,12 @@ class DirtyWorktreeRecovery:
                     )
                 comparison_tree = prepared_dependency_input.input_tree_sha
             else:
-                comparison_tree = self._restore_recorded_input(target, recovery)
+                comparison_tree = self._restore_recorded_input(
+                    target,
+                    recovery,
+                    replay_task=replay_task,
+                    ready_lockfile_handoffs=ready_lockfile_handoffs,
+                )
             patch = self._load_patch(recovery)
             self.worktrees.apply_patch(target, self._patch_path(recovery))
             self.mark_untracked_intent_to_add(
