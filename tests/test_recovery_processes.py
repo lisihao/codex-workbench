@@ -1,3 +1,4 @@
+import ctypes
 from pathlib import Path
 import subprocess
 import sys
@@ -8,6 +9,10 @@ from tests.process_probe_fixture import isolated_process_catalog
 
 from codex_workbench.recovery_processes import (
     RecoveryProcessError,
+    _PROC_BSDINFO_SIZE,
+    _PROC_PIDTBSDINFO,
+    _PROC_PIDVNODEPATHINFO,
+    _SZOMB,
     _darwin_process_cwds,
     assert_recovery_source_idle,
     source_process_ids,
@@ -108,6 +113,56 @@ class RecoveryProcessesTests(unittest.TestCase):
         ), patch("codex_workbench.recovery_processes.ctypes.get_errno", return_value=0):
             with self.assertRaisesRegex(RecoveryProcessError, "cwd lookup was incomplete"):
                 _darwin_process_cwds(501)
+
+    def test_native_cwd_zero_skips_kernel_confirmed_zombie(self) -> None:
+        libproc = Mock()
+
+        def list_pids(_kind, _uid, buffer, _size):
+            if buffer is None:
+                return 4
+            buffer[0] = 123
+            return 4
+
+        def pid_info(_pid, flavor, _argument, buffer, _size):
+            if flavor == _PROC_PIDVNODEPATHINFO:
+                return 0
+            self.assertEqual(flavor, _PROC_PIDTBSDINFO)
+            status = _SZOMB.to_bytes(4, byteorder=sys.byteorder)
+            ctypes.memmove(buffer, b"\0" * 4 + status, 8)
+            return _PROC_BSDINFO_SIZE
+
+        libproc.proc_listpids = Mock(side_effect=list_pids)
+        libproc.proc_pidinfo = Mock(side_effect=pid_info)
+        with patch(
+            "codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc
+        ), patch("codex_workbench.recovery_processes.ctypes.get_errno", return_value=0):
+            self.assertEqual(_darwin_process_cwds(501), ())
+
+    def test_native_cwd_zero_rejects_confirmed_live_process(self) -> None:
+        libproc = Mock()
+
+        def list_pids(_kind, _uid, buffer, _size):
+            if buffer is None:
+                return 4
+            buffer[0] = 123
+            return 4
+
+        def pid_info(_pid, flavor, _argument, buffer, _size):
+            if flavor == _PROC_PIDVNODEPATHINFO:
+                return 0
+            self.assertEqual(flavor, _PROC_PIDTBSDINFO)
+            status = (2).to_bytes(4, byteorder=sys.byteorder)
+            ctypes.memmove(buffer, b"\0" * 4 + status, 8)
+            return _PROC_BSDINFO_SIZE
+
+        libproc.proc_listpids = Mock(side_effect=list_pids)
+        libproc.proc_pidinfo = Mock(side_effect=pid_info)
+        with patch(
+            "codex_workbench.recovery_processes.ctypes.CDLL", return_value=libproc
+        ), patch(
+            "codex_workbench.recovery_processes.ctypes.get_errno", return_value=0
+        ), self.assertRaisesRegex(RecoveryProcessError, "cwd lookup was incomplete"):
+            _darwin_process_cwds(501)
 
     def test_unreadable_linux_process_refuses_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
