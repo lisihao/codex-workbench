@@ -1390,9 +1390,9 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             runner=runner,
         ).materialize(worktree, timeout_seconds=5_400)
 
-        self.assertEqual(receipt["materialization_timeout_seconds"], 900)
+        self.assertEqual(receipt["materialization_timeout_seconds"], 1_800)
         self.assertEqual(receipt["store_dir"], str(store.resolve()))
-        self.assertEqual([timeout for _command, timeout in calls], [900, 900, 900])
+        self.assertEqual([timeout for _command, timeout in calls], [1_800, 1_800, 1_800])
         self.assertIn("--pm-on-fail=ignore", calls[1][0])
         self.assertEqual(calls[1][0][-2:], ("--store-dir", str(store.resolve())))
 
@@ -1598,6 +1598,55 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             (Path("node_modules"), Path("packages/fixture/node_modules")),
         )
         commands = receipt["commands"]
+        assert isinstance(commands, list)
+        self.assertFalse(any("install" in command["command"] for command in commands))
+
+    def test_offline_materializer_backfills_failed_template_from_complete_linker(self) -> None:
+        worktree = self.root / "failed-template-backfill"
+        template_root = self.root / "templates"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+        installs = 0
+        clone_attempts = 0
+
+        def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal installs, clone_attempts
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            if args[0] == "/bin/cp":
+                clone_attempts += 1
+                if clone_attempts == 1:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+                shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+            installs += 1
+            cwd = kwargs["cwd"]
+            assert isinstance(cwd, Path)
+            linker = cwd / "node_modules"
+            (linker / ".bin").mkdir(parents=True)
+            (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "offline frozen install ok\n", "")
+
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            template_dir=template_root,
+            runner=runner,
+        )
+        failed = materializer.materialize(worktree, timeout_seconds=120)
+        recovered = materializer.materialize(worktree, timeout_seconds=120)
+
+        self.assertEqual(installs, 1)
+        self.assertEqual(failed["template"]["state"], "publication_failed")
+        self.assertEqual(recovered["template"]["state"], "seeded")
+        self.assertEqual(recovered["template"]["source"], "complete-local-linker")
+        self.assertTrue(Path(recovered["template"]["path"]).is_dir())
+        self.assertEqual(clone_attempts, 2)
+        commands = recovered["commands"]
         assert isinstance(commands, list)
         self.assertFalse(any("install" in command["command"] for command in commands))
 

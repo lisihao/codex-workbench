@@ -1,3 +1,3 @@
 """Codex Workbench persistent coordinator."""
 
-__version__ = "1.19.46"
+__version__ = "1.19.47"
