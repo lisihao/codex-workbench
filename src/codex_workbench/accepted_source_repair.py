@@ -350,6 +350,7 @@ def build_accepted_repair_bindings(
                     node_id,
                     validated_dependency_input,
                     artifacts=store.artifacts,
+                    refreshing_ancestor_node_ids=requested,
                 )
             except (DependencyInputError, LockfileHandoffError, ValueError) as error:
                 raise AcceptedSourceRepairError(

@@ -57,12 +57,16 @@ def validate_dependency_input_lineage(
     dependency_input: DependencyInput,
     *,
     artifacts: ArtifactStore | None = None,
+    refreshing_ancestor_node_ids: Sequence[str] = (),
 ) -> None:
     """Require one loaded dependency input to match the current accepted closure.
 
     The task snapshot is authoritative for the ordered ancestor source records.
     A receipt from another task, node, contract base, or accepted-attempt
-    closure is rejected before it can be used as worker input.
+    closure is rejected before it can be used as worker input. Accepted-source
+    repair may name ancestors that the same authorization will refresh. Their
+    immutable historical attempts remain valid only when they precede the
+    current accepted attempts; preparation rebuilds the current closure.
     """
 
     if not isinstance(task, Mapping):
@@ -71,6 +75,17 @@ def validate_dependency_input_lineage(
         raise DependencyInputError("dependency target node is invalid")
     if not isinstance(dependency_input, DependencyInput):
         raise DependencyInputError("dependency input is invalid")
+    if isinstance(refreshing_ancestor_node_ids, (str, bytes)) or not isinstance(
+        refreshing_ancestor_node_ids, Sequence
+    ):
+        raise DependencyInputError("refreshing ancestor ids are invalid")
+    refreshing_ancestors: set[str] = set()
+    for refreshing_node_id in refreshing_ancestor_node_ids:
+        if not isinstance(refreshing_node_id, str) or not refreshing_node_id:
+            raise DependencyInputError("refreshing ancestor id is invalid")
+        if refreshing_node_id in refreshing_ancestors:
+            raise DependencyInputError("refreshing ancestor ids are duplicated")
+        refreshing_ancestors.add(refreshing_node_id)
     task_id = task.get("task_id")
     contract = task.get("contract")
     if not isinstance(task_id, str) or not task_id:
@@ -123,7 +138,9 @@ def validate_dependency_input_lineage(
         for ancestor in accepted_ancestor_nodes(task, node_id)
         for source in (_source_receipt(ancestor),)
     )
-    if tuple(actual) != expected:
+    if tuple(actual) != expected and not _matches_refreshing_ancestor_lineage(
+        actual, expected, refreshing_ancestors
+    ):
         raise DependencyInputError(
             "dependency input receipt ancestor lineage does not match accepted closure"
         )
@@ -150,6 +167,30 @@ def validate_dependency_input_lineage(
         raise DependencyInputError(
             "dependency input includes a lockfile handoff that does not apply to its target"
         )
+
+
+def _matches_refreshing_ancestor_lineage(
+    actual: Sequence[tuple[str, int, str | None]],
+    expected: Sequence[tuple[str, int, str | None]],
+    refreshing_ancestors: set[str],
+) -> bool:
+    """Accept only older receipts for ancestors refreshed by the same repair."""
+
+    if not refreshing_ancestors or len(actual) != len(expected):
+        return False
+    for recorded, current in zip(actual, expected, strict=True):
+        recorded_node_id, recorded_attempt, _recorded_patch_ref = recorded
+        current_node_id, current_attempt, _current_patch_ref = current
+        if recorded_node_id != current_node_id:
+            return False
+        if recorded == current:
+            continue
+        if (
+            recorded_node_id not in refreshing_ancestors
+            or recorded_attempt >= current_attempt
+        ):
+            return False
+    return True
 
 
 def base_dependency_input(
