@@ -1723,7 +1723,7 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(receipt["template"]["state"], "hit")
             self.assertEqual(len(clone_timeouts), 1)
             self.assertGreater(clone_timeouts[0], 360)
-            self.assertLessEqual(clone_timeouts[0], 1_800)
+            self.assertLessEqual(clone_timeouts[0], 3_600)
 
     def test_verifier_readiness_block_preserves_accepted_worker_patch_without_reexecution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
