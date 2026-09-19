@@ -1676,6 +1676,55 @@ raise AssertionError("fatal coordinator failure returned")
             self.assertEqual(first["kind"], "pnpm-offline-materialization")
             self.assertEqual(second["template"]["state"], "reuse")
 
+    def test_cached_pnpm_template_clone_uses_extended_bounded_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template_root = root / "templates"
+            seed = root / "seed"
+            target = root / "target"
+            clone_timeouts: list[int] = []
+            for worktree in (seed, target):
+                worktree.mkdir()
+                (worktree / "package.json").write_text(
+                    json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+                )
+                (worktree / "pnpm-lock.yaml").write_text(
+                    "lockfileVersion: '9.0'\n", encoding="utf-8"
+                )
+
+            def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if args[0] == "/bin/cp":
+                    timeout = kwargs.get("timeout")
+                    assert isinstance(timeout, int)
+                    clone_timeouts.append(timeout)
+                    shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                    return subprocess.CompletedProcess(args, 0, "template cloned\n", "")
+                if args[-1] == "--version":
+                    return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+                cwd = kwargs["cwd"]
+                assert isinstance(cwd, Path)
+                node_modules = cwd / "node_modules"
+                node_modules.mkdir()
+                (node_modules / ".modules.yaml").write_text(
+                    "layoutVersion: 5\n", encoding="utf-8"
+                )
+                (node_modules / ".bin").mkdir()
+                return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
+
+            materializer = PnpmOfflineMaterializer(
+                binary=sys.executable,
+                template_dir=template_root,
+                runner=runner,
+            )
+            materializer.materialize(seed, timeout_seconds=900)
+            clone_timeouts.clear()
+            receipt = materializer.materialize(target, timeout_seconds=3600)
+
+            self.assertEqual(receipt["template"]["state"], "hit")
+            self.assertEqual(len(clone_timeouts), 1)
+            self.assertGreater(clone_timeouts[0], 360)
+            self.assertLessEqual(clone_timeouts[0], 900)
+
     def test_verifier_readiness_block_preserves_accepted_worker_patch_without_reexecution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
