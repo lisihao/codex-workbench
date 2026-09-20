@@ -1259,10 +1259,9 @@ class PnpmOfflineMaterializer:
                 digest.update(b"<missing>")
             digest.update(b"\0")
         payload = {
-            # v3 captures package-local pnpm linkers as well as the root
-            # node_modules tree. Reusing a v2 root-only cache would leave
-            # isolated-workspace package imports unresolved.
-            "schema_version": "3",
+            # v4 limits package-local linkers to lockfile importers. Reusing a
+            # v3 cache could restore unrelated nested package-manager trees.
+            "schema_version": "4",
             "package_manager": package_manager,
             "pnpm_version": pnpm_version,
             "platform": platform.system().lower(),
@@ -1352,25 +1351,67 @@ class PnpmOfflineMaterializer:
             raise
         return outcome
 
-    @staticmethod
-    def _linker_paths(worktree: Path) -> tuple[Path, ...]:
-        """Return pnpm linker directories without walking root dependencies."""
+    @classmethod
+    def _linker_paths(cls, worktree: Path) -> tuple[Path, ...]:
+        """Return root and lockfile-importer pnpm linker directories."""
 
-        root = Path("node_modules")
-        paths = {root}
-        for current, directories, _files in os.walk(worktree):
-            current_path = Path(current)
-            relative = current_path.relative_to(worktree)
-            directories[:] = [name for name in directories if name != ".git"]
-            if relative == Path("."):
-                directories[:] = [name for name in directories if name != "node_modules"]
+        paths = {Path("node_modules")}
+        for importer in cls._lockfile_importers(worktree / "pnpm-lock.yaml"):
+            if importer == Path("."):
                 continue
-            if "node_modules" not in directories:
-                continue
-            candidate = relative / "node_modules"
-            directories.remove("node_modules")
-            paths.add(candidate)
+            candidate = importer / "node_modules"
+            linker = worktree / candidate
+            if linker.is_dir() or linker.is_symlink():
+                paths.add(candidate)
         return tuple(sorted(paths, key=str))
+
+    @staticmethod
+    def _lockfile_importers(lockfile: Path) -> tuple[Path, ...]:
+        """Read safe workspace importer keys from pnpm's generated lockfile."""
+
+        try:
+            lines = lockfile.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as error:
+            raise DirtyWorktreeRecoveryError(f"cannot read pnpm lockfile importers: {error}") from error
+        in_importers = False
+        importers: set[Path] = set()
+        for line in lines:
+            if not in_importers:
+                if line == "importers:":
+                    in_importers = True
+                continue
+            if line and not line.startswith(" "):
+                break
+            if not line.startswith("  ") or line.startswith("    "):
+                continue
+            key = line[2:]
+            if not key.endswith(":"):
+                continue
+            raw = key[:-1]
+            if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+                raw = raw[1:-1].replace("''", "'")
+            elif len(raw) >= 2 and raw[0] == raw[-1] == '"':
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError as error:
+                    raise DirtyWorktreeRecoveryError(
+                        f"pnpm lockfile importer is not valid YAML JSON quoting: {raw}"
+                    ) from error
+                if not isinstance(decoded, str):
+                    raise DirtyWorktreeRecoveryError(
+                        f"pnpm lockfile importer is not text: {raw}"
+                    )
+                raw = decoded
+            relative = Path(raw)
+            if relative == Path("."):
+                importers.add(relative)
+                continue
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise DirtyWorktreeRecoveryError(
+                    f"pnpm lockfile importer is unsafe: {raw!r}"
+                )
+            importers.add(relative)
+        return tuple(sorted(importers or {Path(".")}, key=str))
 
     @staticmethod
     def _template_linker_paths(
