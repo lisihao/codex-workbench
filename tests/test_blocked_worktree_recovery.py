@@ -1558,7 +1558,11 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
             json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
         )
         (worktree / "pnpm-lock.yaml").write_text(
-            "lockfileVersion: '9.0'\n", encoding="utf-8"
+            "lockfileVersion: '9.0'\n"
+            "importers:\n"
+            "  .:\n"
+            "  packages/fixture:\n",
+            encoding="utf-8",
         )
         installs = 0
 
@@ -1667,6 +1671,14 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (worktree / "pnpm-lock.yaml").write_text("lockfileVersion: 9.0\n", encoding="utf-8")
+            (worktree / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: 9.0\n"
+                "importers:\n"
+                "  .:\n"
+                "  native/fixture:\n"
+                "  packages/fixture:\n",
+                encoding="utf-8",
+            )
         (changed / "package.json").write_text(
             json.dumps({"packageManager": "pnpm@11.7.0", "name": "changed-input"}),
             encoding="utf-8",
@@ -1731,6 +1743,28 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertTrue((interrupted / "node_modules" / ".modules.yaml").is_file())
         self.assertEqual((second / "node_modules" / "workspace").resolve(), (second / "packages" / "fixture").resolve())
         self.assertEqual(len(second_receipt["commands"]), 2)
+
+    def test_offline_materializer_ignores_non_importer_node_modules(self) -> None:
+        worktree = self.root / "importer-linkers"
+        package = worktree / "packages" / "fixture"
+        unrelated = worktree / "products" / "desktop" / "fixture"
+        package.mkdir(parents=True)
+        unrelated.mkdir(parents=True)
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n"
+            "importers:\n"
+            "  .:\n"
+            "  'packages/fixture':\n",
+            encoding="utf-8",
+        )
+        (worktree / "node_modules").mkdir()
+        (package / "node_modules").mkdir()
+        (unrelated / "node_modules").mkdir()
+
+        self.assertEqual(
+            PnpmOfflineMaterializer._linker_paths(worktree),
+            (Path("node_modules"), Path("packages/fixture/node_modules")),
+        )
 
     def test_offline_materializer_reads_authority_runtime_environment(self) -> None:
         worktree = self.root / "authority-runtime-fixture"
