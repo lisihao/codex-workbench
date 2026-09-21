@@ -161,8 +161,47 @@ for raw in sys.stdin:
         (root / "last-write-arguments").write_text(json.dumps(arguments, sort_keys=True))
         with (root / "effects").open("a") as stream:
             stream.write("effect\n")
-        if mode in {"write-completed", "write-unknown"}:
+        if mode in {
+            "write-completed",
+            "write-unknown",
+            "write-rejected",
+            "write-rejected-malformed",
+            "write-rejected-wrong-id",
+        }:
             os._exit(0)
+        if mode == "write-indeterminate-then-rejected":
+            send(request_id, {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "state": "indeterminate",
+                        "request_id": arguments.get("request_id"),
+                        "component": "authority_http",
+                        "retry_mutation": False,
+                    }),
+                }],
+                "isError": True,
+            })
+            continue
+        if mode == "write-rejected-direct":
+            rejection = {
+                "request_id": arguments.get("request_id"),
+                "state": "rejected",
+                "effects": "none",
+                "enqueued": False,
+                "rejection": {
+                    "schema_version": 1,
+                    "code": "invalid-workbench-request-fields",
+                    "message": "workbench_request contains unsupported fields",
+                    "invalid_fields": ["strategy.bounded"],
+                    "allowed_fields": ["strategy.version"],
+                },
+            }
+            send(request_id, {
+                "content": [{"type": "text", "text": json.dumps(rejection)}],
+                "isError": True,
+            })
+            continue
         send(request_id, {"content": [{"type": "text", "text": "write-ok"}]})
         continue
     if name == "workbench_get_service_request":
@@ -175,9 +214,36 @@ for raw in sys.stdin:
                 "state": "completed",
                 "result": {"content": [{"type": "text", "text": "persisted-result"}]},
             }
+        elif mode in {
+            "write-rejected",
+            "write-rejected-malformed",
+            "write-rejected-wrong-id",
+            "write-indeterminate-then-rejected",
+        }:
+            payload = {
+                "request_id": "different-request" if mode == "write-rejected-wrong-id" else supplied,
+                "state": "rejected",
+                "effects": "unknown" if mode == "write-rejected-malformed" else "none",
+                "enqueued": False,
+                "rejection": {
+                    "schema_version": 1,
+                    "code": "invalid-workbench-request-fields",
+                    "message": "workbench_request contains unsupported fields",
+                    "invalid_fields": ["strategy.bounded"],
+                    "allowed_fields": ["strategy.version"],
+                },
+            }
         else:
             payload = {"request_id": supplied, "state": "unknown"}
-        send(request_id, {"content": [{"type": "text", "text": json.dumps(payload)}]})
+        result = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+        if mode in {
+            "write-rejected",
+            "write-rejected-malformed",
+            "write-rejected-wrong-id",
+            "write-indeterminate-then-rejected",
+        }:
+            result["isError"] = True
+        send(request_id, result)
         continue
     send(request_id, {"content": [{"type": "text", "text": "unknown"}], "isError": True})
 '''
@@ -459,6 +525,108 @@ class MCPConnectionBridgeTests(unittest.TestCase):
         persisted = self.state_file.read_text()
         self.assertNotIn("stable-write", persisted)
         self.assertNotIn("persisted-result", persisted)
+
+    def test_direct_rejected_write_result_is_forwarded_without_reclassification(self) -> None:
+        output = self._run("write-rejected-direct", [
+            *self._initialize(),
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_write",
+                    "arguments": {"request_id": "rejected-direct"},
+                },
+            },
+        ])
+
+        result = self._by_id(output, 3)["result"]
+        self.assertTrue(result["isError"])
+        receipt = json.loads(result["content"][0]["text"])
+        self.assertEqual(receipt["state"], "rejected")
+        self.assertEqual(receipt["effects"], "none")
+        self.assertFalse(receipt["enqueued"])
+        self.assertEqual(self._log().count("write"), 1)
+        self.assertNotIn("query", self._log())
+
+    def test_lost_rejected_write_response_queries_journal_without_replay(self) -> None:
+        messages = [*self._initialize(), *[
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_write",
+                    "arguments": {"request_id": "rejected-write"},
+                },
+            }
+            for request_id in (3, 4)
+        ]]
+        output = self._run("write-rejected", messages)
+
+        for request_id in (3, 4):
+            result = self._by_id(output, request_id)["result"]
+            self.assertTrue(result["isError"])
+            receipt = json.loads(result["content"][0]["text"])
+            self.assertEqual(receipt["request_id"], "rejected-write")
+            self.assertEqual(receipt["state"], "rejected")
+            self.assertEqual(receipt["effects"], "none")
+            self.assertFalse(receipt["enqueued"])
+        self.assertEqual((self.fixture / "effects").read_text().splitlines(), ["effect"])
+        self.assertEqual(self._log().count("write"), 1)
+        self.assertEqual(self._log().count("query"), 2)
+
+    def test_direct_indeterminate_write_queries_rejected_journal_without_replay(self) -> None:
+        output = self._run("write-indeterminate-then-rejected", [
+            *self._initialize(),
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_write",
+                    "arguments": {"request_id": "rejected-after-indeterminate"},
+                },
+            },
+        ])
+
+        result = self._by_id(output, 3)["result"]
+        self.assertTrue(result["isError"])
+        receipt = json.loads(result["content"][0]["text"])
+        self.assertEqual(receipt["request_id"], "rejected-after-indeterminate")
+        self.assertEqual(receipt["state"], "rejected")
+        self.assertEqual(receipt["effects"], "none")
+        self.assertFalse(receipt["enqueued"])
+        self.assertEqual((self.fixture / "effects").read_text().splitlines(), ["effect"])
+        self.assertEqual(self._log().count("write"), 1)
+        self.assertEqual(self._log().count("query"), 1)
+
+    def _assert_invalid_rejected_receipt_is_indeterminate(self, mode: str) -> None:
+        messages = [*self._initialize(), *[
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_write",
+                    "arguments": {"request_id": "rejected-invalid"},
+                },
+            }
+            for request_id in (3, 4)
+        ]]
+        output = self._run(mode, messages)
+        for request_id in (3, 4):
+            result = self._by_id(output, request_id)["result"]
+            self.assertTrue(result["isError"])
+            self.assertIn("write_indeterminate", result["content"][0]["text"])
+        self.assertEqual((self.fixture / "effects").read_text().splitlines(), ["effect"])
+        self.assertEqual(self._log().count("write"), 1)
+
+    def test_malformed_rejected_journal_receipt_remains_indeterminate_without_replay(self) -> None:
+        self._assert_invalid_rejected_receipt_is_indeterminate("write-rejected-malformed")
+
+    def test_mismatched_rejected_journal_receipt_remains_indeterminate_without_replay(self) -> None:
+        self._assert_invalid_rejected_receipt_is_indeterminate("write-rejected-wrong-id")
 
     def test_handoff_preview_and_status_do_not_poison_apply_identity(self) -> None:
         messages = self._initialize()
