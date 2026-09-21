@@ -1081,7 +1081,7 @@ class MCPConnectionBridge:
     @staticmethod
     def _query_payload(response: Mapping[str, object]) -> dict[str, object] | None:
         result = response.get("result")
-        if not isinstance(result, Mapping) or result.get("isError") is True:
+        if not isinstance(result, Mapping):
             return None
         content = result.get("content")
         if not isinstance(content, list):
@@ -1100,24 +1100,12 @@ class MCPConnectionBridge:
                 return parsed
         return None
 
-    def _resolve_write(self, original_id: object, request_id: str) -> dict[str, object]:
-        if self.transport is None and not self._recover_connection():
-            return _tool_error(original_id, "write_indeterminate", request_token=request_id)
-        query = {
-            "jsonrpc": "2.0",
-            "id": self._next_internal_id("service-request"),
-            "method": "tools/call",
-            "params": {
-                "name": "workbench_get_service_request",
-                "arguments": {"request_id": request_id},
-            },
-        }
-        try:
-            response = self._send_request(query, self.config.request_timeout_seconds)
-        except TransportError as error:
-            self._record_transport_failure(error)
-            return _tool_error(original_id, "write_indeterminate", request_token=request_id)
-        payload = self._query_payload(response)
+    @staticmethod
+    def _resolved_write_response(
+        original_id: object,
+        request_id: str,
+        payload: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
         if (
             payload is not None
             and payload.get("request_id") == request_id
@@ -1125,6 +1113,61 @@ class MCPConnectionBridge:
             and isinstance(payload.get("result"), dict)
         ):
             return {"jsonrpc": "2.0", "id": original_id, "result": payload["result"]}
+        rejection = payload.get("rejection") if payload is not None else None
+        invalid_fields = rejection.get("invalid_fields") if isinstance(rejection, dict) else None
+        allowed_fields = rejection.get("allowed_fields") if isinstance(rejection, dict) else None
+        if (
+            payload is not None
+            and payload.get("request_id") == request_id
+            and payload.get("state") == "rejected"
+            and payload.get("effects") == "none"
+            and payload.get("enqueued") is False
+            and isinstance(rejection, dict)
+            and isinstance(invalid_fields, list)
+            and all(isinstance(field, str) for field in invalid_fields)
+            and isinstance(allowed_fields, list)
+            and all(isinstance(field, str) for field in allowed_fields)
+        ):
+            return {
+                "jsonrpc": "2.0",
+                "id": original_id,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps(payload, ensure_ascii=False),
+                    }],
+                    "isError": True,
+                },
+            }
+        return None
+
+    def _resolve_write(self, original_id: object, request_id: str) -> dict[str, object]:
+        for attempt in range(self.config.max_reconnect_attempts):
+            if self.transport is None and not self._recover_connection():
+                break
+            query = {
+                "jsonrpc": "2.0",
+                "id": self._next_internal_id("service-request"),
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_get_service_request",
+                    "arguments": {"request_id": request_id},
+                },
+            }
+            try:
+                response = self._send_request(query, self.config.request_timeout_seconds)
+            except TransportError as error:
+                self._record_transport_failure(error)
+            else:
+                resolved = self._resolved_write_response(
+                    original_id,
+                    request_id,
+                    self._query_payload(response),
+                )
+                if resolved is not None:
+                    return resolved
+            if attempt + 1 < self.config.max_reconnect_attempts:
+                self._backoff(attempt)
         return _tool_error(original_id, "write_indeterminate", request_token=request_id)
 
     def _handle_tool_call(self, message: dict[str, object]) -> dict[str, object]:
@@ -1178,10 +1221,18 @@ class MCPConnectionBridge:
         # point is always resolved through the Authority journal, never replay.
         self.state.mark_write_sent(stable_request_id)
         try:
-            return self._send_request(message, self.config.request_timeout_seconds)
+            response = self._send_request(message, self.config.request_timeout_seconds)
         except TransportError as error:
             self._record_transport_failure(error)
             return self._resolve_write(request_id, stable_request_id)
+        payload = self._query_payload(response)
+        if (
+            payload is not None
+            and payload.get("state") == "indeterminate"
+            and payload.get("request_id") == stable_request_id
+        ):
+            return self._resolve_write(request_id, stable_request_id)
+        return response
 
     def handle(self, message: dict[str, object]) -> dict[str, object] | None:
         method = message.get("method")
