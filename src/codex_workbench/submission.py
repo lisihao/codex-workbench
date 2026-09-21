@@ -519,7 +519,7 @@ def planning_request_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
-def _freeze_natural_language_request(
+def freeze_natural_language_request(
     *,
     objective: str,
     repository: str,
@@ -677,7 +677,7 @@ def enqueue_natural_language_request(
     probes, and all model calls belong to the background consumer.
     """
 
-    frozen_request, _ = _freeze_natural_language_request(
+    frozen_request, _ = freeze_natural_language_request(
         objective=objective,
         repository=repository,
         allowed_scope=allowed_scope,
@@ -754,7 +754,7 @@ def compile_natural_language_request(
     the store transaction that owns their planning receipt.
     """
 
-    frozen_request, transient_context = _freeze_natural_language_request(
+    frozen_request, transient_context = freeze_natural_language_request(
         objective=objective,
         repository=repository,
         allowed_scope=allowed_scope,

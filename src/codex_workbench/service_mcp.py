@@ -32,6 +32,28 @@ class AuthorityMCPAdapter:
         self._catalog = {tool["name"]: tool for tool in tools}
         return tools
 
+    @staticmethod
+    def _rejected_result(receipt: dict[str, Any]) -> dict[str, Any] | None:
+        """Return one confirmed no-effect rejection as an MCP error result."""
+
+        if receipt.get("state") != "rejected":
+            return None
+        rejection = receipt.get("rejection")
+        invalid_fields = rejection.get("invalid_fields") if isinstance(rejection, dict) else None
+        allowed_fields = rejection.get("allowed_fields") if isinstance(rejection, dict) else None
+        if (
+            not isinstance(receipt.get("request_id"), str)
+            or receipt.get("effects") != "none"
+            or receipt.get("enqueued") is not False
+            or not isinstance(rejection, dict)
+            or not isinstance(invalid_fields, list)
+            or any(not isinstance(field, str) for field in invalid_fields)
+            or not isinstance(allowed_fields, list)
+            or any(not isinstance(field, str) for field in allowed_fields)
+        ):
+            raise ServiceTransportError("Authority returned an invalid rejected request receipt")
+        return _text(receipt, error=True)
+
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
         request_id = message.get("id")
         if request_id is None:
@@ -65,7 +87,8 @@ class AuthorityMCPAdapter:
                 if tool is None:
                     raise ValueError("tool is not in the Authority catalog; refresh tools/list")
                 if name == "workbench_get_service_request":
-                    result = _text(self.client.get_request(arguments.get("request_id")))
+                    receipt = self.client.get_request(arguments.get("request_id"))
+                    result = self._rejected_result(receipt) or _text(receipt)
                 else:
                     copied = dict(arguments)
                     read_only = (
@@ -96,9 +119,13 @@ class AuthorityMCPAdapter:
                     if "source_thread_id" in copied:
                         envelope["session_id"] = copied["source_thread_id"]
                     receipt = self.client.dispatch(envelope, read_only=read_only)
-                    if receipt.get("state") != "completed" or not isinstance(receipt.get("result"), dict):
+                    rejected = self._rejected_result(receipt)
+                    if rejected is not None:
+                        result = rejected
+                    elif receipt.get("state") != "completed" or not isinstance(receipt.get("result"), dict):
                         raise ServiceTransportError("Authority did not return a completed request receipt")
-                    result = receipt["result"]
+                    else:
+                        result = receipt["result"]
             else:
                 return {"jsonrpc": "2.0", "id": request_id,
                         "error": {"code": -32601, "message": "unsupported MCP method"}}

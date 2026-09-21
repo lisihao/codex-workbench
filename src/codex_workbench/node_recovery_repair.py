@@ -378,8 +378,23 @@ class RepairNodeActions:
 
     def _receipt(self, plan: RepairActionPlan, authority_receipt: Mapping[str, Any]) -> RepairActionReceipt:
         state = authority_receipt.get("state")
-        if state not in {"completed", "executing", "unknown"}:
+        if state not in {"completed", "executing", "unknown", "rejected"}:
             raise StateConflictError("Authority journal returned an invalid repair state")
+        if state == "rejected":
+            rejection = authority_receipt.get("rejection")
+            return {
+                "action": _ACTION,
+                "request_id": plan["request_id"],
+                "journal_status": "rejected",
+                "known_effects": True,
+                "receipt": {
+                    "ok": False,
+                    "known_effects": True,
+                    "stage_succeeded": False,
+                    "effects": "none",
+                    "rejection": dict(rejection) if isinstance(rejection, Mapping) else {},
+                },
+            }
         if state != "completed":
             return {
                 "action": _ACTION,

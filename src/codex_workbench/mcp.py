@@ -12,6 +12,7 @@ from . import __version__
 from .acceptance import build_acceptance_report
 from .acceptance_amendment import ACCEPTANCE_AMENDMENT_TOOL, amend_task_acceptance
 from .artifacts import ArtifactStore
+from .authority_service import KnownRequestRejection
 from .blocked_source_repair import blocked_source_repair, blocked_source_repair_receipt
 from .config import WorkbenchConfig
 from .controlled_validation_service import VALIDATION_TOOL, validate_blocked_node
@@ -32,7 +33,11 @@ from .recovery import RecoveryPolicy, WorktreeRecoveryError, WorktreeRecoveryMan
 from .worktrees import WorktreeError
 from .store import CommandConflictError, StateConflictError, WorkbenchStore
 from .task_observation import current_task_observations
-from .submission import enqueue_natural_language_request, planning_request_receipt
+from .submission import (
+    enqueue_natural_language_request,
+    freeze_natural_language_request,
+    planning_request_receipt,
+)
 from .sync import RepositorySynchronizer, RepositorySyncError
 
 
@@ -55,6 +60,25 @@ _LIST_TASKS_NODE_STATES = (
     "indeterminate",
     "cancelled",
 )
+
+_WORKBENCH_REQUEST_ALLOWED_FIELDS = frozenset({
+    "request_id", "objective", "repository", "allowed_scopes", "source_thread_id",
+    "forbidden_scopes", "acceptance_commands", "task_id", "command_id", "base_sha",
+    "planner_model", "executor_model", "verifier_model", "strategy", "task_type",
+    "complexity", "parallelizable", "claude_allowed", "task_points",
+    "verification_tier", "timeout_seconds", "retry_limit",
+    "external_write_permission", "queue",
+})
+_ROUTING_STRATEGY_ALLOWED_FIELDS = frozenset({
+    "version", "task_type", "complexity", "parallelizable", "claude_allowed",
+    "strategy_version", "work_type", "task_kind", "kind", "task_category",
+    "complexity_level", "risk", "risk_level", "allow_claude", "claude_enabled",
+    "claude", "parallel",
+})
+_WORKBENCH_REQUEST_ALLOWED_FIELD_PATHS = tuple(sorted(
+    _WORKBENCH_REQUEST_ALLOWED_FIELDS
+    | {f"strategy.{field}" for field in _ROUTING_STRATEGY_ALLOWED_FIELDS}
+))
 
 
 _HISTORICAL_SOURCE_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -341,7 +365,34 @@ TOOLS: list[dict[str, Any]] = [
                 "planner_model": {"type": "string", "default": "gpt-5.6-sol"},
                 "executor_model": {"type": "string", "default": "gpt-5.6-luna"},
                 "verifier_model": {"type": "string", "default": "gpt-5.6-sol"},
-                "strategy": {"type": "object"},
+                "strategy": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "version": {"type": "string"},
+                        "task_type": {
+                            "enum": [
+                                "implementation", "debugging", "architecture", "review",
+                                "tests", "docs", "creative", "exploration",
+                            ]
+                        },
+                        "complexity": {"enum": ["low", "standard", "high"]},
+                        "parallelizable": {"type": "boolean"},
+                        "claude_allowed": {"type": "boolean"},
+                        "strategy_version": {"type": "string"},
+                        "work_type": {"type": "string"},
+                        "task_kind": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "task_category": {"type": "string"},
+                        "complexity_level": {"type": "string"},
+                        "risk": {"type": "string"},
+                        "risk_level": {"type": "string"},
+                        "allow_claude": {"type": "boolean"},
+                        "claude_enabled": {"type": "boolean"},
+                        "claude": {"type": "boolean"},
+                        "parallel": {"type": "boolean"},
+                    },
+                },
                 "task_type": {
                     "enum": [
                         "implementation",
@@ -709,6 +760,91 @@ class WorkbenchMCPServer:
             "content": [
                 {"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}
             ]
+        }
+
+    def preflight_mutation(self, name: str, arguments: dict[str, Any]) -> None:
+        """Validate known no-effect request boundaries before Authority dispatch."""
+
+        if name != "workbench_request":
+            return
+        extra_fields = sorted(set(arguments) - _WORKBENCH_REQUEST_ALLOWED_FIELDS)
+        strategy = arguments.get("strategy")
+        invalid_fields = list(extra_fields)
+        if strategy is not None:
+            if not isinstance(strategy, dict):
+                invalid_fields.append("strategy")
+            else:
+                invalid_fields.extend(
+                    f"strategy.{field}"
+                    for field in sorted(set(strategy) - _ROUTING_STRATEGY_ALLOWED_FIELDS)
+                )
+        if invalid_fields:
+            raise KnownRequestRejection(
+                "invalid-workbench-request-fields",
+                "workbench_request contains unsupported fields",
+                invalid_fields=invalid_fields,
+                allowed_fields=_WORKBENCH_REQUEST_ALLOWED_FIELD_PATHS,
+            )
+        try:
+            freeze_natural_language_request(**self._workbench_request_kwargs(arguments))
+        except (KeyError, TypeError, ValueError, FileNotFoundError, subprocess.SubprocessError) as error:
+            missing = ["objective"] if "objective" not in arguments else []
+            if strategy is not None and not missing:
+                missing = ["strategy"]
+            message = str(error).strip()
+            raise KnownRequestRejection(
+                "invalid-workbench-request",
+                message[:500] or "workbench_request preflight validation failed",
+                invalid_fields=missing,
+                allowed_fields=_WORKBENCH_REQUEST_ALLOWED_FIELD_PATHS,
+            ) from error
+
+    def _workbench_request_kwargs(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Resolve one workbench_request exactly once for preflight or enqueue."""
+
+        source_thread_id = arguments.get("source_thread_id")
+        binding = (
+            self.store.get_session_binding(source_thread_id)
+            if source_thread_id
+            else None
+        )
+        repository = arguments.get("repository") or (
+            binding["repository"] if binding else None
+        )
+        allowed_scopes = arguments.get("allowed_scopes") or (
+            binding["allowed_scopes"] if binding else None
+        )
+        if not repository or not allowed_scopes:
+            raise ValueError(
+                "repository and allowed_scopes are required unless source_thread_id has an active WB binding"
+            )
+        return {
+            "objective": arguments["objective"],
+            "repository": repository,
+            "allowed_scope": allowed_scopes,
+            "forbidden_scope": arguments.get("forbidden_scopes", ()),
+            "acceptance_commands": arguments.get("acceptance_commands", ()),
+            "task_id": arguments.get("task_id"),
+            "command_id": arguments.get("command_id"),
+            "planner_model": arguments.get("planner_model", "gpt-5.6-sol"),
+            "executor_model": arguments.get("executor_model", "gpt-5.6-luna"),
+            "verifier_model": arguments.get("verifier_model", "gpt-5.6-sol"),
+            "task_type": arguments.get("task_type", "implementation"),
+            "complexity": arguments.get("complexity", "standard"),
+            "parallelizable": bool(arguments.get("parallelizable", True)),
+            "claude_allowed": bool(arguments.get("claude_allowed", True)),
+            "task_points": float(arguments.get("task_points", 1.0)),
+            "verification_tier": arguments.get("verification_tier", "L2"),
+            "timeout_seconds": int(arguments.get("timeout_seconds", 3600)),
+            "retry_limit": int(arguments.get("retry_limit", 3)),
+            "external_write_permission": bool(arguments.get("external_write_permission", False)),
+            "queue": bool(arguments.get("queue", True)),
+            "base_sha": arguments.get("base_sha") or (binding["base_sha"] if binding else None),
+            "routing_strategy": "model-routing-v2",
+            "strategy": arguments.get("strategy"),
+            "source_thread_id": source_thread_id,
+            "context_bundle_ref": binding["context_ref"] if binding else None,
+            "context_excerpt": binding["context_excerpt"] if binding else None,
         }
 
     @staticmethod
@@ -1157,51 +1293,11 @@ class WorkbenchMCPServer:
         if name == "workbench_validate_blocked_node":
             return self._text(validate_blocked_node(self.config, self.store, arguments))
         if name == "workbench_request":
-            source_thread_id = arguments.get("source_thread_id")
-            binding = (
-                self.store.get_session_binding(source_thread_id)
-                if source_thread_id
-                else None
-            )
-            repository = arguments.get("repository") or (
-                binding["repository"] if binding else None
-            )
-            allowed_scopes = arguments.get("allowed_scopes") or (
-                binding["allowed_scopes"] if binding else None
-            )
-            if not repository or not allowed_scopes:
-                raise ValueError(
-                    "repository and allowed_scopes are required unless source_thread_id has an active WB binding"
-                )
             return self._text(
                 enqueue_natural_language_request(
                     self.config,
                     self.store,
-                    objective=arguments["objective"],
-                    repository=repository,
-                    allowed_scope=allowed_scopes,
-                    forbidden_scope=arguments.get("forbidden_scopes", ()),
-                    acceptance_commands=arguments.get("acceptance_commands", ()),
-                    task_id=arguments.get("task_id"),
-                    command_id=arguments.get("command_id"),
-                    planner_model=arguments.get("planner_model", "gpt-5.6-sol"),
-                    executor_model=arguments.get("executor_model", "gpt-5.6-luna"),
-                    verifier_model=arguments.get("verifier_model", "gpt-5.6-sol"),
-                    task_type=arguments.get("task_type", "implementation"),
-                    complexity=arguments.get("complexity", "standard"),
-                    parallelizable=bool(arguments.get("parallelizable", True)),
-                    claude_allowed=bool(arguments.get("claude_allowed", True)),
-                    task_points=float(arguments.get("task_points", 1.0)),
-                    verification_tier=arguments.get("verification_tier", "L2"),
-                    timeout_seconds=int(arguments.get("timeout_seconds", 3600)),
-                    retry_limit=int(arguments.get("retry_limit", 3)),
-                    external_write_permission=bool(arguments.get("external_write_permission", False)),
-                    queue=bool(arguments.get("queue", True)),
-                    base_sha=arguments.get("base_sha") or (binding["base_sha"] if binding else None),
-                    strategy=arguments.get("strategy"),
-                    source_thread_id=source_thread_id,
-                    context_bundle_ref=binding["context_ref"] if binding else None,
-                    context_excerpt=binding["context_excerpt"] if binding else None,
+                    **self._workbench_request_kwargs(arguments),
                 )
             )
         if name == "workbench_get_request":

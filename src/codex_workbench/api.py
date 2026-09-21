@@ -166,7 +166,12 @@ class WorkbenchHTTPServer(ThreadingHTTPServer):
             assert response is not None
             return response["result"]
 
-        self.authority_service = AuthorityService(store, invoke_tool, self.service_instance)
+        self.authority_service = AuthorityService(
+            store,
+            invoke_tool,
+            self.service_instance,
+            preflight_callable=dispatcher.preflight_mutation,
+        )
         self.service_tools = deepcopy(TOOLS)
         for tool in self.service_tools:
             read_only = tool["name"] in READ_ONLY_TOOL_NAMES
