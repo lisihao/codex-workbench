@@ -3,9 +3,11 @@ from __future__ import annotations
 from http import HTTPStatus
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -15,13 +17,15 @@ from codex_workbench.config import WorkbenchConfig
 from codex_workbench.lockfile_handoff import TOOL as HANDOFF_TOOL
 from codex_workbench.model import NodeSpec, TaskContract
 from codex_workbench.store import WorkbenchStore
+from codex_workbench.submission import planning_request_receipt
 
 
 class AuthorityServiceAPITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.config = WorkbenchConfig(Path(self.temp.name), port=0)
+        self.root = Path(self.temp.name)
+        self.config = WorkbenchConfig(self.root, port=0)
         self.config.initialize()
         self.store = WorkbenchStore(self.config.database)
         self.store.initialize()
@@ -113,3 +117,122 @@ class AuthorityServiceAPITests(unittest.TestCase):
         self.assertEqual(error.exception.code, HTTPStatus.CONFLICT)
         error.exception.close()
         self.assertEqual(self.store.get_task("fixture"), before)
+
+    def test_invalid_workbench_request_strategy_is_rejected_before_enqueue(self):
+        envelope = {
+            "request_id": "invalid-strategy",
+            "tool": "workbench_request",
+            "task_id": "invalid-strategy-task",
+            "arguments": {
+                "request_id": "invalid-strategy",
+                "command_id": "invalid-strategy-command",
+                "task_id": "invalid-strategy-task",
+                "objective": "reject unsupported routing metadata",
+                "repository": str(self.root),
+                "allowed_scopes": ["src"],
+                "strategy": {
+                    "complexity": "high",
+                    "bounded": True,
+                    "independent_slice": True,
+                },
+            },
+        }
+        with patch("codex_workbench.mcp.enqueue_natural_language_request") as enqueue:
+            first = self._request("/api/service/requests", envelope)
+
+        self.assertEqual(first["state"], "rejected")
+        self.assertEqual(first["effects"], "none")
+        self.assertFalse(first["enqueued"])
+        self.assertEqual(first["rejection"]["invalid_fields"], [
+            "strategy.bounded", "strategy.independent_slice",
+        ])
+        self.assertIn("strategy.version", first["rejection"]["allowed_fields"])
+        enqueue.assert_not_called()
+        self.assertEqual(self._request("/api/service/requests", envelope), first)
+        self.assertEqual(self._request("/api/service/requests/invalid-strategy"), first)
+        with self.assertRaises(KeyError):
+            self.store.get_planning_request("invalid-strategy-command")
+        with self.assertRaises(HTTPError) as error:
+            self._request("/api/service/requests", {
+                **envelope,
+                "arguments": {
+                    **envelope["arguments"],
+                    "strategy": {"version": "model-routing-v2"},
+                },
+            })
+        self.assertEqual(error.exception.code, HTTPStatus.CONFLICT)
+        error.exception.close()
+
+    def test_valid_terra_request_and_command_identity_are_deduplicated(self):
+        repository = self.root / "terra-repository"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.email", "fixture@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repository), "config", "user.name", "Fixture"], check=True)
+        (repository / "README.md").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "fixture"], check=True)
+
+        def enqueue(_config, _store, **kwargs):
+            request = {
+                "objective": kwargs["objective"],
+                "repository": kwargs["repository"],
+                "allowed_scope": list(kwargs["allowed_scope"]),
+                "strategy": kwargs["strategy"],
+            }
+            return planning_request_receipt(self.store.enqueue_planning_request(
+                kwargs["command_id"], kwargs["task_id"], request,
+            ))
+
+        arguments = {
+            "request_id": "terra-request-1",
+            "command_id": "terra-command",
+            "task_id": "terra-task",
+            "objective": "one independent Terra delivery slice",
+            "repository": str(repository),
+            "allowed_scopes": ["src"],
+            "complexity": "high",
+            "parallelizable": True,
+            "executor_model": "gpt-5.6-terra",
+            "strategy": {
+                "version": "model-routing-v2",
+                "task_type": "implementation",
+                "complexity": "high",
+                "parallelizable": True,
+                "claude_allowed": True,
+            },
+        }
+        first_envelope = {
+            "request_id": "terra-request-1",
+            "tool": "workbench_request",
+            "task_id": "terra-task",
+            "arguments": arguments,
+        }
+        with patch(
+            "codex_workbench.mcp.enqueue_natural_language_request",
+            side_effect=enqueue,
+        ) as submit:
+            first = self._request("/api/service/requests", first_envelope)
+            repeated = self._request("/api/service/requests", first_envelope)
+            second = self._request("/api/service/requests", {
+                **first_envelope,
+                "request_id": "terra-request-2",
+                "arguments": {**arguments, "request_id": "terra-request-2"},
+            })
+
+        self.assertEqual(first["state"], "completed")
+        self.assertEqual(repeated, first)
+        self.assertEqual(second["state"], "completed")
+        self.assertEqual(submit.call_count, 2)
+        self.assertEqual(
+            self.store.get_planning_request("terra-command")["task_id"],
+            "terra-task",
+        )
+        with self.store.connection() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) AS count FROM planning_requests WHERE command_id = 'terra-command'"
+            ).fetchone()
+        assert count is not None
+        self.assertEqual(count["count"], 1)
+        self.assertTrue(submit.call_args.kwargs["parallelizable"])
+        self.assertEqual(submit.call_args.kwargs["strategy"]["complexity"], "high")

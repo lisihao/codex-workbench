@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import threading
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
+from codex_workbench.cli import command_service
 from codex_workbench.service_client import (
     AuthorityHTTPClient, IndeterminateServiceRequest, ServiceHTTPError,
 )
@@ -37,6 +42,14 @@ class ServiceClientTests(unittest.TestCase):
                 if owner.mode in {"lost-response", "missing", "unknown"}:
                     self.close_connection = True
                     return
+                if owner.mode == "rejected":
+                    return self._json({
+                        "request_id": "request-1",
+                        "state": "rejected",
+                        "effects": "none",
+                        "enqueued": False,
+                        "rejection": {"code": "invalid-workbench-request-fields"},
+                    })
                 if owner.mode == "readonly-retry" and owner.posts == 1:
                     return self._json({}, 503)
                 return self._json({"state": "completed", "result": owner.result})
@@ -79,6 +92,50 @@ class ServiceClientTests(unittest.TestCase):
                 self.assertEqual(caught.exception.request_id, "request-1")
                 self.assertEqual(self.posts, 1)
                 self.assertEqual(self.reads, 1)
+
+    def test_known_rejection_is_terminal_and_not_reported_as_indeterminate(self):
+        self.mode = "rejected"
+
+        receipt = self.client.dispatch(self.envelope)
+
+        self.assertEqual(receipt["state"], "rejected")
+        self.assertEqual(receipt["effects"], "none")
+        self.assertFalse(receipt["enqueued"])
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(self.reads, 0)
+
+    def test_service_invoke_cli_prints_rejection_without_transport_failure(self):
+        rejection = {
+            "request_id": "request-1",
+            "state": "rejected",
+            "effects": "none",
+            "enqueued": False,
+            "rejection": {
+                "code": "invalid-workbench-request-fields",
+                "invalid_fields": ["strategy.bounded"],
+                "allowed_fields": ["strategy.version"],
+            },
+        }
+        client = Mock()
+        client.dispatch.return_value = rejection
+        source = io.StringIO(json.dumps(self.envelope))
+        output = io.StringIO()
+        args = SimpleNamespace(
+            home=None,
+            service_action="invoke",
+            request_id="request-1",
+        )
+
+        with (
+            patch("codex_workbench.cli._authority_service_client", return_value=client),
+            patch("sys.stdin", source),
+            redirect_stdout(output),
+        ):
+            exit_code = command_service(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(output.getvalue()), rejection)
+        client.dispatch.assert_called_once()
 
     def test_readonly_requests_can_retry_boundedly(self):
         self.mode = "readonly-retry"

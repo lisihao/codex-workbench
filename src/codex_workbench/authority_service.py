@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import json
 import threading
 from typing import Any
@@ -93,6 +94,31 @@ READ_ONLY_TOOL_NAMES = frozenset({
 
 
 REQUEST_ID_MAX_LENGTH = 200
+_KNOWN_REJECTION_KIND = "known-input-rejection"
+
+
+@dataclass(frozen=True)
+class KnownRequestRejection(Exception):
+    """A pre-effect request validation failure with a bounded public receipt."""
+
+    code: str
+    message: str
+    invalid_fields: tuple[str, ...]
+    allowed_fields: tuple[str, ...]
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        invalid_fields: Sequence[str] = (),
+        allowed_fields: Sequence[str] = (),
+    ) -> None:
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "invalid_fields", tuple(sorted(set(invalid_fields))))
+        object.__setattr__(self, "allowed_fields", tuple(sorted(set(allowed_fields))))
+        Exception.__init__(self, message)
 
 
 def is_read_only_tool(name: object, arguments: object) -> bool:
@@ -121,9 +147,11 @@ class AuthorityService:
         store: WorkbenchStore,
         invoke_callable: Callable[[str, dict[str, Any]], Any],
         instance_id: str,
+        preflight_callable: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.store = store
         self.invoke_callable = invoke_callable
+        self.preflight_callable = preflight_callable
         self.instance_id = self._required_string(instance_id, "instance_id")
         self._drain_condition = threading.Condition()
         self._draining = False
@@ -164,6 +192,17 @@ class AuthorityService:
             })
             if not self._reserve(request, fingerprint, actor):
                 return self.get_request(request_id)
+
+            if self.preflight_callable is not None:
+                try:
+                    self.preflight_callable(request["tool"], request["arguments"])
+                except KnownRequestRejection as error:
+                    return self._settle_rejected(request_id, error)
+                except Exception:
+                    # Only an explicitly classified validation failure proves
+                    # that no owned operation started. An unexpected preflight
+                    # failure stays unknown rather than weakening replay safety.
+                    return self._settle_unknown(request_id)
 
             try:
                 result = self.invoke_callable(request["tool"], request["arguments"])
@@ -384,6 +423,60 @@ class AuthorityService:
                 assert row is not None
             return self._public_receipt(row)
 
+    def _settle_rejected(
+        self,
+        request_id: str,
+        rejection: KnownRequestRejection,
+    ) -> dict[str, Any]:
+        """Persist a confirmed no-effect rejection without widening DB states."""
+
+        timestamp = now_iso()
+        result_json = canonical_json({
+            "kind": _KNOWN_REJECTION_KIND,
+            "schema_version": 1,
+            "effects": "none",
+            "enqueued": False,
+            "code": rejection.code,
+            "message": rejection.message,
+            "invalid_fields": list(rejection.invalid_fields),
+            "allowed_fields": list(rejection.allowed_fields),
+        })
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM authority_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(request_id)
+            changed = connection.execute(
+                """
+                UPDATE authority_requests
+                SET state = 'completed', result_json = ?, updated_at = ?, settled_at = ?
+                WHERE request_id = ? AND state = 'executing' AND instance_id = ?
+                """,
+                (result_json, timestamp, timestamp, request_id, self.instance_id),
+            ).rowcount
+            if changed == 1:
+                WorkbenchStore._event(
+                    connection,
+                    "authority_request.rejected",
+                    row["task_id"],
+                    None,
+                    {
+                        **self._event_payload(row, "rejected"),
+                        "effects": "none",
+                        "enqueued": False,
+                        "code": rejection.code,
+                        "invalid_fields": list(rejection.invalid_fields),
+                    },
+                    created_at=timestamp,
+                )
+                row = connection.execute(
+                    "SELECT request_id, state, result_json FROM authority_requests WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                assert row is not None
+            return self._public_receipt(row)
+
     @staticmethod
     def _mcp_error_result(error: StateConflictError) -> dict[str, Any]:
         """Match the existing MCP representation for a CAS rejection."""
@@ -401,7 +494,22 @@ class AuthorityService:
             result_json = row["result_json"]
             if result_json is None:
                 raise RuntimeError("completed authority request has no result")
-            receipt["result"] = json.loads(str(result_json))
+            result = json.loads(str(result_json))
+            if isinstance(result, dict) and result.get("kind") == _KNOWN_REJECTION_KIND:
+                return {
+                    "request_id": str(row["request_id"]),
+                    "state": "rejected",
+                    "effects": "none",
+                    "enqueued": False,
+                    "rejection": {
+                        key: result[key]
+                        for key in (
+                            "schema_version", "code", "message",
+                            "invalid_fields", "allowed_fields",
+                        )
+                    },
+                }
+            receipt["result"] = result
         return receipt
 
     @staticmethod

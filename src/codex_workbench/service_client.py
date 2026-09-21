@@ -117,7 +117,8 @@ class AuthorityHTTPClient:
                 raise
             receipt = self._resolve_uncertain_write(str(request_id))
         if not read_only and (
-            receipt.get("state") != "completed" or receipt.get("request_id") != request_id
+            receipt.get("state") not in {"completed", "rejected"}
+            or receipt.get("request_id") != request_id
         ):
             raise IndeterminateServiceRequest(str(request_id))
         return receipt

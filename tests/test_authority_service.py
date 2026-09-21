@@ -9,6 +9,7 @@ import unittest
 from codex_workbench.authority_service import (
     AUTHORITY_REQUEST_JOURNAL_DDL,
     AuthorityService,
+    KnownRequestRejection,
     is_read_only_tool,
 )
 from codex_workbench.model import canonical_hash, now_iso
@@ -590,6 +591,114 @@ class AuthorityServiceTests(unittest.TestCase):
         event = self.store.read_events(task_id="task-a")[-1]
         self.assertEqual(event["event_type"], "authority_request.unknown")
         self.assertNotIn("private token", str(event["payload"]))
+
+    def test_known_preflight_rejection_is_durable_and_does_not_invoke(self) -> None:
+        calls: list[str] = []
+
+        def preflight(tool: str, arguments: dict[str, object]) -> None:
+            raise KnownRequestRejection(
+                "invalid-workbench-request-fields",
+                "workbench_request contains unsupported fields",
+                invalid_fields=("strategy.bounded", "strategy.independent_slice"),
+                allowed_fields=("strategy.version", "strategy.parallelizable"),
+            )
+
+        service = AuthorityService(
+            self.store,
+            lambda tool, arguments: calls.append(tool) or self._result(),
+            "authority-a",
+            preflight_callable=preflight,
+        )
+        envelope = {
+            "request_id": "invalid-planning",
+            "tool": "workbench_request",
+            "task_id": "planning-task",
+            "arguments": {
+                "task_id": "planning-task",
+                "command_id": "planning-command",
+                "objective": "invalid routing metadata",
+                "strategy": {"bounded": True, "independent_slice": True},
+            },
+        }
+
+        first = service.dispatch(envelope)
+
+        self.assertEqual(first["state"], "rejected")
+        self.assertEqual(first["effects"], "none")
+        self.assertFalse(first["enqueued"])
+        self.assertEqual(first["rejection"]["invalid_fields"], [
+            "strategy.bounded", "strategy.independent_slice",
+        ])
+        self.assertEqual(service.get_request("invalid-planning"), first)
+        self.assertEqual(service.dispatch(envelope), first)
+        self.assertEqual(calls, [])
+        events = self.store.read_events(task_id="planning-task")
+        self.assertEqual(
+            [event["event_type"] for event in events],
+            ["authority_request.executing", "authority_request.rejected"],
+        )
+        self.assertEqual(events[-1]["payload"]["effects"], "none")
+
+    def test_value_error_after_owned_mutation_remains_unknown(self) -> None:
+        calls = 0
+
+        def invoke(tool: str, arguments: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            self.store.enqueue_planning_request(
+                "post-effect-command",
+                "post-effect-task",
+                {"objective": "durable effect before exception"},
+            )
+            raise ValueError("failure after durable enqueue")
+
+        service = self._service(invoke)
+        envelope = {
+            "request_id": "post-effect-request",
+            "tool": "workbench_request",
+            "task_id": "post-effect-task",
+            "arguments": {"objective": "mutation then failure"},
+        }
+
+        first = service.dispatch(envelope)
+
+        self.assertEqual(first, {
+            "request_id": "post-effect-request",
+            "state": "unknown",
+        })
+        self.assertEqual(
+            self.store.get_planning_request("post-effect-command")["task_id"],
+            "post-effect-task",
+        )
+        self.assertEqual(service.dispatch(envelope), first)
+        self.assertEqual(calls, 1)
+
+    def test_type_error_after_owned_mutation_remains_unknown(self) -> None:
+        calls = 0
+
+        def invoke(tool: str, arguments: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            self.store.enqueue_planning_request(
+                "post-type-error-command",
+                "post-type-error-task",
+                {"objective": "durable effect before type error"},
+            )
+            raise TypeError("type failure after durable enqueue")
+
+        service = self._service(invoke)
+        envelope = {
+            "request_id": "post-type-error-request",
+            "tool": "workbench_request",
+            "task_id": "post-type-error-task",
+            "arguments": {"objective": "mutation then type failure"},
+        }
+
+        first = service.dispatch(envelope)
+
+        self.assertEqual(first["state"], "unknown")
+        self.assertEqual(service.dispatch(envelope), first)
+        self.assertEqual(calls, 1)
 
     def test_recovery_marks_leftover_executing_unknown_without_replay(self) -> None:
         envelope = self._envelope("interrupted")
