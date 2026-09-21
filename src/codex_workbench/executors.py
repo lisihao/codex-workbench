@@ -1796,6 +1796,9 @@ class CodexExecutor(ProcessExecutor):
         if request.worktree is None:
             return ()
         worktree = request.worktree.resolve(strict=False)
+        notes_root = (worktree / ".agents" / "notes").resolve(strict=False)
+        if not notes_root.is_relative_to(worktree):
+            raise ValueError("Codex Agent Note root escapes its worktree")
         directories: list[Path] = []
         for scope in request.spec.get("write_scopes", ()):
             if not isinstance(scope, str):
@@ -1808,8 +1811,8 @@ class CodexExecutor(ProcessExecutor):
             ):
                 continue
             candidate = (worktree / relative).resolve(strict=False)
-            if not candidate.is_relative_to(worktree):
-                raise ValueError(f"Codex write scope escapes its worktree: {scope}")
+            if candidate == notes_root or not candidate.is_relative_to(notes_root):
+                raise ValueError(f"Codex Agent Note write scope escapes its protected root: {scope}")
             if candidate.is_dir():
                 directories.append(candidate)
         return tuple(dict.fromkeys(directories))
