@@ -1764,6 +1764,8 @@ class CodexExecutor(ProcessExecutor):
             command.extend(("--config", f"model_reasoning_effort={effort}"))
         for override in codex_model_long_context_overrides(model):
             command.extend(("--config", override))
+        for directory in CodexExecutor._protected_write_directories(request):
+            command.extend(("--add-dir", str(directory)))
         command.extend((
             "--sandbox",
             "workspace-write",
@@ -1776,6 +1778,41 @@ class CodexExecutor(ProcessExecutor):
             "-",
         ))
         return command
+
+    @staticmethod
+    def _protected_write_directories(request: ExecutionRequest) -> tuple[Path, ...]:
+        """Expose declared repository instruction paths to the Codex sandbox.
+
+        Codex keeps ``.agents`` read-only even inside the primary workspace.
+        Workbench has already validated and frozen each node write scope, so a
+        matching ``--add-dir`` is required for tasks that legitimately update
+        Agent Notes. Skills, hooks, ``AGENTS.md``, and ``.codex`` remain outside
+        this narrow exception.
+
+        @param request: Frozen execution request with a physical worktree.
+        @returns: Existing declared ``.agents`` directories inside the worktree.
+        """
+
+        if request.worktree is None:
+            return ()
+        worktree = request.worktree.resolve(strict=False)
+        directories: list[Path] = []
+        for scope in request.spec.get("write_scopes", ()):
+            if not isinstance(scope, str):
+                continue
+            relative = Path(scope)
+            if (
+                relative.is_absolute()
+                or len(relative.parts) < 3
+                or relative.parts[:2] != (".agents", "notes")
+            ):
+                continue
+            candidate = (worktree / relative).resolve(strict=False)
+            if not candidate.is_relative_to(worktree):
+                raise ValueError(f"Codex write scope escapes its worktree: {scope}")
+            if candidate.is_dir():
+                directories.append(candidate)
+        return tuple(dict.fromkeys(directories))
 
     @staticmethod
     def _worker_schema(*, archify_required: bool = False) -> dict:
