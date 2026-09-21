@@ -681,6 +681,41 @@ class ModelTests(unittest.TestCase):
                     "codex", request, Path("schema.json"), Path("result.json")
                 )
 
+    def test_codex_command_ignores_redirected_notes_root_without_agent_note_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            agents = worktree / ".agents"
+            skills = agents / "skills"
+            skills.mkdir(parents=True)
+            (agents / "notes").symlink_to(skills, target_is_directory=True)
+            for write_scopes in ((), ("src",)):
+                with self.subTest(write_scopes=write_scopes):
+                    request = ExecutionRequest(
+                        task_id="ordinary-write-scope",
+                        node_id="worker",
+                        attempt=1,
+                        contract={
+                            "objective": "execute an ordinary node",
+                            "allowed_scope": list(write_scopes),
+                            "forbidden_scope": [],
+                            "acceptance_commands": [],
+                        },
+                        spec={
+                            "title": "worker",
+                            "prompt": "inspect only",
+                            "model": "gpt-5.6-luna",
+                            "verifier": not write_scopes,
+                            "write_scopes": write_scopes,
+                        },
+                        worktree=worktree,
+                    )
+
+                    command = CodexExecutor._command(
+                        "codex", request, Path("schema.json"), Path("result.json")
+                    )
+
+                    self.assertNotIn("--add-dir", command)
+
     def test_codex_command_rejects_agents_note_symlink_to_skills(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)

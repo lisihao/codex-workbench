@@ -1796,21 +1796,25 @@ class CodexExecutor(ProcessExecutor):
         if request.worktree is None:
             return ()
         worktree = request.worktree.resolve(strict=False)
-        declared_notes_root = worktree / ".agents" / "notes"
-        notes_root = declared_notes_root.resolve(strict=False)
-        if notes_root != declared_notes_root or not notes_root.is_relative_to(worktree):
-            raise ValueError("Codex Agent Note root escapes its worktree")
-        directories: list[Path] = []
+        protected_scopes: list[tuple[str, Path]] = []
         for scope in request.spec.get("write_scopes", ()):
             if not isinstance(scope, str):
                 continue
             relative = Path(scope)
             if (
-                relative.is_absolute()
-                or len(relative.parts) < 3
-                or relative.parts[:2] != (".agents", "notes")
+                not relative.is_absolute()
+                and len(relative.parts) >= 3
+                and relative.parts[:2] == (".agents", "notes")
             ):
-                continue
+                protected_scopes.append((scope, relative))
+        if not protected_scopes:
+            return ()
+        declared_notes_root = worktree / ".agents" / "notes"
+        notes_root = declared_notes_root.resolve(strict=False)
+        if notes_root != declared_notes_root or not notes_root.is_relative_to(worktree):
+            raise ValueError("Codex Agent Note root escapes its worktree")
+        directories: list[Path] = []
+        for scope, relative in protected_scopes:
             candidate = (worktree / relative).resolve(strict=False)
             if candidate == notes_root or not candidate.is_relative_to(notes_root):
                 raise ValueError(f"Codex Agent Note write scope escapes its protected root: {scope}")
