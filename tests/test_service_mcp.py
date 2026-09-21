@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import threading
 import unittest
 from unittest.mock import Mock
 
-from codex_workbench.service_client import IndeterminateServiceRequest
+from codex_workbench.service_client import AuthorityHTTPClient, IndeterminateServiceRequest
 from codex_workbench.service_mcp import AuthorityMCPAdapter, serve_authority_stdio
 
 
@@ -88,6 +90,91 @@ class ServiceMCPTests(unittest.TestCase):
         result = self.call("workbench_get_service_request", {"request_id": "mutation-1"})
         self.assertEqual(json.loads(result["content"][0]["text"])["state"], "unknown")
         self.client.dispatch.assert_not_called()
+
+    def test_http_rejection_reaches_tools_call_and_lookup_without_replay(self):
+        owner = self
+        posts = 0
+        rejection = {
+            "request_id": "invalid-strategy",
+            "state": "rejected",
+            "effects": "none",
+            "enqueued": False,
+            "rejection": {
+                "schema_version": 1,
+                "code": "invalid-workbench-request-fields",
+                "message": "workbench_request contains unsupported fields",
+                "invalid_fields": ["strategy.bounded", "strategy.independent_slice"],
+                "allowed_fields": ["strategy.version", "strategy.parallelizable"],
+            },
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, body):
+                encoded = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                if self.path == "/api/service/tools":
+                    return self._json({"tools": [
+                        {"name": "workbench_request", "annotations": {"readOnlyHint": False}},
+                        {"name": "workbench_get_service_request", "annotations": {"readOnlyHint": True}},
+                    ]})
+                self._json(rejection)
+
+            def do_POST(self):
+                nonlocal posts
+                posts += 1
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self._json(rejection)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = AuthorityHTTPClient(
+                "http://127.0.0.1:" + str(server.server_port),
+                "fixture-token",
+                backoff_seconds=0,
+            )
+            adapter = AuthorityMCPAdapter(client)
+
+            dispatched = adapter.handle({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_request",
+                    "arguments": {
+                        "request_id": "invalid-strategy",
+                        "objective": "invalid strategy",
+                    },
+                },
+            })["result"]
+            looked_up = adapter.handle({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "workbench_get_service_request",
+                    "arguments": {"request_id": "invalid-strategy"},
+                },
+            })["result"]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertTrue(dispatched["isError"])
+        self.assertTrue(looked_up["isError"])
+        self.assertEqual(json.loads(dispatched["content"][0]["text"]), rejection)
+        self.assertEqual(json.loads(looked_up["content"][0]["text"]), rejection)
+        self.assertEqual(posts, 1)
 
     def test_mixed_dry_runs_match_authority_classification(self):
         names = ("workbench_control_task", "workbench_validate_blocked_node", "workbench_amend_task_acceptance")
