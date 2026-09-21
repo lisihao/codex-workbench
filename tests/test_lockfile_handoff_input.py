@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from hashlib import sha256
 import json
 import os
@@ -62,12 +63,17 @@ class _RecoveryMaterializer:
         *,
         timeout_seconds: int,
         require_cached_template: bool = False,
+        phase_observer: Callable[[str, str, Mapping[str, object]], None] | None = None,
     ) -> dict[str, object]:
         if timeout_seconds < 1:
             raise AssertionError("recovery materializer requires a positive timeout")
+        if phase_observer is not None:
+            phase_observer("install", "started", {"fixture": True})
         linker = worktree / "node_modules"
         (linker / ".bin").mkdir(parents=True, exist_ok=True)
         (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+        if phase_observer is not None:
+            phase_observer("install", "finished", {"fixture": True})
         return {
             "schema_version": 1,
             "kind": "pnpm-offline-materialization",
