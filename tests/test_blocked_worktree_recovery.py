@@ -1331,6 +1331,187 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(peak_installs, 1)
 
+    def test_different_template_publications_do_not_hold_the_shared_store_lock(self) -> None:
+        store = self.root / "parallel-template-store"
+        store.mkdir()
+        worktrees = [self.root / "parallel-template-a", self.root / "parallel-template-b"]
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=store,
+        )
+        for index, worktree in enumerate(worktrees):
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+            )
+            (worktree / "pnpm-lock.yaml").write_text(
+                f"lockfileVersion: '9.0'\n# template {index}\n", encoding="utf-8"
+            )
+            linker = worktree / "node_modules"
+            (linker / ".bin").mkdir(parents=True)
+            (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            key = materializer._template_signature(
+                worktree, "pnpm@11.25.0", "11.25.0"
+            )["key"]
+            materializer._write_template_marker(linker, key)
+
+        barrier = threading.Barrier(2)
+        guard = threading.Lock()
+        active_copies = 0
+        peak_copies = 0
+        errors: list[BaseException] = []
+        receipts: list[dict[str, object]] = []
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal active_copies, peak_copies
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            self.assertEqual(args[0], "/bin/cp")
+            with guard:
+                active_copies += 1
+                peak_copies = max(peak_copies, active_copies)
+            barrier.wait(timeout=2)
+            shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+            with guard:
+                active_copies -= 1
+            return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+
+        materializer.runner = runner
+
+        def run(worktree: Path) -> None:
+            try:
+                receipts.append(materializer.materialize(worktree, timeout_seconds=5))
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(worktree,)) for worktree in worktrees]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=4)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(peak_copies, 2)
+        self.assertEqual(len(receipts), 2)
+        for receipt in receipts:
+            self.assertFalse(receipt["shared_store_lock"]["acquired"])
+            self.assertTrue(receipt["template_lock"]["acquired"])
+
+    def test_same_template_publication_is_atomic_and_deduplicated(self) -> None:
+        store = self.root / "same-template-store"
+        store.mkdir()
+        worktrees = [self.root / "same-template-a", self.root / "same-template-b"]
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            store_dir=store,
+        )
+        for worktree in worktrees:
+            worktree.mkdir()
+            (worktree / "package.json").write_text(
+                json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+            )
+            (worktree / "pnpm-lock.yaml").write_text(
+                "lockfileVersion: '9.0'\n", encoding="utf-8"
+            )
+            linker = worktree / "node_modules"
+            (linker / ".bin").mkdir(parents=True)
+            (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+            key = materializer._template_signature(
+                worktree, "pnpm@11.25.0", "11.25.0"
+            )["key"]
+            materializer._write_template_marker(linker, key)
+
+        copy_started = threading.Event()
+        release_copy = threading.Event()
+        copy_count = 0
+        guard = threading.Lock()
+        errors: list[BaseException] = []
+        receipts: list[dict[str, object]] = []
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal copy_count
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            with guard:
+                copy_count += 1
+            copy_started.set()
+            release_copy.wait(timeout=2)
+            shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+            return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+
+        materializer.runner = runner
+
+        def run(worktree: Path) -> None:
+            try:
+                receipts.append(materializer.materialize(worktree, timeout_seconds=5))
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        first = threading.Thread(target=run, args=(worktrees[0],))
+        second = threading.Thread(target=run, args=(worktrees[1],))
+        first.start()
+        self.assertTrue(copy_started.wait(timeout=1))
+        second.start()
+        time.sleep(0.1)
+        release_copy.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(copy_count, 1)
+        self.assertEqual(sorted(receipt["template"]["state"] for receipt in receipts), [
+            "reuse", "seeded",
+        ])
+        key = materializer._template_signature(
+            worktrees[0], "pnpm@11.25.0", "11.25.0"
+        )["key"]
+        template = store.parent / materializer.TEMPLATE_DIRECTORY_NAME / key
+        metadata = json.loads(
+            (template / materializer.TEMPLATE_METADATA_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(metadata["signature"]["key"], key)
+        self.assertTrue(materializer._has_template_marker(template / "node_modules", key))
+
+    def test_template_publication_recovers_stale_crash_staging(self) -> None:
+        template_root = self.root / "crash-templates"
+        worktree = self.root / "crash-template-worktree"
+        worktree.mkdir()
+        (worktree / "package.json").write_text(
+            json.dumps({"packageManager": "pnpm@11.25.0"}), encoding="utf-8"
+        )
+        (worktree / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n", encoding="utf-8"
+        )
+        linker = worktree / "node_modules"
+        (linker / ".bin").mkdir(parents=True)
+        (linker / ".modules.yaml").write_text("layoutVersion: 5\n", encoding="utf-8")
+        materializer = PnpmOfflineMaterializer(
+            binary=sys.executable,
+            template_dir=template_root,
+        )
+        key = materializer._template_signature(
+            worktree, "pnpm@11.25.0", "11.25.0"
+        )["key"]
+        materializer._write_template_marker(linker, key)
+        stale = template_root / f".{key}.staging-dead-process"
+        (stale / "node_modules").mkdir(parents=True)
+
+        def runner(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
+            shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+            return subprocess.CompletedProcess(args, 0, "template clone ok\n", "")
+
+        materializer.runner = runner
+        receipt = materializer.materialize(worktree, timeout_seconds=5)
+
+        self.assertFalse(stale.exists())
+        self.assertEqual(receipt["template"]["state"], "seeded")
+        self.assertTrue((template_root / key / "materialization.json").is_file())
+
     def test_offline_materializer_rejects_known_hanging_pnpm_before_install(self) -> None:
         worktree = self.root / "old-pnpm-fixture"
         worktree.mkdir()
@@ -1458,7 +1639,10 @@ class BlockedWorktreeRecoveryTests(unittest.TestCase):
         assert isinstance(timing, dict)
         self.assertEqual(
             set(timing),
-            {"version", "signature", "lock_wait", "install", "publication", "total"},
+            {
+                "version", "signature", "lock_wait", "template_lock_wait",
+                "install", "cache_clone", "publication", "total",
+            },
         )
         self.assertTrue(all(isinstance(value, float) and value >= 0 for value in timing.values()))
         self.assertEqual(sum(command[0] == "/bin/cp" for command in calls), 1)
