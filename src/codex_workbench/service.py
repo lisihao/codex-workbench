@@ -1260,6 +1260,7 @@ class Coordinator:
 
     def _materialize_worktree_dependencies(
         self,
+        claimed: Mapping[str, Any],
         worktree: Path,
         context: _ExecutionAttributionContext,
         *,
@@ -1276,6 +1277,24 @@ class Coordinator:
         """
 
         materializer = self.blocked_worktree_recovery.materializer
+
+        def observe_phase(
+            phase: str,
+            status: str,
+            details: Mapping[str, object],
+        ) -> None:
+            self.store.record_node_event(
+                "node.execution_stage",
+                str(claimed["task_id"]),
+                str(claimed["node_id"]),
+                {
+                    "attempt": int(claimed["attempt"]),
+                    "phase": phase,
+                    "status": status,
+                    "details": dict(details),
+                },
+            )
+
         try:
             materialization = materializer.materialize(
                 worktree,
@@ -1284,6 +1303,7 @@ class Coordinator:
                     PnpmOfflineMaterializer.MAX_TEMPLATE_SEED_SECONDS,
                 ),
                 require_cached_template=require_cached_template,
+                phase_observer=observe_phase,
             )
         except DirtyWorktreeRecoveryError as error:
             materialization = {
@@ -1928,7 +1948,8 @@ class Coordinator:
                 recovery_artifacts[repair_artifact_kind] = prepared_ref
                 record_dependency_input()
                 self._materialize_worktree_dependencies(
-                    worktree, context, timeout_seconds=int(contract["timeout_seconds"]),
+                    claimed, worktree, context,
+                    timeout_seconds=int(contract["timeout_seconds"]),
                 )
             elif failed_attempt_recovery is not None:
                 (
@@ -1962,6 +1983,7 @@ class Coordinator:
                     )
                 record_dependency_input()
                 self._materialize_worktree_dependencies(
+                    claimed,
                     worktree,
                     context,
                     timeout_seconds=int(contract["timeout_seconds"]),
@@ -2108,6 +2130,19 @@ class Coordinator:
             ):
                 decision = self._missing_quota_reference_decision(decision)
             validate_historical_dispatch()
+            records_model_stage = spec.get("executor") in {"codex", "claude"}
+            if records_model_stage:
+                self.store.record_node_event(
+                    "node.execution_stage",
+                    str(claimed["task_id"]),
+                    str(claimed["node_id"]),
+                    {
+                        "attempt": int(claimed["attempt"]),
+                        "phase": "model",
+                        "status": "started",
+                        "details": {"requested_model": str(spec.get("model", ""))},
+                    },
+                )
             execute_started_monotonic = time.monotonic()
             context.execute_started_at = now_iso()
             if decision is not None and decision.action != "claude":
@@ -2154,6 +2189,18 @@ class Coordinator:
                             request.spec,
                             reason="the selected route completed without a provider fallback",
                         )
+            if records_model_stage:
+                self.store.record_node_event(
+                    "node.execution_stage",
+                    str(claimed["task_id"]),
+                    str(claimed["node_id"]),
+                    {
+                        "attempt": int(claimed["attempt"]),
+                        "phase": "model",
+                        "status": "finished",
+                        "details": {"result_status": result.status},
+                    },
+                )
             context.direct_artifact_refs = self._direct_executor_artifact_refs(result)
             context.execute_finished_at = now_iso()
             context.execute_duration_ms = max(
@@ -2650,6 +2697,7 @@ class Coordinator:
                     )
                 if source_only:
                     self._materialize_worktree_dependencies(
+                        claimed,
                         target,
                         context,
                         timeout_seconds=int(contract["timeout_seconds"]),
@@ -2790,6 +2838,7 @@ class Coordinator:
             )
             if source_only:
                 self._materialize_worktree_dependencies(
+                    claimed,
                     target,
                     context,
                     timeout_seconds=int(contract["timeout_seconds"]),
