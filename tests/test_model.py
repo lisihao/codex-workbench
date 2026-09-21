@@ -549,6 +549,206 @@ class ModelTests(unittest.TestCase):
         self.assertIn("Execution profile: luna_worker", CodexExecutor._prompt(request))
         self.assertIn("Model reasoning effort: max", CodexExecutor._prompt(request))
 
+    def test_codex_command_adds_only_declared_existing_agents_write_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            notes = worktree / ".agents" / "notes" / "implemented"
+            notes.mkdir(parents=True)
+            skills = worktree / ".agents" / "skills"
+            skills.mkdir(parents=True)
+            (worktree / "src").mkdir()
+            request = ExecutionRequest(
+                task_id="agents-write-scope",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "update one Agent Note",
+                    "allowed_scope": [".agents/notes/implemented", ".agents/skills", "src"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                },
+                spec={
+                    "title": "worker",
+                    "prompt": "update the note",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                    "write_scopes": (".agents/notes/implemented", ".agents/skills", "src"),
+                },
+                worktree=worktree,
+            )
+
+            command = CodexExecutor._command(
+                "codex", request, Path("schema.json"), Path("result.json")
+            )
+
+            add_directories = [
+                Path(command[index + 1])
+                for index, value in enumerate(command[:-1])
+                if value == "--add-dir"
+            ]
+            self.assertEqual(add_directories, [notes.resolve()])
+            self.assertNotIn(skills.resolve(), add_directories)
+            self.assertNotIn((worktree / "src").resolve(), add_directories)
+
+    def test_codex_command_rejects_agents_write_scope_that_redirects_within_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / ".agents" / "notes").mkdir(parents=True)
+            (worktree / ".agents" / "skills").mkdir()
+            request = ExecutionRequest(
+                task_id="agents-write-scope-escape",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "reject an escaping scope",
+                    "allowed_scope": [".agents/notes/../skills"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                },
+                spec={
+                    "title": "worker",
+                    "prompt": "must not execute",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                    "write_scopes": (".agents/notes/../skills",),
+                },
+                worktree=worktree,
+            )
+
+            with self.assertRaisesRegex(ValueError, "escapes its protected root"):
+                CodexExecutor._command(
+                    "codex", request, Path("schema.json"), Path("result.json")
+                )
+
+    def test_codex_command_rejects_agents_write_scope_that_escapes_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / ".agents" / "notes").mkdir(parents=True)
+            request = ExecutionRequest(
+                task_id="agents-write-scope-outside",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "reject an escaping scope",
+                    "allowed_scope": [".agents/notes/../../../outside"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                },
+                spec={
+                    "title": "worker",
+                    "prompt": "must not execute",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                    "write_scopes": (".agents/notes/../../../outside",),
+                },
+                worktree=worktree,
+            )
+
+            with self.assertRaisesRegex(ValueError, "escapes its protected root"):
+                CodexExecutor._command(
+                    "codex", request, Path("schema.json"), Path("result.json")
+                )
+
+    def test_codex_command_rejects_agents_notes_root_symlink_to_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            agents = worktree / ".agents"
+            skills = agents / "skills"
+            (skills / "implemented").mkdir(parents=True)
+            (agents / "notes").symlink_to(skills, target_is_directory=True)
+            request = ExecutionRequest(
+                task_id="agents-notes-root-symlink",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "reject a redirected Agent Note root",
+                    "allowed_scope": [".agents/notes/implemented"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                },
+                spec={
+                    "title": "worker",
+                    "prompt": "must not execute",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                    "write_scopes": (".agents/notes/implemented",),
+                },
+                worktree=worktree,
+            )
+
+            with self.assertRaisesRegex(ValueError, "Agent Note root escapes its worktree"):
+                CodexExecutor._command(
+                    "codex", request, Path("schema.json"), Path("result.json")
+                )
+
+    def test_codex_command_ignores_redirected_notes_root_without_agent_note_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            agents = worktree / ".agents"
+            skills = agents / "skills"
+            skills.mkdir(parents=True)
+            (agents / "notes").symlink_to(skills, target_is_directory=True)
+            for write_scopes in ((), ("src",)):
+                with self.subTest(write_scopes=write_scopes):
+                    request = ExecutionRequest(
+                        task_id="ordinary-write-scope",
+                        node_id="worker",
+                        attempt=1,
+                        contract={
+                            "objective": "execute an ordinary node",
+                            "allowed_scope": list(write_scopes),
+                            "forbidden_scope": [],
+                            "acceptance_commands": [],
+                        },
+                        spec={
+                            "title": "worker",
+                            "prompt": "inspect only",
+                            "model": "gpt-5.6-luna",
+                            "verifier": not write_scopes,
+                            "write_scopes": write_scopes,
+                        },
+                        worktree=worktree,
+                    )
+
+                    command = CodexExecutor._command(
+                        "codex", request, Path("schema.json"), Path("result.json")
+                    )
+
+                    self.assertNotIn("--add-dir", command)
+
+    def test_codex_command_rejects_agents_note_symlink_to_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            notes = worktree / ".agents" / "notes"
+            skills = worktree / ".agents" / "skills"
+            notes.mkdir(parents=True)
+            skills.mkdir()
+            (notes / "implemented").symlink_to(skills, target_is_directory=True)
+            request = ExecutionRequest(
+                task_id="agents-write-scope-symlink",
+                node_id="worker",
+                attempt=1,
+                contract={
+                    "objective": "reject a redirected Agent Note scope",
+                    "allowed_scope": [".agents/notes/implemented"],
+                    "forbidden_scope": [],
+                    "acceptance_commands": [],
+                },
+                spec={
+                    "title": "worker",
+                    "prompt": "must not execute",
+                    "model": "gpt-5.6-luna",
+                    "verifier": False,
+                    "write_scopes": (".agents/notes/implemented",),
+                },
+                worktree=worktree,
+            )
+
+            with self.assertRaisesRegex(ValueError, "escapes its protected root"):
+                CodexExecutor._command(
+                    "codex", request, Path("schema.json"), Path("result.json")
+                )
+
     def test_astra_verifier_command_emits_max_effort_and_long_context(self) -> None:
         request = ExecutionRequest(
             task_id="astra-verifier",

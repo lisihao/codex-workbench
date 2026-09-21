@@ -1764,6 +1764,8 @@ class CodexExecutor(ProcessExecutor):
             command.extend(("--config", f"model_reasoning_effort={effort}"))
         for override in codex_model_long_context_overrides(model):
             command.extend(("--config", override))
+        for directory in CodexExecutor._protected_write_directories(request):
+            command.extend(("--add-dir", str(directory)))
         command.extend((
             "--sandbox",
             "workspace-write",
@@ -1776,6 +1778,49 @@ class CodexExecutor(ProcessExecutor):
             "-",
         ))
         return command
+
+    @staticmethod
+    def _protected_write_directories(request: ExecutionRequest) -> tuple[Path, ...]:
+        """Expose declared repository instruction paths to the Codex sandbox.
+
+        Codex keeps ``.agents`` read-only even inside the primary workspace.
+        Workbench has already validated and frozen each node write scope, so a
+        matching ``--add-dir`` is required for tasks that legitimately update
+        Agent Notes. Skills, hooks, ``AGENTS.md``, and ``.codex`` remain outside
+        this narrow exception.
+
+        @param request: Frozen execution request with a physical worktree.
+        @returns: Existing declared ``.agents`` directories inside the worktree.
+        """
+
+        if request.worktree is None:
+            return ()
+        worktree = request.worktree.resolve(strict=False)
+        protected_scopes: list[tuple[str, Path]] = []
+        for scope in request.spec.get("write_scopes", ()):
+            if not isinstance(scope, str):
+                continue
+            relative = Path(scope)
+            if (
+                not relative.is_absolute()
+                and len(relative.parts) >= 3
+                and relative.parts[:2] == (".agents", "notes")
+            ):
+                protected_scopes.append((scope, relative))
+        if not protected_scopes:
+            return ()
+        declared_notes_root = worktree / ".agents" / "notes"
+        notes_root = declared_notes_root.resolve(strict=False)
+        if notes_root != declared_notes_root or not notes_root.is_relative_to(worktree):
+            raise ValueError("Codex Agent Note root escapes its worktree")
+        directories: list[Path] = []
+        for scope, relative in protected_scopes:
+            candidate = (worktree / relative).resolve(strict=False)
+            if candidate == notes_root or not candidate.is_relative_to(notes_root):
+                raise ValueError(f"Codex Agent Note write scope escapes its protected root: {scope}")
+            if candidate.is_dir():
+                directories.append(candidate)
+        return tuple(dict.fromkeys(directories))
 
     @staticmethod
     def _worker_schema(*, archify_required: bool = False) -> dict:
