@@ -1387,6 +1387,9 @@ raise AssertionError("fatal coordinator failure returned")
 
             def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 materializer_calls.append(tuple(args))
+                if args[0] == "/bin/cp":
+                    shutil.copytree(Path(args[-2]), Path(args[-1]), symlinks=True)
+                    return subprocess.CompletedProcess(args, 0, "template cloned\n", "")
                 if args[-1] == "--version":
                     return subprocess.CompletedProcess(args, 0, "11.25.0\n", "")
                 cwd = kwargs["cwd"]
@@ -1397,7 +1400,11 @@ raise AssertionError("fatal coordinator failure returned")
                 (node_modules / ".bin").mkdir()
                 return subprocess.CompletedProcess(args, 0, "offline fixture ok\n", "")
 
-            materializer = PnpmOfflineMaterializer(binary=sys.executable, runner=runner)
+            materializer = PnpmOfflineMaterializer(
+                binary=sys.executable,
+                template_dir=root / "templates",
+                runner=runner,
+            )
             state = root / "state"
             store = WorkbenchStore(state / "state.sqlite")
             store.initialize()
@@ -1455,9 +1462,10 @@ raise AssertionError("fatal coordinator failure returned")
                 coordinator._pool.shutdown(wait=True)
 
             executor.execute.assert_called_once()
-            self.assertEqual(len(materializer_calls), 2)
+            self.assertEqual(len(materializer_calls), 3)
             self.assertEqual(materializer_calls[0][-1], "--version")
             self.assertEqual(materializer_calls[1][1], "install")
+            self.assertEqual(materializer_calls[2][0], "/bin/cp")
             self.assertEqual(len(execution_worktrees), 1)
             work = next(
                 item for item in store.get_task(contract.task_id)["nodes"] if item["node_id"] == "work"
@@ -1476,6 +1484,24 @@ raise AssertionError("fatal coordinator failure returned")
                 )
             )
             self.assertTrue(report["ready"])
+            stages = [
+                (event["payload"]["phase"], event["payload"]["status"])
+                for event in store.read_events(task_id=contract.task_id)
+                if event["event_type"] == "node.execution_stage"
+            ]
+            self.assertEqual(
+                stages,
+                [
+                    ("cache_clone", "started"),
+                    ("cache_clone", "finished"),
+                    ("install", "started"),
+                    ("install", "finished"),
+                    ("cache_publish", "started"),
+                    ("cache_publish", "finished"),
+                    ("model", "started"),
+                    ("model", "finished"),
+                ],
+            )
 
     def test_non_node_worktree_records_non_applicable_materialization_without_pnpm_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

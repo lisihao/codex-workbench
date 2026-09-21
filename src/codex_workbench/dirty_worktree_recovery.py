@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import fcntl
 from hashlib import sha256
@@ -923,6 +923,7 @@ class PnpmOfflineMaterializer:
         *,
         timeout_seconds: int,
         require_cached_template: bool = False,
+        phase_observer: Callable[[str, str, Mapping[str, object]], None] | None = None,
     ) -> dict[str, object]:
         manifest_path = worktree / "package.json"
         lockfile = worktree / "pnpm-lock.yaml"
@@ -962,9 +963,19 @@ class PnpmOfflineMaterializer:
             "version": 0.0,
             "signature": 0.0,
             "lock_wait": 0.0,
+            "template_lock_wait": 0.0,
             "install": 0.0,
+            "cache_clone": 0.0,
             "publication": 0.0,
         }
+
+        def observe(
+            phase: str,
+            status: str,
+            details: Mapping[str, object] | None = None,
+        ) -> None:
+            if phase_observer is not None:
+                phase_observer(phase, status, dict(details or {}))
 
         def timing_receipt() -> dict[str, object]:
             return {
@@ -1031,6 +1042,32 @@ class PnpmOfflineMaterializer:
             if cache_root is not None
             else None
         )
+        shared_lock_path = self._shared_store_lock_path()
+        shared_lock_wait_seconds = 0.0
+        shared_lock_acquired = False
+        template_lock_path = (
+            self._template_lock_path(template_directory)
+            if template_directory is not None
+            else None
+        )
+        template_lock_wait_seconds = 0.0
+        template_lock_acquired = False
+
+        def lock_receipts() -> dict[str, object]:
+            return {
+                "shared_store_lock": {
+                    "path": str(shared_lock_path),
+                    "wait_seconds": shared_lock_wait_seconds,
+                    "scope": "install-only",
+                    "acquired": shared_lock_acquired,
+                },
+                "template_lock": {
+                    "path": str(template_lock_path) if template_lock_path is not None else None,
+                    "wait_seconds": template_lock_wait_seconds,
+                    "scope": "template-key",
+                    "acquired": template_lock_acquired,
+                },
+            }
 
         install_command: tuple[str, ...] = (
             binary,
@@ -1052,17 +1089,24 @@ class PnpmOfflineMaterializer:
                 )
             install_command += ("--store-dir", str(store_dir))
         # Use the fixed Workbench pnpm runtime even when a trusted project
-        # manifest declares an older compatible pnpm.  Recovery is already
-        # frozen/offline and the fixed runtime was qualified before dispatch;
-        # allowing pnpm to download a manifest-pinned CLI would reintroduce an
-        # external registry dependency into this local linker step.
-        # pnpm writes shared store metadata while materializing a worktree-local
-        # linker. The same lock also protects cache publication so no recovery
-        # can observe a partially copied template.
+        # manifest declares an older compatible pnpm. Recovery is already
+        # frozen/offline and the fixed runtime was qualified before dispatch.
+        # The global store lock covers only pnpm's shared metadata write. Cache
+        # clone/publication is isolated by the immutable template key instead.
         template_publish: CommandOutcome | None = None
         template_publication_error: str | None = None
-        with self._shared_store_lock(deadline) as (lock_path, lock_wait_seconds):
-            phase_seconds["lock_wait"] = lock_wait_seconds
+        template_lock = (
+            self._template_lock(template_directory, deadline)
+            if template_directory is not None
+            else nullcontext((None, 0.0))
+        )
+        with template_lock as (held_template_lock_path, held_template_lock_wait):
+            if template_directory is not None:
+                template_lock_acquired = True
+                template_lock_path = held_template_lock_path
+                template_lock_wait_seconds = held_template_lock_wait
+                phase_seconds["template_lock_wait"] = held_template_lock_wait
+                self._discard_stale_template_staging(template_directory)
             available_linker_paths = self._linker_paths(worktree)
             if not require_cached_template and self._linker_tree_is_complete(
                 worktree, available_linker_paths, template_signature["key"]
@@ -1075,11 +1119,13 @@ class PnpmOfflineMaterializer:
                 publication: CommandOutcome | None = None
                 if template_directory is not None and not template_directory.exists():
                     publication_started = time.monotonic()
+                    observe("cache_publish", "started", {"key": template_signature["key"]})
                     try:
                         publication = self._publish_template(
                             template_directory, template_signature, worktree, deadline
                         )
                     except (DirtyWorktreeRecoveryError, OSError) as error:
+                        observe("cache_publish", "failed", {"key": template_signature["key"]})
                         template = {
                             **template,
                             "state": "publication_failed",
@@ -1090,6 +1136,14 @@ class PnpmOfflineMaterializer:
                             ),
                         }
                     else:
+                        observe(
+                            "cache_publish",
+                            "finished",
+                            {
+                                "key": template_signature["key"],
+                                "outcome": "published" if publication is not None else "existing",
+                            },
+                        )
                         if publication is not None:
                             template = {
                                 "state": "seeded",
@@ -1116,17 +1170,30 @@ class PnpmOfflineMaterializer:
                     "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
                     "materialization_timeout_seconds": effective_timeout,
                     "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
-                    "shared_store_lock": {
-                        "path": str(lock_path),
-                        "wait_seconds": lock_wait_seconds,
-                    },
+                    **lock_receipts(),
                     "template": template,
                     **timing_receipt(),
                     "commands": commands,
                 }
             if template_directory is not None:
-                cached_clone = self._clone_cached_template(
-                    template_directory, template_signature, worktree, deadline
+                clone_started = time.monotonic()
+                observe("cache_clone", "started", {"key": template_signature["key"]})
+                try:
+                    cached_clone = self._clone_cached_template(
+                        template_directory, template_signature, worktree, deadline
+                    )
+                except BaseException:
+                    observe("cache_clone", "failed", {"key": template_signature["key"]})
+                    raise
+                finally:
+                    phase_seconds["cache_clone"] = self._elapsed_seconds(clone_started)
+                observe(
+                    "cache_clone",
+                    "finished",
+                    {
+                        "key": template_signature["key"],
+                        "outcome": "hit" if cached_clone is not None else "miss",
+                    },
                 )
                 if cached_clone is not None:
                     clone, replaced_interrupted_node_modules = cached_clone
@@ -1138,10 +1205,7 @@ class PnpmOfflineMaterializer:
                         "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
                         "materialization_timeout_seconds": effective_timeout,
                         "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
-                        "shared_store_lock": {
-                            "path": str(lock_path),
-                            "wait_seconds": lock_wait_seconds,
-                        },
+                        **lock_receipts(),
                         "template": {
                             "state": "hit",
                             "key": template_signature["key"],
@@ -1157,19 +1221,32 @@ class PnpmOfflineMaterializer:
                 )
             self._discard_incomplete_node_modules(worktree)
             install_started = time.monotonic()
-            install = self._run(
-                install_command,
-                worktree,
-                environment,
-                self._remaining_seconds(deadline),
-                stage="frozen offline pnpm install",
-            )
-            phase_seconds["install"] = self._elapsed_seconds(install_started)
+            observe("install", "started", {"key": template_signature["key"]})
+            try:
+                with self._shared_store_lock(deadline) as (held_store_lock_path, held_store_lock_wait):
+                    shared_lock_acquired = True
+                    shared_lock_path = held_store_lock_path
+                    shared_lock_wait_seconds = held_store_lock_wait
+                    phase_seconds["lock_wait"] = held_store_lock_wait
+                    install = self._run(
+                        install_command,
+                        worktree,
+                        environment,
+                        self._remaining_seconds(deadline),
+                        stage="frozen offline pnpm install",
+                    )
+            except BaseException:
+                observe("install", "failed", {"key": template_signature["key"]})
+                raise
+            finally:
+                phase_seconds["install"] = self._elapsed_seconds(install_started)
             if install.exit_code != 0:
+                observe("install", "failed", {"key": template_signature["key"]})
                 raise DirtyWorktreeRecoveryError(
                     "offline pnpm materialization failed: "
                     f"{install.stderr.strip() or install.stdout.strip()}"
                 )
+            observe("install", "finished", {"key": template_signature["key"]})
             if template_directory is not None:
                 self._write_template_marker(worktree / "node_modules", template_signature["key"])
                 if not self._has_template_marker(
@@ -1179,14 +1256,25 @@ class PnpmOfflineMaterializer:
                         "offline pnpm materialization did not retain a complete linker marker"
                     )
                 publication_started = time.monotonic()
+                observe("cache_publish", "started", {"key": template_signature["key"]})
                 try:
                     template_publish = self._publish_template(
                         template_directory, template_signature, worktree, deadline
                     )
                 except (DirtyWorktreeRecoveryError, OSError) as error:
+                    observe("cache_publish", "failed", {"key": template_signature["key"]})
                     template_publication_error = _bounded(
                         str(error) or type(error).__name__,
                         limit=_MATERIALIZATION_DIAGNOSTIC_OUTPUT_BYTES,
+                    )
+                else:
+                    observe(
+                        "cache_publish",
+                        "finished",
+                        {
+                            "key": template_signature["key"],
+                            "outcome": "published" if template_publish is not None else "existing",
+                        },
                     )
                 finally:
                     phase_seconds["publication"] = self._elapsed_seconds(publication_started)
@@ -1217,10 +1305,7 @@ class PnpmOfflineMaterializer:
             "lockfile_sha256": sha256(lockfile.read_bytes()).hexdigest(),
             "materialization_timeout_seconds": effective_timeout,
             "store_dir": str(self.store_dir.resolve(strict=False)) if self.store_dir else None,
-            "shared_store_lock": {
-                "path": str(lock_path),
-                "wait_seconds": lock_wait_seconds,
-            },
+            **lock_receipts(),
             "template": template,
             **timing_receipt(),
             "commands": [version.to_dict(), install.to_dict()],
@@ -1573,16 +1658,64 @@ class PnpmOfflineMaterializer:
 
         return round(max(0.0, time.monotonic() - started), 3)
 
+    def _shared_store_lock_path(self) -> Path:
+        lock_directory = self.store_dir or Path(tempfile.gettempdir())
+        return lock_directory / self.LOCK_FILENAME
+
+    @staticmethod
+    def _template_lock_path(template_directory: Path) -> Path:
+        return template_directory.parent / ".locks" / (template_directory.name + ".lock")
+
+    @contextmanager
+    def _template_lock(
+        self,
+        template_directory: Path,
+        deadline: float,
+    ) -> Iterator[tuple[Path, float]]:
+        lock_path = self._template_lock_path(template_directory)
+        with self._file_lock(
+            lock_path,
+            deadline,
+            "offline pnpm materialization timed out waiting for the template-key lock",
+        ) as receipt:
+            yield receipt
+
+    @staticmethod
+    def _discard_stale_template_staging(template_directory: Path) -> None:
+        """Remove crash residue for one key while its exclusive lock is held."""
+
+        prefix = f".{template_directory.name}.staging-"
+        if not template_directory.parent.exists():
+            return
+        for candidate in template_directory.parent.iterdir():
+            if candidate.name.startswith(prefix):
+                if candidate.is_symlink() or candidate.is_file():
+                    candidate.unlink()
+                else:
+                    shutil.rmtree(candidate)
+
     @contextmanager
     def _shared_store_lock(self, deadline: float) -> Iterator[tuple[Path, float]]:
-        lock_directory = self.store_dir or Path(tempfile.gettempdir())
-        lock_path = lock_directory / self.LOCK_FILENAME
+        lock_path = self._shared_store_lock_path()
+        with self._file_lock(
+            lock_path,
+            deadline,
+            "offline pnpm materialization timed out waiting for the shared pnpm store lock",
+        ) as receipt:
+            yield receipt
+
+    @staticmethod
+    @contextmanager
+    def _file_lock(
+        lock_path: Path,
+        deadline: float,
+        timeout_message: str,
+    ) -> Iterator[tuple[Path, float]]:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             handle = lock_path.open("a+", encoding="utf-8")
         except OSError as error:
-            raise DirtyWorktreeRecoveryError(
-                f"cannot open shared pnpm store lock {lock_path}: {error}"
-            ) from error
+            raise DirtyWorktreeRecoveryError(f"cannot open lock {lock_path}: {error}") from error
         started = time.monotonic()
         try:
             while True:
@@ -1591,9 +1724,7 @@ class PnpmOfflineMaterializer:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise DirtyWorktreeRecoveryError(
-                            "offline pnpm materialization timed out waiting for the shared pnpm store lock"
-                        )
+                        raise DirtyWorktreeRecoveryError(timeout_message)
                     time.sleep(0.1)
             yield lock_path, round(time.monotonic() - started, 3)
         finally:
